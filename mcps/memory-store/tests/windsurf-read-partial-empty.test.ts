@@ -2,19 +2,25 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { registerConversation } from "../src/tools/conversation.ts";
-import {
-    __setWindsurfEndpointResolverForTest,
-    __setWindsurfTransportFactoryForTest,
-    __resetWindsurfEndpointCacheForTest,
-    type WindsurfLsEndpoint,
-    type WindsurfLsTransport,
-} from "../src/windsurf-client.ts";
-import { __setWindsurfCascadeDirForTest } from "../src/windsurf-local-store.ts";
-import { clearMappings } from "../src/conversation-router.ts";
+import type { WindsurfLsEndpoint, WindsurfLsTransport } from "../src/windsurf-client.ts";
 
-process.env.MEMORY_STORE_AUTO_RECORD = "0";
-process.env.MEMORY_STORE_DATA_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "memory-store-wsf-read-partial-"));
+const root = fs.mkdtempSync(path.join(os.tmpdir(), "memory-store-wsf-read-partial-"));
+const pbDir = path.join(root, "pb");
+fs.mkdirSync(pbDir);
+const environment: Record<string, string> = {
+    MEMORY_STORE_AUTO_RECORD: "0", MEMORY_STORE_LIFECYCLE_ENABLED: "false", MEMORY_STORE_DATA_ROOT: root,
+    MEMORY_STORE_DEVIN_CLI_DB_PATH: path.join(root, "absent-cli.db"), MEMORY_STORE_DEVIN_DESKTOP_ROOT: path.join(root, "absent-desktop"),
+    MEMORY_STORE_WSF_SUBAGENT_JOBS_PATH: path.join(root, "absent-jobs.json"),
+    MEMORY_STORE_WINDSURF_PB_ACTIVE_ROOT: pbDir, MEMORY_STORE_WINDSURF_PB_IMPLICIT_ROOT: path.join(root, "absent-implicit"),
+};
+const previousEnvironment = Object.fromEntries(Object.keys(environment).map(name => [name, process.env[name]]));
+for (const [name, value] of Object.entries(environment)) process.env[name] = value;
+const { registerConversation } = await import("../src/tools/conversation.ts");
+const { __setWindsurfEndpointResolverForTest, __setWindsurfTransportFactoryForTest, __resetWindsurfEndpointCacheForTest } = await import("../src/windsurf-client.ts");
+const { __setWindsurfCascadeDirForTest } = await import("../src/windsurf-local-store.ts");
+const { clearMappings } = await import("../src/conversation-router.ts");
+const { DATA_ROOT } = await import("../src/store.ts");
+assert.equal(DATA_ROOT, root);
 
 type ConversationHandler = (args?: Record<string, unknown>) => Promise<{ content?: Array<{ type?: string; text?: string }> }>;
 
@@ -78,7 +84,6 @@ async function readText(handler: ConversationHandler, args: Record<string, unkno
 }
 
 const handler = captureConversationHandler();
-const pbDir = fs.mkdtempSync(path.join(os.tmpdir(), "memory-store-wsf-pb-"));
 __setWindsurfCascadeDirForTest(pbDir);
 
 try {
@@ -129,4 +134,9 @@ try {
     __resetWindsurfEndpointCacheForTest();
     __setWindsurfCascadeDirForTest(null);
     clearMappings();
+    fs.rmSync(root, { recursive: true, force: true });
+    for (const [name, value] of Object.entries(previousEnvironment)) {
+        if (value === undefined) delete process.env[name];
+        else process.env[name] = value;
+    }
 }

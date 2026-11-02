@@ -54,8 +54,8 @@ try {
     const sourceBytes = fs.readFileSync(process.env.MEMORY_STORE_DEVIN_CLI_DB_PATH);
     for (const parentId of [word, uuid]) {
         const listed = await listConversationCandidates({ dataChains: ["windsurf"], source: "local", threadMode: "children", parentConversationId: parentId });
-        assert.deepEqual(listed.candidates.map(item => item.id), [childId]);
-        assert.equal(listed.partial, false);
+        assert.deepEqual(listed.candidates.map(item => item.id), [childId], JSON.stringify({ parentId, listed }));
+        assert.equal(listed.partial, false, JSON.stringify(listed));
         assert.equal(listed.candidates[0].parentConversationId, word);
         assert.ok(listed.candidates[0].aliases?.includes(`${uuid}--subagent-worker`));
     }

@@ -3,9 +3,12 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { createHash } from "node:crypto";
-import { corpusToolResult, isCorpusAction, runCorpusAction, type CorpusToolImplementation } from "../src/tools/conversation-corpus-tool.js";
+import { corpusToolResult, isCorpusAction, runCorpusAction as runCorpusActionRaw, type CorpusToolImplementation } from "../src/tools/conversation-corpus-tool.js";
 import type { CorpusConversation } from "../src/conversation-corpus-types.js";
 import { registerConversation } from "../src/tools/conversation.js";
+
+const runCorpusAction = (params: Parameters<typeof runCorpusActionRaw>[0], supplied?: CorpusToolImplementation) =>
+    runCorpusActionRaw({ dataChain: "codex", ...params }, supplied);
 
 const conversation: CorpusConversation = { id: "target", title: "Example", workspace: "/project", source: "codex" };
 const calls: Array<{ operation: string; args: any }> = [];
@@ -65,7 +68,9 @@ await assert.rejects(() => runCorpusAction({ action: "search_all", query: "word"
 await assert.rejects(() => runCorpusAction({ action: "read_hit", conversationId: "target", startRound: 1 }, api), /sourceRevision/u);
 await assert.rejects(() => runCorpusAction({ action: "read_hit", conversationId: "target", sourceRevision: "revision-a" }, api), /限定读取范围/u);
 await assert.rejects(() => runCorpusAction({ action: "search_all", conversationId: "caller-a", messageRoles: ["system"] }, api), /system/u);
-await assert.rejects(() => runCorpusAction({ action: "search_all", conversationId: "caller-a", dataChain: "windsurf" }, api), /Codex/u);
+await runCorpusAction({ action: "search_all", conversationId: "caller-a", dataChain: "windsurf" }, api);
+assert.deepEqual(calls.at(-1)?.args.request.dataChains, ["windsurf"]);
+await assert.rejects(() => runCorpusActionRaw({ action: "search_all", conversationId: "caller-a" }, api), /concrete dataChain/u);
 
 let handler: (params: any) => Promise<any> = async () => { throw new Error("not registered"); };
 let schema: Record<string, any> = {};
@@ -75,9 +80,9 @@ assert.equal(schema.searchExpression.parse({ all: [{ term: "缓存" }, { any: [{
 const started = await handler({ action: "search_all", conversationId: "caller-a", dataChain: "codex", allTerms: ["缓存"], intersectionScope: "round" });
 assert.equal(JSON.parse(started.content[0].text).taskId, "task-a");
 assert.equal(calls.at(-1)?.args.request.intersectionScope, "round");
-const expanded = await handler({ action: "read_hit", conversationId: "target", sourceRevision: "revision-a", startRound: 3, endRound: 3 });
+const expanded = await handler({ action: "read_hit", conversationId: "target", dataChain: "codex", sourceRevision: "revision-a", startRound: 3, endRound: 3 });
 assert.equal(JSON.parse(expanded.content[0].text).revision, "revision-a");
-const recent = await handler({ action: "read_fast", conversationId: "target", lastRounds: 2, background: false });
+const recent = await handler({ action: "read_fast", conversationId: "target", dataChain: "codex", lastRounds: 2, background: false });
 assert.equal(JSON.parse(recent.content[0].text).requestedRangeComplete, true);
 const missingIdentity = await handler({ action: "search_all", query: "缓存" });
 assert.match(missingIdentity.content[0].text, /调用者/u);

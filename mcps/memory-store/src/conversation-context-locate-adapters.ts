@@ -77,23 +77,28 @@ export const defaultContextLocateAdapters: ConversationContextLocateAdapters = {
             const partial = firstRound > 1 || candidate.sourcePartial || conversationSourceIsPartial(loaded.snapshot) || loaded.snapshot.cacheState === "stale";
             return { rounds: cached.rounds, partial, freshness: "unknown", warnings: partial ? ["cache-only scan contains partial source or bounded recent rounds"] : undefined };
         }
-        if (candidate.sourceBytes !== undefined && candidate.sourceBytes > budget.maxBytes) {
+        const devinSource = candidate.dataChain === "windsurf" && candidate.sourceKind?.startsWith("devin-") && budget.source !== "ls";
+        if (candidate.sourceBytes !== undefined && candidate.sourceBytes > budget.maxBytes && !(devinSource && budget.probe)) {
             return { rounds: [], partial: true, warnings: ["source size exceeds remaining locate budget; increase maxBytes or use a narrower source"] };
         }
         const cancelled = () => budget.isCancelled() || Date.now() >= budget.deadlineAt;
-        if (candidate.dataChain === "windsurf" && candidate.sourceKind?.startsWith("devin-") && budget.source !== "ls") {
+        if (devinSource) {
             const { readDevinConversation } = await import("./devin-conversation.js");
             const loaded = await readDevinConversation(candidate.id, {
                 maxBytes: budget.maxBytes, deadlineMs: budget.deadlineAt, isCancelled: cancelled,
                 link: "summary", materializeAttachments: false,
+                roundRange: budget.probe ? { tailRounds: budget.maxRounds } : undefined,
             });
             if (cancelled()) return { rounds: [], partial: true, warnings: ["Devin context scan was cancelled or exceeded its deadline"] };
             if (!loaded) throw new Error("Devin conversation source is unavailable");
-            const firstRound = budget.probe ? Math.max(1, loaded.rounds.length - budget.maxRounds + 1) : 1;
-            const partial = firstRound > 1 || loaded.raw.partial;
+            const coverage = loaded.raw.coverage;
+            const firstRound = coverage?.startRound ?? (budget.probe ? Math.max(1, loaded.rounds.length - budget.maxRounds + 1) : 1);
+            const bounded = firstRound > 1 || Boolean(coverage && coverage.endRound < coverage.totalRounds);
+            const partial = bounded || loaded.raw.partial;
             return { rounds: loaded.rounds.filter(round => round.roundIndex >= firstRound), partial,
-                filePath: loaded.raw.summary.sourcePath, freshness: partial ? "unknown" : "fresh",
-                warnings: [...loaded.raw.warnings, ...(firstRound > 1 ? ["contextProbe searched a bounded recent-round window"] : [])] };
+                filePath: loaded.raw.summary.sourcePath, freshness: loaded.raw.partial ? "unknown" : "fresh",
+                verifiedIdentity: { aliases: loaded.raw.summary.aliases, uuid: loaded.raw.summary.uuid, sessionId: loaded.raw.summary.sessionId },
+                warnings: [...loaded.raw.warnings, ...(bounded ? ["contextProbe searched a bounded recent-round window"] : [])] };
         }
         const loaded = await loadConversationData(candidate.dataChain, candidate.id, {
             source: budget.source, includeRounds: false, link: "summary", isCancelled: cancelled,

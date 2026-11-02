@@ -1,5 +1,6 @@
 import { workspaceMatches } from "./conversation-filter.js";
-export const CORPUS_QUERY_SEMANTIC_VERSION = "literal-corpus/v2";
+import { corpusConversationKey, resolveCorpusSources, type CorpusSource } from "./conversation-corpus-sources.js";
+export const CORPUS_QUERY_SEMANTIC_VERSION = "literal-corpus/v3";
 import type {
     CorpusConversation,
     CorpusMessage,
@@ -11,6 +12,9 @@ import type {
 } from "./conversation-corpus-types.js";
 
 export interface CorpusMatchSnippet {
+    source: CorpusSource;
+    conversationId: string;
+    canonicalId?: string;
     messageId: string;
     round: number;
     role: CorpusMessageRole;
@@ -104,10 +108,13 @@ export function normalizeCodexCorpusConversationId(value: string): string {
 export function compileCorpusSearch(request: CorpusSearchRequest): CompiledCorpusSearch {
     if (!request || typeof request !== "object") throw new Error("Corpus search request is required");
     const copy = JSON.parse(JSON.stringify(request)) as CorpusSearchRequest;
+    if (copy.dataChains !== undefined) copy.dataChains = resolveCorpusSources({ dataChains: copy.dataChains });
+    if (copy.sourceFailureMode !== undefined && !["warn", "fail"].includes(copy.sourceFailureMode)) throw new Error("Invalid sourceFailureMode");
     if (copy.purpose !== undefined && copy.purpose !== "prepare") throw new Error("Invalid corpus purpose");
     if (copy.purpose === "prepare" && (!Array.isArray(copy.conversationIds) || copy.conversationIds.length !== 1)) {
         throw new Error("Corpus preparation requires exactly one target conversation");
     }
+    if (copy.purpose === "prepare" && copy.dataChains && copy.dataChains.length !== 1) throw new Error("Corpus preparation requires exactly one source");
     if (copy.query !== undefined && (typeof copy.query !== "string" || !copy.query.trim())) {
         throw new Error("query must be a nonempty literal string");
     }
@@ -115,7 +122,8 @@ export function compileCorpusSearch(request: CorpusSearchRequest): CompiledCorpu
     const anyTerms = validTerms(copy.anyTerms, "anyTerms");
     const excludeTerms = validTerms(copy.excludeTerms, "excludeTerms");
     for (const key of ["workspaces", "conversationIds"] as const) validTerms(copy[key], key);
-    if (copy.conversationIds) copy.conversationIds = [...new Set(copy.conversationIds.map(normalizeCodexCorpusConversationId))];
+    if (copy.conversationIds) copy.conversationIds = [...new Set(copy.conversationIds.map(value =>
+        !copy.dataChains || (copy.dataChains.length === 1 && copy.dataChains[0] === "codex") ? normalizeCodexCorpusConversationId(value) : value.trim()))];
     if (copy.intersectionScope && !["conversation", "round", "message"].includes(copy.intersectionScope)) {
         throw new Error("Invalid intersectionScope");
     }
@@ -168,7 +176,10 @@ export function compileCorpusSearch(request: CorpusSearchRequest): CompiledCorpu
 }
 
 export function corpusConversationMatchesScope(conversation: CorpusConversation, request: CorpusSearchRequest): boolean {
-    return (!request.conversationIds?.length || request.conversationIds.includes(conversation.id))
+    const identifiers = [conversation.id, conversation.canonicalId, ...conversation.aliases ?? []].filter((value): value is string => typeof value === "string");
+    const normalize = conversation.source === "codex" ? normalizeCodexCorpusConversationId : (value: string): string => value.trim();
+    return (!request.dataChains || request.dataChains.includes(conversation.source))
+        && (!request.conversationIds?.length || request.conversationIds.some(value => identifiers.some(identifier => normalize(identifier) === normalize(value))))
         && workspaceMatches(conversation.workspace, request.workspaces, request.workspaceMode ?? "contains");
 }
 
@@ -197,11 +208,11 @@ export class CorpusSearchAccumulator {
     constructor(
         readonly conversation: CorpusConversation,
         request: CorpusSearchRequest | CompiledCorpusSearch,
-        readonly source: { revision: string; cacheGeneration?: string; warnings?: string[] },
+        readonly source: { revision: string; cacheGeneration?: string; warnings?: string[]; partial?: boolean },
         options: { maxSnippets?: number; snippetChars?: number } = {},
     ) {
         this.compiled = "terms" in request ? request as CompiledCorpusSearch : compileCorpusSearch(request);
-        this.warnings = [...source.warnings ?? []];
+        this.warnings = [...new Set([...conversation.sourceWarnings ?? [], ...source.warnings ?? []])];
         this.maxSnippets = Math.max(0, Math.min(10, Math.floor(options.maxSnippets ?? 3)));
         this.snippetChars = Math.max(32, Math.min(1000, Math.floor(options.snippetChars ?? 180)));
     }
@@ -259,6 +270,7 @@ export class CorpusSearchAccumulator {
             const snippetStart = Math.max(0, firstHit.start - Math.floor(this.snippetChars / 3));
             const snippetEnd = Math.min(message.text.length, snippetStart + this.snippetChars);
             group.snippets.push({
+                source: this.conversation.source, conversationId: this.conversation.id, canonicalId: this.conversation.canonicalId,
                 messageId: message.id, round: message.round, role: message.role, timestamp: message.timestamp ?? null,
                 term: firstHit.term, matchStart: firstHit.start, matchEnd: firstHit.end, snippetStart, snippetEnd,
                 text: message.text.slice(snippetStart, snippetEnd), position: { ...message.position },
@@ -308,14 +320,16 @@ export class CorpusSearchAccumulator {
             matchingScopes += scope === "message" ? group.matchingMessages : 1;
             latestMatchAt = laterTimestamp(latestMatchAt, group.latestMatchAt);
             if (group.matchedMessages || !hasPositive) rounds.push(round);
-            if (snippets.length < this.maxSnippets) snippets.push(...group.snippets.slice(0, this.maxSnippets - snippets.length));
+            if (snippets.length < this.maxSnippets) snippets.push(...group.snippets.slice(0, this.maxSnippets - snippets.length).map(snippet => ({
+                ...snippet, revision: this.source.revision, sourceRevision: this.source.revision, cacheGeneration: this.source.cacheGeneration,
+            })));
         }
         if (scope === "conversation" ? !this.matches(counts) : !matchingScopes) return null;
         const termCounts = Object.fromEntries(this.compiled.terms.map((term, index) => [term.value, counts[index]]));
         return {
             conversation: { ...this.conversation }, revision: this.source.revision, sourceRevision: this.source.revision,
             round: snippets[0]?.round ?? (hasPositive ? rounds[0] ?? null : null), cacheGeneration: this.source.cacheGeneration,
-            provisional: !complete, termCounts,
+            provisional: !complete || this.source.partial === true, termCounts,
             occurrences: this.compiled.terms.reduce((total, term, index) => total + (term.positive ? counts[index] : 0), 0),
             matchedMessages, matchingScopes: scope === "conversation" ? 1 : matchingScopes, rounds,
             latestMatchAt, latestMatchTimeSource: latestMatchAt ? "message_timestamp" : "unknown", snippets,
@@ -338,6 +352,8 @@ export function sortCorpusMatches(matches: Iterable<CorpusConversationMatch>, so
         const leftScore = score(left);
         const rightScore = score(right);
         if (leftScore !== rightScore) return leftScore > rightScore ? -1 : 1;
-        return left.conversation.id < right.conversation.id ? -1 : left.conversation.id > right.conversation.id ? 1 : 0;
+        const leftKey = corpusConversationKey(left.conversation);
+        const rightKey = corpusConversationKey(right.conversation);
+        return leftKey < rightKey ? -1 : leftKey > rightKey ? 1 : 0;
     });
 }

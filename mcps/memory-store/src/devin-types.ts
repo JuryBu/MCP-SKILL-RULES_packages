@@ -7,6 +7,31 @@ export interface DevinReadOptions {
     maxBytes?: number;
     maxDesktopFiles?: number;
     deadlineMs?: number;
+    roundRange?: DevinRoundRange;
+    identityCache?: import("./devin-identity-cache.js").DevinIdentityCache;
+    identityMode?: "verified" | "physical";
+    physicalSourceKind?: "devin-cli" | "devin-desktop";
+}
+
+export type DevinRoundRange = { tailRounds: number } | { startRound: number; endRound?: number };
+
+export interface DevinRoundCoverage {
+    unit: "round";
+    startRound: number;
+    endRound: number;
+    totalRounds: number;
+    startStep: number;
+    endStepExclusive: number;
+    totalSteps: number;
+    complete: boolean;
+    sourceRevision?: string;
+}
+
+export interface DevinSqliteValidation {
+    sourcePath: string;
+    identity: string;
+    dataVersion: number;
+    epoch: string;
 }
 
 export interface DevinDiscoveryDiagnostic {
@@ -52,6 +77,7 @@ export interface DevinConversationSummary {
     matchedMessageIds: number;
     matchedToolCallIds?: number;
     identityEvidence?: "client-message-id" | "tool-call-id";
+    identityStatus?: "pending";
     mainChainId?: number;
     partial: boolean;
     warnings: string[];
@@ -91,4 +117,7 @@ export interface DevinRawConversation {
     fingerprint: ConversationSourceFingerprint;
     partial: boolean;
     warnings: string[];
+    coverage?: DevinRoundCoverage;
+    sourceEvidence?: { method: "content-digest" | "sqlite-data-version"; revision: string; validationRevision?: string; sources?: DevinSqliteValidation[] };
+    readMetrics?: { identityMs: number; bodyReadMs: number; totalMs: number; bytesRead: number; recordsRead: number; identityCacheHit: boolean };
 }

@@ -4,6 +4,7 @@ import path from "node:path";
 import { createHash } from "node:crypto";
 import type { CorpusMessageRole, CorpusProjection, CorpusProvider, CorpusSearchExpression, CorpusSearchRequest } from "../conversation-corpus-types.js";
 import { normalizeCodexCorpusConversationId } from "../conversation-corpus-search.js";
+import { resolveCorpusSources, type CorpusSource } from "../conversation-corpus-sources.js";
 
 const actions = new Set(["search_all", "search_all_status", "search_all_cancel", "search_all_resume", "read_hit", "read_fast"]);
 
@@ -37,6 +38,9 @@ export interface CorpusToolParams {
     endRound?: number;
     lastRounds?: number;
     dataChain?: string;
+    dataChains?: string[];
+    chain?: string;
+    sourceFailureMode?: "warn" | "fail";
     source?: string;
     prepareCache?: boolean;
 }
@@ -54,14 +58,17 @@ export interface CorpusToolImplementation {
     readFast: (conversation: Parameters<CorpusProvider["read"]>[0], request: {
         startRound?: number; endRound?: number; lastRounds?: number; messageRoles?: CorpusMessageRole[];
     }) => Promise<CorpusProjection>;
-    prepareCache: (args: { ownerId: string; conversationId: string; provider: CorpusProvider }) => Promise<unknown>;
+    prepareCache: (args: { ownerId: string; conversationId: string; dataChain?: CorpusSource; provider: CorpusProvider }) => Promise<unknown>;
 }
 
 async function implementation(): Promise<CorpusToolImplementation> {
-    const [tasks, reader, preparation] = await Promise.all([import("../conversation-corpus-task.js"), import("../conversation-corpus-reader-codex.js"), import("../conversation-corpus-preparation.js")]);
-    return { provider: reader.codexCorpusProvider, start: tasks.startCorpusSearch, status: tasks.getCorpusSearchStatus,
-        cancel: tasks.cancelCorpusSearch, resume: tasks.resumeCorpusSearch, readRounds: reader.readCodexCorpusRounds,
-        readFast: reader.readCodexCorpusFast, prepareCache: preparation.startCorpusPreparation };
+    const [tasks, reader, preparation] = await Promise.all([import("../conversation-corpus-task.js"), import("../conversation-corpus-reader-multi.js"), import("../conversation-corpus-preparation.js")]);
+    const provider = reader.createMultiCorpusProvider();
+    return { provider, start: tasks.startCorpusSearch, status: tasks.getCorpusSearchStatus,
+        cancel: tasks.cancelCorpusSearch, resume: tasks.resumeCorpusSearch,
+        readRounds: (conversation, request) => provider.readRounds(conversation, request, { messageRoles: request.messageRoles }),
+        readFast: (conversation, request) => provider.readFast(conversation, request, { messageRoles: request.messageRoles }),
+        prepareCache: preparation.startCorpusPreparation };
 }
 
 function selectedRoles(input?: string[]): CorpusMessageRole[] | undefined {
@@ -75,8 +82,10 @@ function selectedRoles(input?: string[]): CorpusMessageRole[] | undefined {
 
 export async function runCorpusAction(params: CorpusToolParams, supplied?: CorpusToolImplementation): Promise<unknown> {
     const ownerId = params.conversationId?.trim();
-    if (!ownerId) throw new Error("全库检索和read_fast需要conversationId指定当前调用者，目标范围使用conversationIds；read_hit使用命中项的目标conversationId");
-    if (params.dataChain && params.dataChain !== "auto" && params.dataChain !== "codex") throw new Error("search_all/read_hit/read_fast当前使用本机Codex来源，请指定dataChain=codex");
+    if (!ownerId) throw new Error("全库检索和读取需要conversationId指定当前调用者，目标范围使用conversationIds");
+    const createsRequest = ["search_all", "read_hit", "read_fast"].includes(params.action);
+    const sources = createsRequest || params.dataChain !== undefined || params.dataChains !== undefined || params.chain !== undefined
+        ? resolveCorpusSources(params) : undefined;
     if (params.source === "ls" || params.source === "cache") throw new Error("search_all/read_hit/read_fast使用来源校验后的正文投影，请使用source=auto/local；固定旧fetch缓存可用search/read");
     if (params.forceRefresh && params.action !== "search_all") throw new Error("forceRefresh仅用于新建search_all，既有任务和命中展开保持原来源版本");
     const api = supplied || await implementation();
@@ -87,11 +96,16 @@ export async function runCorpusAction(params: CorpusToolParams, supplied?: Corpu
             expression: params.searchExpression, conversationIds: params.conversationIds, workspaces: params.workspaces,
             workspaceMode: params.workspaceMode, messageRoles: roles, intersectionScope: params.intersectionScope,
             sort: params.searchSort, caseSensitive: params.caseSensitive, forceRefresh: params.forceRefresh,
+            dataChains: sources!, sourceFailureMode: params.sourceFailureMode,
         } });
     }
     if (params.action === "read_hit" || params.action === "read_fast") {
+        if (sources!.length !== 1) throw new Error("读取命中项或单个范围时使用该命中的具体dataChain");
+        const source = sources![0]!;
         if (params.action === "read_fast" && params.conversationIds && params.conversationIds.length !== 1) throw new Error("read_fast的conversationIds只能指定一个目标，省略时读取当前对话");
-        const targetId = normalizeCodexCorpusConversationId(params.action === "read_fast" ? params.conversationIds?.[0] || ownerId : ownerId);
+        if (params.conversationIds && params.conversationIds.length !== 1) throw new Error("读取需要且只接受一个目标conversationIds项");
+        const rawTarget = params.conversationIds?.[0] || ownerId;
+        const targetId = source === "codex" ? normalizeCodexCorpusConversationId(rawTarget) : rawTarget.trim();
         if (params.action === "read_hit" && !params.sourceRevision?.trim()) throw new Error("read_hit需要搜索命中项的sourceRevision，按同一来源版本展开轮次");
         if (params.action === "read_hit" && /^pending(?:[:/-]|$)/u.test(params.sourceRevision!.trim())) throw new Error("该搜索命中仍为暂计，来源尚未完整校验；请等待同一任务的最终sourceRevision，或用read_fast读取当前范围");
         if (params.action === "read_fast" && params.sourceRevision !== undefined) throw new Error("按固定sourceRevision展开请使用read_hit；read_fast读取当前已校验来源");
@@ -101,15 +115,17 @@ export async function runCorpusAction(params: CorpusToolParams, supplied?: Corpu
         }
         if (params.lastRounds !== undefined && (params.startRound !== undefined || params.endRound !== undefined)) throw new Error("lastRounds与startRound/endRound择一使用");
         if (params.startRound !== undefined && params.endRound !== undefined && params.startRound > params.endRound) throw new Error("startRound必须小于或等于endRound");
-        const conversations = await api.provider.list({ conversationIds: [targetId] }, {});
-        const conversation = conversations.find(candidate => candidate.id === targetId);
+        const conversations = await api.provider.list({ conversationIds: [targetId], dataChains: [source], sourceFailureMode: "fail" }, {});
+        const conversation = conversations.find(candidate => candidate.source === source
+            && (candidate.id === targetId || candidate.canonicalId === targetId || candidate.aliases?.includes(targetId)));
         if (!conversation) throw new Error(`${params.action}目标对话在本机来源中不存在`);
         if (params.action === "read_fast") {
-            const cachePreparation = params.prepareCache === false ? undefined : await api.prepareCache({ ownerId, conversationId: targetId, provider: api.provider });
+            const cachePreparation = params.prepareCache === false ? undefined : await api.prepareCache({ ownerId, conversationId: conversation.id, dataChain: source, provider: api.provider });
             try {
                 const projection = await api.readFast(conversation, { startRound: params.startRound, endRound: params.endRound,
                     lastRounds: params.lastRounds, messageRoles: roles });
-                return { ...projection, requestedRangeComplete: projection.requestedRangeComplete === true || projection.complete,
+                return { ...projection, requestedRangeComplete: projection.partial !== true
+                    && projection.requestedRangeComplete !== false && (projection.requestedRangeComplete === true || projection.complete),
                     fullSourceProjectionComplete: projection.complete, cachePreparation };
             } catch (error) {
                 const message = error instanceof Error ? error.message : String(error);
@@ -121,6 +137,13 @@ export async function runCorpusAction(params: CorpusToolParams, supplied?: Corpu
     }
     if (!params.taskId?.trim()) throw new Error(`${params.action}需要原taskId`);
     const identity = { ownerId, taskId: params.taskId.trim() };
+    if (sources) {
+        const original = await api.status({ ...identity, limit: 1, waitMs: 0 }) as { request?: CorpusSearchRequest };
+        const bound = original?.request?.dataChains ?? ["codex"];
+        if (sources.length !== bound.length || sources.some(source => !bound.includes(source))) {
+            throw new Error("请求来源与原taskId绑定的来源不同，请沿用原任务的dataChains");
+        }
+    }
     if (params.action === "search_all_status") {
         const status = await api.status({ ...identity, limit: Math.min(50, Math.max(1, Math.floor(params.limit || 8))),
             cursor: params.continuationCursor, afterRevision: params.afterRevision,

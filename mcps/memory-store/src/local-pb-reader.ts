@@ -1,5 +1,5 @@
 import fs from "node:fs";
-import { createDecipheriv } from "node:crypto";
+import { createDecipheriv, createHash, randomUUID } from "node:crypto";
 
 export type LocalPbSourceFlavor = "windsurf" | "antigravity";
 export type LocalPbCandidateKind = "active" | "implicit";
@@ -143,6 +143,23 @@ export interface LocalPbReadResult {
     diagnostics: LocalPbDiagnostic[];
     partial?: boolean;
     coverage?: LocalPbStepCoverage;
+    sourceRevision?: string;
+    metrics?: { authenticatedBytes: number; decodedSteps: number; reusedSteps: number; prepareMs: number; projectionMs: number };
+}
+
+export type LocalPbReadBudget = Pick<LocalPbReaderOptions, "signal" | "isCancelled" | "deadlineMs">;
+
+export interface PreparedLocalPbReader {
+    readonly totalSteps: number;
+    readonly sourceRevision: string;
+    read(stepRange?: LocalPbStepRangeRequest, budget?: LocalPbReadBudget): LocalPbReadResult;
+}
+
+export interface PreparedLocalPbCandidates {
+    sourceRevision: string;
+    partial: boolean;
+    candidates: Array<{ candidate: LocalPbCandidateKind; label?: string; reader?: PreparedLocalPbReader;
+        error?: { code: LocalPbErrorCode | "UNKNOWN"; message: string } }>;
 }
 
 export interface LocalPbCandidateOutcome {
@@ -168,6 +185,8 @@ const DEFAULT_APPLICATION_KEY = "safeCodeiumworldKeYsecretBalloon";
 const DEFAULT_MAX_PAYLOAD_BYTES = 64 * 1024 * 1024;
 const UTF8_DECODER = new TextDecoder("utf-8", { fatal: true });
 const LITERAL_UTF8_DECODER = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
+const NESTED_MESSAGES = new WeakMap<ProtoField, ProtoMessage | LocalPbReaderError>();
+const UTF8_TEXT = new WeakMap<Uint8Array, { regular?: string; literal?: string; checkedRegular?: boolean; checkedLiteral?: boolean }>();
 
 /**
  * Reads a nonce-prefixed AES-256-GCM payload. The layout is exactly
@@ -179,6 +198,11 @@ export function decryptLocalPb(encrypted: Uint8Array, options: LocalPbReaderOpti
         throw new LocalPbReaderError("TRUNCATED", "Encrypted local PB is shorter than a GCM nonce and authentication tag");
     }
 
+    const maxPayloadBytes = options.maxPayloadBytes ?? DEFAULT_MAX_PAYLOAD_BYTES;
+    if (!Number.isSafeInteger(maxPayloadBytes) || maxPayloadBytes < 0 || encrypted.byteLength - 28 > maxPayloadBytes) {
+        throw new LocalPbReaderError("PAYLOAD_TOO_LARGE", `Encrypted local PB exceeds the ${maxPayloadBytes}-byte payload limit`);
+    }
+
     const key = resolveKey(options);
     const nonce = encrypted.subarray(0, 12);
     const tag = encrypted.subarray(encrypted.byteLength - 16);
@@ -188,7 +212,6 @@ export function decryptLocalPb(encrypted: Uint8Array, options: LocalPbReaderOpti
         const decipher = createDecipheriv("aes-256-gcm", key, nonce);
         decipher.setAuthTag(tag);
         const plaintext = Buffer.concat([decipher.update(ciphertext), decipher.final()]);
-        const maxPayloadBytes = options.maxPayloadBytes ?? DEFAULT_MAX_PAYLOAD_BYTES;
         if (plaintext.byteLength > maxPayloadBytes) {
             throw new LocalPbReaderError("PAYLOAD_TOO_LARGE", `Decrypted local PB exceeds the ${maxPayloadBytes}-byte limit`);
         }
@@ -201,6 +224,11 @@ export function decryptLocalPb(encrypted: Uint8Array, options: LocalPbReaderOpti
 
 /** Parse one encrypted active or implicit PB candidate without touching any client or cache. */
 export function readLocalPbCandidate(candidate: LocalPbCandidate, options: LocalPbReaderOptions): LocalPbReadResult {
+    return prepareLocalPbCandidate(candidate, options).read(options.stepRange);
+}
+
+export function prepareLocalPbCandidate(candidate: LocalPbCandidate, options: LocalPbReaderOptions): PreparedLocalPbReader {
+    const startedAt = performance.now();
     checkLocalPbReadBudget(options);
     if (options.stepRange) resolveLocalPbStepCoverage(options.stepRange, 0);
     const decrypted = decryptLocalPb(candidate.encrypted, options);
@@ -213,22 +241,41 @@ export function readLocalPbCandidate(candidate: LocalPbCandidate, options: Local
     }
 
     const stepFields = bytesFields(trajectory, 2);
-    const coverage = options.stepRange ? resolveLocalPbStepCoverage(options.stepRange, stepFields.length) : undefined;
+    const id = firstTextField(trajectory, 1);
+    const sourceRevision = `local-pb/v2:${options.sourceFlavor}:${candidate.kind}:${createHash("sha256").update(candidate.encrypted).digest("hex")}`;
+    const prepareMs = performance.now() - startedAt;
+    const parsed = new Map<number, LocalPbStep>();
+    let firstProjection = true;
+    return { totalSteps: stepFields.length, sourceRevision, read(stepRange, budget = {}) {
+    const projectionStartedAt = performance.now();
+    const effectiveOptions = { ...options, ...budget };
+    checkLocalPbReadBudget(effectiveOptions);
+    const coverage = stepRange ? resolveLocalPbStepCoverage(stepRange, stepFields.length) : undefined;
     const startStep = coverage?.startStep ?? 0;
     const endStepExclusive = coverage?.endStepExclusive ?? stepFields.length;
+    let decodedSteps = 0;
+    let reusedSteps = 0;
     const parsedSteps = stepFields.slice(startStep, endStepExclusive).map((field, offset) => {
-        checkLocalPbReadBudget(options);
-        const message = parseNested(field, "trajectory step");
-        return parseStep(message, startStep + offset, options.sourceFlavor);
+        checkLocalPbReadBudget(effectiveOptions);
+        const index = startStep + offset;
+        let step = parsed.get(index);
+        if (step) reusedSteps++;
+        else {
+            step = parseStep(parseNested(field, "trajectory step"), index, options.sourceFlavor);
+            parsed.set(index, step);
+            decodedSteps++;
+        }
+        return structuredClone(step);
     });
-    checkLocalPbReadBudget(options);
-    const id = firstTextField(trajectory, 1);
+    checkLocalPbReadBudget(effectiveOptions);
     const diagnostics = parsedSteps.flatMap(step => step.diagnostics);
     if (coverage && !coverage.complete) diagnostics.push({
         kind: "partial",
         message: `PB step range [${coverage.startStep}, ${coverage.endStepExclusive}) of ${coverage.totalSteps}; omitted step bodies were not decoded`,
     });
 
+    const chargedPreparation = firstProjection;
+    firstProjection = false;
     return {
         sourceFlavor: options.sourceFlavor,
         candidate: candidate.kind,
@@ -242,17 +289,58 @@ export function readLocalPbCandidate(candidate: LocalPbCandidate, options: Local
         diagnostics,
         partial: diagnostics.some(diagnostic => diagnostic.kind === "partial" || diagnostic.kind === "unknown_variant"),
         ...(coverage ? { coverage } : {}),
+        sourceRevision,
+        metrics: { authenticatedBytes: chargedPreparation ? candidate.encrypted.byteLength : 0, decodedSteps, reusedSteps, prepareMs: chargedPreparation ? prepareMs : 0,
+            projectionMs: performance.now() - projectionStartedAt },
     };
+    } };
 }
 
 /** Read a filesystem candidate only; no writes, discovery, cache, or live-client calls occur. */
 export function readLocalPbFileCandidate(candidate: LocalPbFileCandidate, options: LocalPbReaderOptions): LocalPbReadResult {
+    return prepareLocalPbFileCandidate(candidate, options).read(options.stepRange);
+}
+
+export function prepareLocalPbFileCandidate(candidate: LocalPbFileCandidate, options: LocalPbReaderOptions): PreparedLocalPbReader {
     checkLocalPbReadBudget(options);
-    return readLocalPbCandidate({
+    const size = fs.statSync(candidate.filePath).size;
+    const maximum = options.maxPayloadBytes ?? DEFAULT_MAX_PAYLOAD_BYTES;
+    if (size > maximum + 28) throw new LocalPbReaderError("PAYLOAD_TOO_LARGE", `Local PB file exceeds the ${maximum}-byte payload limit`);
+    return prepareLocalPbCandidate({
         kind: candidate.kind,
         encrypted: fs.readFileSync(candidate.filePath),
         ...(candidate.label ? { label: candidate.label } : {}),
     }, options);
+}
+
+export function prepareLocalPbFileCandidates(candidates: LocalPbFileCandidate[], options: LocalPbReaderOptions): PreparedLocalPbCandidates {
+    const revisions: unknown[] = [];
+    const outcomes: PreparedLocalPbCandidates["candidates"] = [];
+    for (const candidate of candidates) {
+        checkLocalPbReadBudget(options);
+        let contentRevision: string | undefined;
+        try {
+            const maximum = options.maxPayloadBytes ?? DEFAULT_MAX_PAYLOAD_BYTES;
+            if (fs.statSync(candidate.filePath).size > maximum + 28) throw new LocalPbReaderError("PAYLOAD_TOO_LARGE", "Local PB candidate exceeds maxPayloadBytes; increase the explicit budget to inspect it.");
+            const encrypted = fs.readFileSync(candidate.filePath);
+            contentRevision = createHash("sha256").update(encrypted).digest("hex");
+            const reader = prepareLocalPbCandidate({ kind: candidate.kind, encrypted, label: candidate.label }, options);
+            outcomes.push({ candidate: candidate.kind, ...(candidate.label ? { label: candidate.label } : {}), reader });
+            revisions.push([candidate.kind, candidate.filePath, candidate.label, reader.sourceRevision, "authenticated"]);
+        } catch (error) {
+            if (error instanceof LocalPbReaderError && (error.code === "CANCELLED" || error.code === "DEADLINE_EXCEEDED")) throw error;
+            const failure = { code: error instanceof LocalPbReaderError ? error.code : "UNKNOWN" as const,
+                message: error instanceof Error ? error.message : "Unexpected local PB preparation failure" };
+            outcomes.push({ candidate: candidate.kind, ...(candidate.label ? { label: candidate.label } : {}), error: failure });
+            revisions.push([candidate.kind, candidate.filePath, candidate.label, contentRevision ?? randomUnverifiedRevision(), failure.code]);
+        }
+    }
+    return { sourceRevision: `local-pb-candidates/v1:${options.sourceFlavor}:${createHash("sha256").update(JSON.stringify(revisions)).digest("hex")}`,
+        partial: outcomes.some(outcome => !!outcome.error), candidates: outcomes };
+}
+
+function randomUnverifiedRevision(): string {
+    return `unverified:${randomUUID()}`;
 }
 
 function checkLocalPbReadBudget(options: LocalPbReaderOptions): void {
@@ -417,7 +505,17 @@ function bytesFields(message: ProtoMessage, fieldNumber: number): ProtoField[] {
 
 function parseNested(field: ProtoField, context: string): ProtoMessage {
     if (!field.bytes) throw new LocalPbReaderError("MALFORMED_WIRE", `Missing length-delimited bytes for ${context}`);
-    return parseProtoMessage(field.bytes);
+    const cached = NESTED_MESSAGES.get(field);
+    if (cached instanceof LocalPbReaderError) throw cached;
+    if (cached) return cached;
+    try {
+        const message = parseProtoMessage(field.bytes);
+        NESTED_MESSAGES.set(field, message);
+        return message;
+    } catch (error) {
+        if (error instanceof LocalPbReaderError) NESTED_MESSAGES.set(field, error);
+        throw error;
+    }
 }
 
 function findTrajectory(root: ProtoMessage, kind: LocalPbCandidateKind): ProtoMessage | null {
@@ -460,6 +558,11 @@ function parseStep(message: ProtoMessage, index: number, sourceFlavor: LocalPbSo
     });
     const mappedFields = new Set<number>(activities.map(activity => activity.fieldNumber));
     const toolVariants = extractUnknownVariants(message, mappedFields);
+    const user = firstTextFromNestedField(message, 19);
+    const system = firstTextFromNestedField(message, 114);
+    const response = plannerMessage ? firstTextField(plannerMessage, 1) : undefined;
+    const thinking = plannerMessage ? firstTextField(plannerMessage, 2) : undefined;
+    const modifiedResponse = plannerMessage ? firstTextField(plannerMessage, 3) : undefined;
     const diagnostics = [
         ...detectMarkerDiagnostics({ fields: message.fields.filter(field => !mappedFields.has(field.fieldNumber)) }),
         ...activities.filter(activity => activity.textFields.some(field =>
@@ -478,13 +581,13 @@ function parseStep(message: ProtoMessage, index: number, sourceFlavor: LocalPbSo
         index,
         ...(timestamp ? { timestamp } : {}),
         ...(contextTokens !== undefined ? { contextTokens } : {}),
-        ...(firstTextFromNestedField(message, 19) ? { user: firstTextFromNestedField(message, 19) } : {}),
+        ...(user ? { user } : {}),
         ...(plannerMessage ? { planner: {
-            ...(firstTextField(plannerMessage, 1) ? { response: firstTextField(plannerMessage, 1) } : {}),
-            ...(firstTextField(plannerMessage, 2) ? { thinking: firstTextField(plannerMessage, 2) } : {}),
-            ...(firstTextField(plannerMessage, 3) ? { modifiedResponse: firstTextField(plannerMessage, 3) } : {}),
+            ...(response ? { response } : {}),
+            ...(thinking ? { thinking } : {}),
+            ...(modifiedResponse ? { modifiedResponse } : {}),
         } } : {}),
-        ...(firstTextFromNestedField(message, 114) ? { system: firstTextFromNestedField(message, 114) } : {}),
+        ...(system ? { system } : {}),
         activities,
         toolVariants,
         diagnostics,
@@ -667,12 +770,17 @@ function firstTextLeaf(message: ProtoMessage, remainingDepth = 3): string | unde
 }
 
 function decodeUtf8(bytes: Uint8Array, literal = false): string | undefined {
+    const cached = UTF8_TEXT.get(bytes) ?? {};
+    if (literal ? cached.checkedLiteral : cached.checkedRegular) return literal ? cached.literal : cached.regular;
+    let result: string | undefined;
     try {
         const text = (literal ? LITERAL_UTF8_DECODER : UTF8_DECODER).decode(bytes);
-        return text.length > 0 && !/[\u0000-\u0008\u000e-\u001f]/u.test(text) ? text : undefined;
-    } catch {
-        return undefined;
-    }
+        result = text.length > 0 && !/[\u0000-\u0008\u000e-\u001f]/u.test(text) ? text : undefined;
+    } catch {}
+    if (literal) { cached.checkedLiteral = true; cached.literal = result; }
+    else { cached.checkedRegular = true; cached.regular = result; }
+    UTF8_TEXT.set(bytes, cached);
+    return result;
 }
 
 function extractTimestamp(message: ProtoMessage): LocalPbTimestamp | undefined {

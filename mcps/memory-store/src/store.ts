@@ -4,6 +4,7 @@ import fs from "fs";
 import crypto from "crypto";
 import { fileURLToPath } from "url";
 import { setTimeout as sleep } from "timers/promises";
+import { AsyncLocalStorage } from "node:async_hooks";
 import { indexCache, type WorkspaceIndex, type MemoryIndexEntry } from "./cache.js";
 
 /**
@@ -76,6 +77,7 @@ export interface MemoryFrontmatter {
     conversationId?: string;
     searchSummary: string;
     autoSummary?: string;  // v1.5: Flash 自动生成的搜索摘要
+    autoSummaryProvenance?: string;
     pinned?: boolean;
 }
 
@@ -439,6 +441,13 @@ export async function withIndexLock<T>(key: string, fn: () => T | Promise<T>): P
     indexLocks.set(key, next);
     try {
         await prev;
+        if (/^(?:[a-f0-9]{8}|general|__global__)$/u.test(key)) {
+            const lockPath = path.join(DATA_ROOT, ".memory-locks", `index-${crypto.createHash("sha256").update(key).digest("hex")}.lock`);
+            return await withSharedStoreLock(lockPath, () => {
+                if (key !== "__global__") indexCache.evict(key);
+                return fn();
+            });
+        }
         return await fn();
     } finally {
         resolve!();
@@ -450,6 +459,173 @@ export async function withIndexLock<T>(key: string, fn: () => T | Promise<T>): P
 /** 全局索引专用锁 */
 export async function withGlobalIndexLock<T>(fn: () => T | Promise<T>): Promise<T> {
     return withIndexLock("__global__", fn);
+}
+
+interface MemoryLockLease {
+    active: boolean;
+    nested: Set<Promise<unknown>>;
+}
+
+const memoryLockContext = new AsyncLocalStorage<Map<string, MemoryLockLease>>();
+
+function storeLockOwnerIsDead(content: string): boolean {
+    try {
+        const owner = JSON.parse(content) as { pid?: number };
+        if (!Number.isSafeInteger(owner.pid) || !owner.pid || owner.pid < 1) return false;
+        try { process.kill(owner.pid, 0); return false; }
+        catch (error) { return (error as NodeJS.ErrnoException).code === "ESRCH"; }
+    } catch { return false; }
+}
+
+interface StoreReapIntent {
+    version: 1;
+    kind: "store-reap-intent";
+    pid: number;
+    nonce: string;
+    choosing: boolean;
+    ticket: number;
+}
+
+function storeReapIntents(reaperPath: string): Array<{ filename: string; content: string; intent: StoreReapIntent }> | null {
+    const directory = path.dirname(reaperPath);
+    const prefix = `${path.basename(reaperPath)}.claim-`;
+    const intents: Array<{ filename: string; content: string; intent: StoreReapIntent }> = [];
+    for (const name of fs.readdirSync(directory).filter(name => name.startsWith(prefix) && name.endsWith(".json"))) {
+        const filename = path.join(directory, name);
+        let content: string;
+        try { content = fs.readFileSync(filename, "utf-8"); }
+        catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") continue; return null; }
+        let intent: StoreReapIntent;
+        try { intent = JSON.parse(content) as StoreReapIntent; } catch { return null; }
+        if (intent.version !== 1 || intent.kind !== "store-reap-intent" || !Number.isSafeInteger(intent.pid) || intent.pid < 1
+            || typeof intent.nonce !== "string" || name !== `${prefix}${intent.pid}-${intent.nonce}.json`
+            || typeof intent.choosing !== "boolean" || !Number.isSafeInteger(intent.ticket) || intent.ticket < 0) return null;
+        if (storeLockOwnerIsDead(content)) {
+            try { if (fs.readFileSync(filename, "utf-8") === content) fs.unlinkSync(filename); } catch {}
+        } else intents.push({ filename, content, intent });
+    }
+    return intents;
+}
+
+function publishStoreLock(lockPath: string, token: string): boolean {
+    const temporary = `${lockPath}.owner-${process.pid}-${crypto.randomUUID()}`;
+    let created = false;
+    let published = false;
+    try {
+        fs.writeFileSync(temporary, token, { flag: "wx", mode: 0o600 });
+        created = true;
+        try { fs.linkSync(temporary, lockPath); published = true; return true; }
+        catch (error) { if ((error as NodeJS.ErrnoException).code === "EEXIST") return false; throw error; }
+    } finally {
+        if (created) {
+            try { fs.unlinkSync(temporary); }
+            catch (error) {
+                if (!published) throw error;
+                console.error("[memory-store] store lock initializer cleanup deferred:", temporary, error instanceof Error ? error.message : String(error));
+            }
+        }
+    }
+}
+
+function storeLockHeldError(lockPath: string): NodeJS.ErrnoException {
+    return Object.assign(new Error(`EEXIST: store lock is already held, '${lockPath}'`), { code: "EEXIST", path: lockPath, syscall: "link" });
+}
+
+function reapDeadStoreLock(lockPath: string): void {
+    const reaperPath = `${lockPath}.reap`;
+    const nonce = crypto.randomUUID();
+    const intentPath = `${reaperPath}.claim-${process.pid}-${nonce}.json`;
+    const intent: StoreReapIntent = { version: 1, kind: "store-reap-intent", pid: process.pid, nonce, choosing: true, ticket: 0 };
+    const token = JSON.stringify({ version: 1, kind: "store-reaper", pid: process.pid, nonce, createdAt: new Date().toISOString() });
+    let claimed = false;
+    try {
+        const original = fs.readFileSync(lockPath, "utf-8");
+        if (!storeLockOwnerIsDead(original)) return;
+        writeTextAtomic(intentPath, JSON.stringify(intent));
+        const choosing = storeReapIntents(reaperPath);
+        if (!choosing) return;
+        let largestTicket = 0;
+        for (const candidate of choosing) largestTicket = Math.max(largestTicket, candidate.intent.ticket);
+        intent.ticket = largestTicket + 1;
+        if (!Number.isSafeInteger(intent.ticket)) return;
+        intent.choosing = false;
+        writeTextAtomic(intentPath, JSON.stringify(intent));
+        const candidates = storeReapIntents(reaperPath);
+        if (!candidates || candidates.some(candidate => candidate.filename !== intentPath && (candidate.intent.choosing
+            || candidate.intent.ticket < intent.ticket || candidate.intent.ticket === intent.ticket && candidate.filename < intentPath))) return;
+        if (fs.existsSync(reaperPath)) {
+            const previous = fs.readFileSync(reaperPath, "utf-8");
+            if (!storeLockOwnerIsDead(previous)) return;
+            if (fs.readFileSync(reaperPath, "utf-8") !== previous) return;
+            fs.unlinkSync(reaperPath);
+        }
+        claimed = publishStoreLock(reaperPath, token);
+        if (!claimed) return;
+        if (fs.readFileSync(lockPath, "utf-8") === original) fs.unlinkSync(lockPath);
+    } catch {} finally {
+        if (claimed) {
+            try { if (fs.readFileSync(reaperPath, "utf-8") === token) fs.unlinkSync(reaperPath); } catch {}
+        }
+        try { fs.unlinkSync(intentPath); } catch {}
+    }
+}
+
+async function withSharedStoreLock<T>(lockPath: string, fn: () => T | Promise<T>): Promise<T> {
+    fs.mkdirSync(path.dirname(lockPath), { recursive: true });
+    const token = JSON.stringify({ pid: process.pid, nonce: crypto.randomUUID(), createdAt: new Date().toISOString() });
+    const deadline = Date.now() + 5_000;
+    while (!publishStoreLock(lockPath, token)) {
+        if (Date.now() >= deadline) throw storeLockHeldError(lockPath);
+        reapDeadStoreLock(lockPath);
+        await sleep(25);
+    }
+    try {
+        return await fn();
+    } finally {
+        if (fs.readFileSync(lockPath, "utf-8") === token) fs.unlinkSync(lockPath);
+    }
+}
+
+function memoryLockPath(hash: string, memoryId: string): string {
+    const key = crypto.createHash("sha256").update(JSON.stringify([hash, memoryId])).digest("hex");
+    return path.join(DATA_ROOT, ".memory-locks", `${key}.lock`);
+}
+
+export async function withMemoryLock<T>(hash: string, memoryId: string, fn: () => T | Promise<T>): Promise<T> {
+    const lockPath = memoryLockPath(hash, memoryId);
+    const current = memoryLockContext.getStore()?.get(lockPath);
+    if (current?.active) {
+        const nested = Promise.resolve().then(fn);
+        current.nested.add(nested);
+        try { return await nested; } finally { current.nested.delete(nested); }
+    }
+    return withIndexLock(`memory:${lockPath}`, async () => {
+        return withSharedStoreLock(lockPath, async () => {
+        const held: MemoryLockLease = { active: true, nested: new Set() };
+        const context = new Map(memoryLockContext.getStore());
+        context.set(lockPath, held);
+        indexCache.evict(hash);
+        try {
+            return await memoryLockContext.run(context, fn);
+        } finally {
+            while (held.nested.size) await Promise.allSettled([...held.nested]);
+            held.active = false;
+        }
+        });
+    });
+}
+
+function withMemoryFileWriteLock<T>(hash: string, memoryId: string, fn: () => T): T {
+    const lockPath = memoryLockPath(hash, memoryId);
+    if (memoryLockContext.getStore()?.get(lockPath)?.active) return fn();
+    fs.mkdirSync(path.dirname(lockPath), { recursive: true });
+    const token = JSON.stringify({ pid: process.pid, nonce: crypto.randomUUID(), createdAt: new Date().toISOString() });
+    if (!publishStoreLock(lockPath, token)) throw storeLockHeldError(lockPath);
+    try {
+        return fn();
+    } finally {
+        if (fs.readFileSync(lockPath, "utf-8") === token) fs.unlinkSync(lockPath);
+    }
 }
 
 // ============= 全局索引操作 =============
@@ -846,6 +1022,7 @@ export function buildMemoryFile(frontmatter: MemoryFrontmatter, body: string): s
         const autoLines = frontmatter.autoSummary.split("\n").map(l => `  ${l}`);
         yamlLines.push(...autoLines);
     }
+    if (frontmatter.autoSummaryProvenance) yamlLines.push(`autoSummaryProvenance: ${frontmatter.autoSummaryProvenance}`);
 
     yamlLines.push("---");
     yamlLines.push("");
@@ -937,7 +1114,7 @@ export function writeMemoryFile(hash: string, memoryId: string, content: string)
     const filePath = getEntryPath(hash, memoryId);
     // 确保 entries 目录存在
     fs.mkdirSync(path.dirname(filePath), { recursive: true });
-    writeTextAtomic(filePath, content);
+    withMemoryFileWriteLock(hash, memoryId, () => writeTextAtomic(filePath, content));
 }
 
 /**
@@ -946,7 +1123,7 @@ export function writeMemoryFile(hash: string, memoryId: string, content: string)
 export function deleteMemoryFile(hash: string, memoryId: string): boolean {
     const filePath = getEntryPath(hash, memoryId);
     if (!fs.existsSync(filePath)) return false;
-    fs.unlinkSync(filePath);
+    withMemoryFileWriteLock(hash, memoryId, () => fs.unlinkSync(filePath));
     return true;
 }
 
@@ -982,6 +1159,7 @@ export function findMemoryById(memoryId: string): { hash: string; entry: MemoryI
 export async function syncGlobalIndexForWorkspace(hash: string): Promise<void> {
     await withGlobalIndexLock(() => {
         const globalIndex = readGlobalIndex();
+        indexCache.evict(hash);
         const wsIndex = readWorkspaceIndex(hash);
         const meta = hash === "general" ? null : readWorkspaceMeta(hash);
 

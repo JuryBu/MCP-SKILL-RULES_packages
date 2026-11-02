@@ -18,6 +18,7 @@ export interface MemoryIndexEntry {
     title: string;
     searchSummary: string;
     autoSummary?: string;  // v1.5: Flash 自动生成的搜索摘要
+    autoSummaryProvenance?: string;
     tags: string[];
     category: string;
     createdAt: string;

@@ -1056,7 +1056,7 @@ function localConversationSourceFingerprint(
     if (resolved === "windsurf" || resolved === "antigravity") {
         if (source === "ls") return null;
         const candidates = discoverLocalPbCandidates(resolved, conversationId);
-        return candidates.length ? fingerprintLocalPbCandidates(candidates) : null;
+        return candidates.length ? fingerprintLocalPbCandidates(candidates, resolved) : null;
     }
     return null;
 }

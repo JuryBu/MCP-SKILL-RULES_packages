@@ -22,8 +22,8 @@ test("bounded commit batches retain exact order, newest records and integrity re
         for (let revision = 1; revision <= 37; revision++) await writeCorpusJson(commitPath(revision), commit(revision));
         const loaded = await loadCorpusTask(identity);
         assert.deepEqual(loaded.commits.map(entry => entry.revision), Array.from({ length: 37 }, (_, index) => index + 1));
-        assert.equal(loaded.records.get("first")?.revision, 37);
-        assert.equal(loaded.records.get("second")?.revision, 36);
+        assert.equal(loaded.records.get('["codex","first"]')?.revision, 37);
+        assert.equal(loaded.records.get('["codex","second"]')?.revision, 36);
         assert.equal(loaded.state.computeMs, 37);
         await writeCorpusJson(commitPath(17), { ...commit(17), revision: 18 });
         await assert.rejects(loadCorpusTask(identity), { code: "CORPUS_TASK_CORRUPT" });
@@ -65,7 +65,7 @@ test("mixed legacy commits and immutable batches recover stale state and reject 
         const recovered = await loadCorpusTask(identity);
         assert.equal(recovered.state.revision, 34);
         assert.equal(recovered.state.computeMs, 34);
-        assert.equal(recovered.records.get("first")!.revision, 33);
+        assert.equal(recovered.records.get('["codex","first"]')!.revision, 33);
         assert.deepEqual((await readCorpusTaskCommitRange(task, 16, 20)).map(entry => entry.revision), [16, 17, 18, 19, 20]);
         const filename = path.join(directory, "commits", "000000000002-000000000017.batch.json");
         const original = await fs.readFile(filename, "utf8");

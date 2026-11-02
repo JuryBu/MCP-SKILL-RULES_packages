@@ -1592,7 +1592,7 @@ export async function listRecentWindsurfThreads(
     limit = 50,
     options: WindsurfDiscoveryOptions = {},
 ): Promise<WindsurfConversationSummary[]> {
-    const result = await discoverWindsurfThreads(limit, options);
+    const result = await discoverWindsurfThreads(limit, { ...options, verifyAliases: options.verifyAliases ?? true });
     if (limit > 0 && !result.conversations.length && result.diagnostics.length) {
         throw Object.assign(new Error(result.diagnostics.map(diagnostic => `${diagnostic.code}: ${diagnostic.message}`).join("; ")), { partial: true, diagnostics: result.diagnostics });
     }

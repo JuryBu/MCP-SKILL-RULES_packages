@@ -353,7 +353,7 @@ test("index write failure preserves the task ID and retry repairs the index with
 
 test("ordinary search still counts requested roles and terms", async () => {
     const root = path.join(temporary, "search-regression");
-    const started = await startCorpusSearch({ ownerId: "caller", root, request: { query: "hit" }, provider: providerFor() });
+    const started = await startCorpusSearch({ ownerId: "caller", root, request: { dataChains: ["codex"], query: "hit" }, provider: providerFor() });
     const complete = await waitFor(identity(started, root));
     assert.equal(complete.status, "completed");
     assert.equal(complete.totalMatches, 1);

@@ -8,7 +8,8 @@ import type { CorpusMessage, CorpusProvider } from "../src/conversation-corpus-t
 const temporary = fs.mkdtempSync(path.join(os.tmpdir(), "corpus-performance-"));
 process.env.MEMORY_STORE_DATA_ROOT = path.join(temporary, "data");
 process.env.MEMORY_STORE_LIFECYCLE_ENABLED = "false";
-const { startCorpusSearch, getCorpusSearchStatus, cancelCorpusSearch, resumeCorpusSearch } = await import("../src/conversation-corpus-task.js");
+const { startCorpusSearch: startSearch, getCorpusSearchStatus, cancelCorpusSearch, resumeCorpusSearch } = await import("../src/conversation-corpus-task.js");
+const startCorpusSearch = (options: Parameters<typeof startSearch>[0]) => startSearch({ ...options, request: { dataChains: ["codex"], ...options.request } });
 const { searchCorpusProjection } = await import("../src/conversation-corpus-search.js");
 after(() => fs.rmSync(temporary, { recursive: true, force: true }));
 

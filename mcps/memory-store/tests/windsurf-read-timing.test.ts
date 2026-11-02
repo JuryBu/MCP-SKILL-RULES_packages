@@ -2,21 +2,27 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { registerConversation } from "../src/tools/conversation.ts";
-import {
-    __setWindsurfEndpointResolverForTest,
-    __setWindsurfTransportFactoryForTest,
-    __resetWindsurfEndpointCacheForTest,
-    type WindsurfLsEndpoint,
-    type WindsurfLsTransport,
-} from "../src/windsurf-client.ts";
-import { clearMappings } from "../src/conversation-router.ts";
-import { resetConversationSourceCacheForTests, setConversationSourceCacheDataRootForTests } from "../src/conversation-source-cache.ts";
+import type { WindsurfLsEndpoint, WindsurfLsTransport } from "../src/windsurf-client.ts";
 
-process.env.MEMORY_STORE_AUTO_RECORD = "0";
-process.env.MEMORY_STORE_DATA_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "memory-store-wsf-read-timing-"));
+const root = fs.mkdtempSync(path.join(os.tmpdir(), "memory-store-wsf-read-timing-"));
+const environment: Record<string, string> = {
+    MEMORY_STORE_AUTO_RECORD: "0", MEMORY_STORE_LIFECYCLE_ENABLED: "false", MEMORY_STORE_DATA_ROOT: root,
+    MEMORY_STORE_DEVIN_CLI_DB_PATH: path.join(root, "absent-cli.db"), MEMORY_STORE_DEVIN_DESKTOP_ROOT: path.join(root, "absent-desktop"),
+    MEMORY_STORE_WSF_SUBAGENT_JOBS_PATH: path.join(root, "absent-jobs.json"),
+    MEMORY_STORE_WINDSURF_PB_ACTIVE_ROOT: path.join(root, "absent-active"), MEMORY_STORE_WINDSURF_PB_IMPLICIT_ROOT: path.join(root, "absent-implicit"),
+};
+const previousEnvironment = Object.fromEntries(Object.keys(environment).map(key => [key, process.env[key]]));
+for (const [key, value] of Object.entries(environment)) process.env[key] = value;
+const { registerConversation } = await import("../src/tools/conversation.ts");
+const { __setWindsurfEndpointResolverForTest, __setWindsurfTransportFactoryForTest, __resetWindsurfEndpointCacheForTest } = await import("../src/windsurf-client.ts");
+const { clearMappings } = await import("../src/conversation-router.ts");
+const { resetConversationSourceCacheForTests, setConversationSourceCacheDataRootForTests } = await import("../src/conversation-source-cache.ts");
+const { DATA_ROOT } = await import("../src/store.ts");
+assert.equal(DATA_ROOT, root, "The fixture environment must be installed before source/store imports");
 resetConversationSourceCacheForTests();
 setConversationSourceCacheDataRootForTests(process.env.MEMORY_STORE_DATA_ROOT);
+const startedAt = performance.now();
+const phase = (name: string) => console.log(`WSF_TIMING_PHASE ${name} ${Math.round(performance.now() - startedAt)}ms`);
 
 type ConversationHandler = (args?: Record<string, unknown>) => Promise<{ content?: Array<{ type?: string; text?: string }> }>;
 
@@ -88,11 +94,13 @@ try {
 
     delete process.env.MEMORY_STORE_WINDSURF_READ_TIMING_DEBUG;
     sourceDelayMs = 275;
+    phase("fetch.start");
     const fetchText = await readText(handler, {
         action: "fetch",
         dataChain: "windsurf",
         conversationId,
     });
+    phase("fetch.complete");
     assert.match(fetchText, /⏱ WSF 源分段:/u);
     assert.match(fetchText, /endpoint/u);
     assert.match(fetchText, /steps/u);
@@ -101,26 +109,31 @@ try {
 
     sourceDelayMs = 0;
     process.env.MEMORY_STORE_WINDSURF_READ_TIMING_DEBUG = "1";
+    phase("debugFetch.start");
     const debugFetchText = await readText(handler, {
         action: "fetch",
         dataChain: "windsurf",
         conversationId,
     });
+    phase("debugFetch.complete");
     assert.match(debugFetchText, /⏱ fetch 分段:/u);
     assert.match(debugFetchText, /格式化/u);
     assert.match(debugFetchText, /临时文件/u);
 
+    phase("search.start");
     const searchText = await readText(handler, {
         action: "search",
         dataChain: "windsurf",
         conversationId,
         query: "beta",
     });
+    phase("search.complete");
     assert.match(searchText, /⏱ search 分段:/u);
     assert.match(searchText, /附件物化/u);
     assert.match(searchText, /格式化/u);
 
     process.env.MEMORY_STORE_READ_FORMAT_BUDGET_MS = "0";
+    phase("read.start");
     const readTextResult = await readText(handler, {
         action: "read",
         dataChain: "windsurf",
@@ -128,6 +141,7 @@ try {
         startRound: 1,
         endRound: 2,
     });
+    phase("read.complete");
     assert.match(readTextResult, /⏱ read 分段:/u);
     assert.match(readTextResult, /附件物化/u);
     assert.match(readTextResult, /格式化/u);
@@ -143,4 +157,10 @@ try {
     __setWindsurfTransportFactoryForTest(null);
     __resetWindsurfEndpointCacheForTest();
     clearMappings();
+    resetConversationSourceCacheForTests();
+    assert.ok(path.resolve(root).startsWith(path.resolve(os.tmpdir()) + path.sep));
+    fs.rmSync(root, { recursive: true, force: true });
+    for (const [key, value] of Object.entries(previousEnvironment)) {
+        if (value === undefined) delete process.env[key]; else process.env[key] = value;
+    }
 }

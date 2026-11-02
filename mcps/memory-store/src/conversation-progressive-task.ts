@@ -63,8 +63,16 @@ export async function writeProgressiveState(filename: string, value: unknown): P
     const handle = await fs.open(temporary, "wx");
     try { await handle.writeFile(JSON.stringify(value)); await handle.sync(); }
     finally { await handle.close(); }
-    try { await fs.rename(temporary, filename); }
-    catch (error) { await fs.rm(temporary, { force: true }); throw error; }
+    for (let attempt = 0; ; attempt++) {
+        try { await fs.rename(temporary, filename); return; }
+        catch (error) {
+            if (attempt >= 5 || !["EPERM", "EACCES", "EBUSY"].includes((error as NodeJS.ErrnoException).code || "")) {
+                await fs.rm(temporary, { force: true });
+                throw error;
+            }
+            await sleep(10 * 2 ** attempt);
+        }
+    }
 }
 
 async function recordFor(identity: ProgressiveTaskIdentity): Promise<TaskRecord> {
@@ -196,7 +204,7 @@ export async function getProgressiveTaskStatus(identity: ProgressiveTaskIdentity
             ready: status, requestedRangeComplete: ready?.requestedRangeComplete === true,
             fullSourceComplete: status?.complete === true, fullCacheGeneration: ready?.fullCacheGeneration,
             cancellationPending, warnings: ready?.warnings || [],
-            next: { action: "read_ready", conversationId: identity.ownerId, taskId: identity.taskId },
+            next: { action: "read_ready", conversationId: identity.ownerId, dataChain: record.payload.request.dataChain, taskId: identity.taskId },
         };
         await sleep(Math.min(100, Math.max(1, deadline - Date.now())));
     }

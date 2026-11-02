@@ -1,0 +1,221 @@
+import fs from "node:fs/promises";
+import { performance } from "node:perf_hooks";
+import { discoverLocalPbCandidates, localPbResultToRounds } from "./conversation-source-adapters.js";
+import { prepareLocalPbFileCandidates, type LocalPbFileCandidate, type LocalPbReadResult, type PreparedLocalPbCandidates } from "./local-pb-reader.js";
+import { readDevinConversation, DEVIN_NORMALIZATION_VERSION, splitDevinSubagentId } from "./devin-conversation.js";
+import { resolveDevinConversation, discoverDevinConversations, DevinIdentityCache } from "./devin-sqlite.js";
+import { assertHostFileUnchanged, captureHostFile, type HostFileRevision } from "./conversation-host-files.js";
+import { assertHostReadActive, hostCorpusDigest, type HostCorpusSnapshot } from "./conversation-host-projection.js";
+import type { HostCorpusReaderOptions } from "./conversation-corpus-reader-hosts.js";
+import type { CorpusConversation, CorpusFastReadRequest, CorpusReadControl, CorpusSearchRequest, CorpusSourceStatus, CorpusVerifiedIdentity } from "./conversation-corpus-types.js";
+
+const verifiedIdentities = new WeakMap<CorpusConversation, CorpusVerifiedIdentity>();
+
+export function verifiedCorpusIdentity(conversation: CorpusConversation): CorpusVerifiedIdentity | undefined {
+    const identity = verifiedIdentities.get(conversation);
+    if (!identity || conversation.source !== identity.source || conversation.id !== identity.canonicalId
+        || conversation.canonicalId !== identity.canonicalId || JSON.stringify(conversation.aliases) !== JSON.stringify(identity.aliases)) return undefined;
+    return { ...identity, aliases: [...identity.aliases] };
+}
+
+export function corpusProjectionIdentityMatches(actual: CorpusConversation, expected: CorpusConversation): boolean {
+    if (actual.source !== expected.source) return false;
+    if (actual.id === expected.id && (actual.canonicalId || actual.id) === (expected.canonicalId || expected.id)) return true;
+    const identity = verifiedCorpusIdentity(actual);
+    return Boolean(identity && identity.aliases.includes(expected.id) && identity.aliases.includes(expected.canonicalId || expected.id));
+}
+
+export async function listBinaryHostConversations(source: "windsurf" | "antigravity", request: CorpusSearchRequest, control: CorpusReadControl, options: HostCorpusReaderOptions): Promise<{ conversations: CorpusConversation[]; statuses: CorpusSourceStatus[] }> {
+    const { listLocalPbConversationCandidates } = await import("./conversation-local-list.js");
+    const warnings: string[] = [];
+    const conversations: CorpusConversation[] = [];
+    let partial = false;
+    if (source === "windsurf") {
+        const discovered = await discoverDevinConversations({ ...options.devinOptions, conversationIds: request.conversationIds,
+            limit: options.listLimit || 10_000, verifyAliases: false, isCancelled: control.isCancelled });
+        partial ||= discovered.partial;
+        warnings.push(...discovered.diagnostics.map(item => `${item.code}: ${item.message}`));
+        conversations.push(...discovered.conversations.map(summary => ({ source, id: summary.canonicalId, canonicalId: summary.canonicalId,
+            aliases: summary.aliases, title: summary.title, workspace: summary.cwd || "", updatedAt: summary.updatedAt,
+            rolloutPath: summary.sourcePath, sourceKind: summary.sourceKind, sourceWarnings: summary.warnings,
+            parentConversationId: summary.parentConversationId, isChildThread: summary.isChildThread,
+        })));
+    }
+    const local = listLocalPbConversationCandidates(source, { conversationIds: request.conversationIds, limit: options.listLimit || 10_000,
+        isCancelled: control.isCancelled, onDiagnostic: diagnostic => { partial = true; warnings.push(`${diagnostic.code}: ${diagnostic.message}`); } });
+    conversations.push(...local.filter(candidate => !conversations.some(item => item.id === candidate.id)).map(candidate => ({
+        source, id: candidate.id, canonicalId: candidate.id, title: candidate.id, workspace: "", updatedAt: candidate.updatedAt,
+        sourceKind: `local-pb-${candidate.kinds.join("+")}`, sourceWarnings: [] as string[],
+    })));
+    if (request.workspaces?.length && conversations.some(conversation => !conversation.workspace)) {
+        partial = true;
+        warnings.push("pb_workspace_metadata_unavailable: select conversationIds or inspect the source workspace metadata before narrowing by workspace");
+    }
+    assertHostReadActive(control);
+    return { conversations, statuses: [{ source, status: partial ? "partial" : "ok", candidateCount: conversations.length, warnings }] };
+}
+
+interface PreparedState {
+    key: string;
+    paths: HostFileRevision[];
+    prepared: PreparedLocalPbCandidates;
+    full?: HostCorpusSnapshot;
+}
+
+async function sqliteSources(paths: string[], control: CorpusReadControl): Promise<HostFileRevision[]> {
+    const revisions: HostFileRevision[] = [];
+    for (const filename of [...new Set(paths)].sort()) {
+        for (const suffix of ["", "-wal"]) {
+            try { revisions.push(await captureHostFile(`${filename}${suffix}`, { isCancelled: control.isCancelled })); }
+            catch (error) { if (suffix !== "-wal" || (error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+        }
+    }
+    return revisions;
+}
+
+function physicalKey(revisions: HostFileRevision[]): string {
+    return hostCorpusDigest(revisions.map(item => [item.path, item.sha256]));
+}
+
+function comparePbCandidates(results: LocalPbReadResult[]): LocalPbReadResult {
+    const sorted = [...results].sort((left, right) => right.trajectory.steps.length - left.trajectory.steps.length);
+    const longest = sorted[0];
+    const canonical = (result: LocalPbReadResult) => result.trajectory.steps.map(step => JSON.stringify({ timestamp: step.timestamp, contextTokens: step.contextTokens, user: step.user, planner: step.planner, system: step.system, activities: step.activities, toolVariants: step.toolVariants, diagnostics: step.diagnostics }));
+    const expected = canonical(longest);
+    for (const other of sorted.slice(1)) {
+        if (longest.trajectory.id && other.trajectory.id && longest.trajectory.id !== other.trajectory.id) throw new Error("PB candidate trajectory identities conflict");
+        if (!canonical(other).every((step, index) => step === expected[index])) throw new Error("PB candidates have incomparable contents");
+    }
+    return longest;
+}
+
+export function createBinaryHostReader(source: "windsurf" | "antigravity", options: HostCorpusReaderOptions) {
+    let preparedState: PreparedState | undefined;
+    const readPb = async (conversation: CorpusConversation, request: CorpusFastReadRequest | undefined, control: CorpusReadControl): Promise<HostCorpusSnapshot> => {
+        const started = performance.now();
+        const id = conversation.canonicalId || conversation.id;
+        const candidates: LocalPbFileCandidate[] = options.pbCandidates ? options.pbCandidates(source, id) : discoverLocalPbCandidates(source, id);
+        if (!candidates.length) throw new Error(`No ${source} local PB source for ${id}`);
+        const revisions: HostFileRevision[] = [];
+        for (const candidate of candidates) revisions.push(await captureHostFile(candidate.filePath, { isCancelled: control.isCancelled }));
+        const maximum = options.maxSourceBytes ?? 128 * 1024 * 1024;
+        if (revisions.reduce((sum, value) => sum + value.size, 0) > maximum) throw new Error("PB candidate set exceeds maxSourceBytes; increase the explicit reader budget");
+        const key = physicalKey(revisions);
+        let reused = false;
+        if (!control.forceRefresh && preparedState?.key === key) reused = true;
+        else preparedState = { key, paths: revisions, prepared: prepareLocalPbFileCandidates(candidates, { ...options.pbReaderOptions, sourceFlavor: source, isCancelled: control.isCancelled }) };
+        const state = preparedState!;
+        const preparationMs = performance.now() - started;
+        const available = state.prepared.candidates.filter(item => item.reader);
+        const failures = state.prepared.candidates.filter(item => item.error).map(item => `pb_${item.candidate}_${item.error!.code}: ${item.error!.message}`);
+        if (!available.length) throw new Error(`PB candidate authentication failed: ${failures.join("; ")}`);
+        const origin = { ...conversation, rolloutPath: candidates[0].filePath, canonicalId: id };
+        const revision = hostCorpusDigest(["host-pb/v1", source, id, key, state.prepared.sourceRevision]);
+        let snapshot: HostCorpusSnapshot;
+        if (state.full) snapshot = { ...state.full, timings: { ...state.full.timings, totalMs: performance.now() - started, preparationMs, preparedReused: 1, decodedSteps: 0 } };
+        else if (!request || available.length > 1 || (request.startRound || 1) > 1) {
+            const selected = comparePbCandidates(available.map(item => item.reader!.read(undefined, { isCancelled: control.isCancelled })));
+            const warnings = [...failures, ...selected.diagnostics.map(item => `pb_${item.kind}: ${item.message}`)];
+            const rounds = localPbResultToRounds(selected);
+            snapshot = { conversation: origin, revision, rounds, roundNumbering: "absolute", totalRounds: rounds.length,
+                sourceComplete: true, partial: Boolean(failures.length || selected.partial), warnings,
+                sourceBytes: revisions.reduce((sum, value) => sum + value.size, 0),
+                timings: { totalMs: performance.now() - started, preparationMs, preparedReused: Number(reused), decodedSteps: selected.metrics?.decodedSteps || 0, reusedSteps: selected.metrics?.reusedSteps || 0 } };
+            state.full = snapshot;
+        } else {
+            const reader = available[0].reader!;
+            const wanted = request.lastRounds || request.endRound || 10;
+            let width = Math.min(reader.totalSteps, Math.max(64, wanted * 8));
+            let selected: LocalPbReadResult;
+            let rounds: ReturnType<typeof localPbResultToRounds>;
+            for (;;) {
+                assertHostReadActive(control);
+                selected = reader.read(request.lastRounds ? { tailSteps: Math.max(1, width) } : { startStep: 0, endStepExclusive: width }, { isCancelled: control.isCancelled });
+                rounds = localPbResultToRounds(selected);
+                if (selected.coverage?.complete || rounds.length > wanted || width === reader.totalSteps) break;
+                width = Math.min(reader.totalSteps, Math.max(width + 1, width * 2));
+                await new Promise<void>(resolve => setImmediate(resolve));
+            }
+            const full = selected!.coverage?.complete === true;
+            const tailRelative = Boolean(request.lastRounds && !full);
+            const chosen = request.lastRounds ? rounds!.slice(-wanted) : rounds!.slice(0, wanted);
+            const normalized = tailRelative ? chosen.map((round, index) => ({ ...round, roundIndex: index + 1 })) : chosen;
+            const actualDiagnostics = selected!.diagnostics.filter(item => item.kind !== "partial" || !item.message.startsWith("PB step range ["));
+            const warnings = [...failures, ...actualDiagnostics.map(item => `pb_${item.kind}: ${item.message}`), ...(!full ? ["pb_step_window_only"] : [])];
+            const partial = failures.length > 0 || actualDiagnostics.some(item => item.kind === "unknown_variant" || item.kind === "partial");
+            snapshot = { conversation: origin, revision, rounds: normalized, roundNumbering: tailRelative ? "relative" : "absolute",
+                totalRounds: full ? rounds!.length : undefined, sourceComplete: full, partial, warnings,
+                rangeComplete: !partial && (full || rounds!.length > wanted), sourceBytes: revisions.reduce((sum, value) => sum + value.size, 0),
+                timings: { totalMs: performance.now() - started, preparationMs, preparedReused: Number(reused), decodedSteps: selected!.metrics?.decodedSteps || 0, reusedSteps: selected!.metrics?.reusedSteps || 0, totalSteps: reader.totalSteps } };
+            if (full) state.full = { ...snapshot, rounds: rounds!, rangeComplete: !partial };
+        }
+        for (const item of revisions) await assertHostFileUnchanged(item, control.isCancelled);
+        const currentCandidates = options.pbCandidates ? options.pbCandidates(source, id) : discoverLocalPbCandidates(source, id);
+        if (JSON.stringify(currentCandidates.map(item => [item.kind, item.filePath])) !== JSON.stringify(candidates.map(item => [item.kind, item.filePath]))) throw new Error("PB candidate set changed during projection");
+        assertHostReadActive(control);
+        return snapshot;
+    };
+    const read = async (conversation: CorpusConversation, request: CorpusFastReadRequest | undefined, control: CorpusReadControl): Promise<HostCorpusSnapshot> => {
+        const started = performance.now();
+        assertHostReadActive(control);
+        if (source === "antigravity" || options.pbCandidates) return readPb(conversation, request, control);
+        const ownedIdentityCache = options.devinOptions?.identityCache ? undefined : new DevinIdentityCache();
+        const devinOptions = { ...options.devinOptions, identityCache: options.devinOptions?.identityCache || ownedIdentityCache, isCancelled: control.isCancelled };
+        try {
+        const child = splitDevinSubagentId(conversation.canonicalId || conversation.id);
+        const summary = await resolveDevinConversation(child?.parentId || conversation.canonicalId || conversation.id, devinOptions);
+        if (!summary) return readPb(conversation, request, control);
+        const identityResolvedAt = performance.now();
+        const paths = [summary.sourcePath, ...summary.desktopPaths];
+        const before = await sqliteSources(paths, control);
+        const sourceVerifiedAt = performance.now();
+        let devin;
+        try {
+            devin = await readDevinConversation(conversation.canonicalId || conversation.id, {
+                ...devinOptions, link: "reference", materializeAttachments: false,
+                roundRange: request && !child ? request.lastRounds ? { tailRounds: request.lastRounds } : { startRound: request.startRound || 1, endRound: request.endRound } : undefined,
+            });
+        } catch (error) {
+            if (!request || (error as { code?: string }).code !== "DEVIN_RANGE_UNAVAILABLE") throw error;
+            devin = await readDevinConversation(conversation.canonicalId || conversation.id, { ...devinOptions, link: "reference", materializeAttachments: false });
+        }
+        if (!devin) throw new Error("Devin source changed during range lookup");
+        for (const item of before) await assertHostFileUnchanged(item, control.isCancelled);
+        for (const filename of paths) {
+            const walPath = await fs.realpath(`${filename}-wal`).catch(error => { if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined; throw error; });
+            if (Boolean(walPath) !== before.some(item => item.path === walPath)) throw new Error("Devin WAL source set changed during projection");
+        }
+        const raw = devin.raw;
+        const expectedPaths = [...new Set(await Promise.all(paths.map(filename => fs.realpath(filename))))].sort();
+        const actualPaths = [...new Set(await Promise.all([raw.summary.sourcePath, ...raw.summary.desktopPaths].map(filename => fs.realpath(filename))))].sort();
+        if (raw.summary.canonicalId !== summary.canonicalId || JSON.stringify(expectedPaths) !== JSON.stringify(actualPaths)) {
+            throw new Error("Devin identity source set changed during projection");
+        }
+        const coverage = raw.coverage;
+        const partial = raw.partial && raw.warnings.some(warning => warning !== "DEVIN_RANGE_MAIN_CHAIN_ONLY");
+        const origin: CorpusConversation = { ...conversation, id: raw.summary.canonicalId, canonicalId: raw.summary.canonicalId, aliases: raw.summary.aliases,
+            title: raw.summary.title, workspace: raw.summary.cwd || conversation.workspace, sourceKind: raw.summary.sourceKind, rolloutPath: raw.summary.sourcePath,
+            parentConversationId: raw.summary.parentConversationId, isChildThread: raw.summary.isChildThread };
+        const revision = hostCorpusDigest(["host-devin/v1", DEVIN_NORMALIZATION_VERSION, raw.summary.canonicalId, physicalKey(before)]);
+        if (!child && raw.summary.sourceKind === "devin-cli" && raw.summary.sessionId === raw.summary.canonicalId
+            && raw.summary.identityStatus !== "pending" && raw.summary.desktopPaths.length
+            && ((raw.summary.identityEvidence === "client-message-id" && raw.summary.matchedMessageIds > 0)
+                || (raw.summary.identityEvidence === "tool-call-id" && (raw.summary.matchedToolCallIds || 0) >= 2))) {
+            verifiedIdentities.set(origin, { authority: "devin-sqlite", source: "windsurf", canonicalId: origin.id,
+                aliases: [...raw.summary.aliases], sourceRevision: revision,
+                evidence: hostCorpusDigest([raw.summary.identityEvidence, raw.summary.matchedMessageIds, raw.summary.matchedToolCallIds,
+                    [...raw.summary.aliases].sort(), physicalKey(before)]) });
+        }
+        const totalRounds = coverage?.totalRounds ?? devin.rounds.at(-1)?.roundIndex ?? 0;
+        return { conversation: origin, revision,
+            rounds: devin.rounds, roundNumbering: "absolute", totalRounds, sourceComplete: !coverage || coverage.complete,
+            rangeComplete: !partial && (!coverage || (coverage.startRound === (request?.lastRounds ? Math.max(1, totalRounds - request.lastRounds + 1) : request?.startRound || 1) && coverage.endRound >= Math.min(request?.endRound || totalRounds, totalRounds))),
+            partial, warnings: raw.warnings, sourceBytes: before.reduce((sum, item) => sum + item.size, 0),
+            timings: { ...(raw.readMetrics || {}), identityCacheHit: Number(raw.readMetrics?.identityCacheHit),
+                bodyTotalMs: raw.readMetrics?.totalMs || 0, identityResolutionMs: identityResolvedAt - started,
+                sourceVerificationMs: sourceVerifiedAt - identityResolvedAt, sourceVerificationBytes: before.reduce((sum, item) => sum + item.size, 0),
+                totalMs: performance.now() - started } };
+        } finally { ownedIdentityCache?.close(); }
+    };
+    return { read };
+}

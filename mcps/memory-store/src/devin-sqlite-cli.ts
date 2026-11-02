@@ -1,5 +1,5 @@
 import type { DatabaseSync } from "node:sqlite";
-import type { DevinCompaction, DevinConversationSummary, DevinDesktopMessage, DevinMessageNode } from "./devin-types.js";
+import type { DevinCompaction, DevinConversationSummary, DevinDesktopMessage, DevinMessageNode, DevinRoundCoverage, DevinRoundRange } from "./devin-types.js";
 import { ReadBudget, DevinReadError, asTimestamp, columns, digest, inSnapshot, jsonObject, nodeId } from "./devin-sqlite-store.js";
 
 export interface CliConversation {
@@ -12,12 +12,17 @@ export interface CliConversation {
     hidden: boolean;
     empty: boolean;
     revision: string;
+    coverage?: DevinRoundCoverage;
 }
 
 interface ChainResult {
     nodes: DevinMessageNode[];
     compactions: DevinCompaction[];
     warnings: string[];
+}
+
+interface ValidatedChain extends ChainResult {
+    mainChainId?: number;
 }
 
 function collectMessageIds(nodes: DevinMessageNode[]): Set<string> {
@@ -34,10 +39,18 @@ async function readChain(database: DatabaseSync, sessionId: string, head: number
     budget: ReadBudget, memo: Map<number, DevinMessageNode>, identityOnly = false): Promise<ChainResult> {
     if (head === null) return { nodes: [], compactions: [], warnings: ["DEVIN_MAIN_CHAIN_MISSING"] };
     const messageExpression = identityOnly
-        ? `CASE WHEN json_valid(chat_message) THEN CASE WHEN json_type(chat_message)='object' THEN json_object('role', json_extract(chat_message, '$.role'), 'tool_call_id', json_extract(chat_message, '$.tool_call_id'), 'tool_calls', json((SELECT json_group_array(json_object('id',json_extract(call.value,'$.id'))) FROM json_each(chat_message,'$.tool_calls') AS call WHERE call.type='object')), 'metadata', json_object('created_at', json_extract(chat_message, '$.metadata.created_at'), 'extensions', json_object('chisel/client-message-id', json_extract(chat_message, '$.metadata.extensions."chisel/client-message-id"')))) ELSE chat_message END ELSE chat_message END`
+        ? `CASE WHEN message_blob IS NOT NULL THEN CASE WHEN json_type(message_blob)='object' THEN json_object('role', json_extract(message_blob, '$.role'), 'tool_call_id', json_extract(message_blob, '$.tool_call_id'), 'tool_calls', json((SELECT json_group_array(json_object('id',json_extract(call.value,'$.id'))) FROM json_each(message_blob,'$.tool_calls') AS call WHERE call.type='object')), 'metadata', json_object('created_at', json_extract(message_blob, '$.metadata.created_at'), 'extensions', json_object('chisel/client-message-id', json_extract(message_blob, '$.metadata.extensions."chisel/client-message-id"')))) ELSE chat_message END ELSE chat_message END`
         : "chat_message";
-    const statement = database.prepare(`WITH selected AS (SELECT node_id, parent_node_id, created_at, metadata,
-        ${messageExpression} AS chat_message FROM message_nodes WHERE session_id=? AND node_id=?)
+    const statement = database.prepare(`WITH RECURSIVE reachable(node_id) AS (
+        SELECT ? UNION
+        SELECT nodes.parent_node_id FROM message_nodes AS nodes JOIN reachable ON nodes.node_id=reachable.node_id
+            WHERE nodes.session_id=? AND nodes.parent_node_id IS NOT NULL UNION
+        SELECT json_extract(nodes.metadata,'$.summarized_from') FROM message_nodes AS nodes JOIN reachable ON nodes.node_id=reachable.node_id
+            WHERE nodes.session_id=? AND json_valid(nodes.metadata) AND json_type(nodes.metadata,'$.summarized_from')='integer'
+            LIMIT ?), original AS (SELECT node_id, parent_node_id, created_at, metadata, chat_message,
+            ${identityOnly ? "CASE WHEN json_valid(chat_message) THEN jsonb(chat_message) END" : "NULL"} AS message_blob
+            FROM message_nodes WHERE session_id=? AND node_id IN (SELECT node_id FROM reachable)),
+        selected AS (SELECT node_id, parent_node_id, created_at, metadata, ${messageExpression} AS chat_message FROM original)
         SELECT node_id, parent_node_id, created_at,
         length(CAST(chat_message AS BLOB)) + coalesce(length(CAST(metadata AS BLOB)), 0) AS bytes,
         CASE WHEN length(CAST(chat_message AS BLOB)) + coalesce(length(CAST(metadata AS BLOB)), 0) <= ? THEN chat_message END AS chat_message,
@@ -49,6 +62,22 @@ async function readChain(database: DatabaseSync, sessionId: string, head: number
     const visiting = new Set<number>();
     const frames: Array<{ id: number; exit: boolean }> = [{ id: head, exit: false }];
     try {
+        const remaining = budget.remainingBytes;
+        for (const row of statement.iterate(head, sessionId, sessionId, Math.min(Number.MAX_SAFE_INTEGER, budget.maxNodes + memo.size + 1), sessionId, remaining, remaining)) {
+            const id = nodeId(row.node_id);
+            if (id === null) throw new DevinReadError("DEVIN_CHAIN_NODE_INVALID", "A Devin node reference is invalid.");
+            if (memo.has(id)) continue;
+            await budget.take(Number(row.bytes));
+            const message = jsonObject(row.chat_message, true);
+            const metadata = jsonObject(row.metadata);
+            if (row.parent_node_id !== null && nodeId(row.parent_node_id) === null) {
+                throw new DevinReadError("DEVIN_CHAIN_NODE_INVALID", "A Devin parent reference is invalid.");
+            }
+            const originalTime = message.metadata?.created_at;
+            memo.set(id, { nodeId: id, parentNodeId: nodeId(row.parent_node_id),
+                createdAt: typeof originalTime === "string" || typeof originalTime === "number" ? originalTime : row.created_at as number | string,
+                message, metadata });
+        }
         while (frames.length) {
             budget.check();
             const frame = frames.pop()!;
@@ -71,28 +100,8 @@ async function readChain(database: DatabaseSync, sessionId: string, head: number
                 continue;
             }
             if (visiting.has(frame.id)) throw new DevinReadError("DEVIN_CHAIN_CYCLE", "A Devin parent or summary chain contains a cycle.");
-            let node = memo.get(frame.id);
-            if (!node) {
-                const remaining = budget.remainingBytes;
-                const row = statement.get(sessionId, frame.id, remaining, remaining);
-                if (!row) throw new DevinReadError("DEVIN_CHAIN_NODE_MISSING", "A referenced Devin chain node is missing.");
-                await budget.take(Number(row.bytes));
-                const message = jsonObject(row.chat_message, true);
-                const metadata = jsonObject(row.metadata);
-                if (row.parent_node_id !== null && nodeId(row.parent_node_id) === null) {
-                    throw new DevinReadError("DEVIN_CHAIN_NODE_INVALID", "A Devin parent reference is invalid.");
-                }
-                const originalTime = message.metadata?.created_at;
-                node = {
-                    nodeId: frame.id,
-                    parentNodeId: nodeId(row.parent_node_id),
-                    createdAt: typeof originalTime === "string" || typeof originalTime === "number"
-                        ? originalTime : row.created_at as number | string,
-                    message,
-                    metadata,
-                };
-                memo.set(frame.id, node);
-            }
+            const node = memo.get(frame.id);
+            if (!node) throw new DevinReadError("DEVIN_CHAIN_NODE_MISSING", "A referenced Devin chain node is missing.");
             visiting.add(frame.id);
             frames.push({ id: frame.id, exit: true });
             const previous = node.metadata.summarized_from;
@@ -117,6 +126,78 @@ async function readChain(database: DatabaseSync, sessionId: string, head: number
     }
 }
 
+export async function findCliIdentityCandidates(filename: string, budget: ReadBudget, messageIds: string[], toolCallIds: string[]): Promise<{ sessionIds: string[]; uncertain: boolean }> {
+    return inSnapshot(filename, budget, async database => {
+        const userMatch = messageIds.length ? `json_extract(message_blob,'$.metadata.extensions."chisel/client-message-id"') IN (SELECT value FROM json_each(?))` : "0";
+        const toolMatch = toolCallIds.length ? `json_extract(message_blob,'$.tool_call_id') IN (SELECT value FROM json_each(?))
+                    OR EXISTS (SELECT 1 FROM json_each(message_blob,'$.tool_calls') AS call WHERE call.type='object'
+                        AND json_extract(call.value,'$.id') IN (SELECT value FROM json_each(?)))` : "0";
+        const rows = database.prepare(`WITH projected AS (
+            SELECT session_id, metadata, CASE WHEN json_valid(chat_message) THEN jsonb(chat_message) END AS message_blob FROM message_nodes),
+            matches AS MATERIALIZED (SELECT session_id, CASE WHEN message_blob IS NULL OR json_type(message_blob)!='object'
+                OR (metadata IS NOT NULL AND metadata!='' AND (NOT json_valid(metadata) OR json_type(metadata) NOT IN ('object','null')))
+                THEN 1 ELSE 0 END AS uncertain,
+                CASE WHEN message_blob IS NOT NULL AND json_type(message_blob)='object' THEN
+                    ${userMatch} OR ${toolMatch} ELSE 0 END AS matched FROM projected)
+            SELECT DISTINCT session_id, uncertain FROM matches WHERE uncertain=1 OR matched=1`);
+        const sessionIds = new Set<string>();
+        let uncertain = false;
+        const parameters = [...(messageIds.length ? [JSON.stringify(messageIds)] : []), ...(toolCallIds.length ? [JSON.stringify(toolCallIds), JSON.stringify(toolCallIds)] : [])];
+        for (const row of rows.iterate(...parameters)) {
+            await budget.take(Buffer.byteLength(JSON.stringify(row)));
+            uncertain ||= Number(row.uncertain) === 1;
+            sessionIds.add(String(row.session_id));
+        }
+        return { sessionIds: [...sessionIds], uncertain };
+    });
+}
+
+export function validateDevinRoundRange(request: DevinRoundRange): void {
+    const positive = (value: number) => Number.isSafeInteger(value) && value > 0;
+    if ("tailRounds" in request ? !positive(request.tailRounds) || "startRound" in request || "endRound" in request
+        : !positive(request.startRound) || (request.endRound !== undefined && (!positive(request.endRound) || request.endRound < request.startRound))) {
+        throw new DevinReadError("DEVIN_INVALID_RANGE", "Use positive integer tailRounds or 1-based inclusive startRound/endRound.");
+    }
+}
+
+function roundWindow(chain: ChainResult, request: DevinRoundRange): { nodes: DevinMessageNode[]; coverage: DevinRoundCoverage } {
+    validateDevinRoundRange(request);
+    const boundaries: number[] = [];
+    const summaries = new Set(chain.compactions.map(compaction => compaction.nodeId));
+    for (const [index, node] of chain.nodes.entries()) {
+        if (node.message.role === "system" || node.metadata.is_system_prefix === true || summaries.has(node.nodeId)) continue;
+        if (node.message.role === "user" || !boundaries.length) boundaries.push(index);
+    }
+    const totalRounds = boundaries.length;
+    const startRound = Math.min(totalRounds + 1, "tailRounds" in request ? Math.max(1, totalRounds - request.tailRounds + 1) : request.startRound);
+    const endRound = Math.min(totalRounds, "tailRounds" in request ? totalRounds : request.endRound ?? totalRounds);
+    const startStep = boundaries[startRound - 1] ?? chain.nodes.length;
+    const endStepExclusive = boundaries[endRound] ?? chain.nodes.length;
+    return { nodes: chain.nodes.slice(startStep, endStepExclusive), coverage: { unit: "round", startRound, endRound, totalRounds,
+        startStep, endStepExclusive, totalSteps: chain.nodes.length, complete: startRound === 1 && endRound === totalRounds } };
+}
+
+async function readChainWindow(database: DatabaseSync, sessionId: string, head: number | null, budget: ReadBudget,
+    memo: Map<number, DevinMessageNode>, request: DevinRoundRange, validated?: ValidatedChain): Promise<ChainResult & { coverage: DevinRoundCoverage }> {
+    if (validated && validated.mainChainId !== (head ?? undefined)) throw new DevinReadError("DEVIN_IDENTITY_CHANGED", "Devin main chain changed before range reading.");
+    const headers = validated ?? await readChain(database, sessionId, head, budget, new Map(), true);
+    if (headers.warnings.length) throw new DevinReadError("DEVIN_RANGE_UNAVAILABLE", `Cannot establish round boundaries: ${headers.warnings.join(", ")}; use a full read to inspect source diagnostics.`);
+    const window = roundWindow(headers, request);
+    const statement = database.prepare(`SELECT node_id, length(CAST(chat_message AS BLOB)) AS bytes,
+        CASE WHEN length(CAST(chat_message AS BLOB)) <= ? THEN chat_message END AS selected_message
+        FROM message_nodes WHERE session_id=? AND node_id IN (SELECT value FROM json_each(?))`);
+    const headersById = new Map(window.nodes.map(node => [node.nodeId, node]));
+    for (const row of statement.iterate(budget.remainingBytes, sessionId, JSON.stringify(window.nodes.map(node => node.nodeId)))) {
+        await budget.take(Number(row.bytes));
+        const header = headersById.get(Number(row.node_id))!;
+        memo.set(header.nodeId, { ...header, message: jsonObject(row.selected_message, true) });
+    }
+    const nodes = window.nodes.map(node => memo.get(node.nodeId)!);
+    const compactions = headers.compactions.filter(item => memo.has(item.nodeId)).map(item => ({ ...item,
+        summary: typeof memo.get(item.nodeId)!.message.content === "string" ? memo.get(item.nodeId)!.message.content : "" }));
+    return { nodes, compactions, warnings: ["DEVIN_RANGE_MAIN_CHAIN_ONLY"], coverage: window.coverage };
+}
+
 function workspaceUris(workingDirectory: unknown, extra: unknown): string[] {
     let parsed: unknown = [];
     try { if (typeof extra === "string") parsed = JSON.parse(extra); } catch {
@@ -137,14 +218,14 @@ function knownToolIds(nodes: DevinMessageNode[]): Set<string> {
 }
 
 async function cliSupplement(database: DatabaseSync, sessionId: string, filename: string,
-    mainNodes: DevinMessageNode[], memo: Map<number, DevinMessageNode>, budget: ReadBudget): Promise<{
+    mainNodes: DevinMessageNode[], memo: Map<number, DevinMessageNode>, budget: ReadBudget, mainOnly = false): Promise<{
         messages: DevinDesktopMessage[]; state: unknown[]; warnings: string[];
     }> {
     const messages: DevinDesktopMessage[] = [];
     const state: unknown[] = [];
     const warnings: string[] = [];
     const toolIds = knownToolIds(mainNodes);
-    if (columns(database, "subagent_heads").has("chain_node_id")) {
+    if (!mainOnly && columns(database, "subagent_heads").has("chain_node_id")) {
         const heads = database.prepare("SELECT agent_id, chain_node_id, updated_at FROM subagent_heads WHERE session_id=? ORDER BY agent_id");
         for (const head of heads.iterate(sessionId)) {
             await budget.take(Buffer.byteLength(JSON.stringify(head)));
@@ -180,8 +261,8 @@ async function cliSupplement(database: DatabaseSync, sessionId: string, filename
             coalesce(length(CAST(tool_call_json AS BLOB)),0) + coalesce(length(CAST(tool_call_update_json AS BLOB)),0) AS bytes,
             CASE WHEN coalesce(length(CAST(tool_call_json AS BLOB)),0) + coalesce(length(CAST(tool_call_update_json AS BLOB)),0) <= ? THEN tool_call_json END AS tool_call_json,
             CASE WHEN coalesce(length(CAST(tool_call_json AS BLOB)),0) + coalesce(length(CAST(tool_call_update_json AS BLOB)),0) <= ? THEN tool_call_update_json END AS tool_call_update_json
-            FROM tool_call_state WHERE session_id=? ORDER BY tool_call_id`);
-        for (const row of statement.iterate(budget.remainingBytes, budget.remainingBytes, sessionId)) {
+            FROM tool_call_state WHERE session_id=? ${mainOnly ? "AND tool_call_id IN (SELECT value FROM json_each(?))" : ""} ORDER BY tool_call_id`);
+        for (const row of statement.iterate(budget.remainingBytes, budget.remainingBytes, sessionId, ...(mainOnly ? [JSON.stringify([...toolIds])] : []))) {
             await budget.take(Number(row.bytes));
             const initial = jsonObject(row.tool_call_json);
             const update = jsonObject(row.tool_call_update_json);
@@ -199,7 +280,7 @@ async function cliSupplement(database: DatabaseSync, sessionId: string, filename
 }
 
 export async function readCliConversations(filename: string, budget: ReadBudget,
-    options: { identityOnly?: boolean; metadataOnly?: boolean; sessionId?: string; conversationIds?: string[]; acceptSummary?: (summary: DevinConversationSummary) => boolean; onConversation?: (conversation: CliConversation) => void; onSession?: () => void; onSessionError?: (id: string, error: unknown) => void } = {}): Promise<CliConversation[]> {
+    options: { identityOnly?: boolean; metadataOnly?: boolean; roundRange?: DevinRoundRange; validatedChain?: ValidatedChain; sessionId?: string; conversationIds?: string[]; acceptSummary?: (summary: DevinConversationSummary) => boolean; onConversation?: (conversation: CliConversation) => void; onSession?: () => void; onSessionError?: (id: string, error: unknown) => void } = {}): Promise<CliConversation[]> {
     return inSnapshot(filename, budget, async (database, identity, schema) => {
         const sessionColumns = columns(database, "sessions");
         const nodeColumns = columns(database, "message_nodes");
@@ -219,10 +300,11 @@ export async function readCliConversations(filename: string, budget: ReadBudget,
             try {
                 const empty = !database.prepare("SELECT 1 FROM message_nodes WHERE session_id=? LIMIT 1").get(sessionId);
                 const memo = new Map<number, DevinMessageNode>();
-                const chain = empty || options.metadataOnly ? { nodes: [], compactions: [], warnings: empty ? ["DEVIN_EMPTY_CONVERSATION"] : [] }
+                const chain: ChainResult & { coverage?: DevinRoundCoverage } = empty || options.metadataOnly ? { nodes: [], compactions: [], warnings: empty ? ["DEVIN_EMPTY_CONVERSATION"] : [] }
+                    : options.roundRange && !options.identityOnly ? await readChainWindow(database, sessionId, nodeId(session.main_chain_id), budget, memo, options.roundRange, options.validatedChain)
                     : await readChain(database, sessionId, nodeId(session.main_chain_id), budget, memo, options.identityOnly);
                 const supplement = options.identityOnly || options.metadataOnly ? { messages: [], state: [], warnings: [] }
-                    : await cliSupplement(database, sessionId, filename, chain.nodes, memo, budget);
+                    : await cliSupplement(database, sessionId, filename, chain.nodes, memo, budget, Boolean(options.roundRange));
                 const warnings = [...new Set([...chain.warnings, ...supplement.warnings])];
                 const summary: DevinConversationSummary = {
                     id: sessionId, canonicalId: sessionId, sessionId, aliases: [sessionId],
@@ -239,6 +321,7 @@ export async function readCliConversations(filename: string, budget: ReadBudget,
                     messageIds: collectMessageIds(chain.nodes), toolCallIds: knownToolIds(chain.nodes), hidden: Number(session.hidden ?? 0) !== 0,
                     empty,
                     revision: digest([identity, schema, session, [...memo.values()], chain.compactions, supplement.state, warnings]),
+                    ...(chain.coverage ? { coverage: chain.coverage } : {}),
                 });
                 options.onConversation?.(results[results.length - 1]);
             } catch (error) {

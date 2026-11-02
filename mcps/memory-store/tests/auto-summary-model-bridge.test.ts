@@ -1,0 +1,123 @@
+import assert from "node:assert/strict";
+import fs from "node:fs";
+import http from "node:http";
+import os from "node:os";
+import path from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
+import { validateAutoSummaryCandidate } from "../src/auto-summary-validation.ts";
+
+const root = fs.mkdtempSync(path.join(os.tmpdir(), "auto-summary-bridge-"));
+process.env.MEMORY_STORE_DATA_ROOT = root;
+process.env.MEMORY_STORE_AUTO_RECORD = "0";
+process.env.MEMORY_STORE_AGY_AUTO_ENABLED = "0";
+process.env.MEMORY_STORE_CODEX_COMMAND = path.join(root, "no-real-codex-command");
+process.env.MEMORY_STORE_LS_MODEL_FALLBACKS = "summary-fallback,summary-last";
+const notice = "Synthetic Model is no longer available. Please switch to another model.";
+let grokText = notice;
+let grokDelay = 0;
+let grokCalls = 0;
+let lsMode: "fallback" | "empty" | "all-invalid" | "delay" = "fallback";
+const lsModels: string[] = [];
+const server = http.createServer((request, response) => {
+    if (request.url === "/v1/models") {
+        response.writeHead(200, { "content-type": "application/json" });
+        response.end(JSON.stringify({ data: [{ id: "fixture-model" }] }));
+        return;
+    }
+    assert.equal(request.url, "/v1/chat/completions");
+    grokCalls++;
+    request.resume();
+    request.on("end", () => {
+        setTimeout(() => {
+            response.writeHead(200, { "content-type": "application/json" });
+            response.end(JSON.stringify({ choices: [{ message: { content: grokText }, finish_reason: "stop" }] }));
+        }, grokDelay);
+    });
+});
+await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+const address = server.address();
+assert.ok(address && typeof address !== "string");
+process.env.MEMORY_STORE_GROK_PROXY_URL = `http://127.0.0.1:${address.port}`;
+const ls = await import("../src/ls-client.ts");
+const rpc = await import("../src/ls-rpc.ts");
+const transport = await import("../src/provider-transport-adapter.ts");
+const bridge = await import("../src/model-bridge.ts");
+ls.__setParentLsForTest({ info: { pid: process.pid, csrfToken: "synthetic", workspaceId: "synthetic", ports: [1] }, port: 1 });
+rpc.__setLsRpcImplForTest(async (_info, _port, method, payload) => {
+    assert.equal(method, "GetModelResponse");
+    const model = String(payload.model);
+    lsModels.push(model);
+    if (lsMode === "delay") await delay(150);
+    const text = lsMode === "empty" ? "" : lsMode === "all-invalid" || model === "summary-primary" ? notice : "记录合成案例的实际修复、验证与后续安排。";
+    return { status: 200, data: { response: text }, rawSize: text.length };
+});
+await transport.configureProviderTransportAdapterForTest({ mode: "shadow" });
+const options = { responseValidator: (candidate: { text: string }) => validateAutoSummaryCandidate(candidate.text) };
+
+try {
+    const fallback = await bridge.callModelResponse("summary-primary", "synthetic only", "auto", 5_000, options);
+    assert.equal(fallback.chainUsed, "antigravity");
+    assert.equal(fallback.modelUsed, "summary-fallback");
+    assert.deepEqual(lsModels, ["summary-primary", "summary-fallback"]);
+    assert.equal(fallback.attemptFailures?.filter(failure => failure.kind === "response-validation").length, 2);
+    assert.ok(fallback.attemptFailures?.every(failure => failure.occurredAt));
+    lsModels.length = 0;
+    const explicit = await bridge.callModelResponse("summary-primary", "synthetic only", "grok", 5_000, options);
+    assert.equal(explicit.text, null);
+    assert.equal(explicit.failureClass, "Quality");
+    assert.equal(lsModels.length, 0);
+    lsMode = "all-invalid";
+    const allInvalid = await bridge.callModelResponse("summary-primary", "synthetic only", "antigravity", 5_000, options);
+    assert.equal(allInvalid.text, null);
+    assert.equal(allInvalid.attemptFailures?.filter(failure => failure.kind === "response-validation").length, 3);
+    assert.equal(lsModels.length, 3);
+    assert.equal(allInvalid.failureClass, "Quality");
+    lsModels.length = 0;
+    lsMode = "empty";
+    const empty = await bridge.callModelResponse("summary-primary", "synthetic only", "antigravity", 5_000, options);
+    assert.equal(empty.text, null);
+    assert.equal(lsModels.length, 3);
+    assert.match(empty.error || "", /empty-response/);
+    lsMode = "delay";
+    lsModels.length = 0;
+    const deadline = await bridge.callModelResponse("summary-primary", "synthetic only", "antigravity", 40, options);
+    assert.equal(deadline.text, null);
+    assert.equal(deadline.timedOut, true);
+    assert.equal(deadline.failureClass, "UnknownOutcome");
+    assert.equal(lsModels.length, 1);
+    await delay(170);
+    lsModels.length = 0;
+    const controller = new AbortController();
+    controller.abort();
+    const cancelled = await bridge.callModelResponse("summary-primary", "synthetic only", "antigravity", 5_000, { ...options, signal: controller.signal });
+    assert.equal(cancelled.cancelled, true);
+    assert.equal(lsModels.length, 0);
+    grokText = "记录服务停用错误的根因排查，已修复错误响应被接受为摘要的问题。";
+    const legitimate = await bridge.callModelResponse("summary-primary", "synthetic only", "grok", 5_000, options);
+    assert.equal(legitimate.text, grokText);
+    const fakeAgy = path.join(root, "synthetic-agy.mjs");
+    const fakeAgyLog = path.join(root, "synthetic-agy-models.jsonl");
+    fs.writeFileSync(fakeAgy, `import fs from "node:fs"; const args = process.argv.slice(2); if (args.includes("--help")) { console.log("synthetic agy help"); process.exit(0); } const model = args[args.indexOf("--model") + 1]; fs.appendFileSync(${JSON.stringify(fakeAgyLog)}, JSON.stringify(model) + "\\n"); console.log(model.includes("(High)") ? ${JSON.stringify(notice)} : "合成 AGY 摘要记录验证结果。");`);
+    const agy = await bridge.callModelResponse("summary-primary", "synthetic only", "agy", 8_000, { ...options, agyCommand: process.execPath, agyCommandArgs: [fakeAgy] });
+    assert.equal(agy.chainUsed, "agy", JSON.stringify(agy));
+    assert.equal(agy.modelUsed, "Gemini 3.8 Flash (Medium)");
+    assert.deepEqual(fs.readFileSync(fakeAgyLog, "utf-8").trim().split("\n").map(line => JSON.parse(line)), ["Gemini 3.8 Flash (High)", "Gemini 3.8 Flash (Medium)"]);
+    assert.equal(agy.attemptFailures?.[0].model, "Gemini 3.8 Flash (High)");
+    grokDelay = 160;
+    const priorCalls = grokCalls;
+    const unknown = await bridge.callModelResponse("summary-primary", "synthetic only", "auto", 40, options);
+    assert.equal(unknown.text, null);
+    assert.equal(unknown.failureClass, "UnknownOutcome");
+    assert.equal(lsModels.length, 0);
+    assert.equal(grokCalls, priorCalls + 1);
+    await delay(180);
+    console.log("auto-summary-model-bridge: rejected service notice falls back, actual LS/AGY candidate models retained, explicit chains isolated, all-invalid/empty bounded, deadline/cancel/UnknownOutcome stop, normal discussion accepted");
+} finally {
+    rpc.__setLsRpcImplForTest(null);
+    ls.__resetLsTestOverridesForTest();
+    await transport.resetProviderTransportAdapterForTest();
+    server.closeAllConnections();
+    await new Promise<void>(resolve => server.close(() => resolve()));
+    assert.equal(path.dirname(path.resolve(root)), path.resolve(os.tmpdir()));
+    fs.rmSync(root, { recursive: true, force: true });
+}

@@ -1,6 +1,17 @@
 import type { ConversationAttachment } from "./conversation-attachments.js";
+import type { CorpusSource } from "./conversation-corpus-sources.js";
+import type { ConversationRound } from "./trajectory.js";
 
 export type CorpusMessageRole = "user" | "assistant" | "tool" | "subagent";
+
+export interface CorpusVerifiedIdentity {
+    authority: "devin-sqlite";
+    source: "windsurf";
+    canonicalId: string;
+    aliases: string[];
+    evidence: string;
+    sourceRevision: string;
+}
 
 export interface CorpusSourcePosition {
     path?: string;
@@ -31,7 +42,11 @@ export interface CorpusConversation {
     updatedAt?: string;
     rolloutPath?: string;
     archived?: boolean;
-    source: "codex";
+    source: CorpusSource;
+    canonicalId?: string;
+    aliases?: string[];
+    sourceKind?: string;
+    sourceWarnings?: string[];
     parentConversationId?: string;
     rootConversationId?: string;
     isChildThread?: boolean;
@@ -45,10 +60,14 @@ export interface CorpusProjection {
     cacheGeneration?: string;
     messages: CorpusMessage[];
     complete: boolean;
+    partial?: boolean;
     requestedRangeComplete?: boolean;
     warnings: string[];
     sourceBytes?: number;
     timings?: Record<string, number>;
+    rounds?: ConversationRound[];
+    roundNumbering?: "absolute" | "relative";
+    totalRounds?: number;
 }
 
 export interface CorpusSearchExpression {
@@ -59,6 +78,8 @@ export interface CorpusSearchExpression {
 }
 
 export interface CorpusSearchRequest {
+    dataChains?: CorpusSource[];
+    sourceFailureMode?: "warn" | "fail";
     purpose?: "prepare";
     query?: string;
     allTerms?: string[];
@@ -90,11 +111,38 @@ export interface CorpusProjectionChunk {
     warnings: string[];
     sourceBytes?: number;
     replaceFromRound?: number;
+    verified?: boolean;
+    rounds?: ConversationRound[];
+    roundNumbering?: "absolute" | "relative";
 }
 
 export interface CorpusProvider {
     semanticVersion?: string;
+    sourceStatuses?: () => CorpusSourceStatus[];
     list(request: CorpusSearchRequest, control: CorpusReadControl): Promise<CorpusConversation[]>;
     readCached?(conversation: CorpusConversation, control: CorpusReadControl): Promise<CorpusProjection | null>;
     read(conversation: CorpusConversation, control: CorpusReadControl): Promise<CorpusProjection>;
+}
+
+export interface CorpusSourceStatus {
+    source: CorpusSource;
+    status: "ok" | "partial" | "error";
+    candidateCount: number;
+    warnings: string[];
+    error?: string;
+}
+
+export interface CorpusRoundReadRequest {
+    messageRoles?: CorpusMessageRole[];
+    startRound?: number;
+    endRound?: number;
+    lastRounds?: number;
+    revision: string;
+}
+
+export type CorpusFastReadRequest = Omit<CorpusRoundReadRequest, "revision">;
+
+export interface CorpusRangeProvider extends CorpusProvider {
+    readRounds(conversation: CorpusConversation, request: CorpusRoundReadRequest, control?: CorpusReadControl): Promise<CorpusProjection>;
+    readFast(conversation: CorpusConversation, request: CorpusFastReadRequest, control?: CorpusReadControl): Promise<CorpusProjection>;
 }

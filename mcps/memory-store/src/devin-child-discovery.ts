@@ -5,7 +5,7 @@ import type { ListConversationCandidatesOptions, UnifiedConversationCandidate } 
 
 export async function discoverDevinChildCandidates(parents: UnifiedConversationCandidate[], options: ListConversationCandidatesOptions & {
     readRaw?: (id: string, options: DevinReadOptions) => Promise<DevinRawConversation | null>;
-}): Promise<{ candidates: UnifiedConversationCandidate[]; warnings: string[] }> {
+}): Promise<{ candidates: UnifiedConversationCandidate[]; warnings: string[]; verifiedParents: Array<Pick<DevinRawConversation, "summary" | "partial" | "fingerprint">> }> {
     const requestedParents = options.conversationIds?.map(id => splitDevinSubagentId(id)?.parentId || id);
     const pool = [...parents];
     const explicitParents = [options.parentConversationId, ...(options.conversationIds || []).map(id => splitDevinSubagentId(id)?.parentId)].filter((id): id is string => Boolean(id));
@@ -17,6 +17,7 @@ export async function discoverDevinChildCandidates(parents: UnifiedConversationC
         .filter(parent => !requestedParents?.length || requestedParents.some(id => [parent.id, ...(parent.aliases || [])].includes(id)));
     const warnings: string[] = [];
     const candidates: UnifiedConversationCandidate[] = [];
+    const verifiedParents: Array<Pick<DevinRawConversation, "summary" | "partial" | "fingerprint">> = [];
     const maximumParents = Math.min(8, Math.max(1, options.candidateLimit || 8));
     if (selected.length > maximumParents) warnings.push("devin_child_parent_budget: child enumeration incomplete");
     const limited = selected.slice(0, maximumParents);
@@ -28,12 +29,13 @@ export async function discoverDevinChildCandidates(parents: UnifiedConversationC
         try {
             const raw = await (options.readRaw || readDevinRawConversation)(parent.id, { maxBytes: perParentBytes, deadlineMs: deadlineAt, isCancelled: options.isCancelled });
             if (!raw) { warnings.push(`devin_child_parent_unavailable:${parent.id}`); continue; }
+            verifiedParents.push({ summary: raw.summary, partial: raw.partial, fingerprint: raw.fingerprint });
             const children = selectDevinSubagents(raw);
             if (raw.partial) warnings.push(`devin_child_source_partial:${parent.id}`);
             for (const [agentId, entry] of children) {
                 if (candidates.length >= maximumChildren || options.isCancelled?.() || Date.now() >= deadlineAt) {
                     warnings.push("devin_child_candidate_budget");
-                    return { candidates, warnings };
+                    return { candidates, warnings, verifiedParents };
                 }
                 const id = devinSubagentId(raw.summary.canonicalId, agentId);
                 const payload = entry.payload;
@@ -51,5 +53,5 @@ export async function discoverDevinChildCandidates(parents: UnifiedConversationC
         } catch (error) { warnings.push(`devin_child_read_failed:${parent.id}:${String(error)}`); }
         await new Promise<void>(resolve => setImmediate(resolve));
     }
-    return { candidates, warnings };
+    return { candidates, warnings, verifiedParents };
 }

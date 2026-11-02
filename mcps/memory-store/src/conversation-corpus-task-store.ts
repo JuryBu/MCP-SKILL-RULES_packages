@@ -2,8 +2,9 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import crypto from "node:crypto";
 import { DATA_ROOT } from "./store.js";
-import type { CorpusConversation, CorpusSearchRequest } from "./conversation-corpus-types.js";
-import type { CorpusConversationMatch } from "./conversation-corpus-search.js";
+import type { CorpusConversation, CorpusSearchRequest, CorpusSourceStatus, CorpusVerifiedIdentity } from "./conversation-corpus-types.js";
+import { CORPUS_SOURCES, corpusConversationKey, resolveCorpusSources, type CorpusSource } from "./conversation-corpus-sources.js";
+import { compileCorpusSearch, type CorpusConversationMatch } from "./conversation-corpus-search.js";
 
 export type CorpusTaskPhase = "listing" | "scanning" | "finalizing" | "idle";
 export type CorpusTaskState = "running" | "cancelling" | "completed" | "partial" | "cancelled" | "failed" | "resumable";
@@ -12,6 +13,7 @@ export interface CorpusSemanticVersion { query: string | null; provider: string 
 export interface CorpusPreparedEvidence {
     kind: "conversation_body_projection";
     conversationId: string;
+    source?: CorpusSource;
     sourceRevision: string;
     cacheGeneration?: string;
     complete: boolean;
@@ -22,6 +24,7 @@ export interface CorpusPreparedEvidence {
 export interface CorpusTaskCommit {
     revision: number;
     conversationId: string;
+    source?: CorpusSource;
     complete: boolean;
     result: CorpusConversationMatch | null;
     scannedMessages: number;
@@ -34,6 +37,7 @@ export interface CorpusTaskCommit {
     semanticVersion?: CorpusSemanticVersion;
     prepared?: CorpusPreparedEvidence;
     unverified?: boolean;
+    verifiedIdentity?: CorpusVerifiedIdentity;
 }
 
 export interface CorpusTaskCoverage {
@@ -50,7 +54,8 @@ export interface CorpusTaskCoverage {
     mirrorMessagesSkipped: number;
     sourceBytes: number;
     warnings: string[];
-    errors: Array<{ conversationId: string; message: string }>;
+    errors: Array<{ source?: CorpusSource; conversationId: string; message: string }>;
+    sourceStatuses: CorpusSourceStatus[];
 }
 
 export interface CorpusTaskStoredState {
@@ -73,6 +78,8 @@ export interface CorpusTaskStoredState {
     computeMs: number;
     semanticVersion?: CorpusSemanticVersion;
     commitBatchSize?: number;
+    dataChains?: CorpusSource[];
+    sourceStatuses?: CorpusSourceStatus[];
 }
 
 export interface CorpusTaskSnapshot {
@@ -117,13 +124,61 @@ async function corpusCommitFiles(directory: string): Promise<CorpusCommitFile[]>
 }
 
 function validateCommit(commit: CorpusTaskCommit, revision: number): void {
+    const source = corpusCommitSource(commit);
+    const identity = commit?.verifiedIdentity;
+    const verified = Boolean(identity && identity.authority === "devin-sqlite" && identity.source === "windsurf" && source === identity.source
+        && typeof identity.canonicalId === "string" && identity.canonicalId && Array.isArray(identity.aliases)
+        && identity.aliases.every(alias => typeof alias === "string") && identity.aliases.includes(commit.conversationId)
+        && identity.aliases.includes(identity.canonicalId) && /^[a-f0-9]{64}$/u.test(identity.evidence)
+        && typeof identity.sourceRevision === "string" && identity.sourceRevision
+        && (!commit.result || (commit.result.conversation?.id === identity.canonicalId
+            && commit.result.conversation.canonicalId === identity.canonicalId && commit.result.sourceRevision === identity.sourceRevision))
+        && (!commit.prepared || (commit.prepared.conversationId === identity.canonicalId && commit.prepared.sourceRevision === identity.sourceRevision)));
     if (!commit || commit.revision !== revision || typeof commit.conversationId !== "string" || !commit.conversationId
-        || (commit.result && commit.result.conversation?.id !== commit.conversationId)) {
+        || !CORPUS_SOURCES.includes(source)
+        || (identity && !verified)
+        || (commit.result && ((!verified && commit.result.conversation?.id !== commit.conversationId) || commit.result.conversation.source !== source))
+        || (commit.prepared && ((!verified && commit.prepared.conversationId !== commit.conversationId) || (commit.prepared.source ?? "codex") !== source))) {
         throw corpusTaskError("CORPUS_TASK_CORRUPT", "Corpus task commit identity is invalid");
     }
     if (commit.semanticVersion && [commit.semanticVersion.query, commit.semanticVersion.provider]
         .some(value => value !== null && (typeof value !== "string" || !value.trim()))) {
         throw corpusTaskError("CORPUS_TASK_CORRUPT", "Corpus task commit semantic version is invalid");
+    }
+}
+
+function validateCommitSource(state: CorpusTaskStoredState, commit: CorpusTaskCommit): void {
+    const sources = state.dataChains ?? ["codex"];
+    if (!sources.includes(corpusCommitSource(commit)) || (commit.source === undefined && (sources.length !== 1 || sources[0] !== "codex"))) {
+        throw corpusTaskError("CORPUS_TASK_CORRUPT", "Corpus task commit does not identify a bound source");
+    }
+}
+
+export function corpusCommitSource(commit: Pick<CorpusTaskCommit, "source"> | null | undefined): CorpusSource {
+    return commit?.source ?? "codex";
+}
+
+export function corpusCommitKey(commit: Pick<CorpusTaskCommit, "source" | "conversationId">): string {
+    return corpusConversationKey({ source: corpusCommitSource(commit), id: commit.conversationId });
+}
+
+export function corpusPreparationDirectory(options: { ownerId: string; root?: string; conversationId: string; source: CorpusSource }): string {
+    const base = path.join(corpusOwnerDirectory(options), "preparations");
+    const identity = options.source === "codex" ? options.conversationId : corpusConversationKey({ source: options.source, id: options.conversationId });
+    const hash = crypto.createHash("sha256").update(identity).digest("hex");
+    return options.source === "codex" ? path.join(base, hash) : path.join(base, options.source, hash);
+}
+
+export function corpusTaskSources(request: CorpusSearchRequest): CorpusSource[] {
+    return request.dataChains === undefined ? ["codex"] : resolveCorpusSources({ dataChains: request.dataChains });
+}
+
+export function validateCorpusSourceStatuses(statuses: CorpusSourceStatus[], sources: CorpusSource[]): void {
+    if (!Array.isArray(statuses) || new Set(statuses.map(status => status?.source)).size !== statuses.length
+        || statuses.some(status => !status || !sources.includes(status.source) || !["ok", "partial", "error"].includes(status.status)
+            || !Number.isInteger(status.candidateCount) || status.candidateCount < 0 || !Array.isArray(status.warnings)
+            || status.warnings.some(warning => typeof warning !== "string") || (status.error !== undefined && typeof status.error !== "string"))) {
+        throw corpusTaskError("CORPUS_TASK_CORRUPT", "Corpus source coverage is invalid");
     }
 }
 
@@ -142,7 +197,7 @@ async function readCommitFile(task: Pick<CorpusTaskLoaded, "directory" | "state"
                 || batch.commits.length !== file.lastRevision - file.firstRevision + 1) throw new Error("Invalid commit batch identity");
             commits = batch.commits;
         } else commits = [value as CorpusTaskCommit];
-        commits.forEach((commit, index) => validateCommit(commit, file.firstRevision + index));
+        commits.forEach((commit, index) => { validateCommit(commit, file.firstRevision + index); validateCommitSource(task.state, commit); });
         return commits;
     } catch {
         throw corpusTaskError("CORPUS_TASK_CORRUPT", "Corpus task commit file is missing or invalid");
@@ -152,7 +207,7 @@ async function readCommitFile(task: Pick<CorpusTaskLoaded, "directory" | "state"
 export async function writeCorpusTaskCommits(task: Pick<CorpusTaskLoaded, "directory" | "state">, commits: CorpusTaskCommit[]): Promise<void> {
     if (!commits.length || commits.length > 32) throw new Error("Corpus commit batch must contain 1 to 32 entries");
     const firstRevision = commits[0]!.revision;
-    commits.forEach((commit, index) => validateCommit(commit, firstRevision + index));
+    commits.forEach((commit, index) => { validateCommit(commit, firstRevision + index); validateCommitSource(task.state, commit); });
     if (firstRevision !== task.state.revision + 1) throw new Error("Corpus commit batch must extend the durable revision");
     const lastRevision = commits.at(-1)!.revision;
     const filename = commits.length === 1 ? `${revisionName(firstRevision)}.json`
@@ -295,26 +350,46 @@ export async function loadCorpusTask(options: { ownerId: string; taskId: string;
         || (state.commitBatchSize !== undefined && (!Number.isInteger(state.commitBatchSize) || state.commitBatchSize < 1 || state.commitBatchSize > 32))) {
         throw corpusTaskError("CORPUS_TASK_CORRUPT", "Corpus task revision or snapshot identity is invalid");
     }
-    const request = await readCorpusJson<CorpusSearchRequest>(path.join(directory, "request.json"));
+    let request = await readCorpusJson<CorpusSearchRequest>(path.join(directory, "request.json"));
     if (crypto.createHash("sha256").update(JSON.stringify(request)).digest("hex") !== state.requestHash) {
         throw corpusTaskError("CORPUS_TASK_CORRUPT", "Corpus task request integrity check failed");
     }
+    let sources: CorpusSource[];
+    try { sources = corpusTaskSources(request); }
+    catch { throw corpusTaskError("CORPUS_TASK_CORRUPT", "Corpus task sources are invalid"); }
+    try {
+        if (state.dataChains !== undefined && JSON.stringify(resolveCorpusSources({ dataChains: state.dataChains }).sort()) !== JSON.stringify([...sources].sort())) {
+            throw new Error("Source binding changed");
+        }
+    } catch { throw corpusTaskError("CORPUS_TASK_CORRUPT", "Corpus task source binding changed"); }
+    state.dataChains = sources;
+    if (state.sourceStatuses !== undefined) {
+        validateCorpusSourceStatuses(state.sourceStatuses, sources);
+        if (state.sourceStatuses.length !== sources.length) throw corpusTaskError("CORPUS_TASK_CORRUPT", "Corpus task source coverage is incomplete");
+    }
+    try { request = compileCorpusSearch({ ...request, dataChains: sources, sourceFailureMode: request.sourceFailureMode ?? "warn" }).request; }
+    catch { throw corpusTaskError("CORPUS_TASK_CORRUPT", "Corpus task request is invalid"); }
     if (preferSnapshot && state.snapshotId && !["running", "cancelling", "resumable"].includes(state.status)) {
         return { directory, state, request, candidates: [], commits: [], records: new Map() };
     }
     const candidates = state.discoveryComplete ? await readCorpusJson<CorpusConversation[]>(path.join(directory, "candidates.json")) : [];
-    const candidateIds = new Set(candidates.map(candidate => candidate.id));
+    if (!Array.isArray(candidates) || candidates.some(candidate => !candidate || !sources.includes(candidate.source)
+        || typeof candidate.id !== "string" || !candidate.id || typeof candidate.workspace !== "string")) {
+        throw corpusTaskError("CORPUS_TASK_CORRUPT", "Corpus task candidates have invalid source identities");
+    }
+    const candidateIds = new Set(candidates.map(corpusConversationKey));
+    if (candidateIds.size !== candidates.length) throw corpusTaskError("CORPUS_TASK_CORRUPT", "Corpus task has duplicate candidate identities");
     const files = await corpusCommitFiles(directory);
     const commits: CorpusTaskCommit[] = [];
     const records = new Map<string, CorpusTaskCommit>();
     for (let offset = 0; offset < files.length; offset += 16) {
         const batch = await Promise.all(files.slice(offset, offset + 16).map(file => readCommitFile({ directory, state }, file)));
         for (const commit of batch.flat()) {
-            if (commit.revision !== commits.length + 1 || !candidateIds.has(commit.conversationId)) {
+            if (commit.revision !== commits.length + 1 || !candidateIds.has(corpusCommitKey(commit))) {
                 throw corpusTaskError("CORPUS_TASK_CORRUPT", "Corpus task commit sequence or candidate identity is invalid");
             }
             commits.push(commit);
-            records.set(commit.conversationId, commit);
+            records.set(corpusCommitKey(commit), commit);
         }
     }
     if (state.revision > commits.length) {
@@ -337,26 +412,57 @@ export function corpusCurrentRecords(task: CorpusTaskLoaded): CorpusTaskCommit[]
     return [...task.records.values()].filter(record => corpusSemanticVersionsEqual(record.semanticVersion, task.state.semanticVersion));
 }
 
+export function corpusResultRecords(task: CorpusTaskLoaded): CorpusTaskCommit[] {
+    const seen = new Set<string>();
+    return corpusCurrentRecords(task).filter(record => {
+        const identity = record.verifiedIdentity;
+        const result = record.result;
+        if (!record.complete || record.unverified || !result || result.provisional || !identity
+            || identity.authority !== "devin-sqlite" || identity.source !== corpusCommitSource(record)
+            || result.conversation.source !== identity.source || result.conversation.id !== identity.canonicalId
+            || result.conversation.canonicalId !== identity.canonicalId || !identity.aliases.includes(record.conversationId)
+            || !identity.evidence || !identity.sourceRevision) return true;
+        const key = JSON.stringify([identity.source, identity.canonicalId, identity.evidence, identity.sourceRevision,
+            { ...result, conversation: { source: identity.source, id: identity.canonicalId }, warnings: [] }]);
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+    });
+}
+
 export function corpusCoverage(task: CorpusTaskLoaded): CorpusTaskCoverage {
     const records = corpusCurrentRecords(task);
     const committed = records.filter(record => record.complete).length;
-    const errors = records.filter(record => record.error).map(record => ({ conversationId: record.conversationId, message: record.error! }));
+    const errors = records.filter(record => record.error).map(record => ({ source: corpusCommitSource(record), conversationId: record.conversationId, message: record.error! }));
     const partial = records.filter(record => !record.complete && !record.error).length;
+    const sourceStatuses = corpusTaskSources(task.request).map((source): CorpusSourceStatus => {
+        const status = task.state.sourceStatuses?.find(status => status.source === source);
+        const sourceRecords = records.filter(record => corpusCommitSource(record) === source);
+        const candidates = task.candidates.filter(candidate => candidate.source === source);
+        const error = status?.error ?? (sourceRecords.filter(record => record.error).map(record => `${record.conversationId}: ${record.error}`).join("; ") || undefined);
+        return {
+            source, candidateCount: status?.candidateCount ?? candidates.length,
+            status: status?.status === "error" ? "error" : status?.status === "partial" || sourceRecords.some(record => !record.complete) ? "partial" : "ok",
+            warnings: [...new Set([...(status?.warnings ?? []), ...candidates.flatMap(candidate => candidate.sourceWarnings ?? []), ...sourceRecords.flatMap(record => record.warnings)])],
+            ...(error ? { error } : {}),
+        };
+    });
     return {
         scope: "frozen_candidates", discoveryComplete: task.state.discoveryComplete,
-        complete: task.state.discoveryComplete && committed === task.candidates.length && !task.state.error,
+        complete: task.state.discoveryComplete && committed === task.candidates.length && !task.state.error && sourceStatuses.every(status => status.status === "ok"),
         candidateConversations: task.candidates.length, scannedConversations: records.length, committedConversations: committed,
         partialConversations: partial, errorConversations: errors.length,
         pendingConversations: task.candidates.length - committed - partial - errors.length,
         scannedMessages: records.reduce((total, record) => total + record.scannedMessages, 0),
         mirrorMessagesSkipped: records.reduce((total, record) => total + record.mirrorMessagesSkipped, 0),
         sourceBytes: records.reduce((total, record) => total + record.sourceBytes, 0),
-        warnings: [...new Set(records.flatMap(record => record.warnings))], errors,
+        warnings: [...new Set(sourceStatuses.flatMap(status => [...status.warnings, ...(status.error ? [`${status.source}: ${status.error}`] : [])]))], errors, sourceStatuses,
     };
 }
 
 export function corpusCursor(task: CorpusTaskLoaded, snapshotId: string, offset: number, snapshotHash: string): string {
-    const payload = Buffer.from(JSON.stringify({ version: 1, taskId: task.state.taskId, owner: corpusOwnerHash(task.state.ownerId), snapshotId, snapshotHash, offset })).toString("base64url");
+    const payload = Buffer.from(JSON.stringify({ version: 1, taskId: task.state.taskId, owner: corpusOwnerHash(task.state.ownerId), requestHash: task.state.requestHash,
+        dataChains: corpusTaskSources(task.request), snapshotId, snapshotHash, offset })).toString("base64url");
     const signature = crypto.createHmac("sha256", task.state.secret).update(payload).digest("base64url");
     return `${payload}.${signature}`;
 }
@@ -372,6 +478,9 @@ export function parseCorpusCursor(task: CorpusTaskLoaded, cursor: string): { sna
         if (decoded.version !== 1 || decoded.taskId !== task.state.taskId || decoded.owner !== corpusOwnerHash(task.state.ownerId)
             || !/^snapshot-[a-f0-9-]{36}$/.test(decoded.snapshotId) || !/^[a-f0-9]{64}$/.test(decoded.snapshotHash)
             || !Number.isInteger(decoded.offset) || decoded.offset < 0) throw new Error("Invalid cursor identity");
+        if ((decoded.requestHash !== undefined && decoded.requestHash !== task.state.requestHash)
+            || (decoded.dataChains !== undefined && JSON.stringify(decoded.dataChains) !== JSON.stringify(corpusTaskSources(task.request)))
+            || (decoded.dataChains === undefined && JSON.stringify(corpusTaskSources(task.request)) !== '["codex"]')) throw new Error("Invalid cursor sources");
         return decoded;
     } catch { throw corpusTaskError("CORPUS_CURSOR_INVALID", "Cursor does not belong to this task, owner, or final snapshot"); }
 }

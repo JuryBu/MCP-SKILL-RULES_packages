@@ -14,6 +14,7 @@ import type { ProviderTrafficClass } from "./provider-control-contracts.js";
 import type { FailureClass } from "./record-scheduler-contracts.js";
 import { spawnWindowsJobProcess, type WindowsJobProcess } from "./windows-job-process.js";
 import { CodexDiagnosticRecorder, type CodexBridgeDiagnostics, type CodexDiagnosticContext } from "./codex-bridge-diagnostics.js";
+import { callValidatedAgyCandidates, callValidatedLsCandidates } from "./auto-summary-model-candidates.js";
 
 const execAsync = promisify(exec);
 const CODEX_STATUS_TTL = 60_000;
@@ -53,6 +54,21 @@ type ResolvedChain = Exclude<Chain, "auto">;
 
 export type ModelBridgeRetryStrategy = "provider-fallback-exhausted";
 
+export interface ModelBridgeAttemptFailure {
+    provider: ResolvedChain | null;
+    model: string | null;
+    reason: string;
+    occurredAt: string;
+    kind: "response-validation" | "provider";
+    failureClass?: FailureClass;
+}
+
+export interface ModelResponseCandidate {
+    text: string;
+    provider: ResolvedChain;
+    model: string | null;
+}
+
 export interface ModelBridgeResult {
     text: string | null;
     chainUsed: ResolvedChain | null;
@@ -66,6 +82,7 @@ export interface ModelBridgeResult {
     agyAttempts?: readonly AgyAttempt[];
     codexDiagnostics?: CodexBridgeDiagnostics;
     safetyStopped?: boolean;
+    attemptFailures?: readonly ModelBridgeAttemptFailure[];
 }
 
 export interface CodexExecResult {
@@ -87,6 +104,7 @@ export interface ClaudeCodeExecResult {
 }
 
 export interface ModelBridgeOptions {
+    responseValidator?: (candidate: ModelResponseCandidate) => string | null;
     allowClaudeCodeFallback?: boolean;
     agyCommand?: string;
     agyCommandArgs?: readonly string[];
@@ -950,6 +968,22 @@ export async function callModelResponse(
     timeoutMs: number = 30_000,
     options: ModelBridgeOptions = {},
 ): Promise<ModelBridgeResult> {
+    const failures: ModelBridgeAttemptFailure[] = [];
+    const result = await callModelResponseInternal(model, prompt, chain, timeoutMs, options, failures);
+    if (!result.text && result.error && !failures.some(failure => failure.reason === result.error)) {
+        failures.push({ provider: result.chainUsed, model: result.modelUsed || null, reason: result.error, occurredAt: new Date().toISOString(), kind: "provider", failureClass: result.failureClass });
+    }
+    return failures.length ? { ...result, attemptFailures: failures } : result;
+}
+
+async function callModelResponseInternal(
+    model: string,
+    prompt: string,
+    chain: Chain | string,
+    timeoutMs: number,
+    options: ModelBridgeOptions,
+    failures: ModelBridgeAttemptFailure[],
+): Promise<ModelBridgeResult> {
     const deadline = createModelBridgeDeadline(timeoutMs, options);
     const deadlineFailure = (phase: "preflight" | "execution"): ModelBridgeResult => ({
         text: null,
@@ -1028,6 +1062,25 @@ export async function callModelResponse(
     }
 
     const errors: string[] = [];
+    const validateCandidate = <Candidate extends { text: string | null; error?: string; failureClass?: FailureClass; cancelled?: boolean; safetyStopped?: boolean; timedOut?: boolean; truncated?: boolean }>(provider: ResolvedChain, actualModel: string | null, candidate: Candidate): Candidate => {
+        if (!options.responseValidator) return candidate;
+        if (candidate.cancelled || candidate.safetyStopped || candidate.timedOut || candidate.truncated || candidate.failureClass === "UnknownOutcome") return { ...candidate, text: null };
+        if (candidate.text === null) return candidate;
+        let reason: string | null;
+        try {
+            reason = options.responseValidator({ text: candidate.text, provider, model: actualModel });
+        } catch {
+            reason = "response-validator-failed";
+        }
+        if (!reason) return candidate;
+        const error = `Invalid model response: ${reason}`;
+        failures.push({ provider, model: actualModel, reason: error, occurredAt: new Date().toISOString(), kind: "response-validation", failureClass: "Quality" });
+        return { ...candidate, text: null, error, failureClass: "Quality" };
+    };
+    const recordFailure = (provider: ResolvedChain, actualModel: string | null, reason: string, failureClass?: FailureClass): void => {
+        errors.push(reason);
+        if (failures.at(-1)?.reason !== reason || failures.at(-1)?.provider !== provider) failures.push({ provider, model: actualModel, reason, occurredAt: new Date().toISOString(), kind: "provider", failureClass });
+    };
     let grokDiagnostics: GrokExecDiagnostics | undefined;
     let codexDiagnostics: CodexBridgeDiagnostics | undefined;
     let singleCandidateFailureClass: FailureClass | undefined;
@@ -1052,7 +1105,7 @@ export async function callModelResponse(
         if (resolved === "grok") {
             const grokContext = options.grokContext || "default";
             const grokModel = mapGrokModel(model, grokContext);
-            const result = await callGrokExec(prompt, grokModel, remainingMs, mapGrokMaxTokens(grokContext), {
+            const result = validateCandidate("grok", grokModel, await callGrokExec(prompt, grokModel, remainingMs, mapGrokMaxTokens(grokContext), {
                 context: grokContext,
                 trafficClass: options.trafficClass,
                 providerTrafficClass,
@@ -1061,8 +1114,11 @@ export async function callModelResponse(
                 idempotencyKey: options.idempotencyKey,
                 shouldCancel: options.shouldCancel,
                 signal: deadline.signal,
-            });
-            if (deadline.remainingMs() === 0) return { ...deadlineFailure("execution"), failureClass: result.failureClass ?? "UnknownOutcome", grokDiagnostics: result.diagnostics, modelUsed: grokModel };
+            }));
+            if (deadline.remainingMs() === 0) {
+                recordFailure("grok", grokModel, result.error || deadlineFailure("execution").error!, result.failureClass ?? "UnknownOutcome");
+                return { ...deadlineFailure("execution"), failureClass: result.failureClass ?? "UnknownOutcome", grokDiagnostics: result.diagnostics, modelUsed: grokModel };
+            }
             grokDiagnostics = result.diagnostics;
             if (candidates.length === 1) singleCandidateFailureClass = result.failureClass;
             if (result.text) return { text: result.text, chainUsed: "grok", modelUsed: grokModel, grokDiagnostics: result.diagnostics };
@@ -1077,7 +1133,7 @@ export async function callModelResponse(
                     grokDiagnostics: result.diagnostics,
                 };
             }
-            errors.push(result.error || "Grok 模型桥调用失败");
+            recordFailure("grok", grokModel, result.error || "Grok 模型桥调用失败", result.failureClass);
             if (result.failureClass === "UnknownOutcome") return { text: null, chainUsed: "grok", modelUsed: grokModel, error: result.error, failureClass: result.failureClass, grokDiagnostics: result.diagnostics };
             if (result.timedOut && resolvedChain === "grok") {
                 return {
@@ -1094,7 +1150,7 @@ export async function callModelResponse(
         }
 
         if (resolved === "agy") {
-            const result = await callAgyWithFallback(prompt, {
+            const agyOptions = {
                         command: options.agyCommand,
                         commandArgs: options.agyCommandArgs,
                         timeoutMs: remainingMs,
@@ -1102,13 +1158,18 @@ export async function callModelResponse(
                         trafficClass: providerTrafficClass,
                         providerLease: options.providerLease,
                         attemptId: options.attemptId,
-                    });
+                    };
+            const rawResult = options.responseValidator && !options.providerLease
+                ? await callValidatedAgyCandidates(prompt, agyOptions, options.responseValidator, failures)
+                : await callAgyWithFallback(prompt, agyOptions);
+            const result = validateCandidate("agy", rawResult.model, rawResult);
             if (result.text && deadline.remainingMs() > 0) return { text: result.text, chainUsed: "agy", modelUsed: result.model };
             const diagnostics = result.timing
                 ? ` [phase=${result.phase || "unknown"}; totalMs=${deadline.elapsedMs()}; preflightMs=${preflightMs}; admissionWaitMs=${Math.round(result.timing.admissionWaitMs)}; executionMs=${Math.round(result.timing.executionMs)}]`
                 : "";
             const agyError = `${deadline.reason === "timeout" ? "agy CLI 调用超时" : result.error || "agy CLI 模型调用失败"}${diagnostics}`;
             if (deadline.remainingMs() === 0) {
+                recordFailure("agy", result.model, agyError, result.failureClass);
                 return {
                     text: null,
                     chainUsed: null,
@@ -1130,7 +1191,7 @@ export async function callModelResponse(
                     agyAttempts: result.attempts,
                 };
             }
-            errors.push(agyError);
+            recordFailure("agy", result.model, agyError, result.failureClass);
             if (result.timedOut && resolvedChain === "agy") {
                 return {
                     text: null,
@@ -1159,18 +1220,26 @@ export async function callModelResponse(
 
         if (resolved === "antigravity") {
             const lsModel = options.antigravityModelOverride || model;
-            const result = await callLsModelDetailed(lsModel, prompt, remainingMs);
-            if (deadline.remainingMs() === 0) return { ...deadlineFailure("execution"), modelUsed: lsModel, error: [result.error, deadlineFailure("execution").error].filter(Boolean).join("；") };
+            const rawResult = options.responseValidator
+                ? await callValidatedLsCandidates(lsModel, prompt, remainingMs, deadline.signal, options.responseValidator, failures)
+                : { ...await callLsModelDetailed(lsModel, prompt, remainingMs), modelUsed: lsModel };
+            const actualModel = rawResult.modelUsed || lsModel;
+            const result = validateCandidate("antigravity", actualModel, rawResult);
+            if (deadline.remainingMs() === 0) {
+                recordFailure("antigravity", actualModel, result.error || deadlineFailure("execution").error!, result.failureClass ?? "UnknownOutcome");
+                return { ...deadlineFailure("execution"), modelUsed: actualModel, error: [result.error, deadlineFailure("execution").error].filter(Boolean).join("；") };
+            }
+            if (result.cancelled || result.failureClass === "UnknownOutcome") return { ...result, chainUsed: "antigravity", modelUsed: actualModel };
             if (candidates.length === 1) singleCandidateFailureClass = result.failureClass;
-            if (result.text) return { text: result.text, chainUsed: "antigravity", modelUsed: lsModel };
-            errors.push(result.error || "Antigravity LS 模型调用失败");
+            if (result.text) return { text: result.text, chainUsed: "antigravity", modelUsed: actualModel };
+            recordFailure("antigravity", actualModel, result.error || "Antigravity LS 模型调用失败", result.failureClass);
             // 真超时：与 codex 分支对齐早返回，透传 timedOut 让上层区分「超时」vs「普通失败」，
             // 不再无条件落到下个候选 / 触发重试（避免一次真超时后又白等一整轮）。
             if (result.timedOut) {
                 return {
                     text: null,
                     chainUsed: null,
-                    modelUsed: lsModel,
+                    modelUsed: actualModel,
                     error: result.error || "Antigravity LS 模型调用超时",
                     timedOut: true,
                     failureClass: result.failureClass,
@@ -1180,13 +1249,16 @@ export async function callModelResponse(
         }
 
         if (resolved === "codex") {
-            const result = await callCodexExec(prompt, model, remainingMs, options.diagnosticContext, { ...options, signal: deadline.signal, isDeadlineTimeout: () => deadline.reason === "timeout" });
+            const result = validateCandidate("codex", mapModelName(model), await callCodexExec(prompt, model, remainingMs, options.diagnosticContext, { ...options, signal: deadline.signal, isDeadlineTimeout: () => deadline.reason === "timeout" }));
             codexDiagnostics = result.codexDiagnostics;
-            if (deadline.remainingMs() === 0) return { ...deadlineFailure("execution"), codexDiagnostics, cancelled: result.cancelled, safetyStopped: result.safetyStopped, failureClass: result.failureClass ?? "UnknownOutcome" };
+            if (deadline.remainingMs() === 0) {
+                recordFailure("codex", mapModelName(model), result.error || deadlineFailure("execution").error!, result.failureClass ?? "UnknownOutcome");
+                return { ...deadlineFailure("execution"), codexDiagnostics, cancelled: result.cancelled, safetyStopped: result.safetyStopped, failureClass: result.failureClass ?? "UnknownOutcome" };
+            }
             if (result.cancelled) return { ...result, chainUsed: "codex", modelUsed: mapModelName(model) };
             if (candidates.length === 1) singleCandidateFailureClass = result.failureClass;
             if (result.text) return { text: result.text, chainUsed: "codex", modelUsed: mapModelName(model), codexDiagnostics, safetyStopped: result.safetyStopped };
-            errors.push(result.error || "Codex 模型桥调用失败");
+            recordFailure("codex", mapModelName(model), result.error || "Codex 模型桥调用失败", result.failureClass);
             if (result.timedOut || result.safetyStopped || result.failureClass === "UnknownOutcome" || chain === "codex") {
                 return {
                     text: null,
@@ -1202,14 +1274,14 @@ export async function callModelResponse(
             continue;
         }
 
-        const result = await callClaudeCodeExec(prompt, model, remainingMs, { ...options, signal: deadline.signal });
+        const result = validateCandidate("claude-code", model, await callClaudeCodeExec(prompt, model, remainingMs, { ...options, signal: deadline.signal }));
         if (deadline.remainingMs() === 0) return deadlineFailure("execution");
         if (candidates.length === 1) singleCandidateFailureClass = result.failureClass;
         if (result.text) return { text: result.text, chainUsed: "claude-code", modelUsed: model };
         if (result.cancelled) {
             return { text: null, chainUsed: "claude-code", modelUsed: model, error: result.error, cancelled: true };
         }
-        errors.push(result.error || "Claude Code CLI 模型桥调用失败");
+        recordFailure("claude-code", model, result.error || "Claude Code CLI 模型桥调用失败", result.failureClass);
         return {
             text: null,
             chainUsed: null,

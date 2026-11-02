@@ -25,8 +25,10 @@ import {
 import { indexCache } from "../cache.js";
 import { cleanOldTempFiles, TEMP_DIR } from "../temp-store.js";
 import {
-    captureAutoSummarySnapshot,
-    generateAutoSummary,
+    captureAutoSummaryFileSnapshot,
+    generateAutoSummaryResult,
+    autoSummaryRecoveryInfo,
+    recoverAutoSummaryWriteback,
     writeAutoSummaryIfUnchanged,
 } from "../auto-summary.js";
 import { resolveModelOnlyChainSplit, type Chain } from "../chain.js";
@@ -585,7 +587,10 @@ async function handleEnhance(workspace?: string, chain: Chain = "auto") {
     for (const hash of hashList) {
         const wsIndex = readWorkspaceIndex(hash);
         for (const entry of wsIndex.entries) {
-            if (entry.autoSummary) {
+            const recovery = autoSummaryRecoveryInfo(hash, entry.id);
+            if (recovery && recovery.phase !== "complete" && recovery.phase !== "restored") await recoverAutoSummaryWriteback(hash, entry.id);
+            const currentEntry = readWorkspaceIndex(hash).entries.find(candidate => candidate.id === entry.id) || entry;
+            if (currentEntry.autoSummary) {
                 skipped++;
             } else {
                 targets.push({ hash, entry: { id: entry.id, title: entry.title, tags: entry.tags } });
@@ -614,28 +619,32 @@ async function handleEnhance(workspace?: string, chain: Chain = "auto") {
             const parsed = parseMemoryFile(fileContent);
             if (!parsed) { failed++; continue; }
 
-            const snapshot = captureAutoSummarySnapshot({
-                title: String(parsed.frontmatter.title || target.entry.title),
-                tags: Array.isArray(parsed.frontmatter.tags) ? parsed.frontmatter.tags as string[] : target.entry.tags,
-                updated: String(parsed.frontmatter.updated || ""),
-                body: parsed.body,
-            });
-            const summary = await generateAutoSummary(snapshot.title, snapshot.tags, snapshot.body, chain);
-            if (!summary) { failed++; continue; }
+            const snapshot = captureAutoSummaryFileSnapshot(fileContent, target.entry.title, target.entry.tags);
+            if (!snapshot) { failed++; continue; }
+            const generated = await generateAutoSummaryResult(snapshot.title, snapshot.tags, snapshot.body, chain);
+            const summary = generated.summary;
 
             const writeResult = await writeAutoSummaryIfUnchanged({
                 hash: target.hash,
                 memoryId: target.entry.id,
-                summary,
+                summary: summary ?? undefined,
                 expectedFingerprint: snapshot.fingerprint,
                 fallbackTitle: snapshot.title,
                 fallbackTags: snapshot.tags,
+                expectedSummary: snapshot.expectedSummary,
+                expectedSourceFingerprint: snapshot.sourceFingerprint,
+                provenance: generated.provenance,
             });
 
-            if (writeResult === "written") {
+            if (writeResult === "written" && summary) {
                 success++;
                 console.error(`[memory-store] enhance: ${target.entry.id} ✅`);
                 continue;
+            }
+
+            if (generated.provenance.cancelled || generated.provenance.safetyStopped || generated.provenance.failureClass === "UnknownOutcome") {
+                failed++;
+                break;
             }
 
             if (writeResult === "stale" || writeResult === "missing" || writeResult === "existing") {
@@ -671,6 +680,7 @@ function rebuildWorkspaceIndex(hash: string): void {
     const files = fs.readdirSync(entriesDir).filter(f => f.endsWith(".md"));
     const entries: Array<{
         id: string; title: string; searchSummary: string; autoSummary?: string;
+        autoSummaryProvenance?: string;
         tags: string[]; category: string; createdAt: string;
         updatedAt: string; lastAccessed: string; sizeBytes: number;
         lineCount: number; conversationId?: string; pinned?: boolean;
@@ -697,6 +707,7 @@ function rebuildWorkspaceIndex(hash: string): void {
                 conversationId: fm.conversationId ? String(fm.conversationId) : undefined,
                 pinned: fm.pinned === true ? true : undefined,
                 autoSummary: fm.autoSummary ? String(fm.autoSummary) : undefined,
+                autoSummaryProvenance: typeof fm.autoSummaryProvenance === "string" ? fm.autoSummaryProvenance : undefined,
             });
         } catch { /* skip */ }
     }

@@ -97,7 +97,7 @@ test("the same cancelled task rejects a new cross-directory conflict after an ac
         await original.list({}, {});
         await original.read(sample.conversation, {});
         const root = path.join(sample.directory, "tasks");
-        const started = await startCorpusSearch({ ownerId: "replica-restart-owner", root, request: { query: "祖先正文", conversationIds: [sample.conversation.id] }, provider: {
+        const started = await startCorpusSearch({ ownerId: "replica-restart-owner", root, request: { dataChains: ["codex"], query: "祖先正文", conversationIds: [sample.conversation.id] }, provider: {
             ...original,
             async readCached() { cacheReadStarted = true; await blocked; return null; },
         } });

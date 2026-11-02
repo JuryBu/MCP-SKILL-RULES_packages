@@ -4,6 +4,7 @@ import { homedir } from "node:os";
 import path from "node:path";
 import { Decompress as ZstdDecompress } from "fzstd";
 import xxhash from "xxhash-wasm";
+import { assertHostFileActive, assertHostFileUnchanged, captureHostFile, readHostTextWindow, type HostFileRevision } from "./conversation-host-files.js";
 
 export interface DshReaderOptions {
     sessionsRoot?: string;
@@ -13,6 +14,10 @@ export interface DshReaderOptions {
     maxStabilityAttempts?: number;
     maxDecompressedBytes?: number;
     maxDecompressedFrameBytes?: number;
+    maxCompressedFrameBytes?: number;
+    maxLineBytes?: number;
+    isCancelled?: () => boolean;
+    onProgress?: (progress: { bytes: number; totalBytes: number; phase: string }) => void;
 }
 
 export interface DshSessionHeader {
@@ -90,6 +95,33 @@ export interface DshSessionReadOptions extends DshReaderOptions {
     sessionId?: string;
 }
 
+export interface DshSessionSource {
+    id: string;
+    header: DshSessionHeader;
+    provenance: DshSessionProvenance;
+}
+
+export interface DshSessionCheckpoint {
+    version: 1;
+    source: HostFileRevision;
+    header: DshSessionHeader;
+    resumeByte: number;
+    resumeEventCount: number;
+    resumeLineNo: number;
+    resumeExpectedSeq?: number;
+    resumeDecodedBytes: number;
+    eventCount: number;
+    fingerprint: string;
+}
+
+export interface DshIncrementalReadResult extends DshSessionReadResult {
+    status: "ok" | "unchanged";
+    replaceFromEvent: number;
+    checkpoint: DshSessionCheckpoint;
+    readBytes: number;
+    decodedBytes: number;
+}
+
 interface DshSessionCandidate {
     sessionsRoot: string;
     projectDirectory: string;
@@ -152,16 +184,18 @@ export function resolveDshSessionsRoot(input: ReaderInput = {}): string {
 
 export async function listDshSessionSnapshots(input: ReaderInput = {}): Promise<DshSessionSnapshot[]> {
     const options = normalizeReaderOptions(input);
-    const results = await readAllDshSessions(options);
+    const sources = await listDshSessionSources(options);
+    const results: DshSessionReadResult[] = [];
+    for (const source of sources) results.push(await readDshSessionIncremental(source, options));
     return results.map(result => result.snapshot);
 }
 
 export async function readDshSession(input: ReadInput, options: DshReaderOptions = {}): Promise<DshSessionReadResult> {
     const normalized = normalizeReadInput(input, options);
-    const results = await readAllDshSessions(normalized.options);
-    const result = results.find(item => item.header.id === normalized.id);
-    if (!result) throw new DshSessionReaderError(`DSH session not found: ${normalized.id}`);
-    return result;
+    const sources = await listDshSessionSources(normalized.options);
+    const source = sources.find(item => item.id === normalized.id);
+    if (!source) throw new DshSessionReaderError(`DSH session not found: ${normalized.id}`);
+    return readDshSessionIncremental(source, normalized.options);
 }
 
 function normalizeReaderOptions(input: ReaderInput): DshReaderOptions {
@@ -271,6 +305,307 @@ async function realEntry(candidate: string, sessionsRoot: string): Promise<strin
 function isWithin(root: string, candidate: string): boolean {
     const relative = path.relative(root, candidate);
     return relative === "" || (!relative.startsWith(`..${path.sep}`) && relative !== ".." && !path.isAbsolute(relative));
+}
+
+async function readDshBytes(handle: Awaited<ReturnType<typeof open>>, position: number, length: number, size: number): Promise<Buffer> {
+    if (position + length > size) throw new IncompleteZstdFrameError();
+    const bytes = Buffer.allocUnsafe(length);
+    let filled = 0;
+    while (filled < length) {
+        const result = await handle.read(bytes, filled, length - filled, position + filled);
+        if (!result.bytesRead) throw new IncompleteZstdFrameError();
+        filled += result.bytesRead;
+    }
+    return bytes;
+}
+
+async function readDshFrame(handle: Awaited<ReturnType<typeof open>>, start: number, size: number, limit: number, isCancelled?: () => boolean): Promise<{ bytes: Buffer; end: number; checksum?: number }> {
+    const magic = await readDshBytes(handle, start, 4, size);
+    if (!ZSTD_MAGIC.every((value, index) => magic[index] === value)) throw new DshSessionReaderError("invalid zstd frame magic");
+    const descriptor = (await readDshBytes(handle, start + 4, 1, size))[0];
+    if ((descriptor & 0x08) !== 0) throw new DshSessionReaderError("reserved zstd frame descriptor bit is set");
+    const single = (descriptor & 0x20) !== 0;
+    const flag = descriptor >>> 6;
+    let offset = start + 5 + (single ? 0 : 1) + [0, 1, 2, 4][descriptor & 3] + (flag === 0 ? single ? 1 : 0 : 1 << flag);
+    for (;;) {
+        assertHostFileActive(isCancelled);
+        if (offset - start > limit) throw new DshSessionReaderError("DSH compressed frame exceeds maxCompressedFrameBytes");
+        const bytes = await readDshBytes(handle, offset, 3, size);
+        const header = bytes[0] | bytes[1] << 8 | bytes[2] << 16;
+        const type = header >>> 1 & 3;
+        if (type === 3) throw new DshSessionReaderError("reserved zstd block type");
+        offset += 3 + (type === 1 ? 1 : header >>> 3);
+        if (offset > size) throw new IncompleteZstdFrameError();
+        if (header & 1) break;
+    }
+    let checksum: number | undefined;
+    if (descriptor & 4) {
+        checksum = (await readDshBytes(handle, offset, 4, size)).readUInt32LE();
+        offset += 4;
+    }
+    if (offset - start > limit) throw new DshSessionReaderError("DSH compressed frame exceeds maxCompressedFrameBytes");
+    return { bytes: await readDshBytes(handle, start, offset - start, size), end: offset, checksum };
+}
+
+export async function listDshSessionSources(input: ReaderInput = {}): Promise<DshSessionSource[]> {
+    const options = normalizeReaderOptions(input);
+    const candidates = await discoverDshSessionCandidates(options);
+    const result: DshSessionSource[] = [];
+    const ids = new Set<string>();
+    for (const candidate of candidates) {
+        assertHostFileActive(options.isCancelled);
+        const handle = await open(candidate.sourcePath, "r");
+        try {
+            const before = await handle.stat();
+            let text = "";
+            if (candidate.format === "jsonl.zstd") {
+                const decoder = new TextDecoder("utf-8", { fatal: true });
+                let position = 0;
+                let decodedBytes = 0;
+                while (!text.includes("\n") && position < before.size) {
+                    const frame = await readDshFrame(handle, position, before.size, options.maxCompressedFrameBytes || 32 * 1024 * 1024, options.isCancelled);
+                    const parts: string[] = [];
+                    decodedBytes += await decompressZstdFrame(frame.bytes, decoder, parts, (options.maxDecompressedBytes || DSH_DEFAULT_MAX_DECOMPRESSED_BYTES) - decodedBytes, options.maxDecompressedFrameBytes || DSH_DEFAULT_MAX_DECOMPRESSED_FRAME_BYTES, frame.checksum);
+                    text += parts.join("");
+                    position = frame.end;
+                    if (Buffer.byteLength(text) > (options.maxLineBytes || 16 * 1024 * 1024)) throw new DshSessionReaderError("DSH header exceeds maxLineBytes");
+                }
+            } else {
+                const decoder = new TextDecoder("utf-8", { fatal: true });
+                let position = 0;
+                while (!text.includes("\n") && position < before.size) {
+                    const bytes = await readDshBytes(handle, position, Math.min(16 * 1024, before.size - position), before.size);
+                    text += decoder.decode(bytes, { stream: true });
+                    position += bytes.length;
+                    if (Buffer.byteLength(text) > (options.maxLineBytes || 16 * 1024 * 1024)) throw new DshSessionReaderError("DSH header exceeds maxLineBytes");
+                    assertHostFileActive(options.isCancelled);
+                }
+            }
+            const newline = text.indexOf("\n");
+            if (newline < 0) throw new DshSessionReaderError("DSH session has no complete header record");
+            const header = validateHeader(parseJsonRecord(text.slice(0, newline).replace(/\r$/u, ""), 1));
+            if (ids.has(header.id)) throw new DshSessionReaderError(`duplicate DSH session id ${header.id}`);
+            ids.add(header.id);
+            const after = await handle.stat();
+            if (!sameRevision(before, after) || before.ctimeMs !== after.ctimeMs) throw new DshSessionReaderError("DSH source changed during metadata discovery");
+            result.push({ id: header.id, header, provenance: {
+                source: "dsh", ...candidate, sourceSizeBytes: before.size, sourceMtimeMs: before.mtimeMs,
+                ignoredTrailingTextRecord: false, ignoredTrailingZstdFrame: false,
+            } });
+        } finally {
+            await handle.close();
+        }
+    }
+    return result;
+}
+
+export async function readDshSessionColdWindow(source: DshSessionSource, revision: HostFileRevision, direction: "head" | "tail", maxBytes: number, options: DshReaderOptions = {}): Promise<{ events: DshSessionEvent[]; prefixOmitted: boolean; suffixOmitted: boolean; warnings: string[]; parsedBytes: number; readBytes: number; decodedBytes: number }> {
+    assertHostFileActive(options.isCancelled);
+    const allowedRoot = await realDirectory(resolveDshSessionsRoot(options), resolveDshSessionsRoot(options));
+    const sourcePath = allowedRoot && await realFile(source.provenance.sourcePath, allowedRoot);
+    if (sourcePath !== revision.path) throw new DshSessionReaderError("DSH window source identity changed or is outside the configured root");
+    let text = "";
+    let prefixOmitted = false;
+    let suffixOmitted = false;
+    let readBytes = 0;
+    let decodedBytes = 0;
+    const warnings: string[] = [];
+    if (source.provenance.format === "jsonl") {
+        const window = await readHostTextWindow(revision, direction, maxBytes, options.isCancelled);
+        text = window.text;
+        prefixOmitted = window.prefixOmitted;
+        suffixOmitted = window.suffixOmitted;
+        readBytes = window.readBytes;
+        decodedBytes = window.readBytes;
+        if (window.incompleteTrailingRecord) warnings.push("dsh_incomplete_trailing_record");
+    } else {
+        warnings.push("dsh_window_sequential_frame_checksum_utf8_verification");
+        options.onProgress?.({ bytes: 0, totalBytes: revision.size, phase: "window-wait-frame-verification" });
+        const handle = await open(revision.path, "r");
+        const decoder = new TextDecoder("utf-8", { fatal: true });
+        let position = 0;
+        let frames = 0;
+        const retained: Buffer[] = [];
+        let retainedBytes = 0;
+        try {
+            while (position < revision.size) {
+                assertHostFileActive(options.isCancelled);
+                let frame: Awaited<ReturnType<typeof readDshFrame>>;
+                try { frame = await readDshFrame(handle, position, revision.size, options.maxCompressedFrameBytes || 32 * 1024 * 1024, options.isCancelled); }
+                catch (error) {
+                    if (error instanceof IncompleteZstdFrameError && frames > 0) { warnings.push("dsh_incomplete_trailing_frame"); break; }
+                    throw error;
+                }
+                const parts: string[] = [];
+                decodedBytes += await decompressZstdFrame(frame.bytes, decoder, parts,
+                    (options.maxDecompressedBytes || DSH_DEFAULT_MAX_DECOMPRESSED_BYTES) - decodedBytes,
+                    options.maxDecompressedFrameBytes || DSH_DEFAULT_MAX_DECOMPRESSED_FRAME_BYTES, frame.checksum);
+                const candidate = Buffer.from(parts.join(""));
+                if (direction === "tail") {
+                    retained.push(candidate);
+                    retainedBytes += candidate.length;
+                    while (retainedBytes > maxBytes) {
+                        const excess = retainedBytes - maxBytes;
+                        const first = retained[0];
+                        if (first.length <= excess) { retained.shift(); retainedBytes -= first.length; }
+                        else { retained[0] = first.subarray(excess); retainedBytes -= excess; }
+                        prefixOmitted = true;
+                    }
+                } else {
+                    const available = Math.max(0, maxBytes - retainedBytes);
+                    if (candidate.length > available) suffixOmitted = true;
+                    if (available) { const selected = candidate.subarray(0, available); retained.push(selected); retainedBytes += selected.length; }
+                }
+                position = frame.end;
+                frames++;
+                options.onProgress?.({ bytes: position, totalBytes: revision.size, phase: "window-frame-checksum-utf8" });
+                await new Promise<void>(resolve => setImmediate(resolve));
+            }
+            decoder.decode();
+            readBytes = position;
+            const bytes = Buffer.concat(retained, retainedBytes);
+            const first = prefixOmitted ? bytes.indexOf(10) + 1 : 0;
+            const last = bytes.lastIndexOf(10) + 1;
+            if (!suffixOmitted && last < bytes.length) warnings.push("dsh_incomplete_trailing_record");
+            text = new TextDecoder("utf-8", { fatal: true }).decode(bytes.subarray(first, Math.max(first, last)));
+        } finally { await handle.close(); }
+        if (!text.endsWith("\n")) {
+            if (!suffixOmitted) warnings.push("dsh_incomplete_trailing_record");
+            text = text.slice(0, text.lastIndexOf("\n") + 1);
+        }
+    }
+    const events: DshSessionEvent[] = [];
+    let expectedSeq: number | undefined;
+    let lineNo = 0;
+    options.onProgress?.({ bytes: 0, totalBytes: Buffer.byteLength(text), phase: "window-record-parse" });
+    for (const line of text.split("\n")) {
+        if (!line) continue;
+        assertHostFileActive(options.isCancelled);
+        if (Buffer.byteLength(line) > (options.maxLineBytes || 16 * 1024 * 1024)) throw new DshSessionReaderError("DSH record exceeds maxLineBytes");
+        const stored = parseJsonRecord(line.replace(/\r$/u, ""), ++lineNo);
+        if (!prefixOmitted && lineNo === 1) {
+            if (validateHeader(stored).id !== source.id) throw new DshSessionReaderError("DSH source header identity changed");
+            continue;
+        }
+        for (const value of decodeStorageRecord(stored)) {
+            const event = validateEvent(value);
+            if (expectedSeq !== undefined && event.seq !== expectedSeq) throw new DshSessionReaderError(`non-contiguous DSH window event sequence: expected ${expectedSeq}, got ${event.seq}`);
+            expectedSeq = event.seq + 1;
+            events.push(event);
+        }
+        if (lineNo % 64 === 0) await new Promise<void>(resolve => setImmediate(resolve));
+    }
+    await assertHostFileUnchanged(revision, options.isCancelled);
+    options.onProgress?.({ bytes: Buffer.byteLength(text), totalBytes: Buffer.byteLength(text), phase: "window-record-parse" });
+    assertHostFileActive(options.isCancelled);
+    return { events, prefixOmitted, suffixOmitted, warnings, parsedBytes: Buffer.byteLength(text), readBytes, decodedBytes };
+}
+
+export async function readDshSessionIncremental(source: DshSessionSource, options: DshReaderOptions & { checkpoint?: DshSessionCheckpoint } = {}): Promise<DshIncrementalReadResult> {
+    assertHostFileActive(options.isCancelled);
+    const allowedRoot = await realDirectory(resolveDshSessionsRoot(options), resolveDshSessionsRoot(options));
+    const sourcePath = allowedRoot && await realFile(source.provenance.sourcePath, allowedRoot);
+    if (!sourcePath) throw new DshSessionReaderError("DSH source is outside the configured sessions root or unavailable");
+    const previous = options.checkpoint;
+    const revision = await captureHostFile(sourcePath, { prefixSize: previous?.source.size, isCancelled: options.isCancelled, onProgress: (bytes, totalBytes) => options.onProgress?.({ bytes, totalBytes, phase: "verify" }) });
+    const fingerprint = createHash("sha256").update(`dsh-reader:${DSH_READER_REVISION}:stream1\0${revision.path}\0${revision.sha256}`).digest("hex");
+    const append = previous?.version === 1 && previous.header.id === source.id && previous.source.path === revision.path && previous.source.dev === revision.dev && previous.source.ino === revision.ino && revision.size >= previous.source.size && revision.prefixSha256 === previous.source.sha256;
+    const provenance = { ...source.provenance, sourcePath: revision.path, sourceSizeBytes: revision.size, sourceMtimeMs: revision.mtimeMs };
+    if (append && previous.fingerprint === fingerprint) return {
+        status: "unchanged", header: previous.header, events: [], fingerprint, provenance,
+        snapshot: { id: source.id, header: previous.header, fingerprint, provenance, eventCount: previous.eventCount },
+        checkpoint: { ...previous, source: revision }, replaceFromEvent: previous.eventCount, readBytes: 0, decodedBytes: 0,
+    };
+    let header: DshSessionHeader | undefined = append ? previous.header : undefined;
+    const start = append ? previous.resumeByte : 0;
+    let position = start;
+    let lineNo = append ? previous.resumeLineNo : 0;
+    let expectedSeq = append ? previous.resumeExpectedSeq : undefined;
+    const replaceFromEvent = append ? previous.resumeEventCount : 0;
+    const events: DshSessionEvent[] = [];
+    let pending = "";
+    let decodedBytes = 0;
+    let totalDecodedBytes = append ? previous.resumeDecodedBytes : 0;
+    let resumeByte = start;
+    let resumeEventCount = replaceFromEvent;
+    let resumeLineNo = lineNo;
+    let resumeExpectedSeq = expectedSeq;
+    let resumeDecodedBytes = totalDecodedBytes;
+    let ignoredTrailingZstdFrame = false;
+    let completeFrames = append ? 1 : 0;
+    const decoder = new TextDecoder("utf-8", { fatal: true });
+    const limit = requirePositiveInteger(options.maxDecompressedBytes ?? DSH_DEFAULT_MAX_DECOMPRESSED_BYTES, "maxDecompressedBytes");
+    const consume = (text: string) => {
+        pending += text;
+        let newline = pending.indexOf("\n");
+        while (newline >= 0) {
+            assertHostFileActive(options.isCancelled);
+            const line = pending.slice(0, newline).replace(/\r$/u, "");
+            if (Buffer.byteLength(line) > (options.maxLineBytes || 16 * 1024 * 1024)) throw new DshSessionReaderError("DSH record exceeds maxLineBytes");
+            pending = pending.slice(newline + 1);
+            lineNo++;
+            if (!header) header = validateHeader(parseJsonRecord(line, lineNo));
+            else for (const stored of decodeStorageRecord(parseJsonRecord(line, lineNo))) {
+                const event = validateEvent(stored);
+                if (expectedSeq !== undefined && event.seq !== expectedSeq) throw new DshSessionReaderError(`non-contiguous DSH event sequence at line ${lineNo}: expected ${expectedSeq}, got ${event.seq}`);
+                expectedSeq = event.seq + 1;
+                events.push(event);
+            }
+            newline = pending.indexOf("\n");
+        }
+        if (Buffer.byteLength(pending) > (options.maxLineBytes || 16 * 1024 * 1024)) throw new DshSessionReaderError("DSH record exceeds maxLineBytes");
+    };
+    const markBoundary = () => {
+        resumeByte = position;
+        resumeEventCount = replaceFromEvent + events.length;
+        resumeLineNo = lineNo;
+        resumeExpectedSeq = expectedSeq;
+        resumeDecodedBytes = totalDecodedBytes;
+    };
+    const handle = await open(sourcePath, "r");
+    try {
+        while (position < revision.size) {
+            assertHostFileActive(options.isCancelled);
+            if (source.provenance.format === "jsonl.zstd") {
+                let frame: Awaited<ReturnType<typeof readDshFrame>>;
+                try { frame = await readDshFrame(handle, position, revision.size, options.maxCompressedFrameBytes || 32 * 1024 * 1024, options.isCancelled); }
+                catch (error) {
+                    if (error instanceof IncompleteZstdFrameError && completeFrames > 0) { ignoredTrailingZstdFrame = true; break; }
+                    throw error;
+                }
+                const text: string[] = [];
+                let lastByte: number | undefined;
+                const count = await decompressZstdFrame(frame.bytes, decoder, text, limit - totalDecodedBytes, options.maxDecompressedFrameBytes || DSH_DEFAULT_MAX_DECOMPRESSED_FRAME_BYTES, frame.checksum, bytes => { if (bytes.length) lastByte = bytes.at(-1); });
+                totalDecodedBytes += count;
+                decodedBytes += count;
+                consume(text.join(""));
+                position = frame.end;
+                completeFrames++;
+                if (!pending && lastByte === 10) markBoundary();
+            } else {
+                const bytes = await readDshBytes(handle, position, Math.min(256 * 1024, revision.size - position), revision.size);
+                totalDecodedBytes += bytes.length;
+                decodedBytes += bytes.length;
+                if (totalDecodedBytes > limit) throw new DshSessionReaderError("DSH decompressed output exceeds maxDecompressedBytes");
+                consume(decoder.decode(bytes, { stream: true }));
+                position += bytes.length;
+                if (!pending && bytes.at(-1) === 10) markBoundary();
+            }
+            options.onProgress?.({ bytes: position, totalBytes: revision.size, phase: "decode" });
+            await new Promise<void>(resolve => setImmediate(resolve));
+        }
+        consume(decoder.decode());
+    } finally {
+        await handle.close();
+    }
+    if (!header) throw new DshSessionReaderError("DSH session has no complete header record");
+    if (header.id !== source.id) throw new DshSessionReaderError("DSH source header identity changed");
+    await assertHostFileUnchanged(revision, options.isCancelled);
+    provenance.ignoredTrailingTextRecord = pending.length > 0;
+    provenance.ignoredTrailingZstdFrame = ignoredTrailingZstdFrame;
+    const checkpoint: DshSessionCheckpoint = { version: 1, source: revision, header, resumeByte, resumeEventCount, resumeLineNo, resumeExpectedSeq, resumeDecodedBytes, eventCount: replaceFromEvent + events.length, fingerprint };
+    const snapshot: DshSessionSnapshot = { id: header.id, header, fingerprint, provenance, titleBestEffort: latestSessionTitle(events), eventCount: checkpoint.eventCount };
+    return { status: "ok", header, events, snapshot, fingerprint, provenance, checkpoint, replaceFromEvent, readBytes: position - start, decodedBytes };
 }
 
 async function readCandidate(candidate: DshSessionCandidate, options: DshReaderOptions): Promise<DshSessionReadResult> {
@@ -456,6 +791,7 @@ async function decompressZstdFrame(
     remainingBytes: number,
     maxFrameBytes: number,
     expectedChecksum?: number,
+    onOutput?: (bytes: Uint8Array) => void,
 ): Promise<number> {
     if (remainingBytes <= 0) {
         throw new DshSessionReaderError("DSH zstd decompressed output exceeds maxDecompressedBytes");
@@ -464,6 +800,7 @@ async function decompressZstdFrame(
     let frameBytes = 0;
     const checksum = expectedChecksum === undefined ? undefined : (await xxhashApi).create64();
     const decompressor = new ZstdDecompress(chunk => {
+        onOutput?.(chunk);
         frameBytes += chunk.length;
         if (frameBytes > outputLimit) {
             const limitName = remainingBytes <= maxFrameBytes ? "maxDecompressedBytes" : "maxDecompressedFrameBytes";

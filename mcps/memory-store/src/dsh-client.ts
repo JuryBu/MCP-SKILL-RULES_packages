@@ -9,6 +9,11 @@ import {
     renderConversationAutomationEvent,
 } from "./conversation-automation-event.js";
 import type { DshSessionReadResult, DshSessionEvent } from "./dsh-session-reader.js";
+import type { ConversationAttachment } from "./conversation-attachments.js";
+import { createHash } from "node:crypto";
+import { assertHostFileActive } from "./conversation-host-files.js";
+
+export const DSH_NORMALIZATION_VERSION = 2;
 
 export interface DshConversionDiagnostic {
     eventIndex: number;
@@ -28,6 +33,7 @@ interface ContentProjection {
     references: string[];
     fullText: string;
     toolCalls: Array<{ id?: string; name: string; args: string }>;
+    attachments: ConversationAttachment[];
 }
 
 interface ChunkState {
@@ -93,6 +99,7 @@ function projectContent(
     const references: string[] = [];
     const unknown: string[] = [];
     const toolCalls: Array<{ id?: string; name: string; args: string }> = [];
+    const attachments: ConversationAttachment[] = [];
 
     const visit = (block: unknown): void => {
         const record = asRecord(block);
@@ -126,8 +133,14 @@ function projectContent(
             return;
         }
         if (type === "image" || type === "file" || type === "attachment") {
-            const reference = firstReference(record) || safeJson(record, 300);
+            const originalReference = firstReference(record);
+            const reference = originalReference && !/^data:/iu.test(originalReference) ? originalReference : "[attachment metadata]";
             references.push(`【${type} 引用：${reference}】`);
+            const data = asString(record.data) || asString(asRecord(record.source)?.data);
+            attachments.push({ kind: type === "image" ? "image" : "file", source: "attachment-metadata-redacted", reference,
+                name: asString(record.name), mimeType: asString(record.mimeType) || asString(record.mime_type) || asString(record.media_type),
+                originalPath: asString(record.path), warning: data || originalReference?.startsWith("data:") ? "DSH inline attachment bytes omitted" : undefined,
+                sha256: data ? `sha256:${createHash("sha256").update(data).digest("hex")}` : undefined });
             return;
         }
         const detail = safeJson(record);
@@ -144,6 +157,7 @@ function projectContent(
         references,
         fullText: [visibleText, reasoningText, ...references, ...unknown].filter(Boolean).join("\n"),
         toolCalls,
+        attachments,
     };
 }
 
@@ -229,6 +243,7 @@ export function normalizeDshSessionReadResult(result: DshSessionReadResult): Dsh
 export function normalizeDshSessionEvents(
     events: readonly DshSessionEvent[],
     header?: unknown,
+    isCancelled?: () => boolean,
 ): DshConversationConversionResult {
     const diagnostics: DshConversionDiagnostic[] = [];
     const rawRounds: ConversationRound[] = [];
@@ -239,6 +254,7 @@ export function normalizeDshSessionEvents(
     const canonicalHumanMessageIds = new Set<string>();
 
     for (const rawEvent of events) {
+        assertHostFileActive(isCancelled);
         const event = asRecord(rawEvent);
         if (asString(event?.type) !== "user/message") continue;
         const data = asRecord(event?.data);
@@ -338,6 +354,11 @@ export function normalizeDshSessionEvents(
                 rawRole: eventType,
                 semanticRole: "user",
                 mediaAttachments: projection.references,
+                attachments: projection.attachments,
+                ...(Array.isArray(message.annotations) ? { annotations: message.annotations.flatMap(value => {
+                    const item = asRecord(value);
+                    return typeof item?.selectedText === "string" && typeof item.comment === "string" ? [{ selectedText: item.selectedText, comment: item.comment }] : [];
+                }) } : {}),
             };
             round.userMessages?.push(userMessage);
             round.userMessage = (round.userMessages || []).map(item => item.text).filter(Boolean).join("\n\n");
@@ -349,6 +370,7 @@ export function normalizeDshSessionEvents(
                 semanticRole: "user",
                 kind: "message",
                 text: userText,
+                attachments: projection.attachments,
             });
             return;
         }
@@ -389,6 +411,7 @@ export function normalizeDshSessionEvents(
     appendHeader();
 
     for (let eventIndex = 0; eventIndex < events.length; eventIndex++) {
+        assertHostFileActive(isCancelled);
         const event = asRecord(events[eventIndex]);
         if (!event) {
             diagnostics.push({ eventIndex, eventType: "unknown", code: "malformed_event", detail: safeJson(events[eventIndex]) });
@@ -466,6 +489,7 @@ export function normalizeDshSessionEvents(
                 semanticRole: "assistant",
                 kind: "message",
                 text: projection.fullText,
+                attachments: projection.attachments,
             });
             state.emitted = true;
             continue;

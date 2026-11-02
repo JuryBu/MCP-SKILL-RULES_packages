@@ -239,7 +239,7 @@ test("tool entry persists normalized roles for dedupe and refuses unbuilt roles 
     childProcess.fork = (() => { const child = new FixtureChild(); children.push(child); return child; }) as typeof childProcess.fork;
     syncBuiltinESMExports();
     try {
-        const params = { action: "prepare", conversationId: request.ownerId, conversationIds: [request.conversationId], lastRounds: 1, prepareCache: false, waitSeconds: 0 };
+        const params = { action: "prepare", conversationId: request.ownerId, dataChain: "codex", conversationIds: [request.conversationId], lastRounds: 1, prepareCache: false, waitSeconds: 0 };
         const started = await runProgressiveAction(params) as any;
         for (let attempts = 0; !children[0]?.payload && attempts < 300; attempts++) await sleep(10);
         const payload = children[0]?.payload;
@@ -265,6 +265,7 @@ test("tool entry persists normalized roles for dedupe and refuses unbuilt roles 
                 assert.match(text, /were not prepared: tool/);
                 const next = JSON.parse(text.split("Next call: ")[1]);
                 assert.equal(next.action, "prepare");
+                assert.equal(next.dataChain, "codex");
                 assert.deepEqual(next.conversationIds, [request.conversationId]);
                 assert.deepEqual(next.messageRoles, ["tool"]);
                 assert.equal(next.prepareCache, false);

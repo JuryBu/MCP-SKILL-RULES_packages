@@ -4,7 +4,8 @@ import os from "node:os";
 import path from "node:path";
 import { test, after } from "node:test";
 import { setTimeout as delay } from "node:timers/promises";
-import { startCorpusSearch, getCorpusSearchStatus, cancelCorpusSearch, resumeCorpusSearch } from "../src/conversation-corpus-task.ts";
+import { startCorpusSearch as startSearch, getCorpusSearchStatus, cancelCorpusSearch, resumeCorpusSearch } from "../src/conversation-corpus-task.ts";
+const startCorpusSearch = (options: Parameters<typeof startSearch>[0]) => startSearch({ ...options, request: { dataChains: ["codex"], ...options.request } });
 import type { CorpusProjection, CorpusProvider } from "../src/conversation-corpus-types.ts";
 
 const directory = fs.mkdtempSync(path.join(os.tmpdir(), "corpus-prefetch-"));

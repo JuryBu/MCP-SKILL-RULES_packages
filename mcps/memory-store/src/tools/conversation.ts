@@ -897,6 +897,7 @@ function formatWindsurfPartialWarning(loaded: Awaited<ReturnType<typeof loadConv
 type ConversationReadSegmentTiming = {
     label: "附件物化" | "格式化" | "临时文件";
     ms: number;
+    skippedReason?: string;
 };
 
 type ConversationReadTimingState = {
@@ -962,7 +963,7 @@ function formatConversationReadSegmentTiming(timing: ConversationReadTimingState
     const shouldShow = isWindsurfReadTimingDebugEnabled()
         || timing.segments.some(item => item.ms >= getWindsurfReadTimingSlowMs());
     if (!shouldShow) return "";
-    return `⏱ ${timing.action} 分段: ${timing.segments.map(item => `${item.label} ${formatSegmentDuration(item.ms)}`).join(" | ")}`;
+    return `⏱ ${timing.action} 分段: ${timing.segments.map(item => `${item.label} ${item.skippedReason ?? formatSegmentDuration(item.ms)}`).join(" | ")}`;
 }
 
 function appendConversationReadDetail(text: string, detail?: string): string {
@@ -1956,20 +1957,20 @@ export function registerConversation(server: McpServer, dependencies: {
   recall — 自动、按轮次或全量恢复 context-only 上下文
   export — 将可读对话原文持久化导出为 Markdown / PDF
   deep_locate — 五个数据源后台有预算地深搜正文片段，Codex/Claude Code 保持流式 JSONL 读取
-  search_all — 本机全部Codex正文组合搜索；conversationId是当前调用者，conversationIds/workspaces可选限定目标，默认双方正文
+  search_all — 按具体dataChain或显式dataChains搜索本机五端正文；conversationId是调用者，conversationIds/workspaces限定目标，默认双方正文
   search_all_status/cancel/resume — 使用同一调用者conversationId和原taskId取得动态结果、取消或恢复；页面大小不截断扫描
-  read_hit — 使用命中项的目标conversationId、sourceRevision和轮次展开同一来源正文
-  read_fast — conversationId指定当前调用者，conversationIds可选一个目标；末N轮默认先准备就绪范围并返回可查询taskId，完整历史继续后台构建
+  read_hit — conversationId填调用者，conversationIds填命中目标，dataChain/sourceRevision/轮次固定同一来源；兼容旧目标conversationId用法
+  read_fast — 明确单个dataChain，conversationId指定调用者，conversationIds可选一个目标；末N轮先准备就绪范围，完整历史继续后台构建
   prepare/prepare_status/cancel/resume — 分段准备历史，默认最新优先，buildOrder=oldest可从前构建；同一taskId持续反馈真实就绪范围
   read_ready/search_ready/locate_ready/extract_ready — 在完整历史尚未构建完时使用已就绪范围，返回覆盖、暂计状态和稳定引用
 fetch/search/read/recall/export 必须传 conversationId（共享 broker 后端拦截所有无 ID 调用，含 antigravity——跨 session 共享后端无法安全推断「当前对话」）。先用 action="list" 定位 ID。`,
         {
             action: z.enum(["list", "fetch", "search", "read", "recall", "export", "deep_locate", "deep_locate_status", "deep_locate_cancel", "search_all", "search_all_status", "search_all_cancel", "search_all_resume", "read_hit", "read_fast", "prepare", "prepare_status", "prepare_cancel", "prepare_resume", "read_ready", "search_ready", "locate_ready", "extract_ready"]).default("search")
-                .describe("list/fetch/search/read/recall/export=已有原文功能；deep_locate=有预算定位；search_all及status/cancel/resume=本机Codex完整正文组合搜索和动态任务；read_hit=按命中来源版本/轮次展开；read_fast=无需先完整fetch的指定轮次/近期正文"),
+                .describe("list/fetch/search/read/recall/export=已有原文功能；deep_locate=有预算定位；search_all及status/cancel/resume=显式单端或多端正文组合搜索和动态任务；read_hit=按命中来源版本/轮次展开；read_fast=无需先完整fetch的指定轮次/近期正文"),
             conversationId: z.string().optional()
-                .describe("稳定对话ID。search_all、read_fast与deep_locate系列填当前调用者ID，目标筛选使用conversationIds；read_hit和fetch/search/read/export填目标对话ID；WSF接受已验证的UUID/文字别名"),
+                .describe("稳定对话ID。search_all、read_fast、read_hit与deep_locate系列填当前调用者ID，目标筛选使用conversationIds；read_hit兼容旧目标ID用法；fetch/search/read/export填目标ID；WSF接受已验证的UUID/文字别名"),
             conversationIds: z.array(z.string()).optional()
-                .describe("[deep_locate/search_all/read_fast] 可选目标范围；read_fast最多一个，省略读当前对话；单数conversationId指定调用者"),
+                .describe("[deep_locate/search_all/read_fast/read_hit] 可选目标范围；read_fast/read_hit最多一个，省略时兼容读取conversationId；单数conversationId指定调用者"),
             allTerms: z.array(z.string().min(1).max(4096)).max(100).optional()
                 .describe("[search_all] 全部包含的词；默认在同一对话满足，intersectionScope可改同轮/同消息"),
             anyTerms: z.array(z.string().min(1).max(4096)).max(100).optional()
@@ -2102,13 +2103,11 @@ fetch/search/read/recall/export 必须传 conversationId（共享 broker 后端�
 
             try {
                 if (isProgressiveAction(params) || (params.action === "read_fast" && params.lastRounds !== undefined && params.progressive !== false && !dependencies.corpus && !params.forceRefresh && params.source !== "cache" && params.source !== "ls")) {
-                    const split = resolveChainSplit({ chain: params.chain, dataChain: params.dataChain, modelChain: params.modelChain });
-                    if (isProgressiveAction(params) || split.dataChain === "codex") return corpusToolResult(await runProgressiveAction({ ...params, dataChain: split.dataChain }));
+                    return corpusToolResult(await runProgressiveAction(params));
                 }
                 if (isCorpusAction(params.action)) {
                     if (params.action === "search_all" && params.background === false) throw new Error("search_all使用可查询的后台任务，请省略background或设为true");
-                    const split = resolveChainSplit({ chain: params.chain, dataChain: params.dataChain, modelChain: params.modelChain });
-                    const result = await runCorpusAction({ ...params, dataChain: split.dataChain }, dependencies.corpus);
+                    const result = await runCorpusAction(params, dependencies.corpus);
                     if (!result || typeof result !== "object" || Array.isArray(result)) throw new Error("全库检索未返回有效状态对象");
                     return corpusToolResult({ ...result, requestElapsedMs: Date.now() - startTime });
                 }
@@ -3175,6 +3174,7 @@ fetch/search/read/recall/export 必须传 conversationId（共享 broker 后端�
                         }, startTime);
                     }
                     const matchedRoundIndices = matches.length > 0 ? matches.map(match => match.roundIndex) : rankedResults.map(result => Number(result.id));
+                    const resultFormattingStartedAt = Date.now();
                     const output: string[] = [`🔍 搜索 "${query}" — ${actualMode} 模式命中 ${matches.length || rankedResults.length} 处\n`];
                     for (const match of matches) {
                         output.push(match.matchType === "annotation" ? formatAnnotationSearchMatch(match)
@@ -3193,6 +3193,8 @@ fetch/search/read/recall/export 必须传 conversationId（共享 broker 后端�
                         }
                         output.push("");
                     }
+                    searchTiming.segments.push({ label: "格式化", ms: Math.max(0, Date.now() - resultFormattingStartedAt) });
+                    if (contextRounds === 0) searchTiming.segments.push({ label: "附件物化", ms: 0, skippedReason: "未请求上下文" });
                     if (contextRounds > 0) {
                         const totalRoundCount = getConversationRoundIndexBounds(loaded).last;
                         const contextIndices = conversationSearchContextIndices(matchedRoundIndices.map(roundIndex => ({ roundIndex })), totalRoundCount, contextRounds, searchFilter);

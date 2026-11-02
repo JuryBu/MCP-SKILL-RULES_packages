@@ -2,6 +2,7 @@ import type { ProgressiveSource } from "./conversation-progressive-types.js";
 import type { ConversationLinkMode } from "./chain.js";
 import type { CorpusMessageRole } from "./conversation-corpus-types.js";
 import type { Depth } from "./trajectory.js";
+import { CORPUS_SOURCES, type CorpusSource } from "./conversation-corpus-sources.js";
 
 export const PROGRESSIVE_MESSAGE_ROLES: readonly CorpusMessageRole[] = ["user", "assistant", "tool", "subagent"];
 
@@ -21,7 +22,7 @@ export interface ProgressiveRequest {
     direction: "latest" | "oldest";
     initialRounds: number;
     buildFull: boolean;
-    dataChain: "codex";
+    dataChain: CorpusSource;
     link?: ConversationLinkMode;
     messageRoles?: CorpusMessageRole[];
     depth?: Depth;
@@ -56,7 +57,7 @@ export function isProgressiveRequest(value: unknown): value is ProgressiveReques
     const request = value as ProgressiveRequest;
     return typeof request.ownerId === "string" && Boolean(request.ownerId.trim()) && request.ownerId.length <= 4096
         && typeof request.conversationId === "string" && Boolean(request.conversationId.trim()) && request.conversationId.length <= 4096
-        && request.dataChain === "codex"
+        && CORPUS_SOURCES.includes(request.dataChain)
         && (request.link === undefined || ["reference", "summary", "expand_children"].includes(request.link))
         && (request.depth === undefined || ["brief", "normal", "full"].includes(request.depth))
         && (request.messageRoles === undefined || (Array.isArray(request.messageRoles)

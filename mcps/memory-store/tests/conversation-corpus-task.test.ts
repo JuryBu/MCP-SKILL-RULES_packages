@@ -12,7 +12,8 @@ import type { CorpusConversation, CorpusMessage, CorpusProjection, CorpusProvide
 const temporary = fs.mkdtempSync(path.join(os.tmpdir(), "corpus-task-test-"));
 process.env.MEMORY_STORE_DATA_ROOT = path.join(temporary, "data");
 process.env.MEMORY_STORE_LIFECYCLE_ENABLED = "false";
-const { startCorpusSearch, getCorpusSearchStatus, cancelCorpusSearch, resumeCorpusSearch } = await import("../src/conversation-corpus-task.js");
+const { startCorpusSearch: startSearch, getCorpusSearchStatus, cancelCorpusSearch, resumeCorpusSearch } = await import("../src/conversation-corpus-task.js");
+const startCorpusSearch = (options: Parameters<typeof startSearch>[0]) => startSearch({ ...options, request: { dataChains: ["codex"], ...options.request } });
 const { runCorpusAction } = await import("../src/tools/conversation-corpus-tool.js");
 const { corpusTaskDirectory } = await import("../src/conversation-corpus-task-store.js");
 type Identity = Parameters<typeof getCorpusSearchStatus>[0];
@@ -515,7 +516,7 @@ test("restart reports resumable and continues from durable completed commits", a
                 return {conversation,revision:'v1',complete:true,warnings:[],messages:[{id:'a-one',round:1,role:'user',text:'hit',position:{ordinal:1}}]};
             }
         };
-        const task = await startCorpusSearch({ownerId:'restart-owner',root,request:{query:'hit'},provider});
+        const task = await startCorpusSearch({ownerId:'restart-owner',root,request:{dataChains:['codex'],query:'hit'},provider});
         for(let attempt=0;attempt<500;attempt++){
             const status=await getCorpusSearchStatus({ownerId:task.ownerId,taskId:task.taskId,root});
             if(status.coverage.committedConversations===1){console.log('TASK='+task.taskId);process.exit(0)}

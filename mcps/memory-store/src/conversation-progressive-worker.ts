@@ -22,6 +22,11 @@ const send = (message: unknown): Promise<void> => new Promise((resolve, reject) 
 });
 
 async function execute(payload: ProgressiveTaskPayload): Promise<string> {
+    if (payload.request.dataChain !== "codex") {
+        const { executeHostProgressivePreparation } = await import("./conversation-progressive-worker-hosts.js");
+        return executeHostProgressivePreparation(payload, { isCancelled: () => cancelled, onProgress: send,
+            onActive: value => { active = value; } });
+    }
     const { request, directory } = payload;
     const projection = normalizeProgressiveProjection(request.messageRoles, request.depth);
     let ready: ProgressiveReadyState = { version: 1, phase: "source", previous: [], requestedRangeComplete: false,

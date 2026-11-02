@@ -6,6 +6,7 @@ import type { DevinDesktopMessage, DevinMessageNode, DevinRawConversation, Devin
 import type { ConversationRound, SubagentSummary } from "./trajectory.js";
 import { devinText as text, redactDevinBinary, devinDesktopText as desktopText, devinUserContent, addDevinToolDetails } from "./devin-conversation-content.js";
 import { attachDevinToolImages } from "./devin-tool-attachments.js";
+import { DevinReadError } from "./devin-sqlite-store.js";
 export { redactDevinBinary } from "./devin-conversation-content.js";
 
 export interface DevinConversationOptions extends DevinReadOptions {
@@ -125,9 +126,10 @@ export function devinRawToRounds(raw: DevinRawConversation, options: DevinConver
     const nodes = raw.nodes.length ? raw.nodes : desktopNodes(raw.desktopMessages);
     const summaryIds = new Set(raw.compactions.map(compaction => compaction.nodeId));
     let current: ConversationRound | undefined;
-    for (let step = 0; step < nodes.length; step++) {
+    for (let nodeIndex = 0; nodeIndex < nodes.length; nodeIndex++) {
         if (options.signal?.aborted || options.isCancelled?.() || (options.deadlineMs !== undefined && Date.now() >= options.deadlineMs)) throw new Error("Devin conversion cancelled or deadline exceeded");
-        const node = nodes[step];
+        const step = nodeIndex + (raw.coverage?.startStep ?? 0);
+        const node = nodes[nodeIndex];
         const message = node.message;
         if (message.role === "system" || node.metadata.is_system_prefix === true) continue;
         if (summaryIds.has(node.nodeId)) {
@@ -135,7 +137,7 @@ export function devinRawToRounds(raw: DevinRawConversation, options: DevinConver
             continue;
         }
         if (message.role === "user" || !current) {
-            current = emptyRound(rounds.length + 1, step);
+            current = emptyRound(rounds.length + (raw.coverage?.startRound ?? 1), step);
             current.createdAt = originalTime(node);
             rounds.push(current);
         }
@@ -220,6 +222,7 @@ export function devinRawToRounds(raw: DevinRawConversation, options: DevinConver
 export async function readDevinConversation(id: string, options: DevinConversationOptions = {}): Promise<{ raw: DevinRawConversation; rounds: ConversationRound[] } | null> {
     const { readDevinRawConversation } = await import("./devin-sqlite.js");
     const child = splitDevinSubagentId(id);
+    if (child && options.roundRange) throw new DevinReadError("DEVIN_RANGE_UNAVAILABLE", "Devin child round ranges require a full child read; omit roundRange.");
     let raw = await readDevinRawConversation(child?.parentId || id, options);
     if (!raw) return null;
     if (child) {

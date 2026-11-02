@@ -16,8 +16,8 @@ import {
 import { type MemoryIndexEntry } from "../cache.js";
 import { checkDuplicates } from "../search.js";
 import {
-    captureAutoSummarySnapshot,
-    generateAutoSummary,
+    captureAutoSummaryFileSnapshot,
+    generateAutoSummaryResult,
     writeAutoSummaryIfUnchanged,
     type AutoSummarySnapshot,
 } from "../auto-summary.js";
@@ -96,12 +96,7 @@ export function registerWrite(server: McpServer): void {
                 // 构建并写入文件
                 const fileContent = buildMemoryFile(frontmatter, content);
                 writeMemoryFile(hash, id, fileContent);
-                const autoSummarySnapshot = captureAutoSummarySnapshot({
-                    title: frontmatter.title,
-                    tags: frontmatter.tags,
-                    updated: frontmatter.updated,
-                    body: content,
-                });
+                const autoSummarySnapshot = captureAutoSummaryFileSnapshot(fileContent, title, tags)!;
 
                 // 更新索引（串行化读改写，防并发丢条目）
                 const indexEntry: MemoryIndexEntry = {
@@ -173,18 +168,25 @@ async function triggerAutoSummary(
     chain: Chain
 ): Promise<void> {
     try {
-        const summary = await generateAutoSummary(snapshot.title, snapshot.tags, snapshot.body, chain);
-        if (!summary) return; // LS 不可用，静默跳过
+        const generated = await generateAutoSummaryResult(snapshot.title, snapshot.tags, snapshot.body, chain);
+        const summary = generated.summary;
 
         const result = await writeAutoSummaryIfUnchanged({
             hash,
             memoryId,
-            summary,
+            summary: summary ?? undefined,
             expectedFingerprint: snapshot.fingerprint,
             fallbackTitle: snapshot.title,
             fallbackTags: snapshot.tags,
+            expectedSummary: snapshot.expectedSummary,
+            expectedSourceFingerprint: snapshot.sourceFingerprint,
+            provenance: generated.provenance,
         });
-        if (result === "written") {
+        if (!summary) {
+            console.error(`[memory-store] autoSummary 生成失败状态已记录: ${memoryId} (${result}; provider=${generated.provenance.provider || "unknown"}; model=${generated.provenance.model || "unknown"})`);
+            return;
+        }
+        if (result === "written" && summary) {
             console.error(`[memory-store] ✅ autoSummary 已生成: ${memoryId} (${summary.length}字)`);
             return;
         }

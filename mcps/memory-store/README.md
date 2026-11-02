@@ -1,18 +1,26 @@
-# MCP Memory Store v1.26.0
+# MCP Memory Store v1.27.0
 
 ## 本地检索与分段就绪读取
 
-`conversation_read_original(action="search_all")` 在本地Codex对话正文中组合关键词，支持工作区、对话、角色范围，以及交集、并集和排除条件。返回持久任务，使用同一调用者 `conversationId` 与原 `taskId` 查询动态结果、取消或恢复；命中附带次数、轮次和来源版本，可继续 `read_hit` 定点读取。
+`conversation_read_original(action="search_all")` 在Codex、Claude Code、Windsurf/Devin、Antigravity和DeepSeek Harness的本地对话正文中组合关键词，支持工作区、对话、角色范围，以及交集、并集和排除条件。单端显式传入具体 `dataChain`，多端显式使用 `dataChains`；调用者应填写当前端，工具按选择范围查找。返回持久任务，使用同一调用者 `conversationId` 与原 `taskId` 查询动态结果、取消或恢复；命中附带来源、次数、轮次和来源版本，可继续 `read_hit` 定点读取。[五端搜索与范围读取](docs/five-host-search.md)说明了参数、覆盖和来源差异。
 
-Codex的末N轮 `read_fast` 和适用的大型 `fetch` 默认先返回分段准备任务。独立使用 `prepare` 时，`conversationId` 表示调用者，`conversationIds` 指定一个目标；`buildOrder="latest"` 优先最新内容，`oldest` 优先最早内容，`lastRounds` 设置优先准备的轮数。`prepareCache=false` 只准备所需窗口；默认继续补齐完整缓存。
+五端的末N轮 `read_fast` 和 `prepare` 支持先返回分段准备任务，Codex适用的大型 `fetch` 继续使用这一路线。`conversationId` 表示调用者，`conversationIds` 指定一个目标，并显式填写目标 `dataChain`；`buildOrder="latest"` 优先最新内容，`oldest` 优先最早内容，`lastRounds` 设置优先准备的轮数。`prepareCache=false` 只准备所需窗口；默认继续补齐完整缓存。
 
 有范围就绪后，即可用同一 `taskId` 执行 `read_ready`、`search_ready`、`locate_ready` 和 `extract_ready`，其余范围继续准备。`prepare_status` 返回真实覆盖、任务状态与不透明 `revision`；把它原样传入 `afterProgressRevision` 并设置 `waitSeconds=30`，可等待新结果。`prepare_cancel` 保留已发布范围，`prepare_resume` 在原worker退出后沿原task恢复。
 
 初期轮号属于各自块，配合 `blockId` 使用；稳定 `rangeRef` 可直接定位原轮，补齐旧历史或切换到完整轮号后仍有效。只有完整来源校验并发布结束，`fullSourceComplete` 才为true。搜索同时报告已查范围与暂计状态，调用者可逐次取得增长结果。常规Record、Guard和recall继续使用完整缓存。
 
+`publishedRangeComplete` 表示当前缓存覆盖了请求的范围，`sourceRangeVerified` 表示来源能确认该范围，`requestedRangeComplete` 同时考虑两项。来源带有未知字段、未完成尾部或其它partial诊断时，已读正文仍可使用，响应保留覆盖缺口与警告。后台发布早期历史时保持已就绪的最新窗口，旧引用继续绑定原来源和版本。
+
 `conversation_golden_extract` 可以显式提供 `progressiveTaskId` 与 `rangeRefs`，只分析已选择的完整轮对象，结果保留来源与范围说明。省略这两个参数时沿用完整历史提取。将 `progressive=false` 可选择旧的完整读取路线；压缩来源的完整性校验、资源限额和取消保护保持有效。
 
 跨对话搜索默认逐项持久提交，完成队列与已校验索引复用减少重复工作。有界批量发布保留为内部可选策略，采用前应对实际数据验证收益和恢复结果。
+
+## 自动摘要与受控修复
+
+自动摘要默认Grok优先，失败后沿允许的链路回退；显式指定模型链路时遵循该范围。完整停用通知、服务错误封装和空响应在接受之前校验，无效候选共享原总期限。新写入、更新及补缺摘要均保存实际提供方、模型、生成时间和失败来源，失败时保留已有摘要。
+
+确认异常的旧摘要可用[受控修复说明](docs/auto-summary-repair.md)中的检查清单定点替换。默认只读，实际执行核对整份确认清单SHA256、原摘要精确值及正文/元数据指纹；备份、索引失败恢复和还原均沿同一事务。常规补缺继续跳过已有摘要，防止在未确认的范围内重写正常内容。
 
 ## Record归属核查
 
@@ -77,7 +85,7 @@ Devin 使用 Node.js 内置 SQLite，只读事务兼容正在写入的数据库�
 - **内置去重**：写入时自动检测相似记忆
 - **置顶记忆**：每个工作区 3 条置顶精华，概览优先显示
 - **对话原文读取** (v1.4+)：绕过 CHECKPOINT 压缩读取对话完整内容，并支持按宿主链路取数
-- **Auto Summary 双轨制** (v1.5+)：AI 手写 searchSummary + Flash 自动生成 autoSummary，双路搜索提升召回率
+- **Auto Summary 双轨制** (v1.5+)：AI 手写 searchSummary + Grok优先的自动生成autoSummary，双路搜索提升召回率
 - **黄金片段提取** (v1.5+)：从对话中提取关键决策、发现、踩坑经验，与现有记忆自动去重
 - **与 LS 同生共死** (v1.6+)：MCP 进程绑定父 LS，窗口开着永不超时，窗口关闭 30s 内自动退出
 - **LS 注册表加速** (v1.6+)：跨窗口 LS 发现从 PowerShell 全量扫描 (2-5s) 降至注册表查询 (~5ms)

@@ -12,10 +12,11 @@ import {
     countLines,
     readConfig,
     type MemoryFrontmatter,
+    withMemoryLock,
 } from "../store.js";
 import {
-    captureAutoSummarySnapshot,
-    generateAutoSummary,
+    captureAutoSummaryFileSnapshot,
+    generateAutoSummaryResult,
     shouldGenerateAutoSummaryForUpdate,
     writeAutoSummaryIfUnchanged,
     type AutoSummarySnapshot,
@@ -23,6 +24,7 @@ import {
 import { resolveModelOnlyChainSplit, type Chain } from "../chain.js";
 import { formatToolError } from "../error-format.js";
 import { modelChainInputSchema } from "./schema-utils.js";
+import { parseAutoSummaryProvenance, pendingAutoSummaryProvenance } from "../auto-summary-provenance.js";
 
 /**
  * memory_update — 更新/追加记忆
@@ -60,7 +62,12 @@ export function registerUpdate(server: McpServer): void {
                     }, startTime);
                 }
 
-                const { hash, entry } = found;
+                return await withMemoryLock(found.hash, id, async () => {
+                const currentFound = findMemoryById(id);
+                if (!currentFound || currentFound.hash !== found.hash) {
+                    return appendTiming({ content: [{ type: "text" as const, text: `❌ 记忆已移动或删除: ${id}` }] }, startTime);
+                }
+                const { hash, entry } = currentFound;
                 const fileContent = readMemoryFile(hash, id);
                 if (!fileContent) {
                     return appendTiming({
@@ -154,16 +161,13 @@ export function registerUpdate(server: McpServer): void {
 
                 // 重建文件
                 const contentChanged = (content !== undefined) || (append !== undefined);
-                const summaryInputChanged = contentChanged
-                    || title !== undefined
-                    || Boolean(tags?.length)
-                    || Boolean(removeTags?.length);
-                const existingAutoSummary = fm.autoSummary ? String(fm.autoSummary) : entry.autoSummary;
+                const existingAutoSummary = typeof fm.autoSummary === "string" ? fm.autoSummary : undefined;
                 const shouldGenerateAutoSummary = shouldGenerateAutoSummaryForUpdate({
                     contentChanged,
                     titleChanged: title !== undefined,
                     tagsChanged: Boolean(tags?.length) || Boolean(removeTags?.length),
                     existingAutoSummary,
+                    existingSummaryPending: parseAutoSummaryProvenance(fm.autoSummaryProvenance)?.status === "pending",
                 });
                 const newFrontmatter: MemoryFrontmatter = {
                     id: String(fm.id || id),
@@ -174,20 +178,17 @@ export function registerUpdate(server: McpServer): void {
                     updated: now,
                     workspace: String(fm.workspace || "general"),
                     conversationId: fm.conversationId ? String(fm.conversationId) : undefined,
-                    searchSummary: String(fm.searchSummary || entry.searchSummary),
-                    autoSummary: summaryInputChanged ? undefined : existingAutoSummary,
+                    searchSummary: typeof fm.searchSummary === "string" ? fm.searchSummary : entry.searchSummary,
+                    autoSummary: existingAutoSummary,
+                    autoSummaryProvenance: shouldGenerateAutoSummary
+                        ? pendingAutoSummaryProvenance(fm.autoSummaryProvenance, now)
+                        : typeof fm.autoSummaryProvenance === "string" ? fm.autoSummaryProvenance : entry.autoSummaryProvenance,
                     pinned: fm.pinned !== undefined ? Boolean(fm.pinned) : entry.pinned,
                 };
-                const autoSummarySnapshot = shouldGenerateAutoSummary
-                    ? captureAutoSummarySnapshot({
-                        title: newFrontmatter.title,
-                        tags: (Array.isArray(newFrontmatter.tags) ? newFrontmatter.tags : []) as string[],
-                        updated: newFrontmatter.updated,
-                        body,
-                    })
-                    : null;
-
                 const newContent = buildMemoryFile(newFrontmatter, body);
+                const autoSummarySnapshot = shouldGenerateAutoSummary
+                    ? captureAutoSummaryFileSnapshot(newContent, newFrontmatter.title, newFrontmatter.tags)
+                    : null;
                 writeMemoryFile(hash, id, newContent);
 
                 // 更新索引（串行化读改写）
@@ -204,6 +205,8 @@ export function registerUpdate(server: McpServer): void {
                         indexEntry.lastAccessed = now;
                         indexEntry.sizeBytes = Buffer.byteLength(newContent, "utf-8");
                         indexEntry.lineCount = countLines(newContent);
+                        indexEntry.autoSummary = newFrontmatter.autoSummary;
+                        indexEntry.autoSummaryProvenance = newFrontmatter.autoSummaryProvenance;
                     }
                 });
                 await syncGlobalIndexForWorkspace(hash);
@@ -225,6 +228,7 @@ export function registerUpdate(server: McpServer): void {
                         text: `✅ 记忆已更新: [${id}] "${newFrontmatter.title}"\n${changes.join("\n")}`,
                     }],
                 }, startTime);
+                });
             } catch (error) {
                 return appendTiming({
                     content: [{
@@ -247,18 +251,25 @@ async function triggerAutoSummaryUpdate(
     chain: Chain
 ): Promise<void> {
     try {
-        const summary = await generateAutoSummary(snapshot.title, snapshot.tags, snapshot.body, chain);
-        if (!summary) return;
+        const generated = await generateAutoSummaryResult(snapshot.title, snapshot.tags, snapshot.body, chain);
+        const summary = generated.summary;
 
         const result = await writeAutoSummaryIfUnchanged({
             hash,
             memoryId,
-            summary,
+            summary: summary ?? undefined,
             expectedFingerprint: snapshot.fingerprint,
             fallbackTitle: snapshot.title,
             fallbackTags: snapshot.tags,
+            expectedSummary: snapshot.expectedSummary,
+            expectedSourceFingerprint: snapshot.sourceFingerprint,
+            provenance: generated.provenance,
         });
-        if (result === "written") {
+        if (!summary) {
+            console.error(`[memory-store] autoSummary 生成失败状态已记录: ${memoryId} (${result}; provider=${generated.provenance.provider || "unknown"}; model=${generated.provenance.model || "unknown"})`);
+            return;
+        }
+        if (result === "written" && summary) {
             console.error(`[memory-store] ✅ autoSummary 已重新生成: ${memoryId} (${summary.length}字)`);
             return;
         }

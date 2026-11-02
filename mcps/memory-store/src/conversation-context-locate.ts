@@ -69,6 +69,7 @@ export interface ContextLocateRoundSource {
     warnings?: string[];
     filePath?: string;
     freshness?: "fresh" | "unknown";
+    verifiedIdentity?: Pick<UnifiedConversationCandidate, "aliases" | "uuid" | "sessionId">;
 }
 
 export interface ContextLocateScanResult {
@@ -204,7 +205,7 @@ async function scanRounds(candidate: UnifiedConversationCandidate, query: string
             const snippet = matchingSnippet(message.text, query, budget.mode);
             if (snippet !== null) {
                 hits.push({
-                    ...candidateHitIdentity(candidate),
+                    ...candidateHitIdentity(candidate), ...loaded.verifiedIdentity,
                     source: "message_body_hit", mode: budget.mode, roundIndex: round.roundIndex,
                     role: message.role, rawRole: message.rawRole, snippet,
                     filePath: loaded.filePath,
@@ -293,6 +294,10 @@ export function contextLocateResolution(matches: number, partial: boolean): Conv
 export function annotateContextLocateCandidates(candidates: UnifiedConversationCandidate[], result: ConversationContextLocateResult): UnifiedConversationCandidate[] {
     return candidates.map(candidate => {
         const hits = result.hits.filter(hit => hit.dataChain === candidate.dataChain && hit.conversationId === candidate.id);
-        return hits.length ? { ...candidate, contextProbe: hits.slice(0, 3).map(hit => `[${hit.role}] R${hit.roundIndex}${hit.sourcePosition.childConversationId ? ` child=${hit.sourcePosition.childConversationId}` : ""} ${hit.snippet}`) } : candidate;
+        return hits.length ? { ...candidate,
+            aliases: [...new Set([...(candidate.aliases ?? []), ...hits.flatMap(hit => hit.aliases ?? [])])],
+            uuid: hits.find(hit => hit.uuid)?.uuid ?? candidate.uuid,
+            sessionId: hits.find(hit => hit.sessionId)?.sessionId ?? candidate.sessionId,
+            contextProbe: hits.slice(0, 3).map(hit => `[${hit.role}] R${hit.roundIndex}${hit.sourcePosition.childConversationId ? ` child=${hit.sourcePosition.childConversationId}` : ""} ${hit.snippet}`) } : candidate;
     });
 }

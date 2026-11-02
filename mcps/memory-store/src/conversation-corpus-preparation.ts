@@ -1,26 +1,29 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-import crypto from "node:crypto";
 import { setTimeout as sleep } from "node:timers/promises";
 import type { CorpusProvider, CorpusSearchRequest } from "./conversation-corpus-types.js";
+import { normalizeCorpusSource, type CorpusSource } from "./conversation-corpus-sources.js";
+import { normalizeCodexCorpusConversationId } from "./conversation-corpus-search.js";
 import { getCorpusSearchStatus, resumeCorpusSearch, startCorpusSearch, type CorpusSearchStatus } from "./conversation-corpus-task.js";
 import {
-    acquireCorpusLease, corpusOwnerDirectory, corpusTaskError, readCorpusJson, writeCorpusJson,
+    acquireCorpusLease, corpusOwnerDirectory, corpusPreparationDirectory, corpusTaskError, corpusTaskSources, readCorpusJson, writeCorpusJson,
     type CorpusTaskStoredState,
 } from "./conversation-corpus-task-store.js";
 
 export interface StartCorpusPreparationOptions {
     ownerId: string;
     conversationId: string;
+    dataChain?: CorpusSource;
     provider: CorpusProvider;
     root?: string;
 }
 
 interface PreparationIndex {
-    version: 1 | 2;
+    version: 1 | 2 | 3;
     ownerId: string;
     conversationId: string;
     taskId: string;
+    dataChain?: CorpusSource;
 }
 
 const starts = new Map<string, Promise<CorpusSearchStatus>>();
@@ -44,14 +47,15 @@ async function reusableTask(options: StartCorpusPreparationOptions, directory: s
     let index: PreparationIndex | undefined;
     try { index = await readCorpusJson<PreparationIndex>(path.join(directory, "index.json")); }
     catch (error) { if (codeOf(error) !== "ENOENT" && !(error instanceof SyntaxError)) throw error; }
-    if ((index?.version === 2 || index?.version === 1) && index.ownerId === options.ownerId && index.conversationId === options.conversationId
+    if ((index?.version === 3 || index?.version === 2 || index?.version === 1) && index.ownerId === options.ownerId && index.conversationId === options.conversationId
+        && (index.dataChain ?? "codex") === options.dataChain
         && /^corpus-[a-f0-9-]{36}$/.test(index.taskId)) {
         try {
             const status = await getCorpusSearchStatus({ ...options, taskId: index.taskId });
             if (status.request.purpose !== "prepare" || status.request.conversationIds?.length !== 1
                 || status.request.conversationIds[0] !== options.conversationId) throw corpusTaskError("CORPUS_TASK_CORRUPT", "Preparation index points to a different request");
             if (active(status.status)) return status;
-            if (index.version === 2) {
+            if (index.version !== 1) {
                 try { await fs.stat(path.join(directory, "creating.json")); }
                 catch (error) { if (codeOf(error) === "ENOENT") return undefined; throw error; }
             }
@@ -66,7 +70,8 @@ async function reusableTask(options: StartCorpusPreparationOptions, directory: s
         let state: CorpusTaskStoredState;
         try {
             request = await readCorpusJson<CorpusSearchRequest>(path.join(taskDirectory, "request.json"));
-            if (request.purpose !== "prepare" || request.conversationIds?.length !== 1 || request.conversationIds[0] !== options.conversationId) continue;
+            if (request.purpose !== "prepare" || request.conversationIds?.length !== 1 || request.conversationIds[0] !== options.conversationId
+                || JSON.stringify(corpusTaskSources(request)) !== JSON.stringify([options.dataChain])) continue;
             state = await readCorpusJson<CorpusTaskStoredState>(path.join(taskDirectory, "state.json"));
         } catch (error) { if (codeOf(error) === "ENOENT") continue; throw error; }
         if (active(state.status)) candidates.push(await getCorpusSearchStatus({ ...options, taskId: entry.name }));
@@ -80,16 +85,16 @@ async function start(options: StartCorpusPreparationOptions, directory: string):
     try {
         const previous = await reusableTask(options, directory);
         if (!previous) await writeCorpusJson(path.join(directory, "creating.json"), {
-            ownerId: options.ownerId, conversationId: options.conversationId, createdAt: new Date().toISOString(),
+            ownerId: options.ownerId, conversationId: options.conversationId, dataChain: options.dataChain, createdAt: new Date().toISOString(),
         });
         const status = previous?.status === "resumable"
             ? await resumeCorpusSearch({ ...options, taskId: previous.taskId })
             : previous ?? await startCorpusSearch({ ...options, request: {
-                purpose: "prepare", conversationIds: [options.conversationId], messageRoles: ["user", "assistant", "subagent"],
+                purpose: "prepare", dataChains: [options.dataChain!], conversationIds: [options.conversationId], messageRoles: ["user", "assistant", "subagent"],
             } });
         try {
             await writeCorpusJson(path.join(directory, "index.json"), {
-                version: 2, ownerId: options.ownerId, conversationId: options.conversationId, taskId: status.taskId,
+                version: 3, ownerId: options.ownerId, conversationId: options.conversationId, taskId: status.taskId, dataChain: options.dataChain,
             } satisfies PreparationIndex);
             await fs.rm(path.join(directory, "creating.json"), { force: true });
         } catch (error) {
@@ -102,12 +107,13 @@ async function start(options: StartCorpusPreparationOptions, directory: string):
 }
 
 export async function startCorpusPreparation(options: StartCorpusPreparationOptions): Promise<CorpusSearchStatus> {
-    options = { ...options };
-    const ownerDirectory = corpusOwnerDirectory(options);
+    options = { ...options, dataChain: normalizeCorpusSource(options.dataChain ?? "codex") };
+    corpusOwnerDirectory(options);
     if (typeof options.conversationId !== "string" || !options.conversationId.trim() || options.conversationId.length > 4096) {
         throw new Error("A nonempty target conversationId is required for corpus preparation");
     }
-    const directory = path.join(ownerDirectory, "preparations", crypto.createHash("sha256").update(options.conversationId).digest("hex"));
+    options.conversationId = options.dataChain === "codex" ? normalizeCodexCorpusConversationId(options.conversationId) : options.conversationId.trim();
+    const directory = corpusPreparationDirectory({ ...options, source: options.dataChain! });
     const pending = starts.get(directory);
     if (pending) return pending;
     const promise = start(options, directory);

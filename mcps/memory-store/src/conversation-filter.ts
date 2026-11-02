@@ -737,16 +737,30 @@ export async function listConversationCandidates(options: ListConversationCandid
         diagnosticsBySource.set(source, diagnostics);
         const cacheListing = options.source === "cache" ? listCachedContextCandidates(source, fetchLimit, options) : undefined;
         const raw = cacheListing?.candidates || await listSourceCandidates(source, fetchLimit, adapters, source === "antigravity" && Boolean(options.workspaces?.length), { ...options, deadlineAt }, diagnostics);
-        const warnings = [...raw.flatMap(candidateWarnings), ...raw.flatMap(candidate => candidate.discoveryWarnings || []), ...(cacheListing?.warnings || []), ...diagnostics.map(diagnostic => `${diagnostic.code}: ${diagnostic.message}`)];
+        const warnings = [...(cacheListing?.warnings || []), ...diagnostics.map(diagnostic => `${diagnostic.code}: ${diagnostic.message}`)];
         if (cacheListing?.partial && !warnings.length) warnings.push("cache_candidate_budget");
         const needsChildren = options.threadMode === "children" || options.threadMode === "all" || Boolean(options.contextProbe?.trim() || options.query?.trim())
             || options.conversationIds?.some(id => Boolean(splitDevinSubagentId(id)));
         if (source === "windsurf" && options.source !== "cache" && !options.adapters && needsChildren) {
             const scopedParents = raw.filter(candidate => workspaceMatches(candidateWorkspacesForScope(candidate, options.workspaceScope || "any"), options.workspaces || [], options.workspaceMode || "any"));
             const children = await discoverDevinChildCandidates(scopedParents, { ...options, deadlineMs: Math.max(1, deadlineAt - Date.now()) });
+            for (const parent of children.verifiedParents) {
+                const verifiedIds = new Set([parent.summary.id, parent.summary.canonicalId, ...parent.summary.aliases]);
+                const matchingIndices: number[] = [];
+                for (const [index, candidate] of raw.entries()) {
+                    if (candidate.sourceKind?.startsWith("devin-") && [candidate.id, ...(candidate.aliases || [])].some(id => verifiedIds.has(id))) {
+                        matchingIndices.push(index);
+                    }
+                }
+                if (matchingIndices.length) {
+                    raw[matchingIndices[0]!] = { ...candidateFromDevinConversation(parent.summary), sourcePartial: parent.partial || parent.summary.partial };
+                    for (const index of matchingIndices.slice(1).reverse()) raw.splice(index, 1);
+                }
+            }
             raw.push(...children.candidates.filter(child => !raw.some(candidate => candidate.id === child.id)));
             warnings.push(...children.warnings);
         }
+        warnings.push(...raw.flatMap(candidateWarnings), ...raw.flatMap(candidate => candidate.discoveryWarnings || []));
         warnings.push(...raw.filter(item => item.sourcePartial).map(item => `partial_source:${item.id}`));
         if (raw.length >= fetchLimit && !options.conversationIds?.length) warnings.push("candidate_limit: source enumeration may be incomplete");
         if (options.source !== "cache" && (options.source === "local" || (source === "windsurf" && options.conversationIds?.length)) && options.workspaces?.length) {

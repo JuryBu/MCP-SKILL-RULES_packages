@@ -406,12 +406,27 @@ interface JsonlLineReadOptions {
     startByte?: number;
     endByte?: number;
     startLineNo?: number;
+    isCancelled?: () => boolean;
+    onProgress?: (bytes: number, totalBytes: number) => void;
 }
 
 type JsonlLineCallback = (line: string, lineNo: number, byteOffset: number) => boolean | void;
 
 function yieldToEventLoop(): Promise<void> {
     return new Promise(resolve => globalThis.setImmediate(resolve));
+}
+
+function assertClaudeCodeReadActive(isCancelled?: () => boolean): void {
+    if (!isCancelled?.()) return;
+    const error = new Error("Claude Code source read cancelled");
+    error.name = "AbortError";
+    throw error;
+}
+
+function claudeCodeMessageAnnotations(value: unknown): Array<{ selectedText: string; comment: string }> {
+    if (!Array.isArray(value)) return [];
+    return value.filter(item => item && typeof item.selectedText === "string" && typeof item.comment === "string")
+        .map(item => ({ selectedText: item.selectedText, comment: item.comment }));
 }
 
 function readJsonlLines(
@@ -507,6 +522,7 @@ async function readJsonlLinesAsync(
     let keepGoing = true;
 
     const maybeYield = async (force = false) => {
+        assertClaudeCodeReadActive(options.isCancelled);
         if (!force && linesSinceYield < CLAUDE_JSONL_YIELD_EVERY_LINES) return;
         linesSinceYield = 0;
         await yieldToEventLoop();
@@ -514,6 +530,7 @@ async function readJsonlLinesAsync(
 
     try {
         while (keepGoing && position < endOffset) {
+            assertClaudeCodeReadActive(options.isCancelled);
             const toRead = Math.min(buffer.length, endOffset - position);
             const { bytesRead } = await handle.read(buffer, 0, toRead, position);
             if (bytesRead <= 0) break;
@@ -524,6 +541,7 @@ async function readJsonlLinesAsync(
 
             let newlineIndex = pending.indexOf("\n");
             while (newlineIndex >= 0) {
+                assertClaudeCodeReadActive(options.isCancelled);
                 let rawLine = pending.slice(0, newlineIndex);
                 if (rawLine.endsWith("\r")) rawLine = rawLine.slice(0, -1);
                 const rawWithNl = pending.slice(0, newlineIndex + 1);
@@ -544,6 +562,7 @@ async function readJsonlLinesAsync(
                 pending = "";
             }
             if (keepGoing) await maybeYield(true);
+            options.onProgress?.(scannedBytes, endOffset - startOffset);
         }
         const tail = decoder.end();
         if (keepGoing && tail) pending += tail;
@@ -1058,6 +1077,14 @@ export function getClaudeCodeThread(conversationId: string): ClaudeCodeThreadInf
     return listRecentClaudeCodeThreads(1000).find(thread => thread.id === resolved) || null;
 }
 
+export function getClaudeCodeCorpusThread(conversationId: string): ClaudeCodeThreadInfo | null {
+    const desktopIndex = readClaudeCodeDesktopIndexMap();
+    const matches = listJsonlFiles(claudeProjectsDir(), 100_000).filter(filePath => path.basename(filePath, ".jsonl").toLowerCase() === conversationId.toLowerCase());
+    if (matches.length !== 1) return null;
+    const thread = readThreadMetadata(matches[0], desktopIndex, { bounded: true });
+    return thread?.id === conversationId ? thread : null;
+}
+
 export async function getClaudeCodeOwnershipMetadataAsync(conversationIds: string[]): Promise<{
     entries: Map<string, { cwd?: string; issue?: string }>;
     diagnostics: { directoriesRead: number; transcriptFilesRead: number; desktopFilesRead: number; failures: string[] };
@@ -1563,6 +1590,8 @@ function createClaudeCodeRoundsBuilder(jsonlPath: string, cwd?: string): ClaudeC
                 fileViews: [],
                 compactionSummaries: compactionInfo ? [compactionInfo] : undefined,
             };
+            const annotations = claudeCodeMessageAnnotations(message.annotations ?? event.annotations);
+            if (!compactionInfo && annotations.length) currentRound.userMessages = [{ text: currentRound.userMessage, stepIndex, annotations, attachments: extracted.attachments }];
             currentRoundReplayByte = isCompactSummary && Number.isSafeInteger(pendingCompactBoundary?.byteOffset)
                 ? pendingCompactBoundary!.byteOffset!
                 : byteOffset;
@@ -1604,7 +1633,7 @@ function createClaudeCodeRoundsBuilder(jsonlPath: string, cwd?: string): ClaudeC
             }
             if (extracted.toolUses.length > 0) recordSourceCheckpoint("tool_call", round, byteOffset, lineNo);
             const response = extracted.text || (aiToolCalls.length ? `（调用工具：${aiToolCalls.map(item => item.name).join(", ")}）` : "");
-            if (response || pendingThinking || extracted.thinking) {
+            if (response || pendingThinking || extracted.thinking || extracted.attachments.length) {
                 round.aiResponses.push({
                     stepIndex,
                     response,
@@ -1612,6 +1641,10 @@ function createClaudeCodeRoundsBuilder(jsonlPath: string, cwd?: string): ClaudeC
                     toolCalls: aiToolCalls,
                 });
                 pendingThinking = "";
+            }
+            if (extracted.attachments.length) {
+                round.semanticEvents ||= [];
+                round.semanticEvents.push({ semanticRole: "assistant", stepIndex, text: extracted.text, attachments: extracted.attachments });
             }
             return;
         }
@@ -1683,6 +1716,24 @@ async function buildClaudeCodeRoundsAsync(jsonlPath: string, cwd?: string, readO
     return builder.finish();
 }
 
+export async function readClaudeCodeWindowText(jsonlPath: string, text: string, startByte: number, cwd?: string, isCancelled?: () => boolean): Promise<ConversationRound[]> {
+    const builder = createClaudeCodeRoundsBuilder(jsonlPath, cwd);
+    let position = 0;
+    let lineNo = 0;
+    let byteOffset = startByte;
+    while (position < text.length) {
+        assertClaudeCodeReadActive(isCancelled);
+        const newline = text.indexOf("\n", position);
+        if (newline < 0) break;
+        const line = text.slice(position, newline);
+        builder.handleLine(line.replace(/\r$/u, ""), ++lineNo, byteOffset);
+        byteOffset += Buffer.byteLength(text.slice(position, newline + 1));
+        position = newline + 1;
+        if (lineNo % 64 === 0) await yieldToEventLoop();
+    }
+    return builder.finish().rounds;
+}
+
 const CLAUDE_CODE_INCREMENTAL_CHECKPOINT_ANCHOR_BYTES = 8 * 1024;
 
 export interface ClaudeCodeRoundTailCheckpoint {
@@ -1702,6 +1753,8 @@ export interface ClaudeCodeRoundTailReadOptions {
     startByte?: number;
     checkpoint?: ClaudeCodeRoundTailCheckpoint;
     sourceChange?: "append" | "replace";
+    isCancelled?: () => boolean;
+    onProgress?: (bytes: number, totalBytes: number) => void;
 }
 
 export interface ClaudeCodeRoundTailReadResult {
@@ -1770,6 +1823,7 @@ export async function readClaudeCodeRoundTail(
     jsonlPath: string,
     options: ClaudeCodeRoundTailReadOptions = {},
 ): Promise<ClaudeCodeRoundTailReadResult> {
+    assertClaudeCodeReadActive(options.isCancelled);
     let before: fs.Stats;
     try {
         before = await fs.promises.stat(jsonlPath);
@@ -1826,6 +1880,8 @@ export async function readClaudeCodeRoundTail(
         startByte,
         endByte: before.size,
         startLineNo: checkpoint ? checkpoint.replayStartLineNo - 1 : 0,
+        isCancelled: options.isCancelled,
+        onProgress: options.onProgress,
     });
     let after: fs.Stats;
     try {
@@ -1848,6 +1904,7 @@ export async function readClaudeCodeRoundTail(
     }));
     const lastRoundCheckpoint = sourceCheckpoints.filter(item => item.kind === "round_start").at(-1);
     const anchor = await claudeCodeCheckpointAnchor(jsonlPath, before.size);
+    assertClaudeCodeReadActive(options.isCancelled);
     return {
         status: "ok",
         replaceFromRound,

@@ -5,7 +5,7 @@ import path from "node:path";
 import type { ConversationAttachment } from "./conversation-attachments.js";
 import {
     LocalPbReaderError,
-    readLocalPbFileCandidate,
+    prepareLocalPbFileCandidates,
     type LocalPbCandidateKind,
     type LocalPbErrorCode,
     type LocalPbFileCandidate,
@@ -120,15 +120,17 @@ export function discoverLocalPbCandidates(host: LocalPbSourceFlavor, conversatio
         .filter((candidate): candidate is LocalPbDiscoveredCandidate => Boolean(candidate));
 }
 
-export function fingerprintLocalPbCandidates(candidates: LocalPbDiscoveredCandidate[]): ConversationSourceFingerprint {
-    const revision = createHash("sha256")
-        .update(JSON.stringify(candidates.map(candidate => ({ kind: candidate.kind, size: candidate.size, mtimeMs: candidate.mtimeMs }))))
-        .digest("hex");
+function fingerprintPreparedLocalPbCandidates(candidates: LocalPbDiscoveredCandidate[], revision: string): ConversationSourceFingerprint {
     return {
         size: candidates.reduce((sum, candidate) => sum + candidate.size, 0),
         mtime: candidates.reduce((latest, candidate) => Math.max(latest, candidate.mtimeMs), 0),
         revision,
     };
+}
+
+export function fingerprintLocalPbCandidates(candidates: LocalPbDiscoveredCandidate[], host: LocalPbSourceFlavor): ConversationSourceFingerprint {
+    const prepared = prepareLocalPbFileCandidates(candidates, { sourceFlavor: host });
+    return fingerprintPreparedLocalPbCandidates(candidates, prepared.sourceRevision);
 }
 
 function canonicalLocalPbStep(step: LocalPbStep): string {
@@ -377,9 +379,17 @@ export function loadLocalPbConversation(host: LocalPbSourceFlavor, conversationI
     if (candidates.length === 0) return null;
     const successfulCandidates: Array<{ candidate: LocalPbDiscoveredCandidate; result: LocalPbReadResult }> = [];
     const diagnostics: LocalPbCandidateDiagnostic[] = [];
-    for (const candidate of candidates) {
+    const prepared = prepareLocalPbFileCandidates(candidates, { sourceFlavor: host });
+    for (const [index, candidate] of candidates.entries()) {
         try {
-            const result = readLocalPbFileCandidate(candidate, { sourceFlavor: host });
+            const outcome = prepared.candidates[index]!;
+            if (!outcome.reader) {
+                const failure = outcome.error;
+                diagnostics.push({ kind: candidate.kind, status: "failed", errorCode: failure?.code ?? "UNKNOWN",
+                    message: failure?.message ?? "Local PB candidate preparation failed" });
+                continue;
+            }
+            const result = outcome.reader.read();
             successfulCandidates.push({ candidate, result });
             diagnostics.push({
                 kind: candidate.kind,
@@ -408,7 +418,7 @@ export function loadLocalPbConversation(host: LocalPbSourceFlavor, conversationI
         selected,
         rounds,
         totalSteps: selected.trajectory.steps.length,
-        fingerprint: fingerprintLocalPbCandidates(candidates),
+        fingerprint: fingerprintPreparedLocalPbCandidates(candidates, prepared.sourceRevision),
         candidateKinds: successfulCandidates.map(candidate => candidate.candidate.kind),
         partial,
         localPbActivities: { sourceFlavor: host, activityCount: entries.length, formalRoundCount: rounds.length, partial, entries,

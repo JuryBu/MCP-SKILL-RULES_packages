@@ -4,7 +4,8 @@ import os from "node:os";
 import path from "node:path";
 import { spawn } from "node:child_process";
 import { after, test } from "node:test";
-import { startCorpusSearch, getCorpusSearchStatus, cancelCorpusSearch, resumeCorpusSearch } from "../src/conversation-corpus-task.ts";
+import { startCorpusSearch as startSearch, getCorpusSearchStatus, cancelCorpusSearch, resumeCorpusSearch } from "../src/conversation-corpus-task.ts";
+const startCorpusSearch = (options: Parameters<typeof startSearch>[0]) => startSearch({ ...options, request: { dataChains: ["codex"], ...options.request } });
 import { corpusTaskDirectory, loadCorpusTask } from "../src/conversation-corpus-task-store.ts";
 import type { CorpusProjection, CorpusProvider } from "../src/conversation-corpus-types.ts";
 
@@ -308,7 +309,7 @@ test("process exit after a published batch recovers a lagging state with the sam
         }};
         const rename = fs.rename.bind(fs);
         fs.rename = async (from, to) => { await rename(from, to); if (String(to).endsWith(".batch.json")) process.exit(0); };
-        const started = await startCorpusSearch({ownerId, root, request:{query:"hit"}, provider, commitBatchSize:32});
+        const started = await startCorpusSearch({ownerId, root, request:{dataChains:["codex"],query:"hit"}, provider, commitBatchSize:32});
         const identity = {ownerId, root, taskId:started.taskId};
         console.log(JSON.stringify(identity));
         const deadline = Date.now()+5000;
@@ -362,7 +363,7 @@ test("process exit before rename ignores the orphan temporary file and replays e
         const rename = fs.rename.bind(fs);
         fs.rename = async (from, to) => { if (String(to).endsWith(".batch.json")) process.exit(0); return rename(from, to); };
         const provider = {async list(){return items.map(item=>item.conversation);},async read(candidate){return items.find(item=>item.conversation.id===candidate.id);}};
-        const started = await startCorpusSearch({ownerId,root,request:{query:"hit"},provider,commitBatchSize:8});
+        const started = await startCorpusSearch({ownerId,root,request:{dataChains:["codex"],query:"hit"},provider,commitBatchSize:8});
         console.log(JSON.stringify({ownerId,root,taskId:started.taskId}));
         setTimeout(()=>process.exit(2),5000).unref();
     `;

@@ -3,13 +3,16 @@ import fsp from "node:fs/promises";
 import path from "node:path";
 import crypto from "node:crypto";
 import { setImmediate as yieldImmediate } from "node:timers/promises";
-import type { CorpusConversation, CorpusProvider, CorpusProjection, CorpusSearchRequest } from "./conversation-corpus-types.js";
+import type { CorpusConversation, CorpusProvider, CorpusProjection, CorpusSearchRequest, CorpusSourceStatus, CorpusVerifiedIdentity } from "./conversation-corpus-types.js";
+import { corpusProjectionIdentityMatches, verifiedCorpusIdentity } from "./conversation-host-binary.js";
+import { corpusConversationKey, resolveCorpusSources, type CorpusSource } from "./conversation-corpus-sources.js";
 import {
     compileCorpusSearch, CorpusSearchAccumulator, corpusConversationMatchesScope, sortCorpusMatches, CORPUS_QUERY_SEMANTIC_VERSION,
     type CorpusConversationMatch,
 } from "./conversation-corpus-search.js";
 import {
-    acquireCorpusLease, corpusCoverage, corpusCurrentRecords, corpusCursor, corpusOwnerDirectory, corpusOwnerHash, corpusTaskDirectory, corpusTaskError,
+    acquireCorpusLease, corpusCommitKey, corpusCommitSource, corpusCoverage, corpusCurrentRecords, corpusCursor, corpusPreparationDirectory, corpusOwnerHash, corpusTaskDirectory, corpusTaskError,
+    corpusTaskSources, validateCorpusSourceStatuses, corpusResultRecords,
     corpusSemanticVersionsEqual,
     loadCorpusTask, parseCorpusCursor, readCorpusJson, readCorpusTaskCommitRange, writeCorpusJson, writeCorpusTaskCommits,
     type CorpusTaskCommit, type CorpusTaskCoverage, type CorpusTaskLoaded, type CorpusTaskSnapshot,
@@ -19,7 +22,7 @@ import {
 export type { CorpusTaskCoverage, CorpusTaskState } from "./conversation-corpus-task-store.js";
 export type { CorpusConversationMatch, CorpusMatchSnippet } from "./conversation-corpus-search.js";
 
-export interface CorpusSearchIdentity { ownerId: string; taskId: string; root?: string; }
+export interface CorpusSearchIdentity { ownerId: string; taskId: string; root?: string; dataChain?: CorpusSource; dataChains?: CorpusSource[]; }
 export interface CorpusSearchStatusOptions extends CorpusSearchIdentity {
     limit?: number;
     cursor?: string;
@@ -46,10 +49,12 @@ export interface CorpusSearchStatus {
     changes?: {
         upserts: CorpusConversationMatch[];
         removedConversationIds: string[];
+        removedConversations: Array<{ source: CorpusSource; conversationId: string }>;
+        removedConversationKeys: string[];
         throughRevision: number;
         hasMore: boolean;
     };
-    progress?: { conversationId?: string; phase: string; bytes?: number; totalBytes?: number };
+    progress?: { source?: CorpusSource; conversationId?: string; phase: string; bytes?: number; totalBytes?: number };
     timings: { queryComputeMs: number; taskWallMs: number };
     error?: string;
     prepared?: CorpusPreparedEvidence;
@@ -142,17 +147,18 @@ async function writeConversationCommit(runtime: CorpusRuntime, entries: PendingC
     const task = runtime.task;
     const staged = new Map<string, CorpusTaskCommit>();
     const commits = entries.map((entry, index): CorpusTaskCommit => {
-        const previous = staged.get(entry.conversationId) ?? task.records.get(entry.conversationId);
+        const key = corpusCommitKey(entry);
+        const previous = staged.get(key) ?? task.records.get(key);
         const commit: CorpusTaskCommit = {
             ...entry, revision: task.state.revision + index + 1,
             queryComputeMs: task.state.computeMs, semanticVersion: task.state.semanticVersion,
             changed: JSON.stringify(previous?.result ?? null) !== JSON.stringify(entry.result),
         };
-        staged.set(entry.conversationId, commit);
+        staged.set(key, commit);
         return commit;
     });
     await writeCorpusTaskCommits(task, commits);
-    for (const commit of commits) task.records.set(commit.conversationId, commit);
+    for (const commit of commits) task.records.set(corpusCommitKey(commit), commit);
     task.commits.push(...commits);
     task.state.revision = commits.at(-1)!.revision;
     task.state.updatedAt = new Date().toISOString();
@@ -168,7 +174,7 @@ async function finishTask(task: CorpusTaskLoaded, status: CorpusTaskState): Prom
     const snapshotId = `snapshot-${crypto.randomUUID()}`;
     const snapshot: CorpusTaskSnapshot = {
         snapshotId, revision: task.state.revision, status,
-        results: sortCorpusMatches(corpusCurrentRecords(task).flatMap(record => record.result ? [record.result] : []), task.request.sort),
+        results: sortCorpusMatches(corpusResultRecords(task).flatMap(record => record.result ? [record.result] : []), task.request.sort),
         coverage: corpusCoverage(task),
         semanticVersion: task.state.semanticVersion, prepared: preparedEvidence(task),
     };
@@ -182,7 +188,8 @@ async function finishTask(task: CorpusTaskLoaded, status: CorpusTaskState): Prom
 
 function preparedEvidence(task: CorpusTaskLoaded): CorpusPreparedEvidence | undefined {
     const record = corpusCurrentRecords(task).find(record => record.prepared);
-    return record?.prepared ? { ...record.prepared, commitPath: path.join(task.directory, "commits", `${String(record.revision).padStart(12, "0")}.json`) } : undefined;
+    return record?.prepared ? { ...record.prepared, source: record.prepared.source ?? corpusCommitSource(record),
+        commitPath: path.join(task.directory, "commits", `${String(record.revision).padStart(12, "0")}.json`) } : undefined;
 }
 
 function semanticVersion(provider: CorpusProvider): CorpusSemanticVersion {
@@ -192,28 +199,53 @@ function semanticVersion(provider: CorpusProvider): CorpusSemanticVersion {
     return { query: CORPUS_QUERY_SEMANTIC_VERSION, provider: provider.semanticVersion ?? null };
 }
 
-function validateProjection(projection: CorpusProjection, conversationId: string): void {
-    if (!projection || projection.conversation?.id !== conversationId || projection.conversation.source !== "codex"
-        || typeof projection.revision !== "string" || !projection.revision || !Array.isArray(projection.messages)
+function validateProjection(projection: CorpusProjection, candidate: CorpusConversation): void {
+    if (!projection || !projection.conversation || !corpusProjectionIdentityMatches(projection.conversation, candidate)
+        || typeof projection.revision !== "string" || !projection.revision.trim() || !Array.isArray(projection.messages)
         || typeof projection.complete !== "boolean" || !Array.isArray(projection.warnings)
         || projection.warnings.some(warning => typeof warning !== "string")) {
         throw new Error("Provider returned an invalid corpus projection or a different conversation");
     }
-    if (projection.complete && /^pending(?:[:/-]|$)/u.test(projection.revision)) throw new Error("A complete projection requires a verified source revision");
+    if (projectionComplete(projection) && /^pending(?:[:/-]|$)/u.test(projection.revision)) throw new Error("A complete projection requires a verified source revision");
 }
 
-async function scanProjection(runtime: CorpusRuntime, projection: CorpusProjection): Promise<void> {
+function projectionComplete(projection: CorpusProjection): boolean {
+    return projection.complete && !("partial" in projection && projection.partial === true);
+}
+
+function validateSourceBinding(task: CorpusTaskLoaded, options: Pick<CorpusSearchIdentity, "dataChain" | "dataChains">): void {
+    if (options.dataChain === undefined && options.dataChains === undefined) return;
+    const sources = resolveCorpusSources(options);
+    if (JSON.stringify([...sources].sort()) !== JSON.stringify([...corpusTaskSources(task.request)].sort())) {
+        throw corpusTaskError("CORPUS_SOURCE_MISMATCH", "Requested sources do not match this task; resume the original task with its bound sources");
+    }
+}
+
+function captureSourceStatuses(task: CorpusTaskLoaded, provider: CorpusProvider, candidates?: CorpusConversation[]): void {
+    const sources = corpusTaskSources(task.request);
+    const statuses = provider.sourceStatuses?.();
+    if (statuses !== undefined) validateCorpusSourceStatuses(statuses, sources);
+    task.state.sourceStatuses = sources.map((source): CorpusSourceStatus => {
+        const status = statuses?.find(status => status.source === source);
+        if (status) return { ...status, warnings: [...status.warnings] };
+        if (statuses !== undefined) return { source, status: "error", candidateCount: 0, warnings: [], error: "Provider omitted source coverage" };
+        return { source, status: "ok", candidateCount: candidates?.filter(candidate => candidate?.source === source).length ?? 0, warnings: [] };
+    });
+}
+
+async function scanProjection(runtime: CorpusRuntime, projection: CorpusProjection, candidate: CorpusConversation, verifiedIdentity?: CorpusVerifiedIdentity): Promise<void> {
     const task = runtime.task;
+    const complete = projectionComplete(projection);
     const sourceBytes = Number.isFinite(projection.sourceBytes) && projection.sourceBytes! >= 0 ? projection.sourceBytes! : 0;
     if (task.request.purpose === "prepare") {
         if (projection.messages.some(message => !message || typeof message.id !== "string" || !message.id
             || !Number.isInteger(message.round) || message.round < 1 || typeof message.text !== "string"
             || !task.request.messageRoles!.includes(message.role))) throw new Error("Provider returned invalid preparation messages");
         if (!cancelled(runtime)) await commitConversation(runtime, {
-            conversationId: projection.conversation.id, complete: projection.complete, result: null,
+            source: candidate.source, conversationId: candidate.id, complete, result: null, verifiedIdentity,
             scannedMessages: projection.messages.length, mirrorMessagesSkipped: 0, sourceBytes, warnings: projection.warnings,
             prepared: { kind: "conversation_body_projection", conversationId: projection.conversation.id,
-                sourceRevision: projection.revision, cacheGeneration: projection.cacheGeneration, complete: projection.complete, sourceBytes },
+                source: projection.conversation.source, sourceRevision: projection.revision, cacheGeneration: projection.cacheGeneration, complete, sourceBytes },
         });
         return;
     }
@@ -224,7 +256,7 @@ async function scanProjection(runtime: CorpusRuntime, projection: CorpusProjecti
         const result = accumulator.snapshot(complete);
         task.state.computeMs += performance.now() - computeStart;
         await commitConversation(runtime, {
-            conversationId: projection.conversation.id, complete, result,
+            source: candidate.source, conversationId: candidate.id, complete, result, verifiedIdentity,
             scannedMessages: accumulator.scannedMessages, mirrorMessagesSkipped: accumulator.mirrorMessagesSkipped,
             sourceBytes, warnings: projection.warnings,
         }, defer);
@@ -241,12 +273,12 @@ async function scanProjection(runtime: CorpusRuntime, projection: CorpusProjecti
             await yieldImmediate();
         }
     }
-    if (!cancelled(runtime)) await commit(projection.complete, true);
+    if (!cancelled(runtime)) await commit(complete, true);
 }
 
-async function retractUnverified(runtime: CorpusRuntime, conversationId: string): Promise<void> {
-    if (!runtime.task.records.get(conversationId)?.unverified) return;
-    await commitConversation(runtime, { conversationId, complete: false, result: null,
+async function retractUnverified(runtime: CorpusRuntime, candidate: CorpusConversation): Promise<void> {
+    if (!runtime.task.records.get(corpusConversationKey(candidate))?.unverified) return;
+    await commitConversation(runtime, { source: candidate.source, conversationId: candidate.id, complete: false, result: null,
         scannedMessages: 0, mirrorMessagesSkipped: 0, sourceBytes: 0, warnings: [] });
 }
 
@@ -258,7 +290,7 @@ async function readProjection(runtime: CorpusRuntime, provider: CorpusProvider, 
     let accumulator: CorpusSearchAccumulator | undefined;
     let lastCommit = -Infinity;
     let sourceBytes = 0;
-    const warnings = new Set<string>();
+    const warnings = new Set<string>(candidate.sourceWarnings);
     let dirty = false;
     let flushTimer: ReturnType<typeof setTimeout> | undefined;
     const clearFlush = (): void => { if (flushTimer) clearTimeout(flushTimer); flushTimer = undefined; };
@@ -268,13 +300,15 @@ async function readProjection(runtime: CorpusRuntime, provider: CorpusProvider, 
         const result = accumulator.snapshot(false);
         task.state.computeMs += performance.now() - snapshotStart;
         if (result) result.warnings = [...warnings];
+        const identity = verifiedCorpusIdentity(accumulator.conversation);
+        const verifiedIdentity = identity ? { ...identity, sourceRevision: accumulator.source.revision } : undefined;
         dirty = false;
-        await commitConversation(runtime, { conversationId: candidate.id, complete: false, result,
+        await commitConversation(runtime, { source: candidate.source, conversationId: candidate.id, complete: false, result,
             scannedMessages: accumulator.scannedMessages, mirrorMessagesSkipped: accumulator.mirrorMessagesSkipped,
-            sourceBytes, warnings: [...warnings], unverified: true });
+            sourceBytes, warnings: [...warnings], unverified: true, verifiedIdentity });
         lastCommit = Date.now();
     };
-    const settle = async (): Promise<void> => { clearFlush(); await queue; await retractUnverified(runtime, candidate.id); };
+    const settle = async (): Promise<void> => { clearFlush(); await queue; await retractUnverified(runtime, candidate); };
     runtime.settleRead = settle;
     try {
         const projection = await provider.read(candidate, {
@@ -282,17 +316,17 @@ async function readProjection(runtime: CorpusRuntime, provider: CorpusProvider, 
             isCancelled: () => cancelled(runtime),
             onProgress: progress => {
                 if (!accepting || cancelled(runtime)) return;
-                runtime.progress = { ...progress, conversationId: candidate.id };
+                runtime.progress = { ...progress, source: candidate.source, conversationId: candidate.id };
                 notify(runtime);
             },
             onChunk: chunk => {
                 if (!accepting || cancelled(runtime)) return Promise.resolve();
                 const work = queue.then(async () => {
                     if (streamError || cancelled(runtime)) return;
-                    validateProjection({ ...chunk, complete: false }, candidate.id);
+                    validateProjection({ ...chunk, complete: false }, candidate);
                     if (Number.isFinite(chunk.sourceBytes) && chunk.sourceBytes! >= 0) sourceBytes = chunk.sourceBytes!;
                     runtime.progress = { ...runtime.progress, phase: task.request.purpose === "prepare" ? "preparing" : "query_stream",
-                        conversationId: candidate.id, bytes: sourceBytes };
+                        source: candidate.source, conversationId: candidate.id, bytes: sourceBytes };
                     if (task.request.purpose === "prepare") { notify(runtime); return; }
                     for (const warning of chunk.warnings) warnings.add(warning);
                     const revision = /^pending(?:[:/-]|$)/u.test(chunk.revision) ? chunk.revision : `pending:${chunk.revision}`;
@@ -325,7 +359,7 @@ async function readProjection(runtime: CorpusRuntime, provider: CorpusProvider, 
         accepting = false;
         clearFlush();
         await queue;
-        if (cancelled(runtime)) await retractUnverified(runtime, candidate.id);
+        if (cancelled(runtime)) await retractUnverified(runtime, candidate);
         if (runtime.settleRead === settle) runtime.settleRead = undefined;
     }
 }
@@ -354,26 +388,43 @@ async function executeSearch(runtime: CorpusRuntime, provider: CorpusProvider): 
     try {
         for (const record of [...task.records.values()]) {
             if (corpusSemanticVersionsEqual(record.semanticVersion, task.state.semanticVersion)) continue;
-            await commitConversation(runtime, { conversationId: record.conversationId, complete: false, result: null,
+            await commitConversation(runtime, { source: corpusCommitSource(record), conversationId: record.conversationId, complete: false, result: null,
                 scannedMessages: 0, mirrorMessagesSkipped: 0, sourceBytes: 0, warnings: ["Semantic version changed; source revalidation pending"] });
         }
-        if (!task.state.discoveryComplete) {
+        if (!task.state.discoveryComplete || task.state.sourceStatuses?.some(status => status.status !== "ok")) {
             runtime.progress = { phase: "listing" };
-            const candidates = await provider.list(JSON.parse(JSON.stringify(task.request)), { isCancelled: () => cancelled(runtime) });
+            let candidates: CorpusConversation[];
+            try { candidates = await provider.list(JSON.parse(JSON.stringify(task.request)), { isCancelled: () => cancelled(runtime) }); }
+            catch (error) {
+                captureSourceStatuses(task, provider);
+                if (!provider.sourceStatuses) task.state.sourceStatuses = task.state.sourceStatuses!.map(status => ({ ...status, status: "error", error: messageOf(error) }));
+                await saveState(task);
+                throw error;
+            }
+            captureSourceStatuses(task, provider, candidates);
             if (cancelled(runtime)) { await finishTask(task, "cancelled"); return; }
             if (!Array.isArray(candidates) || candidates.some(candidate => !candidate || typeof candidate.id !== "string" || !candidate.id
-                || candidate.source !== "codex" || typeof candidate.workspace !== "string")) throw new Error("Provider returned an invalid corpus candidate list");
-            task.candidates = [...new Map(candidates.filter(candidate => corpusConversationMatchesScope(candidate, task.request))
-                .map(candidate => [candidate.id, { ...candidate }])).values()].sort((left, right) => left.id < right.id ? -1 : left.id > right.id ? 1 : 0);
+                || !corpusTaskSources(task.request).includes(candidate.source) || typeof candidate.workspace !== "string"
+                || (candidate.sourceWarnings !== undefined && (!Array.isArray(candidate.sourceWarnings) || candidate.sourceWarnings.some(warning => typeof warning !== "string"))))) throw new Error("Provider returned an invalid corpus candidate list");
+            const byKey = new Map(task.candidates.map(candidate => [corpusConversationKey(candidate), candidate]));
+            for (const candidate of candidates.filter(candidate => corpusConversationMatchesScope(candidate, task.request))) {
+                const key = corpusConversationKey(candidate);
+                byKey.set(key, { ...candidate, sourceWarnings: [...new Set([...(byKey.get(key)?.sourceWarnings ?? []), ...(candidate.sourceWarnings ?? [])])] });
+            }
+            task.candidates = [...byKey.values()].sort((left, right) => corpusConversationKey(left).localeCompare(corpusConversationKey(right)));
             if (task.request.purpose === "prepare" && task.candidates.length !== 1) throw new Error("Corpus preparation target was not found");
             await writeCorpusJson(path.join(task.directory, "candidates.json"), task.candidates);
             task.state.discoveryComplete = true;
             task.state.phase = "scanning";
             await saveState(task);
             notify(runtime);
+            const failures = task.state.sourceStatuses!.filter(status => status.status === "error");
+            if (task.request.sourceFailureMode === "fail" && failures.length) {
+                throw new Error(failures.map(status => `${status.source}: ${status.error ?? "Source discovery failed"}`).join("; "));
+            }
         }
         const pending = task.candidates.filter(candidate => {
-            const committed = task.records.get(candidate.id);
+            const committed = task.records.get(corpusConversationKey(candidate));
             return !(committed?.complete && corpusSemanticVersionsEqual(committed.semanticVersion, task.state.semanticVersion));
         });
         let nextPrefetch = 0;
@@ -384,30 +435,36 @@ async function executeSearch(runtime: CorpusRuntime, provider: CorpusProvider): 
                 const candidate = pending[nextPrefetch++]!;
                 const cached = Promise.resolve().then(() => provider.readCached!(candidate, {
                     messageRoles: [...task.request.messageRoles!], isCancelled: () => stopPrefetch || cancelled(runtime),
-                })).then(projection => { publishPrefetch(candidate.id, { projection }); },
-                    error => { publishPrefetch(candidate.id, { error }); });
-                prefetched.set(candidate.id, cached);
+                })).then(projection => { publishPrefetch(corpusConversationKey(candidate), { projection }); },
+                    error => { publishPrefetch(corpusConversationKey(candidate), { error }); });
+                prefetched.set(corpusConversationKey(candidate), cached);
             }
         };
         const deferred = new Set<string>();
-        const pendingById = new Map(pending.map(candidate => [candidate.id, candidate]));
+        const pendingById = new Map(pending.map(candidate => [corpusConversationKey(candidate), candidate]));
         const processCandidate = async (candidate: CorpusConversation, cached?: CachedRead): Promise<boolean> => {
-            runtime.progress = { phase: "reading", conversationId: candidate.id };
+            runtime.progress = { phase: "reading", source: candidate.source, conversationId: candidate.id };
             notify(runtime);
             try {
                 if (cached && "error" in cached) throw cached.error;
                 const projection = cached?.projection ?? await readProjection(runtime, provider, candidate);
-                if (cancelled(runtime)) { await retractUnverified(runtime, candidate.id); return false; }
-                validateProjection(projection, candidate.id);
-                runtime.progress = { phase: task.request.purpose === "prepare" ? "preparing" : "query", conversationId: candidate.id };
-                await scanProjection(runtime, projection);
+                if (cancelled(runtime)) { await retractUnverified(runtime, candidate); return false; }
+                validateProjection(projection, candidate);
+                const identity = verifiedCorpusIdentity(projection.conversation);
+                const verifiedIdentity = identity ? { ...identity, sourceRevision: projection.revision } : undefined;
+                projection.conversation = { ...candidate, ...projection.conversation,
+                    sourceWarnings: [...new Set([...(candidate.sourceWarnings ?? []), ...(projection.conversation.sourceWarnings ?? [])])] };
+                projection.warnings = [...new Set([...(projection.conversation.sourceWarnings ?? []), ...projection.warnings])];
+                runtime.progress = { phase: task.request.purpose === "prepare" ? "preparing" : "query", source: candidate.source, conversationId: candidate.id };
+                await scanProjection(runtime, projection, candidate, verifiedIdentity);
             } catch (error) {
-                if (cancelled(runtime)) { await retractUnverified(runtime, candidate.id); return false; }
+                if (cancelled(runtime)) { await retractUnverified(runtime, candidate); return false; }
                 await commitConversation(runtime, {
-                    conversationId: candidate.id, complete: false,
+                    source: candidate.source, conversationId: candidate.id, complete: false,
                     result: null, scannedMessages: 0, mirrorMessagesSkipped: 0,
-                    sourceBytes: 0, warnings: [], error: messageOf(error),
+                    sourceBytes: 0, warnings: candidate.sourceWarnings ?? [], error: messageOf(error),
                 });
+                if (task.request.sourceFailureMode === "fail") throw error;
             }
             return true;
         };
@@ -427,7 +484,7 @@ async function executeSearch(runtime: CorpusRuntime, provider: CorpusProvider): 
             await flushCommits(runtime);
         }
         for (const candidate of pending) {
-            if (useCached && !deferred.has(candidate.id)) continue;
+            if (useCached && !deferred.has(corpusConversationKey(candidate))) continue;
             if (cancelled(runtime) || !await processCandidate(candidate)) break;
         }
         await settlePrefetch();
@@ -466,8 +523,7 @@ async function acquireSearchLease(directory: string, options: CorpusSearchIdenti
     const release = await acquireCorpusLease(directory);
     if (request.purpose !== "prepare") return release;
     try {
-        const execution = path.join(corpusOwnerDirectory(options), "preparations",
-            crypto.createHash("sha256").update(request.conversationIds![0]).digest("hex"), "execution");
+        const execution = path.join(corpusPreparationDirectory({ ...options, conversationId: request.conversationIds![0]!, source: corpusTaskSources(request)[0]! }), "execution");
         await fsp.mkdir(execution, { recursive: true });
         const deadline = Date.now() + 500;
         for (;;) {
@@ -485,6 +541,8 @@ async function acquireSearchLease(directory: string, options: CorpusSearchIdenti
 export async function startCorpusSearch(options: StartCorpusSearchOptions): Promise<CorpusSearchStatus> {
     corpusOwnerHash(options.ownerId);
     const request = compileCorpusSearch(options.request).request;
+    request.dataChains = resolveCorpusSources({ dataChains: request.dataChains });
+    request.sourceFailureMode ??= "warn";
     const semantics = semanticVersion(options.provider);
     const every = options.checkpointEveryMessages ?? 256;
     const interval = options.checkpointIntervalMs ?? 250;
@@ -503,7 +561,7 @@ export async function startCorpusSearch(options: StartCorpusSearchOptions): Prom
             version: 1, taskId, ownerId: options.ownerId, requestHash: crypto.createHash("sha256").update(JSON.stringify(request)).digest("hex"),
             secret: crypto.randomBytes(32).toString("hex"), status: "running", phase: "listing", revision: 0,
             discoveryComplete: false, createdAt: now, updatedAt: now, checkpointEveryMessages: every, checkpointIntervalMs: interval, computeMs: 0,
-            semanticVersion: semantics, commitBatchSize,
+            semanticVersion: semantics, commitBatchSize, dataChains: request.dataChains,
         };
         const task: CorpusTaskLoaded = { directory, state, request, candidates: [], records: new Map(), commits: [] };
         await writeCorpusJson(path.join(directory, "request.json"), request);
@@ -515,7 +573,9 @@ export async function startCorpusSearch(options: StartCorpusSearchOptions): Prom
 
 async function statusTask(options: CorpusSearchIdentity, preferSnapshot = false): Promise<CorpusTaskLoaded> {
     const directory = corpusTaskDirectory(options);
-    return runtimes.get(directory)?.task ?? loadCorpusTask(options, preferSnapshot);
+    const task = runtimes.get(directory)?.task ?? await loadCorpusTask(options, preferSnapshot);
+    validateSourceBinding(task, options);
+    return task;
 }
 
 export async function getCorpusSearchStatus(options: CorpusSearchStatusOptions): Promise<CorpusSearchStatus> {
@@ -537,7 +597,7 @@ export async function getCorpusSearchStatus(options: CorpusSearchStatusOptions):
         });
         task = await statusTask(options, true);
     }
-    let results = sortCorpusMatches(corpusCurrentRecords(task).flatMap(record => record.result ? [record.result] : []), task.request.sort);
+    let results = sortCorpusMatches(corpusResultRecords(task).flatMap(record => record.result ? [record.result] : []), task.request.sort);
     const semantics = task.state.semanticVersion ?? { query: null, provider: null };
     let viewSemanticVersion = semantics;
     let prepared = preparedEvidence(task);
@@ -553,12 +613,21 @@ export async function getCorpusSearchStatus(options: CorpusSearchStatusOptions):
         if (snapshot.snapshotId !== snapshotId || !Number.isInteger(snapshot.revision) || snapshot.revision > task.state.revision) {
             throw corpusTaskError("CORPUS_CURSOR_INVALID", "Final snapshot identity or revision is invalid");
         }
-        results = snapshot.results;
-        coverage = snapshot.coverage;
+        results = snapshot.results.map(result => ({ ...result, snippets: result.snippets.map(snippet => ({
+            ...snippet, source: result.conversation.source, conversationId: result.conversation.id, canonicalId: result.conversation.canonicalId,
+        })) }));
+        if (snapshot.coverage.sourceStatuses === undefined && JSON.stringify(corpusTaskSources(task.request)) !== '["codex"]') {
+            throw corpusTaskError("CORPUS_TASK_CORRUPT", "Multi-source snapshot is missing source coverage");
+        }
+        coverage = { ...snapshot.coverage, sourceStatuses: snapshot.coverage.sourceStatuses ?? [{
+            source: "codex", status: snapshot.coverage.complete ? "ok" : "partial", candidateCount: snapshot.coverage.candidateConversations, warnings: snapshot.coverage.warnings,
+        }] };
+        validateCorpusSourceStatuses(coverage.sourceStatuses, corpusTaskSources(task.request));
+        if (coverage.sourceStatuses.length !== corpusTaskSources(task.request).length) throw corpusTaskError("CORPUS_TASK_CORRUPT", "Snapshot source coverage is incomplete");
         viewRevision = snapshot.revision;
         snapshotStatus = snapshot.status;
         viewSemanticVersion = snapshot.semanticVersion ?? { query: null, provider: null };
-        prepared = snapshot.prepared;
+        prepared = snapshot.prepared ? { ...snapshot.prepared, source: snapshot.prepared.source ?? "codex" } : undefined;
         snapshotHash ??= crypto.createHash("sha256").update(JSON.stringify(snapshot)).digest("hex");
         if (offset > results.length) throw corpusTaskError("CORPUS_CURSOR_INVALID", "Cursor offset is outside the final snapshot");
     }
@@ -584,10 +653,13 @@ export async function getCorpusSearchStatus(options: CorpusSearchStatusOptions):
                 page = await readCorpusTaskCommitRange(task, options.afterRevision + 1, throughRevision);
             } catch { throw corpusTaskError("CORPUS_TASK_CORRUPT", "Requested corpus revision history is missing or invalid"); }
         }
-        const changed = new Map(page.filter(commit => commit.changed).map(commit => [commit.conversationId, commit]));
+        const changed = new Map(page.filter(commit => commit.changed).map(commit => [corpusCommitKey(commit), commit]));
+        const removed = [...changed.values()].filter(commit => !commit.result || !corpusSemanticVersionsEqual(commit.semanticVersion, task.state.semanticVersion));
         response.changes = {
             upserts: [...changed.values()].flatMap(commit => commit.result && corpusSemanticVersionsEqual(commit.semanticVersion, task.state.semanticVersion) ? [commit.result] : []),
-            removedConversationIds: [...changed.values()].filter(commit => !commit.result || !corpusSemanticVersionsEqual(commit.semanticVersion, task.state.semanticVersion)).map(commit => commit.conversationId),
+            removedConversationIds: corpusTaskSources(task.request).length === 1 ? removed.map(commit => commit.conversationId) : [],
+            removedConversations: removed.map(commit => ({ source: corpusCommitSource(commit), conversationId: commit.conversationId })),
+            removedConversationKeys: removed.map(corpusCommitKey),
             throughRevision, hasMore: throughRevision < task.state.revision,
         };
     }
