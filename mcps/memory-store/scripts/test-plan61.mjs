@@ -6,7 +6,16 @@ import { fileURLToPath } from "node:url";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const group = process.argv.find(argument => argument.startsWith("--group="))?.slice(8) || "all";
-if (!["all", "summary", "conversation"].includes(group)) throw new Error("Use --group=all|summary|conversation");
+if (!["all", "summary", "conversation", "guard"].includes(group)) throw new Error("Use --group=all|summary|conversation|guard");
+const guardTests = new Set([
+    "grok-client", "grok-availability", "grok-availability-enforced", "grok-concurrency",
+    "provider-transport-adapter", "provider-transport-wiring", "model-bridge",
+    "model-bridge-agy-deadline", "model-bridge-agy-preflight", "model-bridge-unknown-outcome",
+    "codex-bridge-diagnostics", "codex-bridge-stderr-rejection", "model-bridge-codex-stderr",
+    "background-task-diagnostics", "guard-final-coverage", "guard-final-coverage-tool",
+    "guard-provider-budget", "guard-target-scope", "guard-engine-evidence", "guard-engine-self-reference",
+    "stage-guard-target-binding", "cancel-guard",
+]);
 let tests = [
     "auto-summary-validation", "auto-summary-model-bridge", "auto-summary-stale-write",
     "auto-summary-repair", "auto-summary-locks", "auto-summary-tools", "auto-summary-root-fixes", "auto-summary-lock-publication", "auto-summary-independent-review",
@@ -23,7 +32,11 @@ let tests = [
     "devin-conversation", "devin-bridge", "devin-consumers", "devin-identity-cache-bridge", "devin-legacy-isolation",
     "devin-discovery-offline", "conversation-source-fingerprint", "local-pb-prepared", "local-pb-reader",
     "local-pb-activity-bridge", "windsurf-read-timing", "windsurf-read-partial-empty", "conversation-context-locate",
-].filter(name => group === "all" || (group === "summary") === name.startsWith("auto-summary-")).map(name => `tests/${name}.test.ts`);
+    ...guardTests,
+].filter(name => group === "all"
+    || (group === "guard" ? guardTests.has(name)
+        : group === "summary" ? name.startsWith("auto-summary-")
+            : !name.startsWith("auto-summary-") && !guardTests.has(name))).map(name => `tests/${name}.test.ts`);
 const startFrom = process.argv.find(argument => argument.startsWith("--start-from="))?.slice(13);
 if (startFrom) {
     const offset = tests.indexOf(`tests/${startFrom}.test.ts`);

@@ -1,0 +1,14 @@
+{
+  "description": "Sanitized CLI log shape; fixture-read-rules is inert text and must never be executed.",
+  "stdout": [
+    { "type": "thread.started", "thread_id": "fixture-thread" },
+    { "type": "turn.started" },
+    { "type": "item.completed", "item": { "id": "fixture-message", "type": "agent_message", "text": "Fixture progress only" } },
+    { "type": "item.started", "item": { "id": "fixture-tool", "type": "mcp_tool_call", "tool": "fixture_context", "status": "in_progress" } },
+    { "type": "item.completed", "item": { "id": "fixture-tool", "type": "mcp_tool_call", "tool": "fixture_context", "status": "failed", "error": { "message": "MCP tool is not available to the model" } } }
+  ],
+  "stderr": [
+    "2000-01-01T00:00:00.000001Z ERROR codex_models_manager::manager: failed to refresh available models: request timed out",
+    "2000-01-01T00:00:01.000001Z ERROR codex_core::tools::router: error=exec_command failed: CreateProcess { message: \"Rejected(\\\"`fixture-read-rules 中文猫` rejected: blocked by policy\\\")\" }"
+  ]
+}

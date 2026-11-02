@@ -622,11 +622,11 @@ export async function resolveModelChainCandidates(
         if (chain === "antigravity") return (await available(isLsAvailable)) ? ["antigravity"] : [];
         if (chain === "codex") return (await available(isCodexBridgeAvailable)) ? ["codex"] : [];
         if (chain === "claude-code") return (await available(isClaudeCodeBridgeAvailable)) ? ["claude-code"] : [];
-        if (chain === "grok") return (await available(isGrokBridgeAvailable)) ? ["grok"] : [];
+        if (chain === "grok") return (await available(() => isGrokBridgeAvailable(scopedOptions))) ? ["grok"] : [];
         if (chain === "agy") return (await available(() => isAgyBridgeAvailable(scopedOptions))) ? ["agy"] : [];
 
         const candidates: ResolvedChain[] = [];
-        if (await available(isGrokBridgeAvailable)) candidates.push("grok");
+        if (await available(() => isGrokBridgeAvailable(scopedOptions))) candidates.push("grok");
         if (isAgyAutoEnabled() && await available(() => isAgyBridgeAvailable(scopedOptions))) candidates.push("agy");
         if (await available(isLsAvailable)) candidates.push("antigravity");
         if (await available(isCodexBridgeAvailable)) candidates.push("codex");
@@ -737,7 +737,9 @@ export async function callCodexExec(prompt: string, model: string, timeoutMs: nu
                 error: finalResult.error, killTree: killTreeResult || undefined,
             });
             if (audit.rejectedCommandCount > 0) {
-                finalResult = { ...finalResult, safetyStopped: true, ...(finalResult.error ? { failureClass: "DeterministicInput" as const } : {}) };
+                finalResult = { ...finalResult, safetyStopped: true, ...(audit.stderrRejectedCommandCount > 0
+                    ? { error: "Codex CLI观察到明确拒绝，原调用已停止", failureClass: "DeterministicInput" as const }
+                    : finalResult.error ? { failureClass: "DeterministicInput" as const } : {}) };
             } else if (finalResult.error && audit.runningCommandCount > 0) {
                 finalResult = { ...finalResult, failureClass: "UnknownOutcome" };
             }
@@ -796,6 +798,7 @@ export async function callCodexExec(prompt: string, model: string, timeoutMs: nu
         child.stderr.on("data", (chunk) => {
             diagnostics.recordStderr(chunk);
             stderr = (stderr + stderrDecoder.write(chunk)).slice(-512 * 1024);
+            if (diagnostics.hasObservedRejection()) requestStop("rejection");
         });
 
         child.stdin.on("error", () => {
@@ -1257,7 +1260,7 @@ async function callModelResponseInternal(
             }
             if (result.cancelled) return { ...result, chainUsed: "codex", modelUsed: mapModelName(model) };
             if (candidates.length === 1) singleCandidateFailureClass = result.failureClass;
-            if (result.text) return { text: result.text, chainUsed: "codex", modelUsed: mapModelName(model), codexDiagnostics, safetyStopped: result.safetyStopped };
+            if (result.text) return { ...result, chainUsed: "codex", modelUsed: mapModelName(model), codexDiagnostics };
             recordFailure("codex", mapModelName(model), result.error || "Codex 模型桥调用失败", result.failureClass);
             if (result.timedOut || result.safetyStopped || result.failureClass === "UnknownOutcome" || chain === "codex") {
                 return {

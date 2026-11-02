@@ -14,6 +14,7 @@ import {
 } from "./guard-evidence-index.js";
 import type { GuardState } from "./guard-store.js";
 import { callModelResponse, resolveModelChainCandidates } from "./model-bridge.js";
+import { getGrokBridgeAvailabilityDiagnostics } from "./grok-client.js";
 import { loadConversationData } from "./conversation-bridge.js";
 import { assertConversationConsumerSourceComplete } from "./devin-source-evidence.js";
 import { iterateCachedConversationSourceCacheRounds } from "./conversation-source-cache.js";
@@ -318,9 +319,13 @@ async function callFlashWithChain(
         return { text: null, error: shouldAbortGuardRun(options) ? "Guard 模型调用已取消" : "Guard 模型预检超过总时限 [phase=preflight]", infrastructureError: true };
     }
     if (candidates.length === 0) {
+        const grokStatus = modelChain === "grok" || modelChain === "auto" ? getGrokBridgeAvailabilityDiagnostics() : null;
+        const grokFailure = grokStatus && !grokStatus.available
+            ? `；Grok预检 phase=${grokStatus.phase} failure=${grokStatus.failure || "unknown"} elapsedMs=${Math.round(grokStatus.durationMs)} timeoutMs=${grokStatus.timeoutMs}${grokStatus.status !== undefined ? ` httpStatus=${grokStatus.status}` : ""}${grokStatus.errorCode ? ` code=${grokStatus.errorCode}` : ""}`
+            : "";
         return {
             text: null,
-            error: `Guard modelChain=${modelChain || "auto"} 当前没有可用 provider；未用猜测 provider 的预算渲染后再次 auto 调用`,
+            error: `Guard modelChain=${modelChain || "auto"} 当前没有通过预检的模型链路${grokFailure}`,
             infrastructureError: true,
         };
     }

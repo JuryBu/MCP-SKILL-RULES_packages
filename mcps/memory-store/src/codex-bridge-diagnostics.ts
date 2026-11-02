@@ -42,6 +42,7 @@ export interface CodexBridgeDiagnostics {
     stderr: CodexDiagnosticArtifact;
     commandCount: number;
     rejectedCommandCount: number;
+    stderrRejectedCommandCount: number;
     failedCommandCount: number;
     runningCommandCount: number;
     eventCount: number;
@@ -71,6 +72,26 @@ interface CaptureStream {
     limit: number;
 }
 
+interface DiagnosticLines {
+    decoder: StringDecoder;
+    pendingLine: string;
+    skippingLine: boolean;
+    lineNumber: number;
+}
+
+interface StderrRejectionObservation {
+    source: "stderr";
+    lineNumber: number;
+    lineSha256: string;
+    logger: "codex_core::tools::router";
+    tool: string;
+    rejectionEvidence: "cli-policy-error";
+    reason: "blocked by policy";
+    command: string;
+    commandTruncated: boolean;
+    executionObserved: false;
+}
+
 interface DiagnosticOutcome {
     exitCode: number | null;
     timedOut: boolean;
@@ -86,6 +107,7 @@ const MAX_COMMANDS = 128;
 const MAX_COMMAND_CHARS = 8192;
 const REJECTION_STATUSES = new Set(["declined", "rejected", "denied"]);
 const REJECTION_CODES = new Set(["permission_denied", "approval_denied", "approval_rejected", "command_rejected", "exec_policy_denied", "sandbox_denied", "policy_denied"]);
+const STDERR_REJECTION_LOG = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z[ \t]+ERROR[ \t]+codex_core::tools::router:[ \t]+error=(exec_command|shell_command) failed:[ \t]+CreateProcess[ \t]*\{[ \t]*message:[ \t]*("(?:\\.|[^"\\])*")[ \t]*\}[ \t]*$/u;
 
 export function hasCodexModelRefusalClaim(text: string): boolean {
     const affirmative = text.replace(/(?:没有|并未|未曾|从未|未)\s*(?:被|遭)?\s*(?:策略)?\s*拒绝|\bno\s+(?:command|tool|read)\b[^\n.;]{0,40}\b(?:rejected|denied)\b|\b(?:not|never)\s+(?:been\s+)?(?:rejected|denied)\b/giu, "");
@@ -97,11 +119,11 @@ export class CodexDiagnosticRecorder {
     private readonly directory: string;
     private readonly stdout: CaptureStream;
     private readonly stderr: CaptureStream;
-    private readonly decoder = new StringDecoder("utf8");
+    private readonly stdoutLines: DiagnosticLines = { decoder: new StringDecoder("utf8"), pendingLine: "", skippingLine: false, lineNumber: 0 };
+    private readonly stderrLines: DiagnosticLines = { decoder: new StringDecoder("utf8"), pendingLine: "", skippingLine: false, lineNumber: 0 };
     private readonly commands = new Map<string, CommandObservation>();
+    private readonly stderrRejections = new Map<string, StderrRejectionObservation>();
     private readonly startedAt = new Date().toISOString();
-    private pendingLine = "";
-    private skippingLine = false;
     private eventCount = 0;
     private observedRejection = false;
     private eventCoverage: "complete" | "partial" = "complete";
@@ -158,34 +180,68 @@ export class CodexDiagnosticRecorder {
     recordStdout(chunk: Buffer | string): void {
         if (this.completed) return;
         const bytes = this.capture(this.stdout, chunk);
-        this.consumeText(this.decoder.write(bytes));
+        this.consumeText("stdout", this.stdoutLines.decoder.write(bytes));
     }
 
     recordStderr(chunk: Buffer | string): void {
-        if (!this.completed) this.capture(this.stderr, chunk);
+        if (this.completed) return;
+        const bytes = this.capture(this.stderr, chunk);
+        this.consumeText("stderr", this.stderrLines.decoder.write(bytes));
     }
 
     hasObservedRejection(): boolean {
         return this.observedRejection;
     }
 
-    private consumeText(text: string): void {
+    private consumeText(source: "stdout" | "stderr", text: string): void {
+        const stream = source === "stdout" ? this.stdoutLines : this.stderrLines;
         for (const fragment of text.split(/(?<=\n)/u)) {
             const finishedLine = fragment.endsWith("\n");
-            if (!this.skippingLine) {
-                this.pendingLine += fragment;
-                if (this.pendingLine.length > MAX_EVENT_LINE_CHARS) {
-                    this.pendingLine = "";
-                    this.skippingLine = true;
+            if (!stream.skippingLine) {
+                stream.pendingLine += fragment;
+                if (stream.pendingLine.length > MAX_EVENT_LINE_CHARS) {
+                    stream.pendingLine = "";
+                    stream.skippingLine = true;
                     this.eventCoverage = "partial";
                 }
             }
             if (finishedLine) {
-                if (!this.skippingLine) this.consumeEvent(this.pendingLine);
-                this.pendingLine = "";
-                this.skippingLine = false;
+                stream.lineNumber++;
+                if (!stream.skippingLine) {
+                    if (source === "stdout") this.consumeEvent(stream.pendingLine);
+                    else this.consumeStderr(stream.pendingLine, stream.lineNumber);
+                }
+                stream.pendingLine = "";
+                stream.skippingLine = false;
             }
         }
+    }
+
+    private consumeStderr(line: string, lineNumber: number): void {
+        const rawLine = line.replace(/\r?\n$/u, "");
+        const normalized = rawLine.replace(/\u001b\[[0-?]*[ -/]*[@-~]/gu, "");
+        const match = STDERR_REJECTION_LOG.exec(normalized);
+        if (!match) return;
+        let detail: unknown;
+        try {
+            const message: unknown = JSON.parse(match[2]);
+            if (typeof message !== "string" || !message.startsWith("Rejected(") || !message.endsWith(")")) return;
+            detail = JSON.parse(message.slice(9, -1));
+        } catch { return; }
+        const suffix = "` rejected: blocked by policy";
+        if (typeof detail !== "string" || !detail.startsWith("`") || !detail.endsWith(suffix)) return;
+        const command = detail.slice(1, -suffix.length);
+        if (!command) return;
+        this.observedRejection = true;
+        this.eventCoverage = "partial";
+        const lineSha256 = crypto.createHash("sha256").update(rawLine, "utf8").digest("hex");
+        if (this.stderrRejections.has(lineSha256) || this.stderrRejections.size >= MAX_COMMANDS) return;
+        this.stderrRejections.set(lineSha256, {
+            source: "stderr", lineNumber, lineSha256, logger: "codex_core::tools::router", tool: match[1],
+            rejectionEvidence: "cli-policy-error", reason: "blocked by policy",
+            command: command.slice(0, MAX_COMMAND_CHARS), commandTruncated: command.length > MAX_COMMAND_CHARS,
+            executionObserved: false,
+        });
     }
 
     private consumeEvent(line: string): void {
@@ -217,8 +273,10 @@ export class CodexDiagnosticRecorder {
     finish(outcome: DiagnosticOutcome): CodexBridgeDiagnostics {
         if (this.completed) return this.completed;
         if (outcome.timedOut || outcome.cancelled || outcome.exitCode === null) this.eventCoverage = "partial";
-        this.consumeText(this.decoder.end());
-        if (this.pendingLine && !this.skippingLine) this.consumeEvent(this.pendingLine);
+        this.consumeText("stdout", this.stdoutLines.decoder.end());
+        this.consumeText("stderr", this.stderrLines.decoder.end());
+        if (this.stdoutLines.pendingLine && !this.stdoutLines.skippingLine) this.consumeEvent(this.stdoutLines.pendingLine);
+        if (this.stderrLines.pendingLine && !this.stderrLines.skippingLine) this.consumeStderr(this.stderrLines.pendingLine, this.stderrLines.lineNumber + 1);
         const closeStream = (stream: CaptureStream): CodexDiagnosticArtifact => {
             if (stream.descriptor !== undefined) {
                 try { fs.closeSync(stream.descriptor); } catch (error) {
@@ -233,10 +291,15 @@ export class CodexDiagnosticRecorder {
             };
         };
         const commands = [...this.commands.values()];
+        const stderrRejections = [...this.stderrRejections.values()];
+        const structuredRejections = commands.filter(command => command.rejectionEvidence);
+        const stderrOnlyRejections = stderrRejections.filter(rejection => !structuredRejections.some(command =>
+            command.type === "command_execution" && !command.commandTruncated && !rejection.commandTruncated && command.command === rejection.command));
         const result: CodexBridgeDiagnostics = {
             callId: this.callId, stdout: closeStream(this.stdout), stderr: closeStream(this.stderr),
             commandCount: commands.length,
-            rejectedCommandCount: Math.max(this.observedRejection ? 1 : 0, commands.filter(command => command.rejectionEvidence).length),
+            rejectedCommandCount: Math.max(this.observedRejection ? 1 : 0, stderrRejections.length, structuredRejections.length + stderrOnlyRejections.length),
+            stderrRejectedCommandCount: stderrRejections.length,
             failedCommandCount: commands.filter(command => command.status === "failed" || typeof command.exitCode === "number" && command.exitCode !== 0).length,
             runningCommandCount: commands.filter(command => ["in_progress", "running"].includes(command.status)).length,
             eventCount: this.eventCount, eventCoverage: this.eventCoverage,
@@ -250,7 +313,7 @@ export class CodexDiagnosticRecorder {
             const manifestText = JSON.stringify({
                 version: 1, state: "finished", startedAt: this.startedAt, finishedAt: new Date().toISOString(),
                 recorderPid: process.pid, metadata: this.metadata, outcome: { ...outcome, lastText: undefined },
-                ...result, commands,
+                ...result, commands, stderrRejections,
             }, null, 2);
             fs.writeFileSync(partialPath, manifestText, { encoding: "utf8", flag: "wx", mode: 0o600 });
             fs.renameSync(partialPath, manifestPath);
