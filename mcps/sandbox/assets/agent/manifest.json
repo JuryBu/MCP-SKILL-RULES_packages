@@ -1,0 +1,160 @@
+{
+  "schemaVersion": 1,
+  "source": "approved-project-character-prototype",
+  "approvedAt": "2026-10-30",
+  "cellPixels": [
+    10,
+    20
+  ],
+  "regular": {
+    "columns": 30,
+    "rows": 17,
+    "width": 300,
+    "height": 340
+  },
+  "compact": {
+    "columns": 15,
+    "rows": 9,
+    "width": 150,
+    "height": 180
+  },
+  "animationFamilies": [
+    "idle",
+    "thinking",
+    "searching",
+    "typing"
+  ],
+  "visualDataSha256": "4c5880f5e74884f860e2762eeaa592c5c4badc065a3209bb55949bb70ef87e92",
+  "files": [
+    {
+      "path": "sprites.json",
+      "bytes": 46441,
+      "sha256": "1c6f8922fc5aa538a90c8d11874300f4cc2b02552ab54391612e10566799328c"
+    },
+    {
+      "path": "sixel/animation-index.json",
+      "bytes": 2248,
+      "sha256": "db5f8736b9748281636fa09a8b4b857961152990c481ba79d04de935407d2509"
+    },
+    {
+      "path": "sixel/cat-compact.sixel",
+      "bytes": 15085,
+      "sha256": "0a5e7f783f9907b975833384e2ef31b9d172765918cd79ef3b63d70fbbcbea0b"
+    },
+    {
+      "path": "sixel/cat-regular.sixel",
+      "bytes": 44201,
+      "sha256": "df07ccae4d2764bbb152a52ef8d51d5b2b6dda4dd002dd92f9676f260cfa8920"
+    },
+    {
+      "path": "sixel/human-compact.sixel",
+      "bytes": 39664,
+      "sha256": "65464f34929b8da4bffbeef9c30dba9303ed86b16633fcda8d0f6ef99757ee97"
+    },
+    {
+      "path": "sixel/human-regular.sixel",
+      "bytes": 102974,
+      "sha256": "a0f6a4d899122f1011eead741a6eefde8fcb2739b36625187ab0b6af8de9fd70"
+    },
+    {
+      "path": "sixel/idle-0-compact.sixel",
+      "bytes": 15688,
+      "sha256": "c04a61e24472b7a9e6c97faecab49a49781dc44f50ba176320f9940b0dc56ca3"
+    },
+    {
+      "path": "sixel/idle-0-regular.sixel",
+      "bytes": 43740,
+      "sha256": "3239a0b2ae4e26947ff3695ac1a4b76f30d60dfd603f8c65a2429f44bb0a37ce"
+    },
+    {
+      "path": "sixel/idle-1-compact.sixel",
+      "bytes": 15323,
+      "sha256": "9a57cadbb9c306591e3ef461df9b49fc686af402faa45206aa4b16fdf259a1c8"
+    },
+    {
+      "path": "sixel/idle-1-regular.sixel",
+      "bytes": 43022,
+      "sha256": "2ed542cae44baa84e2a594bb18598016ed5e1fa1377d73ee205af1a0e7c84309"
+    },
+    {
+      "path": "sixel/idle-2-compact.sixel",
+      "bytes": 15523,
+      "sha256": "735c05d135169262334fd81a13e2ff71ad3affc8eb0786da6a791997e0fed5b5"
+    },
+    {
+      "path": "sixel/idle-2-regular.sixel",
+      "bytes": 42819,
+      "sha256": "b8aaecfc2b5dc42dd7c0a0d4ebbf4fc3a646faeba66c8c002e0e68cd172dca00"
+    },
+    {
+      "path": "sixel/idle-3-compact.sixel",
+      "bytes": 15425,
+      "sha256": "1c5a51a006d1d7bac244b98a25dba88a13bfa1df5c2d05f43aaaae4dc2b8e67e"
+    },
+    {
+      "path": "sixel/idle-3-regular.sixel",
+      "bytes": 43097,
+      "sha256": "d58912acce98801a0461eeac354ebd8a34799371e7ef4c227cb3bb18b357e450"
+    },
+    {
+      "path": "sixel/searching-0-compact.sixel",
+      "bytes": 45649,
+      "sha256": "166d36fb5c107b2b78af1a60a2c7a5c9a6fb1d96253354a805c9fa8ab7b0c3c9"
+    },
+    {
+      "path": "sixel/searching-0-regular.sixel",
+      "bytes": 113361,
+      "sha256": "0d55daa05f30b587d8ba27ac53e95c8ca72e021e64960a8d088c7cb5b4c15566"
+    },
+    {
+      "path": "sixel/searching-1-compact.sixel",
+      "bytes": 44826,
+      "sha256": "913a32a792d5562dabf58662ce234eaef31153cbaadf07f1c1c6e4a8c22ca178"
+    },
+    {
+      "path": "sixel/searching-1-regular.sixel",
+      "bytes": 109746,
+      "sha256": "72268c50d110a906eabb8e6baf9cd60f2d624f144eabb3c0c33a56e83d0ee4e6"
+    },
+    {
+      "path": "sixel/thinking-0-compact.sixel",
+      "bytes": 43785,
+      "sha256": "b834ae6bbbe770628f660bb61bd55a6c91d554e7604f959e9827cfeea088c152"
+    },
+    {
+      "path": "sixel/thinking-0-regular.sixel",
+      "bytes": 108241,
+      "sha256": "6329b27d2ee7bcb0d392131f75fb4e359abf32a85f8c08d0db47c981bcfe3a6d"
+    },
+    {
+      "path": "sixel/thinking-1-compact.sixel",
+      "bytes": 43509,
+      "sha256": "92c1ae675f6f20705a608545ad340e03b1ad81811f3968e14fd3880a2d954573"
+    },
+    {
+      "path": "sixel/thinking-1-regular.sixel",
+      "bytes": 106477,
+      "sha256": "9164e888a6e2ef9a486149178ec4f67d4ea44b0f6a23eb19b00735a9ccb36cf9"
+    },
+    {
+      "path": "sixel/typing-0-compact.sixel",
+      "bytes": 48212,
+      "sha256": "bcd793efd767d5416315b81ec75f77efe29469597c46f0002fbcaada37a0d6d7"
+    },
+    {
+      "path": "sixel/typing-0-regular.sixel",
+      "bytes": 120658,
+      "sha256": "b2e13c80ade978df6f4046cdac73adfae3d38a9019562313b7871722edcc37f7"
+    },
+    {
+      "path": "sixel/typing-1-compact.sixel",
+      "bytes": 47847,
+      "sha256": "2becd04064458f4a199a1cac910a049d8eef152cf059ebb71a18ba8de50bf029"
+    },
+    {
+      "path": "sixel/typing-1-regular.sixel",
+      "bytes": 119731,
+      "sha256": "7317c821d94db3091584a5b2f3c730cd597f8facd2cf2847ee8efcfb5a2e1b92"
+    }
+  ]
+}

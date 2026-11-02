@@ -15,6 +15,7 @@ internal static class WindowsJobRunner
     private const uint JOB_OBJECT_LIMIT_JOB_MEMORY = 0x00000200;
     private const uint JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000;
     private const uint JOB_OBJECT_MSG_JOB_MEMORY_LIMIT = 10;
+    private const int JobObjectBasicAccountingInformation = 1;
     private const int JobObjectAssociateCompletionPortInformation = 7;
     private const int JobObjectExtendedLimitInformation = 9;
     private const uint WAIT_OBJECT_0 = 0;
@@ -105,6 +106,19 @@ internal static class WindowsJobRunner
     }
 
     [StructLayout(LayoutKind.Sequential)]
+    private struct JOBOBJECT_BASIC_ACCOUNTING_INFORMATION
+    {
+        public long TotalUserTime;
+        public long TotalKernelTime;
+        public long ThisPeriodTotalUserTime;
+        public long ThisPeriodTotalKernelTime;
+        public uint TotalPageFaultCount;
+        public uint TotalProcesses;
+        public uint ActiveProcesses;
+        public uint TotalTerminatedProcesses;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
     private struct PERFORMANCE_INFORMATION
     {
         public uint cb;
@@ -167,6 +181,9 @@ internal static class WindowsJobRunner
     private static extern bool GetExitCodeProcess(IntPtr process, out uint exitCode);
 
     [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool TerminateProcess(IntPtr process, uint exitCode);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
     private static extern bool CloseHandle(IntPtr handle);
 
     [DllImport("kernel32.dll", SetLastError = true)]
@@ -199,6 +216,7 @@ internal static class WindowsJobRunner
     {
         long memoryMB = 0;
         string metadataPath = null;
+        string controlFilePath = null;
         string currentDirectory = null;
         string shellCommandBase64 = null;
         int commandIndex = -1;
@@ -215,6 +233,10 @@ internal static class WindowsJobRunner
             else if (args[index] == "--cwd" && index + 1 < args.Length)
             {
                 currentDirectory = args[++index];
+            }
+            else if (args[index] == "--control-file" && index + 1 < args.Length)
+            {
+                controlFilePath = args[++index];
             }
             else if (args[index] == "--shell-base64" && index + 1 < args.Length)
             {
@@ -258,6 +280,14 @@ internal static class WindowsJobRunner
         PROCESS_INFORMATION process = new PROCESS_INFORMATION();
         bool memoryLimitHit = false;
         ulong peakBytes = 0;
+        bool commandStarted = false;
+        bool processAssigned = false;
+        bool resumeAttempted = false;
+        bool runCompleted = false;
+        bool cancelRequested = false;
+        uint? childExitCode = null;
+        string startErrorType = null;
+        int? startErrorCode = null;
         try
         {
             job = CreateJobObject(IntPtr.Zero, null);
@@ -286,12 +316,16 @@ internal static class WindowsJobRunner
                 ThrowLastWin32("CreateProcess");
             }
             if (!AssignProcessToJobObject(job, process.hProcess)) ThrowLastWin32("AssignProcessToJobObject");
+            processAssigned = true;
+            resumeAttempted = true;
             if (ResumeThread(process.hThread) == UInt32.MaxValue) ThrowLastWin32("ResumeThread");
+            commandStarted = true;
             CloseHandle(process.hThread);
             process.hThread = IntPtr.Zero;
 
-            WriteMetadata(metadataPath, peakBytes, memoryLimitHit, null, true, null, null);
+            WriteMetadata(metadataPath, peakBytes, memoryLimitHit, null, true, null, null, false, null, "unconfirmed", false, null);
             DateTime nextMetadataWrite = DateTime.UtcNow;
+            bool terminationRequested = false;
             while (true)
             {
                 uint wait = WaitForSingleObject(process.hProcess, 25);
@@ -299,37 +333,134 @@ internal static class WindowsJobRunner
                 peakBytes = Math.Max(peakBytes, QueryPeakJobMemory(job));
                 if (DateTime.UtcNow >= nextMetadataWrite)
                 {
-                    WriteMetadata(metadataPath, peakBytes, memoryLimitHit, null, true, null, null);
+                    WriteMetadata(metadataPath, peakBytes, memoryLimitHit, null, true, null, null, false, null, "unconfirmed", cancelRequested, null);
                     nextMetadataWrite = DateTime.UtcNow.AddMilliseconds(100);
                 }
-                if (memoryLimitHit)
+                if (memoryLimitHit && !terminationRequested)
                 {
-                    TerminateJobObject(job, 137);
+                    if (!TerminateJobObject(job, 137)) ThrowLastWin32("TerminateJobObject");
+                    terminationRequested = true;
                 }
                 if (wait == WAIT_OBJECT_0) break;
                 if (wait != WAIT_TIMEOUT) ThrowLastWin32("WaitForSingleObject");
+                if (!terminationRequested && IsCancellationRequested(controlFilePath))
+                {
+                    cancelRequested = true;
+                    if (!TerminateJobObject(job, 130)) ThrowLastWin32("TerminateJobObject");
+                    terminationRequested = true;
+                }
             }
 
             DrainCompletionPort(completionPort, ref memoryLimitHit);
             peakBytes = Math.Max(peakBytes, QueryPeakJobMemory(job));
-            uint childExitCode;
-            if (!GetExitCodeProcess(process.hProcess, out childExitCode)) ThrowLastWin32("GetExitCodeProcess");
-            WriteMetadata(metadataPath, peakBytes, memoryLimitHit, childExitCode, true, null, null);
-            return memoryLimitHit ? 137 : unchecked((int)childExitCode);
+            uint exitCode;
+            if (!GetExitCodeProcess(process.hProcess, out exitCode)) ThrowLastWin32("GetExitCodeProcess");
+            childExitCode = exitCode;
+            runCompleted = true;
+            return memoryLimitHit ? 137 : unchecked((int)exitCode);
         }
         catch (Exception error)
         {
-            string errorType = !Directory.Exists(currentDirectory) ? "working_directory_missing" : "payload_start_failed";
+            if (!commandStarted)
+            {
+                startErrorType = !string.IsNullOrEmpty(currentDirectory) && !Directory.Exists(currentDirectory)
+                    ? "working_directory_missing" : "payload_start_failed";
+            }
             Win32Exception win32 = error as Win32Exception;
-            WriteMetadata(metadataPath, peakBytes, memoryLimitHit, null, false, errorType, win32 != null ? (int?)win32.NativeErrorCode : null);
+            startErrorCode = win32 != null ? (int?)win32.NativeErrorCode : null;
             throw;
         }
         finally
         {
-            if (process.hThread != IntPtr.Zero) CloseHandle(process.hThread);
-            if (process.hProcess != IntPtr.Zero) CloseHandle(process.hProcess);
-            if (completionPort != IntPtr.Zero) CloseHandle(completionPort);
-            if (job != IntPtr.Zero) CloseHandle(job);
+            bool handlesClosed = true;
+            int? cleanupErrorCode = null;
+            uint? activeProcessesAtRelease = null;
+            if (process.hProcess != IntPtr.Zero && !processAssigned)
+            {
+                if (!TerminateProcess(process.hProcess, 250)) cleanupErrorCode = Marshal.GetLastWin32Error();
+                if (WaitForSingleObject(process.hProcess, 3500) != WAIT_OBJECT_0) handlesClosed = false;
+            }
+            if (process.hThread != IntPtr.Zero && !CloseHandle(process.hThread)) handlesClosed = false;
+            if (process.hProcess != IntPtr.Zero && !CloseHandle(process.hProcess)) handlesClosed = false;
+            bool jobReleased = ReleaseJob(job, memoryLimitHit ? 137U : cancelRequested ? 130U : 0U, out activeProcessesAtRelease, ref cleanupErrorCode);
+            if (completionPort != IntPtr.Zero && !CloseHandle(completionPort)) handlesClosed = false;
+            bool terminalConfirmed = (runCompleted || !resumeAttempted) && handlesClosed && jobReleased && !cleanupErrorCode.HasValue;
+            WriteMetadata(metadataPath, peakBytes, memoryLimitHit, childExitCode, commandStarted, startErrorType, startErrorCode,
+                terminalConfirmed, activeProcessesAtRelease, terminalConfirmed ? "released" : "unconfirmed", cancelRequested, cleanupErrorCode);
+        }
+    }
+
+    private static bool IsCancellationRequested(string controlFilePath)
+    {
+        if (string.IsNullOrEmpty(controlFilePath)) return false;
+        try
+        {
+            using (FileStream stream = new FileStream(controlFilePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
+            {
+                if (stream.Length > 64) return false;
+                using (StreamReader reader = new StreamReader(stream, Encoding.UTF8, true))
+                {
+                    return string.Equals(reader.ReadToEnd().Trim(), "cancel", StringComparison.Ordinal);
+                }
+            }
+        }
+        catch (IOException) { return false; }
+        catch (UnauthorizedAccessException) { return false; }
+    }
+
+    private static bool ReleaseJob(IntPtr job, uint exitCode, out uint? activeProcessesAtRelease, ref int? cleanupErrorCode)
+    {
+        activeProcessesAtRelease = null;
+        if (job == IntPtr.Zero) return false;
+        bool confirmed = false;
+        try
+        {
+            activeProcessesAtRelease = QueryActiveProcesses(job);
+            if (activeProcessesAtRelease.Value > 0)
+            {
+                if (!TerminateJobObject(job, exitCode)) ThrowLastWin32("TerminateJobObject");
+                Stopwatch cleanupClock = Stopwatch.StartNew();
+                do
+                {
+                    activeProcessesAtRelease = QueryActiveProcesses(job);
+                    if (activeProcessesAtRelease.Value == 0) break;
+                    Thread.Sleep(10);
+                }
+                while (cleanupClock.ElapsedMilliseconds < 3500);
+            }
+            confirmed = activeProcessesAtRelease == 0;
+        }
+        catch (Win32Exception error)
+        {
+            cleanupErrorCode = error.NativeErrorCode;
+        }
+        finally
+        {
+            if (!CloseHandle(job))
+            {
+                cleanupErrorCode = Marshal.GetLastWin32Error();
+                confirmed = false;
+            }
+        }
+        return confirmed;
+    }
+
+    private static uint QueryActiveProcesses(IntPtr job)
+    {
+        int size = Marshal.SizeOf(typeof(JOBOBJECT_BASIC_ACCOUNTING_INFORMATION));
+        IntPtr buffer = Marshal.AllocHGlobal(size);
+        try
+        {
+            if (!QueryInformationJobObject(job, JobObjectBasicAccountingInformation, buffer, (uint)size, IntPtr.Zero))
+            {
+                ThrowLastWin32("QueryInformationJobObject(active processes)");
+            }
+            JOBOBJECT_BASIC_ACCOUNTING_INFORMATION information = (JOBOBJECT_BASIC_ACCOUNTING_INFORMATION)Marshal.PtrToStructure(buffer, typeof(JOBOBJECT_BASIC_ACCOUNTING_INFORMATION));
+            return information.ActiveProcesses;
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(buffer);
         }
     }
 
@@ -422,7 +553,8 @@ internal static class WindowsJobRunner
         }
     }
 
-    private static void WriteMetadata(string path, ulong peakBytes, bool memoryLimitHit, uint? childExitCode, bool commandStarted, string startErrorType, int? startErrorCode)
+    private static void WriteMetadata(string path, ulong peakBytes, bool memoryLimitHit, uint? childExitCode, bool commandStarted, string startErrorType, int? startErrorCode,
+        bool terminalConfirmed, uint? activeProcessesAtRelease, string cleanupState, bool cancelRequested, int? cleanupErrorCode)
     {
         string directory = Path.GetDirectoryName(path);
         if (!string.IsNullOrEmpty(directory)) Directory.CreateDirectory(directory);
@@ -431,8 +563,23 @@ internal static class WindowsJobRunner
             ",\"childExitCode\":" + (childExitCode.HasValue ? childExitCode.Value.ToString(CultureInfo.InvariantCulture) : "null") +
             ",\"commandStarted\":" + (commandStarted ? "true" : "false") +
             ",\"startErrorType\":" + (startErrorType == null ? "null" : "\"" + startErrorType + "\"") +
-            ",\"startErrorCode\":" + (startErrorCode.HasValue ? startErrorCode.Value.ToString(CultureInfo.InvariantCulture) : "null") + "}";
-        File.WriteAllText(path, json, new UTF8Encoding(false));
+            ",\"startErrorCode\":" + (startErrorCode.HasValue ? startErrorCode.Value.ToString(CultureInfo.InvariantCulture) : "null") +
+            ",\"terminalConfirmed\":" + (terminalConfirmed ? "true" : "false") +
+            ",\"activeProcessesAtRelease\":" + (activeProcessesAtRelease.HasValue ? activeProcessesAtRelease.Value.ToString(CultureInfo.InvariantCulture) : "null") +
+            ",\"cleanupState\":\"" + cleanupState + "\"" +
+            ",\"cancelRequested\":" + (cancelRequested ? "true" : "false") +
+            ",\"cleanupErrorCode\":" + (cleanupErrorCode.HasValue ? cleanupErrorCode.Value.ToString(CultureInfo.InvariantCulture) : "null") + "}";
+        string temporaryPath = path + ".tmp-" + Process.GetCurrentProcess().Id.ToString(CultureInfo.InvariantCulture);
+        try
+        {
+            File.WriteAllText(temporaryPath, json, new UTF8Encoding(false));
+            if (File.Exists(path)) File.Replace(temporaryPath, path, null);
+            else File.Move(temporaryPath, path);
+        }
+        finally
+        {
+            if (File.Exists(temporaryPath)) File.Delete(temporaryPath);
+        }
     }
 
     private static string QuoteArgument(string value)

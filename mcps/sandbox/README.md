@@ -1,10 +1,12 @@
-# MCP Sandbox v1.18.1
+# MCP Sandbox v1.19.0
 
 > Grok / ProGrok 支持仅包含客户端桥接代码；本包不提供代理服务、账号、API Key，也不会自动安装、启动或修补接收方的 ProGrok。任何 `yolo` / 自动批准模式都属于高权限执行选项，通用安装不要默认启用。
 
-代码执行沙箱 MCP Server，解决 Antigravity IDE 中 run_command 的超时卡死、临时文件繁琐、输出管理粗糙等痛点。
+代码执行与外部模型会话 MCP Server，提供受控进程执行、资源管理、代码搜索和独立的 Sandbox Agent Server。
 
 ## 功能
+
+代码与进程：
 
 | 工具 | 功能 |
 |------|------|
@@ -12,10 +14,49 @@
 | `sandbox_session` | 持久 REPL 会话，变量状态跨调用保持 |
 | `sandbox_batch` | 一次调用并行执行多个任务 |
 | `sandbox_status` | 查看系统状态、可用环境、GPU/CUDA 信息 |
-| `sandbox_codex` | Codex CLI 专用调用，后台模式不阻塞，自动报告检查，支持 gpt-5.5/exec review |
 | `sandbox_launch` | 长任务脱离执行（模型训练等），进程独立于 MCP，磁盘持久化 |
+
+模型与搜索：
+
+| 工具 | 功能 |
+|------|------|
+| `sandbox_codex` | Codex CLI 专用调用，后台模式不阻塞，自动报告检查，支持 gpt-5.5/exec review |
 | `smart_search` | 三模式代码搜索（exact/fuzzy/smart），smart 支持 `modelChain=auto|grok|antigravity|codex|claude-code|cc` 链路选择，兼容 `chain` |
 | `sandbox_council` | 多模型审议工具，主持模型控制轮次和有限工具调用，Markdown/JSON 副本落盘 |
+| `sandbox_agent` | 外部 API 模型会话，与人工 CLI 共用控制、存储、工具循环和费用账本 |
+| `sandbox_grok` | 选择已有 Progrok 配置，通过同一 Agent Server 使用 Grok |
+
+## Sandbox Agent 与外部模型
+
+普通辅助工作继续使用宿主原有子代理和工具；用户明确指定外部模型，或任务确需该模型时，使用 `sandbox_agent`、`sandbox_grok` 或 Council 的 API 模式。人工入口为 npm bin `sandbox_agent`，完整命令、字段及异常处理见 [CLI 使用说明](src/agent-cli/README.md)。
+
+本节描述源码中的 Agent 接口。安装时核对完整 `dist/`、`assets/agent/`、锁定依赖及支持 `node:sqlite` 的 Node 运行时，再用 CLI `--help/--version`、Agent `server.info` 和新 MCP 连接的 `tools/list` 核对实际能力。构建、安装、进程加载和目标环境验收分别记录，旧客户端可能缓存工具说明。
+
+本包要求 **Node.js >=24.12.0**，版本下限采用当前实际已验范围：源码构建和完整正式验收使用 Node.js **24.12.0**，独立安装运行已在 **24.22.1** 核验，**22 系尚未验收**。依赖包含 `undici@7.30.1`，Agent Core 默认使用 `node:sqlite`，部署时同时保留锁定依赖和对应 Node 运行时。
+
+### 会话、权限与模型选择
+
+MCP 调用显式提供 `callerHost/callerConversationId/action/params`，前两个字段标识外部主调用方，`params.conversationId` 标识 Agent 会话。`action` 使用正式 RPC 方法名，公共 schema 定义运行参数；复杂操作按 CLI 说明和对应方法的实际 schema 执行。
+
+普通资料可按当前系统账号已有权限读取，写入限主调用方批准的根目录及动作声明的路径，修改时核对文件版本。CLI 新建会话默认归档保存、写入根为当前工作目录，`--write-root` 可重复指定。删除、配置及 Git 历史变更等危险动作交主调用方核对批准，控制文件和凭据由可信核心保护。命令和共享工具遵守同一任务规则，可靠检测命中本机禁止动作时保留错误、暂停并交回主调用方。
+
+内部子任务默认关闭，明确启用后最多一层，主调用方指定模型、推理强度、规则、写入范围和父子预算。模型规则优先选择会话的 `options.modelRulesRef`，未提供时选择 API Profile 的 `globalModelRulesRef`，按本次运行冻结来源、版本和哈希；明确提供的任务规则无效时返回错误。普通辅助工作仍沿用宿主原生子代理，内部模型禁止递归调用模型工具。
+
+先用 `profile list/get/validate` 查看已有脱敏配置，再用 `model list/get` 查看精确模型目录。上下文窗口、输出上限、模态、参数和价格随来源及版本记录，未获声明的能力显示 `unknown`。联网刷新目录使用显式 `model refresh`。执行需要有限根预算和供应商跨任务累计上限，模型与推理强度分别按当前条目选择。
+
+`sandbox_grok` 复用已有 `protocol=progrok` 配置，多个配置时显式选择 `profileId`。创建、更新会话或 `runs.start` 可指定 `modelId`；查询、交互和取消沿用原会话及执行身份。Grok 入口沿用 Agent 的权限、保存、预算和回执合同。
+
+### 未知结果、保存与恢复
+
+超时或断连后，沿原客户端、命令号、会话、执行和预算查回，停止自动重发收费动作。原执行为 `outcome_unknown` 且本地工作及所属资源确认释放后，主调用方可显式 `runs.cancel(acknowledgeUnknown=true)` 结束本地等待。返回 `waitEnded=true` 时，CLI 仍为退出码 **7**，原结果、副作用和费用未知状态及预留继续保留。旧 `error` 回执保持原内容，本次确认使用独立的稳定命令号；新任务另行明确提交。
+
+| 保存方式 | CLI 选择 | 生命周期 |
+|---|---|---|
+| 临时 | `--mode temporary` | 正常关闭后清理正文、媒体及所属临时引用，最小核账状态单独保留 |
+| 限时 | `--mode ttl --ttl 2h` | 按显式时长和活动执行、未决资源状态处理到期清理 |
+| 长期归档 | `--mode archive` | 持久保留原文及原件，按实际状态关闭和重开 |
+
+保存方式变更先预览，再带原 `previewToken/policyRevision` 确认。BPC（后台渐进压缩）整理后续请求所用的较早内容，依次选择会话压缩模型、API 配置的全局压缩模型、当前任务模型；未另配时沿用当前模型。完整原文、媒体及原生响应引用按所选保存生命周期保留，通过 `history` 和 `artifact list/show/save` 查回并校验。临时会话关闭后的内容清理、原费用未知和压缩原候选恢复各按自身状态处理，详细步骤见 [CLI 使用说明](src/agent-cli/README.md)。
 
 ## 核心优势（vs run_command）
 
@@ -163,7 +204,7 @@ Windsurf / WSF 通过本机共享 HTTP broker 使用 Sandbox MCP，不新增任�
 
 - WSF MCP 配置文件：客户端自己的 MCP 配置文件
 - 推荐配置：`mcpServers.sandbox.serverUrl = "http://127.0.0.1:14588/sandbox/mcp"`
-- 已验证 broker 端点：`/sandbox/mcp` 可完成 MCP `initialize` / `tools/list`，暴露 8 个 Sandbox 工具
+- broker 端点为 `/sandbox/mcp`，通过 MCP `initialize` / `tools/list` 核对连接及实际工具集合；Agent/Grok 的安装与运行范围按对应版本单独验收
 - 若 WSF 直连 Streamable HTTP `/mcp` 失败，fallback 是用 `mcp-remote` stdio 包装同一个 broker endpoint；不要把 Sandbox 改成 WSF 专属 stdio 后端
 - WSF 只作为 MCP 客户端；`modelChain="windsurf"` 和 `provider="windsurf"` 均不支持，也不应加入 schema
 - WSF 侧使用 `sandbox_session`、`sandbox_launch`、`smart_search(background=true)`、`sandbox_council(background=true)` 时必须显式传稳定 `ownerId`，建议形如 `wsf:<project-or-task>`，避免共享 broker 下与 Codex / Antigravity / Claude Code 串任务
@@ -172,13 +213,15 @@ Windsurf / WSF 通过本机共享 HTTP broker 使用 Sandbox MCP，不新增任�
 
 ## sandbox_council 多模型审议
 
-`sandbox_council` 用于红蓝黑队讨论、设计审议、实验结果复盘、做题后审议和 Guard 式检查。它不是完整 agentic sandbox：参与模型只发言，只有 `moderator` 主持模型能决定调用有限工具、继续讨论、点名补充或终止。
+`sandbox_council` 用于多角度讨论、设计审议、实验结果复盘、做题后审议和 Guard 式检查。参与模型独立发言，`moderator` 主持模型控制讨论节奏；既有 provider 可按配置调用有限工具。
+
+共用 API 模式使用 `provider="api"`，每个参与者及主持人选择已有 `profileId`、目录中的 `model`、实际支持的 `params` 和有限 `budget`，沿用 Agent Server 的供应商累计费用上限。此模式只讨论调用方准备的材料，关闭全部执行工具，图片与原生响应按产物引用保存。未知受理沿原命令、会话及执行查回，费用预留保持，停止自动重发和换模型。配置与预算字段见 [CLI 使用说明](src/agent-cli/README.md)。
 
 核心能力：
 
 - `participants[]`: 每个参与者配置 `id / role / provider / model / params / supportsVision`
 - `moderator`: 主持模型配置对象，必须包含 `id / role / provider`，可选 `model / params / supportsVision`；不能写成 `"gpt-5.4"` 字符串
-- `provider`: `antigravity`、`codex`、`grok`、`claudeCode`、`openai`、`anthropic`、`gemini`、`antigravityCli`、`geminiCli`（兼容别名）、`customOpenAICompatible`
+- `provider`: `api`（共用 Agent 配置）、`antigravity`、`codex`、`grok`、`claudeCode`、`openai`、`anthropic`、`gemini`、`antigravityCli`、`geminiCli`（兼容别名）、`customOpenAICompatible`
 - WSF 不提供 `provider="windsurf"`；在 WSF Cascade 中调用 council 时仍需显式选择现有 provider
 - `files[]`: 背景文件，支持 `range`；纯文本文件直接抽取，图片会自动提升到 `images[]`。复杂文件优先经本地 `agy`（`antigravityCli`）索引，再降级到安全的本地结构化解析；PPTX 始终不交给 Codex。其他结构化文件只有显式启用 `SANDBOX_COUNCIL_STRUCTURED_CODEX_FALLBACK=1` 才允许 Codex 作为最后兜底。索引产物会检查大小和 `<<<COUNCIL_INDEX>>>` 标记，避免把大索引堆进内存
 - `manualContext`: 手动粘贴的上下文

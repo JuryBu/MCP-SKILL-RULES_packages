@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * MCP Sandbox Server v1.18.1
+ * MCP Sandbox Server v1.19.0
  *
  * 代码执行沙箱，解决 Antigravity IDE 中 run_command 的痛点。
  *
@@ -33,6 +33,8 @@ import { registerCodex, cleanupCodexTasks } from "./tools/codex.js";
 import { registerLaunch } from "./tools/launch.js";
 import { registerSmartSearch } from "./tools/smart-search.js";
 import { registerCouncil } from "./tools/council.js";
+import { registerAgent, cleanupAgentClients } from "./tools/agent.js";
+import { registerGrok } from "./tools/grok.js";
 import { cleanOldCouncilTasks, scanCouncilTasksOnStartup } from "./council/background.js";
 import { runCouncilArtifactGc } from "./council/artifact-gc.js";
 import { initParentLs } from "./ls-client.js";
@@ -43,7 +45,7 @@ import { initParentLs } from "./ls-client.js";
 // 创建 MCP Server 实例
 const server = new McpServer({
     name: "sandbox-mcp-server",
-    version: "1.18.1",
+    version: "1.19.0",
 });
 
 // 注册所有 8 个工具
@@ -55,6 +57,8 @@ registerCodex(server);
 registerLaunch(server);
 registerSmartSearch(server);
 registerCouncil(server);
+registerAgent(server);
+registerGrok(server);
 
 // === 使用指南 Resource ===
 server.resource(
@@ -68,13 +72,31 @@ server.resource(
         contents: [
             {
                 uri: "sandbox://guide",
-            text: `# MCP Sandbox v1.18.1 使用指南
+            text: `# MCP Sandbox v1.19.0 使用指南
 
 默认实时水位调度：实际物理/提交余量和Windows压力信号决定接纳，不再因1536MB预估记账或2048MB总观测线单独拒绝；显式24MB按24MB记账。已开始任务经过默认1秒启动观察窗口、被后续系统采样覆盖后退出预估扣账；新增观测增长继续保留到下一采样。小请求在黄色水位继续前进，红色水位、过期采样和恢复未完成仍暂停新执行。单进程树maxMemoryMB硬保护不变。错误正文与结构化结果同时解释有效请求、真实阻断和水位。SANDBOX_ADMISSION_MODE=fixed仅供显式选择旧额度模式。
 
 参数与判断：memoryRequestMB合法范围为16～maxMemoryMB，显式24MB不会提升；普通工具省略时取min(硬上限,max(64,ceil(硬上限/4)))，Codex使用其单独配置的默认请求。admission_timeout只证明启动前等待超时，先看admissionDecision.blockedBy：水位、过期/不完整采样、后台恢复和显式fixed额度是不同原因。按有效retryAfterMs最多重试一次，不为排队而盲目低报估计；memory/execution_timeout等已启动失败先核对副作用。
 
 局部限制：batch仍有本次maxParallel与maxTotalMemoryMB预算，Session仍有会话数和请求总额限制；它们不代表系统缺内存，实时水位模式没有移除这些可配置工具限制。短命令优先exec/batch，持久资源显式传ownerId，不清理他人会话。长任务采用后台taskId，Codex宿主按30～45秒短轮询，不超过60秒。当前会话可能缓存旧说明，实际版本以新连接的tools/list与sandbox://guide为准，不因刷新说明重启整个Codex。
+
+## 外部模型与 Sandbox Agent
+
+普通辅助工作继续使用宿主原生子代理和工具；用户指定或任务确需外部API模型时，使用sandbox_agent、sandbox_grok或Council API模式。人工CLI的npm bin名为sandbox_agent，与MCP共用独立Agent Server。此处说明源码接口，已安装能力由server.info和新连接tools/list核对。
+
+sandbox_agent显式传callerHost/callerConversationId/action/params，前两项为外部主调用方身份，params.conversationId为Agent会话。公共schema定义运行参数，action与正式RPC同名。sandbox_grok选择已有protocol=progrok配置，多配置时显式选profileId；创建、更新会话或runs.start可选modelId，查询、交互和取消沿原执行身份。
+
+普通资料按当前账号已有权限读取，写入限批准根及动作声明的路径，危险动作交主调用方批准。CLI新建默认归档，写入根默认当前工作目录，可重复--write-root。控制文件和凭据由可信核心保护，命令和共享工具遵守同一任务规则；可靠检测命中本机禁止动作时保留错误并暂停，交主调用方处理。
+
+内部子任务默认关闭，明确启用后最多一层，主调用方指定模型、推理强度、冻结规则、写入范围和预算。模型规则优先options.modelRulesRef，未提供时取API Profile的globalModelRulesRef；明确提供但无效时返回错误。内部模型禁止递归调用模型工具。
+
+先查看脱敏profile与精确model目录，模型和推理强度分别按实际参数声明选择。执行需要有限根预算及供应商跨任务累计上限；Council的provider=api选择已有profileId/model/params/budget，只讨论准备好的材料并关闭执行工具。
+
+断连或结果未知时沿原clientCommandId、conversationId、runId、expectedRunEpoch及预算查回，停止自动重发收费动作。原outcome_unknown执行的本地工作和所属资源确认释放后，主调用方可显式runs.cancel(acknowledgeUnknown=true)结束本地等待。waitEnded=true时CLI仍返回7，原结果、副作用与费用未知状态及预留继续保留；旧error回执保持，新确认使用独立稳定命令号，新任务另行明确提交。
+
+保存方式为temporary、ttl（显式时长）与archive。保存策略变更先预览再确认，普通权限更新按当前版本及空闲资源检查执行。BPC（后台渐进压缩）依次取会话压缩模型、API全局压缩模型、当前任务模型，未另配时沿用当前模型。完整原文、图片及原生响应引用在所选保存生命周期内保留，用history和artifact命令查回原件。
+
+完整命令、字段和恢复示例见[CLI使用说明](src/agent-cli/README.md)。目标终端IME、字体与实体操作链，以及各真实供应商的模型能力，按对应版本与实际环境分别验收。
 
 ## 核心优势（vs run_command）
 | 功能 | run_command | sandbox |
@@ -562,7 +584,7 @@ async function heartbeatCheck(): Promise<void> {
 
 // === 启动 ===
 async function main(): Promise<void> {
-console.error(`[sandbox] MCP Server v1.18.1 启动中... (ppid=${process.ppid})`);
+console.error(`[sandbox] MCP Server v1.19.0 启动中... (ppid=${process.ppid})`);
     logStdinEvent("STARTED");
 
     // 初始化数据目录
@@ -622,7 +644,7 @@ console.error(`[sandbox] MCP Server v1.18.1 启动中... (ppid=${process.ppid})`
     const transport = new StdioServerTransport();
     await server.connect(transport);
 
-console.error(`[sandbox] MCP Server v1.18.1 已启动，绑定父 LS PID=${process.ppid}`);
+console.error(`[sandbox] MCP Server v1.19.0 已启动，绑定父 LS PID=${process.ppid}`);
     logStdinEvent(`BOUND to parent LS PID=${process.ppid}`);
 
     // === 非 LS 环境兜底超时 ===
@@ -657,6 +679,7 @@ const cleanup = async () => {
     isClosing = true;
     console.error("[sandbox] 正在关闭...");
     clearInterval(heartbeatTimer);
+    await cleanupAgentClients();
     closeAllSessions(); // 关闭所有 REPL 会话和子进程
     cleanupCodexTasks(); // 清理所有后台 Codex 任务
 };

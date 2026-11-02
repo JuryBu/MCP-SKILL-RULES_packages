@@ -22,6 +22,7 @@ import type {
     CouncilTurnMessage,
 } from "./types.js";
 import { normalizeCouncilModelConfig, normalizeCouncilProvider } from "./types.js";
+import { AgentCouncilSession, type CouncilApiClientFactory } from "./api-session.js";
 
 const DEFAULT_MAX_ROUNDS = Number(process.env.SANDBOX_COUNCIL_MAX_ROUNDS || 4);
 const DEFAULT_MAX_TOOL_CALLS = Number(process.env.SANDBOX_COUNCIL_MAX_TOOL_CALLS || 6);
@@ -39,7 +40,7 @@ function clip(text: string, maxChars: number): string {
 function supportsDirectImageInput(config: CouncilRunParams["participants"][number] | CouncilRunParams["moderator"]): boolean {
     if (!config.supportsVision) return false;
     const provider = normalizeCouncilProvider(config.provider);
-    return ["openai", "anthropic", "gemini", "antigravityCli", "grok", "customOpenAICompatible"].includes(provider);
+    return Boolean(config.profileId) || ["api", "openai", "anthropic", "gemini", "antigravityCli", "grok", "customOpenAICompatible"].includes(provider);
 }
 
 function normalizeTimeoutMs(value: unknown): number | undefined {
@@ -156,7 +157,7 @@ function buildParticipantContext(
 function formatHistory(rounds: CouncilTranscript["rounds"]): string {
     const text = rounds.map((round) => {
         const messages = round.messages.map((message) => {
-            const body = message.error ? `ERROR: ${message.error}` : message.text;
+            const body = message.error ? `ERROR: ${message.error}` : `${message.text}${message.metadata?.media ? `\n原生媒体结果: ${JSON.stringify(message.metadata.media)}` : ""}`;
             return `[${message.participantId}/${message.role}]\n${body}`;
         }).join("\n\n");
         const moderatorSteps = round.moderatorSteps && round.moderatorSteps.length > 0
@@ -203,7 +204,7 @@ function moderatorPrompt(
         webFetchText: params.tools?.webFetchText !== false,
         simpleScript: params.tools?.simpleScript !== false,
     }).filter(([, enabled]) => enabled).map(([name]) => name).join(", ");
-    const currentMessages = messages.map((message) => `[${message.participantId}/${message.role}]\n${message.error ? `ERROR: ${message.error}` : message.text}`).join("\n\n");
+    const currentMessages = messages.map((message) => `[${message.participantId}/${message.role}]\n${message.error ? `ERROR: ${message.error}` : message.text}${message.metadata?.media ? `\n原生媒体结果: ${JSON.stringify(message.metadata.media)}` : ""}`).join("\n\n");
     const currentToolResults = roundToolResults.length > 0
         ? `# 本轮已执行工具\n${roundToolResults.map((toolResult, index) => `[tool:${index + 1}:${toolResult.tool}:${toolResult.ok ? "ok" : "error"}]\n${toolResult.text}`).join("\n\n")}`
         : "";
@@ -445,6 +446,7 @@ async function buildImageObservations(params: CouncilRunParams): Promise<string>
     throwIfCouncilAborted(params.signal);
     const imagePaths = params.images || [];
     if (imagePaths.length === 0) return "";
+    if (params.apiSession && !params.transcriptionModel && !hasOnlyTextActors(params)) return "";
     const model = (params.transcriptionModel && supportsDirectImageInput(params.transcriptionModel) ? params.transcriptionModel : undefined)
         || params.participants.find((p) => supportsDirectImageInput(p))
         || (supportsDirectImageInput(params.moderator) ? params.moderator : undefined);
@@ -456,10 +458,11 @@ async function buildImageObservations(params: CouncilRunParams): Promise<string>
             "请把这些图片转述成可供多模型文本讨论使用的观察记录。",
             "要求：描述可见文字、布局、数据、异常、可能不确定处；不要做身份识别。",
         ].join("\n");
-        const result = await callCouncilModel({ ...model, supportsVision: true }, prompt, imagePaths, DEFAULT_COUNCIL_MODEL_TIMEOUT_MS, params.signal, params.runId);
+        const result = await callCouncilModel({ ...model, supportsVision: true }, prompt, imagePaths, DEFAULT_COUNCIL_MODEL_TIMEOUT_MS, params.signal, params.runId, params.apiSession);
         return result.text;
     } catch (err) {
         throwIfCouncilAborted(params.signal);
+        if (model.profileId || model.provider === "api") throw err;
         return `多模态转述失败: ${err instanceof Error ? err.message : String(err)}`;
     }
 }
@@ -492,6 +495,7 @@ async function buildOnlyTextProjection(
         return "";
     }
     const fileSection = formatFilesSection(files, params.contextMode || "summary");
+    if (params.apiSession && !params.textProjectionModel) return [fileSection, imageObservations].filter(Boolean).join("\n\n");
     const prompt = [
         "你在为 sandbox_council 的纯文本参与者准备输入材料。",
         "请把下面的文件内容、图片观察和上下文整理成忠实、细致、可直接讨论的纯文本 dossier。",
@@ -503,7 +507,7 @@ async function buildOnlyTextProjection(
     ].filter(Boolean).join("\n\n");
     const model = params.textProjectionModel || defaultTextProjectionModel();
     try {
-        const result = await callCouncilModel(model, prompt, [], DEFAULT_COUNCIL_MODEL_TIMEOUT_MS, params.signal, params.runId);
+        const result = await callCouncilModel(model, prompt, [], DEFAULT_COUNCIL_MODEL_TIMEOUT_MS, params.signal, params.runId, params.apiSession);
         return result.text;
     } catch (err) {
         throwIfCouncilAborted(params.signal);
@@ -643,11 +647,12 @@ async function runCouncilWithinArtifactRun(params: CouncilRunParams): Promise<Co
         const participantsToCall = activeParticipants.length > 0 ? activeParticipants : effectiveParams.participants;
         const extraInstruction = [afterToolInstruction, askInstruction].filter(Boolean).join("\n\n");
         let completedParticipants = 0;
+        let apiFailure: unknown;
         emitProgress(params, transcript, `Round ${round}: 正在调用 ${participantsToCall.length} 个参与模型。`);
         const messages = await Promise.all(participantsToCall.map(async (participant): Promise<CouncilTurnMessage> => {
             try {
                 const prompt = participantPrompt(effectiveParams, participant.id, participant.role, participantContexts.get(participant.id) || sharedContext, history, extraInstruction);
-                const result = await callCouncilModel(participant, prompt, supportsDirectImageInput(participant) ? imagePaths : [], modelTimeoutMs, effectiveParams.signal, effectiveParams.runId);
+                const result = await callCouncilModel(participant, prompt, supportsDirectImageInput(participant) ? imagePaths : [], modelTimeoutMs, effectiveParams.signal, effectiveParams.runId, effectiveParams.apiSession);
                 completedParticipants++;
                 params.onProgress?.(`Round ${round}: ${participant.id}/${participant.role} 已返回 (${completedParticipants}/${participantsToCall.length})，模型=${result.model}\n摘要: ${summarizeForProgress(result.text)}`);
                 return {
@@ -658,9 +663,11 @@ async function runCouncilWithinArtifactRun(params: CouncilRunParams): Promise<Co
                     model: result.model,
                     text: result.text,
                     metadata: result.metadata,
+                    response: result.response,
                 };
             } catch (err) {
                 throwIfCouncilAborted(effectiveParams.signal);
+                if (participant.profileId || participant.provider === "api") apiFailure ??= err;
                 completedParticipants++;
                 params.onProgress?.(`Round ${round}: ${participant.id}/${participant.role} 调用失败 (${completedParticipants}/${participantsToCall.length})\n错误: ${err instanceof Error ? err.message : String(err)}`);
                 return {
@@ -673,6 +680,7 @@ async function runCouncilWithinArtifactRun(params: CouncilRunParams): Promise<Co
                 };
             }
         }));
+        if (apiFailure) throw apiFailure;
         askTarget = undefined;
         askInstruction = undefined;
         afterToolInstruction = undefined;
@@ -705,12 +713,15 @@ async function runCouncilWithinArtifactRun(params: CouncilRunParams): Promise<Co
             moderatorStep++;
             const modPrompt = moderatorPrompt(effectiveParams, moderatorContext, history, messages, toolCallsUsed, maxToolCalls, roundToolResults, moderatorStep);
             try {
-                const moderatorResult = await callCouncilModel(effectiveParams.moderator, modPrompt, supportsDirectImageInput(effectiveParams.moderator) ? imagePaths : [], modelTimeoutMs, effectiveParams.signal, effectiveParams.runId);
-                moderator = parseModeratorDecision(moderatorResult.text);
+                const moderatorResult = await callCouncilModel(effectiveParams.moderator, modPrompt, supportsDirectImageInput(effectiveParams.moderator) ? imagePaths : [], modelTimeoutMs, effectiveParams.signal, effectiveParams.runId, effectiveParams.apiSession);
+                moderator = !moderatorResult.text && moderatorResult.response?.blocks.some(block => ["image", "audio", "video", "file"].includes(block.type))
+                    ? { action: "terminate", summary: "", rawText: "" } : parseModeratorDecision(moderatorResult.text);
                 moderator.metadata = moderatorResult.metadata;
+                moderator.response = moderatorResult.response;
                 params.onProgress?.(`Round ${round} / 主持步骤 ${moderatorStep}: 主持模型已返回，动作=${moderator.action}，模型=${moderatorResult.model}\n摘要: ${summarizeForProgress(moderator.summary)}`);
             } catch (err) {
                 throwIfCouncilAborted(effectiveParams.signal);
+                if (effectiveParams.moderator.profileId || effectiveParams.moderator.provider === "api") throw err;
                 moderator = buildModeratorFailureDecision(messages, err);
                 moderatorSteps.push(moderator);
                 params.onProgress?.(`Round ${round}: 主持模型调用失败，已使用规则兜底提前终止\n错误: ${err instanceof Error ? err.message : String(err)}`);
@@ -814,22 +825,35 @@ async function runCouncilWithinArtifactRun(params: CouncilRunParams): Promise<Co
         }
     }
 
-    if (!transcript.finalAnswer) {
+    if (!transcript.finalAnswer && !transcript.rounds.at(-1)?.moderator.response?.blocks.some(block => ["image", "audio", "video", "file"].includes(block.type))) {
         transcript.finalAnswer = transcript.rounds.at(-1)?.moderator.summary || "讨论结束但没有生成最终结论。";
     }
     const saved = saveCouncilTranscript(transcript, params.transcriptPath, params.outputDir);
     return saved;
 }
 
-export async function runCouncil(params: CouncilRunParams): Promise<CouncilTranscript> {
+export async function runCouncil(params: CouncilRunParams, dependencies: { apiClientFactory?: CouncilApiClientFactory } = {}): Promise<CouncilTranscript> {
     const runParams = ensureCouncilArtifactRun(params);
+    const actors = [...params.participants, params.moderator, params.transcriptionModel, params.textProjectionModel].filter((actor): actor is CouncilModelConfig => Boolean(actor));
+    const usesApi = actors.some(actor => actor.profileId || actor.provider === "api");
+    const apiSession = usesApi && !params.apiSession ? new AgentCouncilSession({ runId: runParams.runId!,
+        sourceRunId: params.resumeState?.sourceRunId, ownerId: params.ownerId, clientFactory: dependencies.apiClientFactory }) : undefined;
     try {
-        const result = await runCouncilWithinArtifactRun(runParams);
+        if (usesApi && new Set([...params.participants.map(actor => actor.id), params.moderator.id]).size !== params.participants.length + 1) {
+            throw new Error("E_COUNCIL_ACTOR_ID: API参与者和主持人必须使用各自唯一的id");
+        }
+        if (usesApi && params.files?.some(file => !/\.(?:txt|md|json|csv|ts|js|py|html|xml|yaml|yml|log)$/iu.test(file.path))) {
+            throw new Error("E_COUNCIL_PREPARED_INPUT_REQUIRED: API Council只读取主线已准备的文本材料，复杂附件请先完成提取");
+        }
+        const result = await runCouncilWithinArtifactRun({ ...runParams, ...(usesApi ? { apiSession: params.apiSession ?? apiSession,
+            tools: { webSearch: false, webFetchText: false, simpleScript: false }, maxToolCalls: 0 } : {}) });
         finishCouncilRunIfRunning(result.runId, "done");
         return result;
     } catch (error) {
         finishCouncilRunIfRunning(runParams.runId as string, runParams.signal?.aborted || (error instanceof Error && error.name === "AbortError") ? "interrupted" : "error");
         throw error;
+    } finally {
+        await apiSession?.close();
     }
 }
 

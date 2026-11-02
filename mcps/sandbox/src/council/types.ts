@@ -9,6 +9,7 @@ export const COUNCIL_PROVIDERS = [
     "grok",
     "claudeCode",
     "customOpenAICompatible",
+    "api",
 ] as const;
 
 export type CouncilProvider = typeof COUNCIL_PROVIDERS[number];
@@ -30,6 +31,8 @@ export interface CouncilModelConfig {
     model?: string;
     params?: Record<string, unknown>;
     supportsVision?: boolean;
+    profileId?: string;
+    budget?: Record<string, unknown>;
 }
 
 export function normalizeCouncilModelConfig(config: CouncilModelConfig): CouncilModelConfig {
@@ -101,6 +104,7 @@ export interface CouncilTurnMessage {
     text: string;
     error?: string;
     metadata?: Record<string, unknown>;
+    response?: import("../agent-server/providers/types.js").NormalizedResponse;
 }
 
 export interface CouncilModeratorDecision {
@@ -115,6 +119,7 @@ export interface CouncilModeratorDecision {
     finalAnswer?: string;
     rawText: string;
     metadata?: Record<string, unknown>;
+    response?: import("../agent-server/providers/types.js").NormalizedResponse;
 }
 
 export interface CouncilTranscript {
@@ -205,4 +210,5 @@ export interface CouncilRunParams {
     artifactManifestPath?: string;
     signal?: AbortSignal;
     onProgress?: (progress: string) => void;
+    apiSession?: import("./providers.js").CouncilApiSession;
 }

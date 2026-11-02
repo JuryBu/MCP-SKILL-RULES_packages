@@ -1,0 +1,114 @@
+{
+  "thinking": {
+    "regular": [
+      {
+        "file": "thinking-0-regular.sixel",
+        "durationMs": 1400
+      },
+      {
+        "file": "thinking-1-regular.sixel",
+        "durationMs": 200
+      }
+    ],
+    "compact": [
+      {
+        "file": "thinking-0-compact.sixel",
+        "durationMs": 1400
+      },
+      {
+        "file": "thinking-1-compact.sixel",
+        "durationMs": 200
+      }
+    ]
+  },
+  "searching": {
+    "regular": [
+      {
+        "file": "searching-0-regular.sixel",
+        "durationMs": 450
+      },
+      {
+        "file": "searching-1-regular.sixel",
+        "durationMs": 450
+      }
+    ],
+    "compact": [
+      {
+        "file": "searching-0-compact.sixel",
+        "durationMs": 450
+      },
+      {
+        "file": "searching-1-compact.sixel",
+        "durationMs": 450
+      }
+    ]
+  },
+  "typing": {
+    "regular": [
+      {
+        "file": "typing-0-regular.sixel",
+        "durationMs": 250
+      },
+      {
+        "file": "typing-1-regular.sixel",
+        "durationMs": 250
+      }
+    ],
+    "compact": [
+      {
+        "file": "typing-0-compact.sixel",
+        "durationMs": 250
+      },
+      {
+        "file": "typing-1-compact.sixel",
+        "durationMs": 250
+      }
+    ]
+  },
+  "idle": {
+    "regular": [
+      {
+        "file": "idle-0-regular.sixel",
+        "durationMs": 1300
+      },
+      {
+        "file": "idle-1-regular.sixel",
+        "durationMs": 200
+      },
+      {
+        "file": "idle-0-regular.sixel",
+        "durationMs": 600
+      },
+      {
+        "file": "idle-2-regular.sixel",
+        "durationMs": 300
+      },
+      {
+        "file": "idle-3-regular.sixel",
+        "durationMs": 300
+      }
+    ],
+    "compact": [
+      {
+        "file": "idle-0-compact.sixel",
+        "durationMs": 1300
+      },
+      {
+        "file": "idle-1-compact.sixel",
+        "durationMs": 200
+      },
+      {
+        "file": "idle-0-compact.sixel",
+        "durationMs": 600
+      },
+      {
+        "file": "idle-2-compact.sixel",
+        "durationMs": 300
+      },
+      {
+        "file": "idle-3-compact.sixel",
+        "durationMs": 300
+      }
+    ]
+  }
+}

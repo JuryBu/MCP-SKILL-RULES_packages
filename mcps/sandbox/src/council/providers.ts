@@ -1,6 +1,7 @@
 import fs from "fs";
 import os from "os";
 import path from "path";
+import { randomUUID } from "node:crypto";
 import { callGetModelResponseDetailed } from "../ls-client.js";
 import { callCodexText } from "../model-bridge.js";
 import { callClaudeCodeText, claudeCodeOptionsFromParams } from "../claude-code-bridge.js";
@@ -9,6 +10,14 @@ import { normalizeCouncilModelConfig, normalizeCouncilProvider, type CouncilMode
 import { buildAntigravityCliEnvironment, spawnPowerShellScript, withAntigravityCliLease } from "./agy-runtime.js";
 import { councilRuntimeDirectory } from "./paths.js";
 import { councilArtifactPath, registerCouncilArtifact } from "./artifact-store.js";
+import { FetchTransport, decodeResponse } from "../agent-server/providers/http.js";
+import { normalizeGeminiResponse } from "../agent-server/providers/gemini.js";
+import { normalizeChatResponse } from "../agent-server/providers/compatible-chat.js";
+import { normalizeResponsesResponse } from "../agent-server/providers/openai-responses.js";
+import { normalizeAnthropicResponse } from "../agent-server/providers/anthropic.js";
+import { ProviderFault } from "../agent-server/providers/types.js";
+import type { NativeBlock, NormalizedResponse, RawProviderResponse } from "../agent-server/providers/types.js";
+import { saveCouncilApiResponse } from "./api-results.js";
 
 const DEFAULT_OPENAI_MODEL = "gpt-5.4";
 const DEFAULT_ANTHROPIC_MODEL = "claude-sonnet-4-20250514";
@@ -153,6 +162,29 @@ export interface ProviderCallResult {
     provider: string;
     model: string;
     metadata?: Record<string, unknown>;
+    blocks?: NativeBlock[];
+    response?: NormalizedResponse;
+}
+
+export interface CouncilApiSession {
+    call(config: CouncilModelConfig, prompt: string, imagePaths: string[], timeoutMs: number,
+        signal?: AbortSignal, runId?: string): Promise<NormalizedResponse>;
+}
+
+const apiRawResponses = new WeakMap<object, RawProviderResponse>();
+
+function councilApiResult(provider: string, model: string, response: NormalizedResponse, runId?: string): ProviderCallResult {
+    const artifacts = runId ? saveCouncilApiResponse(runId, response) : {};
+    if (!response.complete || ['unknown', 'failed', 'truncated'].includes(response.stop.kind)) {
+        throw new ProviderFault('E_RESPONSE_INCOMPLETE', 'API响应未完整完成，保留原结果并停止自动重发',
+            { acceptance: 'accepted', rawResponse: response.raw });
+    }
+    if (response.stop.kind === 'refused') throw new ProviderFault('E_POLICY_REFUSAL', 'API响应已拒绝该动作', { acceptance: 'accepted', rawResponse: response.raw });
+    if (response.toolCalls.length) throw new ProviderFault('E_COUNCIL_TOOL_PENDING', 'Council工具调用需由同一核心会话处理后再交回结果',
+        { acceptance: 'accepted', rawResponse: response.raw });
+    return { provider, model, text: response.blocks.filter(block => block.type === 'text' && !block.thought)
+        .map(block => block.text ?? '').join('\n').trim(), blocks: response.blocks, response,
+        metadata: { providerResponseId: response.providerResponseId, attemptId: response.attemptId, usage: response.usage, stop: response.stop, ...artifacts } };
 }
 
 interface FallbackModelObject {
@@ -499,6 +531,7 @@ async function withSourceLimit<T>(config: CouncilModelConfig, fn: () => Promise<
 }
 
 function isRetryableError(err: unknown): boolean {
+    if (err instanceof ProviderFault && (err.acceptance === "accepted" || err.acceptance === "unknown")) return false;
     if (err && typeof err === "object") {
         const providerErr = err as ProviderError;
         if (typeof providerErr.retryable === "boolean") return providerErr.retryable;
@@ -543,6 +576,7 @@ async function withRetry<T>(config: CouncilModelConfig, fn: () => Promise<T>): P
         }
     }
     const message = lastErr instanceof Error ? lastErr.message : String(lastErr);
+    if (lastErr instanceof ProviderFault) throw lastErr;
     const wrapped = new Error(retries > 0 ? `${message} (attempts=${attempts}/${retries + 1})` : message) as ProviderError;
     wrapped.retryable = isRetryableError(lastErr);
     if (lastErr && typeof lastErr === "object" && (lastErr as ProviderError).timedOut === true) {
@@ -861,41 +895,13 @@ async function callAntigravityCliText(
 
 async function postJson(url: string, headers: Record<string, string>, body: unknown, timeoutMs: number, signal?: AbortSignal): Promise<any> {
     assertProviderNotAborted(signal);
-    const controller = new AbortController();
-    const onAbort = () => controller.abort();
-    signal?.addEventListener("abort", onAbort, { once: true });
-    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    const transport = new FetchTransport();
     try {
-        const response = await fetch(url, {
-            method: "POST",
-            headers: { "Content-Type": "application/json", ...headers },
-            body: JSON.stringify(body),
-            signal: controller.signal,
-        });
-        const text = await response.text();
-        let data: any = {};
-        try {
-            data = text ? JSON.parse(text) : {};
-        } catch {
-            data = { raw: text };
-        }
-        if (!response.ok) {
-            const message = data?.error?.message || data?.message || text.slice(0, 500);
-            throw new Error(`HTTP ${response.status}: ${message}`);
-        }
-        return data;
-    } catch (err) {
-        if (signal?.aborted) {
-            throw makeProviderAbortError();
-        }
-        if (err instanceof Error && err.name === "AbortError") {
-            throw new Error(`HTTP 请求超时或被中止 (${timeoutMs}ms)`);
-        }
-        throw err;
-    } finally {
-        clearTimeout(timer);
-        signal?.removeEventListener("abort", onAbort);
-    }
+        const raw = decodeResponse(await transport.request({ method: 'POST', url,
+            headers: { 'Content-Type': 'application/json', ...headers }, body: JSON.stringify(body), timeoutMs }, signal));
+        apiRawResponses.set(raw.json, raw);
+        return raw.json;
+    } finally { await transport.close(); }
 }
 
 export async function callCouncilModel(
@@ -905,9 +911,15 @@ export async function callCouncilModel(
     timeoutMs = DEFAULT_COUNCIL_MODEL_TIMEOUT_MS,
     signal?: AbortSignal,
     runId?: string,
+    apiSession?: CouncilApiSession,
 ): Promise<ProviderCallResult> {
     assertProviderNotAborted(signal);
     config = normalizeCouncilModelConfig(config);
+    if (config.profileId || config.provider === "api") {
+        if (!apiSession) throw new ProviderFault("E_COUNCIL_API_SESSION_REQUIRED", "API配置需要共用Agent Server会话", { acceptance: "not_sent" });
+        const response = await apiSession.call(config, prompt, imagePaths, timeoutMs, signal, runId);
+        return councilApiResult(config.provider, response.modelId ?? config.model ?? "profile-default", response, runId);
+    }
     const candidates = [config, ...getFallbackConfigs(config)].map(normalizeCouncilModelConfig);
     const errors: string[] = [];
     for (let index = 0; index < candidates.length; index++) {
@@ -1016,12 +1028,11 @@ async function callCouncilModelOnce(
             ...getSafeBodyOverrides(config.params, ["model", "input", "tools"]),
             model,
             input: [{ role: "user", content }],
+            stream: false,
+            store: false,
         };
         const data = await postJson(endpoint, { Authorization: `Bearer ${key}`, ...getHeadersParam(config.params) }, body, timeoutMs, signal);
-        assertNotTruncated(config.provider, data);
-        const text = extractOpenAIText(data);
-        if (!text) throw new Error("OpenAI Responses API 未返回文本");
-        return { provider: config.provider, model, text };
+        return councilApiResult(config.provider, model, normalizeResponsesResponse(randomUUID(), apiRawResponses.get(data)!), runId);
     }
 
     if (config.provider === "anthropic") {
@@ -1039,16 +1050,14 @@ async function callCouncilModelOnce(
             model,
             max_tokens: getNumberParam(config.params, "max_tokens") || 2048,
             messages: [{ role: "user", content }],
+            stream: false,
         };
         const data = await postJson(endpoint, {
             "x-api-key": key,
             "anthropic-version": getStringParam(config.params, "anthropicVersion") || "2023-06-01",
             ...getHeadersParam(config.params),
         }, body, timeoutMs, signal);
-        assertNotTruncated(config.provider, data);
-        const text = extractAnthropicText(data);
-        if (!text) throw new Error("Anthropic Messages API 未返回文本");
-        return { provider: config.provider, model, text };
+        return councilApiResult(config.provider, model, normalizeAnthropicResponse(randomUUID(), apiRawResponses.get(data)!), runId);
     }
 
     if (config.provider === "gemini") {
@@ -1065,10 +1074,8 @@ async function callCouncilModelOnce(
             contents: [{ role: "user", parts }],
         };
         const data = await postJson(endpoint, { "x-goog-api-key": key, ...getHeadersParam(config.params) }, body, timeoutMs, signal);
-        assertNotTruncated(config.provider, data);
-        const text = extractGeminiText(data);
-        if (!text) throw new Error("Gemini generateContent 未返回文本");
-        return { provider: config.provider, model, text };
+        const raw = apiRawResponses.get(data)!;
+        return councilApiResult(config.provider, model, normalizeGeminiResponse(randomUUID(), raw), runId);
     }
 
     if (config.provider !== "customOpenAICompatible") {
@@ -1088,10 +1095,8 @@ async function callCouncilModelOnce(
         ...getSafeBodyOverrides(config.params, ["model", "messages"]),
         model,
         messages: [{ role: "user", content: messageContent }],
+        stream: false,
     };
     const data = await postJson(endpoint, { Authorization: `Bearer ${key}`, ...getHeadersParam(config.params) }, body, timeoutMs, signal);
-    assertNotTruncated(config.provider, data);
-    const text = extractChatText(data);
-    if (!text) throw new Error("OpenAI-compatible endpoint 未返回文本");
-    return { provider: config.provider, model, text };
+    return councilApiResult(config.provider, model, normalizeChatResponse(randomUUID(), apiRawResponses.get(data)!), runId);
 }

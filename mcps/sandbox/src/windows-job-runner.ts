@@ -12,6 +12,11 @@ export interface WindowsJobMetadata {
     commandStarted: boolean;
     startErrorType: string | null;
     startErrorCode: number | null;
+    terminalConfirmed: boolean;
+    activeProcessesAtRelease: number | null;
+    cleanupState: "released" | "unconfirmed";
+    cancelRequested: boolean;
+    cleanupErrorCode: number | null;
 }
 
 export interface WindowsSystemMemorySample {
@@ -25,6 +30,7 @@ export interface WindowsJobLaunch {
     command: string;
     args: string[];
     metadataPath: string;
+    controlFilePath: string;
     spawnCwd: string;
 }
 
@@ -71,16 +77,19 @@ export function createWindowsJobLaunch(
         throw new WindowsJobLaunchError("working_directory_invalid", `工作目录不是目录: ${cwd}`);
     }
     const metadataPath = path.join(tmpdir(), `sandbox-job-${process.pid}-${randomUUID()}.json`);
+    const controlFilePath = `${metadataPath}.control`;
     return {
         command: runnerPath,
         args: [
             "--memory-mb", String(Math.ceil(maxMemoryMB)),
             "--metadata", metadataPath,
+            "--control-file", controlFilePath,
             "--cwd", cwd,
             "--", command,
             ...args,
         ],
         metadataPath,
+        controlFilePath,
         spawnCwd: path.dirname(runnerPath),
     };
 }
@@ -99,6 +108,10 @@ export function readWindowsJobMetadata(metadataPath: string): WindowsJobMetadata
     try {
         const parsed = JSON.parse(readFileSync(metadataPath, "utf8")) as Partial<WindowsJobMetadata>;
         if (!Number.isFinite(parsed.peakMemoryBytes) || typeof parsed.memoryLimitHit !== "boolean") return null;
+        const activeProcessesAtRelease = Number.isInteger(parsed.activeProcessesAtRelease)
+            && Number(parsed.activeProcessesAtRelease) >= 0 ? Number(parsed.activeProcessesAtRelease) : null;
+        const terminalConfirmed = parsed.terminalConfirmed === true
+            && activeProcessesAtRelease === 0 && parsed.cleanupState === "released";
         return {
             peakMemoryBytes: Math.max(0, Number(parsed.peakMemoryBytes)),
             memoryLimitHit: parsed.memoryLimitHit,
@@ -106,6 +119,11 @@ export function readWindowsJobMetadata(metadataPath: string): WindowsJobMetadata
             commandStarted: typeof parsed.commandStarted === "boolean" ? parsed.commandStarted : true,
             startErrorType: typeof parsed.startErrorType === "string" ? parsed.startErrorType : null,
             startErrorCode: Number.isFinite(parsed.startErrorCode) ? Number(parsed.startErrorCode) : null,
+            terminalConfirmed,
+            activeProcessesAtRelease,
+            cleanupState: terminalConfirmed ? "released" : "unconfirmed",
+            cancelRequested: parsed.cancelRequested === true,
+            cleanupErrorCode: Number.isFinite(parsed.cleanupErrorCode) ? Number(parsed.cleanupErrorCode) : null,
         };
     } catch {
         return null;
@@ -116,6 +134,7 @@ export function removeWindowsJobMetadata(metadataPath: string | null): void {
     if (!metadataPath) return;
     try {
         rmSync(metadataPath, { force: true });
+        rmSync(`${metadataPath}.control`, { force: true });
     } catch {
     }
 }

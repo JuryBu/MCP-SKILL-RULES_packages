@@ -232,6 +232,9 @@ Codex 与你共享 memory-store MCP 和 web-fetcher MCP，能查询项目记忆�
 - Sandbox 的四类超时不能混为一谈：`admission_timeout` 是资源等待超时且未启动，`execution_timeout` 是已经启动后运行超时，`caller_deadline_exceeded` 是排队与执行合计超过调用方总期限，`broker_backend_timeout` 是 broker 与 backend 通信超时；后三类重试前先判断是否可能已有副作用
 - 大输出默认自适应交付：安全预算内直接完整返回，超预算时返回头尾预览和 artifact 的路径、SHA256、字节数、行数及过期时间。需要完整结果时读取 artifact，不要把预览当全文；`maxOutput` 按正文字符计算，元数据预留另计，`maxLines` 超预算仍须保留全文 artifact，批量任务共享单次响应总预算
 - 上述分类属于 Sandbox backend，不能覆盖 Antigravity 自己的外层工具期限；长任务仍使用对应工具的后台模式或 `sandbox_launch`，并沿用本模板已有的 30～60 秒短轮询节奏
+- 用户明确指定或任务确需外部模型时，使用 `sandbox_agent`、`sandbox_grok` 或 Council 的 API 模式，普通辅助仍用宿主原生子代理和工具。显式传外部主调用方身份，单独保存 Agent 会话 ID。
+- 普通资料沿当前账号已有权限读取，受保护凭据和控制文件的禁令继续适用，写入限批准根，危险动作交主调用方批准。内部子任务默认关闭，仅在宿主和本次任务允许、主调用方明确开启后最多一层；已有更严格的禁止孙代理、模型与预算约定继续适用，内部递归调用模型工具保持关闭。本次模型规则优先，未提供时才取 API 配置的全局规则，两者均缺则拒绝派发。
+- 未知受理先查原命令回执、执行和预算，不自动重发。实际本地执行及所属资源确认收尾后，主调用方可显式结束本地等待，原结果、副作用和费用未知状态、预留及旧错误回执继续保留，新任务另行明确提交。保存方式、BPC 与原件查回按产品 CLI 说明和实际 schema 执行。
 - 需要有状态交互式执行（如装包后立即 import）用 sandbox_session
 - 需要同时执行多个独立任务用 sandbox_batch
 - 查看系统环境/GPU/清理临时文件用 sandbox_status

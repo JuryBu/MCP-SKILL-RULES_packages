@@ -8,12 +8,16 @@ import { formatPersistentCouncilTask, readCouncilResumeSource, startPersistentCo
 import type { CouncilProvider, CouncilRunParams } from "../council/types.js";
 import { createCouncilArtifactRun } from "../council/artifact-store.js";
 import { formatCouncilArtifactSummary } from "../council/transcript.js";
+import type { CouncilApiClientFactory } from "../council/api-session.js";
+import { AgentFault } from "../agent-server/protocol.js";
 
-const PROVIDERS = ["antigravity", "codex", "openai", "anthropic", "gemini", "antigravityCli", "geminiCli", "grok", "claudeCode", "customOpenAICompatible"] as const;
+const PROVIDERS = ["antigravity", "codex", "openai", "anthropic", "gemini", "antigravityCli", "geminiCli", "grok", "claudeCode", "customOpenAICompatible", "api"] as const;
 const MODES = ["red_blue_black", "design", "review", "guard_check", "custom"] as const;
 const CONTEXT_MODES = ["none", "summary", "full", "manual"] as const;
 const COUNCIL_BACKGROUND_MAX_RUN_MS = Number(process.env.SANDBOX_COUNCIL_BACKGROUND_MAX_RUN_MS || 45 * 60_000);
-const COUNCIL_TOOL_DESCRIPTION = "多模型审议工具。主持模型控制讨论节奏，参与模型独立发言，主持模型可调用有限工具（webSearch/webFetchText/simpleScript）。\n\n产物与任务：\n- 每次 run 使用稳定 council-artifacts/<runId>/ 根目录，目录内 manifest.json 记录状态、依赖、主要产物和外部引用；后台 task 目录 sandbox-data/temp/council-tasks/<taskId>/ 只保存后台状态、checkpoint 和 resume transcript 快照，核心文件包括 spec.json/progress.json/done.json，用于查询、恢复和结束状态，不是完整 artifact 根目录\n- 服务启动时会自动先执行托管产物的 apply GC（includeLegacy=false），再按 15 天清理过期 council task；legacy 迁移不会自动执行，仍需人工调用 sandbox_status(action=\"gc\", gcScope=\"council\", gcMode=\"apply\")\n- 显式 transcriptPath/outputDir 只登记为外部引用，不属于 council GC 删除范围\n- sandbox_status(action=\"gc\", gcScope=\"council\") 的 gcMode 支持 dryRun/apply/restore/purge；TTL 默认 14 天，最小 7 天；apply 只处理终态 run 组，每次最多 100 个\n- running、dependsOn 引用、文件名恰为 .preserve 的标记文件和损坏 manifest 受保护并报告，不盲删；legacy apply 逐文件隔离到 council-quarantine/<quarantineId>/并写 manifest，restore 可复原，purge 可清除隔离组\n\n定位：\n- 适合红蓝黑队讨论、设计审议、结果复盘、做题后审议和 Guard 式检查，参与模型不能调用工具\n- 使用 provider=\"antigravityCli\" 调本地 agy，使用 provider=\"grok\" 调本机 progrok；模型可用性取决于本机服务与凭据\n- simpleScript 仅用于受限 Node/Python 子进程的文本、JSON、CSV 和统计处理，不是通用命令入口";
+const COUNCIL_TOOL_DESCRIPTION = "多模型审议工具。主持模型控制讨论节奏，参与模型独立发言，主持模型可调用有限工具（webSearch/webFetchText/simpleScript）。\n\n产物与任务：\n- 每次 run 使用稳定 council-artifacts/<runId>/ 根目录，目录内 manifest.json 记录状态、依赖、主要产物和外部引用；后台 task 目录 sandbox-data/temp/council-tasks/<taskId>/ 只保存后台状态、checkpoint 和 resume transcript 快照，核心文件包括 spec.json/progress.json/done.json，用于查询、恢复和结束状态，不是完整 artifact 根目录\n- 仅当 SANDBOX_COUNCIL_AUTO_GC 为 1/true/yes 时，服务启动才先执行托管产物的 apply GC（includeLegacy=false），再按 15 天清理过期 council task；legacy 迁移不会自动执行，仍需人工调用 sandbox_status(action=\"gc\", gcScope=\"council\", gcMode=\"apply\")\n- 显式 transcriptPath/outputDir 只登记为外部引用，不属于 council GC 删除范围\n- sandbox_status(action=\"gc\", gcScope=\"council\") 的 gcMode 支持 dryRun/apply/restore/purge；TTL 默认 14 天，最小 7 天；apply 只处理终态 run 组，每次最多 100 个\n- running、dependsOn 引用、文件名恰为 .preserve 的标记文件和损坏 manifest 受保护并报告，不盲删；legacy apply 逐文件隔离到 council-quarantine/<quarantineId>/并写 manifest，restore 可复原，purge 可清除隔离组\n\n定位：\n- 适合红蓝黑队讨论、设计审议、结果复盘、做题后审议和 Guard 式检查，参与模型不能调用工具\n- 使用 provider=\"antigravityCli\" 调本地 agy，使用 provider=\"grok\" 调本机 progrok；模型可用性取决于本机服务与凭据\n- simpleScript 仅用于受限 Node/Python 子进程的文本、JSON、CSV 和统计处理，不是通用命令入口";
+
+const COUNCIL_PROFILE_DESCRIPTION = `${COUNCIL_TOOL_DESCRIPTION}\n\n共用API配置：provider="api"配合profileId、model、params和有限budget，使用sandbox_agent同一模型目录与供应商累计费用上限，无需传Key。API模式只讨论主线准备的材料，关闭全部执行工具；图片原件、签名和完整原生响应保存在产物目录。未知受理先查原CID/run/命令回执，保留费用预留，不自动重发或换模型。`;
 
 const ModelConfigSchema = z.object({
     id: z.string({
@@ -24,7 +28,9 @@ const ModelConfigSchema = z.object({
         required_error: "模型配置必须包含 role，例如 红队 / 蓝队 / 主持人",
         invalid_type_error: "模型配置 role 必须是字符串，例如 红队 / 蓝队 / 主持人",
     }).min(1).describe("角色说明，如 红队、蓝队、黑队、主持人；moderator 也必须提供 role"),
-    provider: z.enum(PROVIDERS).describe("模型来源；grok 走本机 progrok OpenAI-compatible API；Windsurf/WSF 没有 sandbox_council provider，WSF 中调用本工具时仍应选择现有 provider"),
+    provider: z.enum(PROVIDERS).default("api").describe("已有provider保持兼容；api使用Agent Server已保存的profileId、模型目录、参数和供应商累计费用上限，不传Key"),
+    profileId: z.string().min(1).optional().describe("共用Agent Server API配置ID，可用sandbox_agent的profiles.list及models.list/get查看配置、模型和参数；选择后仅讨论已准备材料，不启用执行工具"),
+    budget: z.record(z.unknown()).optional().describe("API讨论每次执行的有限预算：maxModelCalls、maxOutputTokens、wallMs或deadlineAt、currency；hard还需maxCostMicros。必须沿用已有供应商quotaLimitId，Council不新设或提高总上限"),
     model: z.string().optional().describe("模型名；antigravity 可用 M132/M20/M18/M16/M36、flash、flash-medium、pro-high、sonnet、opus 等别名，也可直接传 MODEL_* 编码；旧 M37 转 M16、M47 转 M18；antigravityCli 使用 agy 完整模型标签（如 Gemini 3.1 Pro (High)），geminiCli 是一个版本周期的弃用别名；grok 默认 grok-4.5；claudeCode 默认 sonnet；不填使用 provider 默认值"),
     params: z.record(z.unknown()).optional().describe("供应商参数。apiKeyEnv/baseUrl/endpoint/headers/body 可选；grok 可用 baseUrl/endpoint 指向 progrok、fallbackModels 或 SANDBOX_COUNCIL_GROK_MODEL_CHAIN 做显式同 provider 降级；claudeCode 支持 maxBudgetUsd/sessionId/permissionMode/timeoutMs/allowedTools/disallowedTools；fallbackModels 可传同 provider 降级链，如 [\"gemini-3-flash\"] 或 [{\"model\":\"gemini-3.1-pro\",\"params\":{\"reasoning\":\"low\"}}]；body 只能覆盖非核心字段，不能覆盖 auth/model/input/messages/contents"),
     supportsVision: z.boolean().optional().describe("该模型是否支持直接接收 images"),
@@ -172,7 +178,7 @@ function toResumeRunParams(args: Record<string, unknown>, ownerId: string): { ru
     return { runParams, resumeSource };
 }
 
-export function registerCouncil(server: McpServer): void {
+export function registerCouncil(server: McpServer, dependencies: { apiClientFactory?: CouncilApiClientFactory } = {}): void {
     const handleCouncil = async (input: Record<string, unknown>, extra?: { signal?: AbortSignal; sessionId?: string }) => {
             const args = input;
             const startTime = Date.now();
@@ -277,7 +283,7 @@ export function registerCouncil(server: McpServer): void {
                     ...baseParams,
                     runId: artifactRun.runId,
                     artifactManifestPath: artifactRun.artifactManifestPath,
-                });
+                }, dependencies);
                 return appendTiming({
                     content: [{ type: "text" as const, text: formatCouncilResult(result) }],
                 }, startTime);
@@ -291,6 +297,8 @@ export function registerCouncil(server: McpServer): void {
                     });
                 }
                 return appendTiming({
+                    isError: true,
+                    ...(err instanceof AgentFault ? { structuredContent: { error: err.toJSON() } } : {}),
                     content: [{ type: "text" as const, text: [`❌ sandbox_council 失败: ${err instanceof Error ? err.message : String(err)}`, synchronousRunId ? formatCouncilArtifactSummary(synchronousRunId) : ""].filter(Boolean).join("\n\n") }],
                 }, startTime);
             } finally {
@@ -302,11 +310,11 @@ export function registerCouncil(server: McpServer): void {
         tool?: (name: string, description: string, shape: typeof CouncilParamsShape, handler: typeof handleCouncil) => unknown;
     };
     if (typeof compatibleServer.registerTool === "function") {
-        compatibleServer.registerTool("sandbox_council", { description: COUNCIL_TOOL_DESCRIPTION, inputSchema: CouncilParamsSchema }, handleCouncil);
+        compatibleServer.registerTool("sandbox_council", { description: COUNCIL_PROFILE_DESCRIPTION, inputSchema: CouncilParamsSchema }, handleCouncil);
         return;
     }
     if (typeof compatibleServer.tool === "function") {
-        compatibleServer.tool("sandbox_council", COUNCIL_TOOL_DESCRIPTION, CouncilParamsShape, handleCouncil);
+        compatibleServer.tool("sandbox_council", COUNCIL_PROFILE_DESCRIPTION, CouncilParamsShape, handleCouncil);
         return;
     }
     throw new Error("MCP server 不支持 registerTool/tool 注册接口");
