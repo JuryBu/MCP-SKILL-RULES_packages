@@ -220,6 +220,13 @@ export function devinRawToRounds(raw: DevinRawConversation, options: DevinConver
 }
 
 export async function readDevinConversation(id: string, options: DevinConversationOptions = {}): Promise<{ raw: DevinRawConversation; rounds: ConversationRound[] } | null> {
+    const { isIsolatedSourceWorker, runIsolatedSource } = await import("./conversation-isolated-source.js");
+    if (!isIsolatedSourceWorker() && !options.identityCache) {
+        const { assertDevinSourceCapability } = await import("./devin-sqlite.js");
+        await assertDevinSourceCapability();
+        const { signal, isCancelled, identityCache, ...serializable } = options;
+        return runIsolatedSource("devin-read", { id, options: serializable }, { deadlineAt: options.deadlineMs, signal, isCancelled });
+    }
     const { readDevinRawConversation } = await import("./devin-sqlite.js");
     const child = splitDevinSubagentId(id);
     if (child && options.roundRange) throw new DevinReadError("DEVIN_RANGE_UNAVAILABLE", "Devin child round ranges require a full child read; omit roundRange.");

@@ -1,8 +1,7 @@
 import { normalizeDataChain, type DataChain, type ConversationLinkMode, type ConversationLogicalChainMode } from "./chain.js";
 import {
-    getCodexThread,
+    getCodexThreadAsync,
     assertCodexSourceVersion,
-    captureCodexSourceVersion,
     captureCodexSourceVersionAsync,
     createCodexSourceRevisionAccumulator,
     codexSourceRevisionFromRounds,
@@ -438,13 +437,13 @@ async function loadFromResolvedChain(
     if (source === "cache" || options.publishedCacheOnly) return loadConversationCacheOnly(key, "cache", options);
     if (options.cacheGeneration) throw new Error("cacheGeneration 只能与 source=cache 或固定缓存读取一起使用");
     if (resolved === "codex" && !options.expectedCodexSource) {
-        const currentThread = getCodexThread(effectiveId);
+        const currentThread = await getCodexThreadAsync(effectiveId);
         if (currentThread?.rolloutPath) {
             options = { ...options, expectedCodexSource: await captureCodexSourceVersionAsync(currentThread.rolloutPath, options.isCancelled) };
         }
     }
     if (resolved === "codex" && options.expectedCodexSource) {
-        const expectedThread = getCodexThread(effectiveId);
+        const expectedThread = await getCodexThreadAsync(effectiveId);
         if (!expectedThread?.rolloutPath) throw new Error("Codex source changed before cache lookup; start a fresh fetch");
         await assertCodexSourceVersion(expectedThread.rolloutPath, options.expectedCodexSource, "before cache lookup", options.isCancelled);
     }
@@ -1041,15 +1040,15 @@ function fileFingerprint(filePath: string | undefined): ConversationSourceFinger
     return { path: filePath, size: stat.size, mtime: stat.mtimeMs };
 }
 
-function localConversationSourceFingerprint(
+async function localConversationSourceFingerprint(
     resolved: ResolvedConversationChain,
     conversationId: string,
     source: ConversationRawSource,
-): ConversationSourceFingerprint | null {
+): Promise<ConversationSourceFingerprint | null> {
     if (resolved === "codex") {
-        const rolloutPath = getCodexThread(conversationId)?.rolloutPath;
+        const rolloutPath = (await getCodexThreadAsync(conversationId))?.rolloutPath;
         if (!rolloutPath) return null;
-        const version = captureCodexSourceVersion(rolloutPath);
+        const version = await captureCodexSourceVersionAsync(rolloutPath);
         return { path: version.sourcePath, size: version.sourceSize, mtime: version.sourceMtimeMs, revision: version.historySource?.revision };
     }
     if (resolved === "claude-code") return fileFingerprint(getClaudeCodeThread(conversationId)?.jsonlPath);
@@ -1168,7 +1167,7 @@ async function prepareConversationCacheFreshness(
                 buildSource: "local",
             };
         }
-        return { fingerprint: localConversationSourceFingerprint(resolved, conversationId, source), buildSource: source };
+        return { fingerprint: await localConversationSourceFingerprint(resolved, conversationId, source), buildSource: source };
     }
     if (source === "ls") {
         const fingerprint = await lsConversationSourceFingerprint(resolved, conversationId, requestClass);
@@ -1178,7 +1177,7 @@ async function prepareConversationCacheFreshness(
         };
     }
     if (source === "auto") {
-        const local = localConversationSourceFingerprint(resolved, conversationId, "local");
+        const local = await localConversationSourceFingerprint(resolved, conversationId, "local");
         let live: ConversationSourceFingerprint | null = null;
         try {
             live = await lsConversationSourceFingerprint(resolved, conversationId, requestClass, false);
@@ -1191,7 +1190,7 @@ async function prepareConversationCacheFreshness(
             buildSource: "auto",
         };
     }
-    return { fingerprint: localConversationSourceFingerprint(resolved, conversationId, source), buildSource: source };
+    return { fingerprint: await localConversationSourceFingerprint(resolved, conversationId, source), buildSource: source };
 }
 
 function hydrateConversationCache(

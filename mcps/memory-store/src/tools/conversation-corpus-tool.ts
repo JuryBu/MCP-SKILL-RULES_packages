@@ -2,7 +2,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { createHash } from "node:crypto";
-import type { CorpusMessageRole, CorpusProjection, CorpusProvider, CorpusSearchExpression, CorpusSearchRequest } from "../conversation-corpus-types.js";
+import type { CorpusMessageRole, CorpusProjection, CorpusProvider, CorpusReadControl, CorpusSearchExpression, CorpusSearchRequest } from "../conversation-corpus-types.js";
 import { normalizeCodexCorpusConversationId } from "../conversation-corpus-search.js";
 import { resolveCorpusSources, type CorpusSource } from "../conversation-corpus-sources.js";
 
@@ -13,6 +13,7 @@ export function isCorpusAction(action: string): boolean {
 }
 
 export interface CorpusToolParams {
+    deadlineMs?: number;
     action: string;
     conversationId?: string;
     conversationIds?: string[];
@@ -54,10 +55,10 @@ export interface CorpusToolImplementation {
     resume: (args: TaskIdentity & { provider: CorpusProvider }) => Promise<unknown>;
     readRounds: (conversation: Parameters<CorpusProvider["read"]>[0], request: {
         revision: string; startRound?: number; endRound?: number; lastRounds?: number; messageRoles?: CorpusMessageRole[];
-    }) => Promise<CorpusProjection>;
+    }, control?: CorpusReadControl) => Promise<CorpusProjection>;
     readFast: (conversation: Parameters<CorpusProvider["read"]>[0], request: {
         startRound?: number; endRound?: number; lastRounds?: number; messageRoles?: CorpusMessageRole[];
-    }) => Promise<CorpusProjection>;
+    }, control?: CorpusReadControl) => Promise<CorpusProjection>;
     prepareCache: (args: { ownerId: string; conversationId: string; dataChain?: CorpusSource; provider: CorpusProvider }) => Promise<unknown>;
 }
 
@@ -66,8 +67,8 @@ async function implementation(): Promise<CorpusToolImplementation> {
     const provider = reader.createMultiCorpusProvider();
     return { provider, start: tasks.startCorpusSearch, status: tasks.getCorpusSearchStatus,
         cancel: tasks.cancelCorpusSearch, resume: tasks.resumeCorpusSearch,
-        readRounds: (conversation, request) => provider.readRounds(conversation, request, { messageRoles: request.messageRoles }),
-        readFast: (conversation, request) => provider.readFast(conversation, request, { messageRoles: request.messageRoles }),
+        readRounds: (conversation, request, control) => provider.readRounds(conversation, request, { ...control, messageRoles: request.messageRoles }),
+        readFast: (conversation, request, control) => provider.readFast(conversation, request, { ...control, messageRoles: request.messageRoles }),
         prepareCache: preparation.startCorpusPreparation };
 }
 
@@ -115,25 +116,21 @@ export async function runCorpusAction(params: CorpusToolParams, supplied?: Corpu
         }
         if (params.lastRounds !== undefined && (params.startRound !== undefined || params.endRound !== undefined)) throw new Error("lastRounds与startRound/endRound择一使用");
         if (params.startRound !== undefined && params.endRound !== undefined && params.startRound > params.endRound) throw new Error("startRound必须小于或等于endRound");
-        const conversations = await api.provider.list({ conversationIds: [targetId], dataChains: [source], sourceFailureMode: "fail" }, {});
+        const control: CorpusReadControl = { deadlineAt: Date.now() + (params.deadlineMs ?? 30_000) };
+        const conversations = await api.provider.list({ conversationIds: [targetId], dataChains: [source], sourceFailureMode: "fail" }, control);
         const conversation = conversations.find(candidate => candidate.source === source
             && (candidate.id === targetId || candidate.canonicalId === targetId || candidate.aliases?.includes(targetId)));
         if (!conversation) throw new Error(`${params.action}目标对话在本机来源中不存在`);
         if (params.action === "read_fast") {
+            const projection = await api.readFast(conversation, { startRound: params.startRound, endRound: params.endRound,
+                    lastRounds: params.lastRounds, messageRoles: roles }, control);
             const cachePreparation = params.prepareCache === false ? undefined : await api.prepareCache({ ownerId, conversationId: conversation.id, dataChain: source, provider: api.provider });
-            try {
-                const projection = await api.readFast(conversation, { startRound: params.startRound, endRound: params.endRound,
-                    lastRounds: params.lastRounds, messageRoles: roles });
                 return { ...projection, requestedRangeComplete: projection.partial !== true
                     && projection.requestedRangeComplete !== false && (projection.requestedRangeComplete === true || projection.complete),
                     fullSourceProjectionComplete: projection.complete, cachePreparation };
-            } catch (error) {
-                const message = error instanceof Error ? error.message : String(error);
-                throw new Error(`${message}${cachePreparation ? `；已登记的缓存准备任务：${JSON.stringify(cachePreparation)}` : ""}`);
-            }
         }
         return api.readRounds(conversation, { revision: params.sourceRevision!, startRound: params.startRound,
-            endRound: params.endRound, lastRounds: params.lastRounds, messageRoles: roles });
+            endRound: params.endRound, lastRounds: params.lastRounds, messageRoles: roles }, control);
     }
     if (!params.taskId?.trim()) throw new Error(`${params.action}需要原taskId`);
     const identity = { ownerId, taskId: params.taskId.trim() };

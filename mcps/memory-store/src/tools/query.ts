@@ -1,12 +1,14 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import path from "path";
+import { setImmediate as yieldImmediate } from "node:timers/promises";
 import { touchActivity, appendTiming } from "../lifecycle.js";
 import {
     readGlobalIndex,
     readWorkspaceIndex,
     readGeneralIndex,
     readMemoryFile,
+    getEntryPath,
     readWorkspaceMeta,
     findWorkspaceHash,
     listWorkspaceHashes,
@@ -18,8 +20,9 @@ import { fuseSearch, grepInEntries, grepGlobal } from "../search.js";
 import { countRecords } from "../record-store.js";
 import { resolveModelOnlyChainSplit } from "../chain.js";
 import { formatToolError } from "../error-format.js";
-import type { SearchMode } from "../search-engine.js";
+import type { SearchMode, TextBlock } from "../search-engine.js";
 import { modelChainInputSchema } from "./schema-utils.js";
+import { readMemoryQueryPrefix } from "../memory-query-prefix.js";
 
 /** 携带来源 hash 的条目（用于全局查询） */
 interface EntryWithSource extends MemoryIndexEntry {
@@ -28,6 +31,30 @@ interface EntryWithSource extends MemoryIndexEntry {
 
 /** 搜索时每条记忆正文截断上限（字符），控内存与 token 成本 */
 const BODY_SNIPPET_LIMIT = 3000;
+const BODY_READ_BATCH_SIZE = 16;
+
+async function buildSearchBlocks(entries: MemoryIndexEntry[], hash: string): Promise<TextBlock[]> {
+    const blocks: TextBlock[] = [];
+    for (let offset = 0; offset < entries.length; offset += BODY_READ_BATCH_SIZE) {
+        const batch = await Promise.allSettled(entries.slice(offset, offset + BODY_READ_BATCH_SIZE).map(async entry => {
+            const sourceHash = (entry as EntryWithSource)._sourceHash || hash;
+            const body = await readMemoryQueryPrefix(getEntryPath(sourceHash, entry.id), BODY_SNIPPET_LIMIT) || "";
+            return {
+                id: entry.id,
+                title: entry.title,
+                content: `${entry.title}\n${entry.searchSummary || ""}\n${entry.autoSummary || ""}\n${entry.tags.join(" ")}\n${body}`,
+                tags: entry.tags,
+                metadata: { updatedAt: entry.updatedAt },
+            };
+        }));
+        for (const result of batch) {
+            if (result.status === "rejected") throw result.reason;
+            blocks.push(result.value);
+        }
+        if (offset + BODY_READ_BATCH_SIZE < entries.length) await yieldImmediate();
+    }
+    return blocks;
+}
 
 /**
  * memory_query — 查询记忆
@@ -146,17 +173,7 @@ export function registerQuery(server: McpServer): void {
                     const requestedMode = (mode || "auto") as SearchMode;
                     if (requestedMode === "auto" && entries.length > 0) {
                         const { search: engineSearch } = await import("../search-engine.js");
-                        const blocks = entries.map(e => {
-                            const srcHash = (e as EntryWithSource)._sourceHash || hash;
-                            const body = (readMemoryFile(srcHash, e.id) || "").slice(0, BODY_SNIPPET_LIMIT);
-                            return {
-                                id: e.id,
-                                title: e.title,
-                                content: `${e.title}\n${e.searchSummary || ""}\n${(e as any).autoSummary || ""}\n${e.tags.join(" ")}\n${body}`,
-                                tags: e.tags,
-                                metadata: { updatedAt: e.updatedAt }, // B2: smart 缓存指纹含版本，防脏读
-                            };
-                        });
+                        const blocks = await buildSearchBlocks(entries, hash);
                         let engineResults = await engineSearch(blocks, query, {
                             mode: "auto",
                             limit: maxResults,
@@ -178,17 +195,7 @@ export function registerQuery(server: McpServer): void {
                     } else if (entries.length > 0) {
                         try {
                             const { search: engineSearch } = await import("../search-engine.js");
-                            const blocks = entries.map(e => {
-                                const srcHash = (e as EntryWithSource)._sourceHash || hash;
-                                const body = (readMemoryFile(srcHash, e.id) || "").slice(0, BODY_SNIPPET_LIMIT);
-                                return {
-                                    id: e.id,
-                                    title: e.title,
-                                    content: `${e.title}\n${e.searchSummary || ""}\n${(e as any).autoSummary || ""}\n${e.tags.join(" ")}\n${body}`,
-                                    tags: e.tags,
-                                    metadata: { updatedAt: e.updatedAt }, // B2: smart 缓存指纹含版本，防脏读
-                                };
-                            });
+                            const blocks = await buildSearchBlocks(entries, hash);
                             const engineResults = await engineSearch(blocks, query, {
                                 mode: requestedMode,
                                 limit: maxResults,

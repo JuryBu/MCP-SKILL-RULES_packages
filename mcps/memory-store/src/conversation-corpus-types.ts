@@ -97,6 +97,7 @@ export interface CorpusSearchRequest {
 }
 
 export interface CorpusReadControl {
+    deadlineAt?: number;
     messageRoles?: CorpusMessageRole[];
     forceRefresh?: boolean;
     isCancelled?: () => boolean;

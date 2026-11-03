@@ -11,6 +11,16 @@ import type { CorpusConversation, CorpusFastReadRequest, CorpusReadControl, Corp
 
 const verifiedIdentities = new WeakMap<CorpusConversation, CorpusVerifiedIdentity>();
 
+export function restoreIsolatedCorpusIdentity(conversation: CorpusConversation, identity?: CorpusVerifiedIdentity): void {
+    if (!identity) return;
+    if (identity.authority !== "devin-sqlite" || identity.source !== conversation.source
+        || identity.canonicalId !== conversation.id || conversation.canonicalId !== conversation.id
+        || JSON.stringify(identity.aliases) !== JSON.stringify(conversation.aliases)) {
+        throw new Error("Isolated source returned conflicting verified identity");
+    }
+    verifiedIdentities.set(conversation, identity);
+}
+
 export function verifiedCorpusIdentity(conversation: CorpusConversation): CorpusVerifiedIdentity | undefined {
     const identity = verifiedIdentities.get(conversation);
     if (!identity || conversation.source !== identity.source || conversation.id !== identity.canonicalId

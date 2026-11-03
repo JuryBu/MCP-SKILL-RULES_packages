@@ -37,6 +37,7 @@ import { cleanupRegistryOnExit } from "./ls-registry.js";
 import { VERSION } from "./version.js";
 import { GUIDE_TEXT } from "./guide-text.js";
 import { installToolConcurrency } from "./tool-concurrency.js";
+import { closeIsolatedSourceWorkers } from "./conversation-isolated-source.js";
 import { cleanOldTasks, runBackgroundTaskStartupRecovery } from "./background-tasks.js";
 import {
     assertRecordMutationStartupRecoverySafe,
@@ -159,6 +160,7 @@ async function gracefulExit(
     );
     const deadlineAt = Date.now() + shutdownTimeoutMs;
     let exitCode = 0;
+    const sourceClose = closeIsolatedSourceWorkers();
 
     console.error(`[memory-store] shutdown scheduler close begin; totalTimeoutMs=${shutdownTimeoutMs}, schedulerTimeoutMs=${schedulerTimeoutMs}`);
     const schedulerClose = closeRecordSchedulerProductionSessions({
@@ -188,6 +190,10 @@ async function gracefulExit(
         exitCode = 1;
         logShutdownStepFailure("provider close", providerResult);
     }
+
+    const sourceResult = await waitForShutdownStep(sourceClose, deadlineAt, remainingShutdownMs(deadlineAt, 6000));
+    if (sourceResult.kind === "timed-out") console.error("[memory-store] shutdown history source cleanup timed out");
+    else if (sourceResult.kind === "failed") { exitCode = 1; logShutdownStepFailure("history source cleanup", sourceResult); }
 
     if (diagnose) {
         const diagnoseResult = await waitForShutdownStep(diagnose(), deadlineAt, remainingShutdownMs(deadlineAt, shutdownTimeoutMs));

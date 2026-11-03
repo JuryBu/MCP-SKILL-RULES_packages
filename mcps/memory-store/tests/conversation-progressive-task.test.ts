@@ -21,6 +21,8 @@ const { openProgressiveCache } = await import("../src/conversation-progressive-c
 const { runProgressiveWorker } = await import("../src/conversation-progressive-worker-client.js");
 const hash = (value: string) => createHash("sha256").update(value).digest("hex");
 const fork = childProcess.fork;
+const execFile = childProcess.execFile;
+const kill = process.kill;
 
 class FixtureChild extends EventEmitter {
     pid: number | undefined = 123456;
@@ -53,12 +55,30 @@ async function until(check: () => boolean | Promise<boolean>) {
 async function withChildren(run: (children: FixtureChild[]) => Promise<void>) {
     const children: FixtureChild[] = [];
     childProcess.fork = (() => { const child = new FixtureChild(); children.push(child); return child; }) as any;
+    childProcess.execFile = ((file: string, args: string[], _options: unknown, callback: (error: Error | null) => void) => {
+        assert.equal(file, "taskkill.exe");
+        const child = [...children].reverse().find(candidate => String(candidate.pid) === args[1]);
+        assert.ok(child, "tree termination must target an owned fixture");
+        assert.deepEqual(args, ["/PID", String(child.pid), "/T", "/F"]);
+        child.kills++;
+        queueMicrotask(() => callback(null));
+        return new EventEmitter();
+    }) as any;
+    process.kill = ((pid: number, signal: NodeJS.Signals) => {
+        if (pid >= 0) return kill(pid, signal);
+        const child = [...children].reverse().find(candidate => candidate.pid === -pid);
+        assert.ok(child, "process group must belong to an owned fixture");
+        child.kills++;
+        return true;
+    }) as typeof process.kill;
     syncBuiltinESMExports();
     try { await run(children); }
     finally {
         for (const child of children) child.complete();
         await sleep(30);
         childProcess.fork = fork;
+        childProcess.execFile = execFile;
+        process.kill = kill;
         syncBuiltinESMExports();
     }
 }
@@ -79,7 +99,7 @@ async function recorded(status: "running" | "cancelled" | "done" = "cancelled", 
 
 function input(roundIndex: number) {
     const round: ConversationRound = { roundIndex, startStep: roundIndex, endStep: roundIndex,
-        userMessage: "fictional-body-" + roundIndex, aiResponses: [], toolCalls: [], taskBoundaries: [], codeActions: [], subagentSummaries: [] };
+        userMessage: "fictional-body-" + roundIndex, mediaAttachments: [], aiResponses: [], toolCalls: [], taskBoundaries: [], codeActions: [], subagentSummaries: [] };
     return { coverage: { kind: "absolute" as const, startRound: roundIndex, endRound: roundIndex }, anchor: { fixture: roundIndex }, rounds: [round],
         messages: [{ id: "fictional-message-" + roundIndex, round: roundIndex, role: "user" as const, text: round.userMessage, position: { ordinal: roundIndex } }] };
 }
@@ -98,18 +118,24 @@ async function published(sample: Awaited<ReturnType<typeof recorded>>, revision 
 
 after(async () => {
     childProcess.fork = fork;
+    childProcess.execFile = execFile;
+    process.kill = kill;
     syncBuiltinESMExports();
     background.__testResetBackgroundTasksForTest();
     await promises.rm(directory, { recursive: true, force: true });
 });
 
-test("spawn errors without exit reject and clear worker polling", async () => withChildren(async children => {
+test("spawn errors without exit still wait for close and clear worker polling", async () => withChildren(async children => {
     const sample = await recorded();
     const work = runProgressiveWorker(sample.payload, { taskId: sample.record.backgroundTaskId, isCancelled: () => false, isSettled: () => false, updateProgress: () => {} });
     assert.equal(children.length, 1);
     children[0]!.pid = undefined;
-    const checked = assert.rejects(work, /synthetic spawn ENOENT/u);
+    let settled = false;
+    const checked = assert.rejects(work, /synthetic spawn ENOENT/u).then(() => { settled = true; });
     children[0]!.emit("error", new Error("synthetic spawn ENOENT"));
+    await sleep(20);
+    assert.equal(settled, false);
+    children[0]!.close();
     await checked;
     assert.equal(children[0]!.kills, 0);
 }));

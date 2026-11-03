@@ -115,8 +115,8 @@ assert.equal(classifyToolRequest("record_manage", { action: "update" }), "auto-b
 assert.equal(classifyToolRequest("record_manage", { action: "bulk_update" }), "auto-background");
 assert.equal(classifyToolRequest("record_manage", { action: "batch_update" }), "auto-background");
 assert.equal(classifyToolRequest("record_manage", { action: "task_status" }), "light");
-assert.equal(classifyToolRequest("background_task_status", { taskId: "task-1" }), "light");
-assert.equal(classifyToolRequest("background_task_cancel", { taskId: "task-1" }), "light");
+assert.equal(classifyToolRequest("background_task_status", { taskId: "task-1" }), "control");
+assert.equal(classifyToolRequest("background_task_cancel", { taskId: "task-1" }), "control");
 assert.equal(classifyToolRequest("stage_guard", { action: "check" }), "mixed");
 assert.equal(classifyToolRequest("stage_guard", { action: "check", taskId: "task-1" }), "light");
 assert.equal(classifyToolRequest("conversation_golden_extract", { taskId: "task-1" }), "light");

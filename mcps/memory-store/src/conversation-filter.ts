@@ -28,7 +28,7 @@ import {
     type DshSessionSnapshot,
 } from "./dsh-session-reader.js";
 import { canonicalWorkspacePath } from "./store.js";
-import type { ConversationContextLocateAdapters, ConversationContextLocateResult, LocateRawSource } from "./conversation-context-locate.js";
+import type { ContextLocateReadBudget, ConversationContextLocateAdapters, ConversationContextLocateResult, LocateRawSource } from "./conversation-context-locate.js";
 import type { DevinConversationSummary } from "./devin-types.js";
 import { listLocalPbConversationCandidates, type ConversationDiscoveryDiagnostic } from "./conversation-local-list.js";
 import { discoverDevinConversations } from "./devin-sqlite.js";
@@ -37,6 +37,7 @@ import { listCachedContextCandidates } from "./conversation-context-locate-cache
 import { discoverDevinChildCandidates } from "./devin-child-discovery.js";
 import { splitDevinSubagentId } from "./devin-conversation.js";
 import { resolveCachedDevinIdentity } from "./devin-identity.js";
+import { isIsolatedSourceWorker, runIsolatedSource } from "./conversation-isolated-source.js";
 
 export type ConversationSource = Exclude<DataChain, "auto">;
 export type WorkspaceMatchMode = "contains" | "exact" | "under" | "any" | "all";
@@ -105,6 +106,7 @@ export interface ListConversationCandidatesOptions {
     maxHits?: number;
     deadlineMs?: number;
     deadlineAt?: number;
+    signal?: AbortSignal;
     isCancelled?: () => boolean;
     conversationIds?: string[];
 }
@@ -150,6 +152,7 @@ export interface ConversationSourceAdapters {
     windsurf: {
         list(limit: number): Promise<WindsurfConversationSummary[]> | WindsurfConversationSummary[];
         discover?: (limit: number, options: ListConversationCandidatesOptions) => Promise<WindsurfDiscoveryResult>;
+        discoverChildren?: typeof discoverDevinChildCandidates;
         resolve(id: string): Promise<string | null> | string | null;
     };
     dsh?: {
@@ -177,6 +180,7 @@ const DEFAULT_ADAPTERS: ConversationSourceAdapters = {
     },
     windsurf: {
         list: limit => listRecentWindsurfThreads(limit),
+        discoverChildren: discoverDevinChildCandidates,
         discover: (limit, options) => discoverWindsurfThreads(limit, {
             conversationIds: options.conversationIds?.map(id => splitDevinSubagentId(id)?.parentId || id),
             workspaces: options.workspaces, workspaceMode: options.workspaceMode, workspaceScope: options.workspaceScope,
@@ -716,7 +720,37 @@ function applyThreadMode(
     return { filtered: main, warnings: [] };
 }
 
+function candidateMatchesIdentity(candidate: UnifiedConversationCandidate, id: string): boolean {
+    return [candidate.id, ...(candidate.aliases || []), candidate.uuid, candidate.sessionId]
+        .some(value => value?.toLowerCase() === id.trim().toLowerCase());
+}
+
+function exactQueryTargets(raw: UnifiedConversationCandidate[], options: ListConversationCandidatesOptions): string[] | undefined {
+    if (options.conversationIds?.length || !options.query?.trim()) return undefined;
+    return raw.some(candidate => candidateMatchesIdentity(candidate, options.query!)) ? [options.query.trim()] : undefined;
+}
+
+function appendDevinChildren(raw: UnifiedConversationCandidate[], children: Awaited<ReturnType<typeof discoverDevinChildCandidates>>): void {
+    for (const parent of children.verifiedParents) {
+        const verifiedIds = new Set([parent.summary.id, parent.summary.canonicalId, ...parent.summary.aliases]);
+        const matchingIndices: number[] = [];
+        for (const [index, candidate] of raw.entries()) {
+            if (candidate.sourceKind?.startsWith("devin-") && [candidate.id, ...(candidate.aliases || [])].some(id => verifiedIds.has(id))) matchingIndices.push(index);
+        }
+        if (matchingIndices.length) {
+            raw[matchingIndices[0]!] = { ...candidateFromDevinConversation(parent.summary), sourcePartial: parent.partial || parent.summary.partial };
+            for (const index of matchingIndices.slice(1).reverse()) raw.splice(index, 1);
+        }
+    }
+    raw.push(...children.candidates.filter(child => !raw.some(candidate => candidate.id === child.id)));
+}
+
 export async function listConversationCandidates(options: ListConversationCandidatesOptions = {}): Promise<ListConversationCandidatesResult> {
+    const deadlineAt = Math.min(options.deadlineAt ?? Infinity, Date.now() + (options.deadlineMs ?? 12_000));
+    if (!options.adapters && !options.contextAdapters && !isIsolatedSourceWorker()) {
+        const { adapters: _adapters, contextAdapters: _contextAdapters, isCancelled, signal, ...payload } = options;
+        return runIsolatedSource<ListConversationCandidatesResult>("candidates", payload, { deadlineAt, isCancelled, signal });
+    }
     const adapters = options.adapters || DEFAULT_ADAPTERS;
     const sources = normalizeConversationSources(options.dataChains);
     const normalizedQuery = normalizeConversationQuery(options.query);
@@ -726,46 +760,34 @@ export async function listConversationCandidates(options: ListConversationCandid
     const collected: UnifiedConversationCandidate[] = [];
     const rawBySource = new Map<ConversationSource, UnifiedConversationCandidate[]>();
     let partial = false;
-    const deadlineAt = Math.min(options.deadlineAt ?? Infinity, Date.now() + (options.deadlineMs ?? 12_000));
+    const callerCancelled = options.isCancelled;
+    const signal = options.signal;
+    options = { ...options, deadlineAt, isCancelled: () => Boolean(signal?.aborted || callerCancelled?.()) };
     const diagnosticsBySource = new Map<ConversationSource, ConversationDiscoveryDiagnostic[]>();
+    let deferredDevinLookup: { parents: UnifiedConversationCandidate[]; options: ListConversationCandidatesOptions } | undefined;
 
     const settled = await Promise.allSettled(sources.map(async source => {
         if (options.isCancelled?.()) throw new Error("candidate discovery cancelled");
+        if (Date.now() >= deadlineAt) throw new Error("candidate discovery deadline exceeded");
         if (options.threadMode === "children" && options.parentDataChain && normalizeDataChain(options.parentDataChain) !== source) return { source, filtered: [], warnings: [] };
         const fetchLimit = conversationSourceFetchLimit(source, sourceLimit, options);
         const diagnostics: ConversationDiscoveryDiagnostic[] = [];
         diagnosticsBySource.set(source, diagnostics);
+        const metadataOptions = source === "windsurf" && adapters.windsurf.discoverChildren && options.threadMode === "children"
+            && options.parentConversationId && !options.conversationIds?.length ? { ...options, conversationIds: [options.parentConversationId] } : options;
         const cacheListing = options.source === "cache" ? listCachedContextCandidates(source, fetchLimit, options) : undefined;
-        const raw = cacheListing?.candidates || await listSourceCandidates(source, fetchLimit, adapters, source === "antigravity" && Boolean(options.workspaces?.length), { ...options, deadlineAt }, diagnostics);
+        const raw = cacheListing?.candidates || await listSourceCandidates(source, fetchLimit, adapters, source === "antigravity" && Boolean(options.workspaces?.length), metadataOptions, diagnostics);
         const warnings = [...(cacheListing?.warnings || []), ...diagnostics.map(diagnostic => `${diagnostic.code}: ${diagnostic.message}`)];
         if (cacheListing?.partial && !warnings.length) warnings.push("cache_candidate_budget");
-        const needsChildren = options.threadMode === "children" || options.threadMode === "all" || Boolean(options.contextProbe?.trim() || options.query?.trim())
-            || options.conversationIds?.some(id => Boolean(splitDevinSubagentId(id)));
-        if (source === "windsurf" && options.source !== "cache" && !options.adapters && needsChildren) {
-            const scopedParents = raw.filter(candidate => workspaceMatches(candidateWorkspacesForScope(candidate, options.workspaceScope || "any"), options.workspaces || [], options.workspaceMode || "any"));
-            const children = await discoverDevinChildCandidates(scopedParents, { ...options, deadlineMs: Math.max(1, deadlineAt - Date.now()) });
-            for (const parent of children.verifiedParents) {
-                const verifiedIds = new Set([parent.summary.id, parent.summary.canonicalId, ...parent.summary.aliases]);
-                const matchingIndices: number[] = [];
-                for (const [index, candidate] of raw.entries()) {
-                    if (candidate.sourceKind?.startsWith("devin-") && [candidate.id, ...(candidate.aliases || [])].some(id => verifiedIds.has(id))) {
-                        matchingIndices.push(index);
-                    }
-                }
-                if (matchingIndices.length) {
-                    raw[matchingIndices[0]!] = { ...candidateFromDevinConversation(parent.summary), sourcePartial: parent.partial || parent.summary.partial };
-                    for (const index of matchingIndices.slice(1).reverse()) raw.splice(index, 1);
-                }
-            }
-            raw.push(...children.candidates.filter(child => !raw.some(candidate => candidate.id === child.id)));
-            warnings.push(...children.warnings);
-        }
-        warnings.push(...raw.flatMap(candidateWarnings), ...raw.flatMap(candidate => candidate.discoveryWarnings || []));
-        warnings.push(...raw.filter(item => item.sourcePartial).map(item => `partial_source:${item.id}`));
         if (raw.length >= fetchLimit && !options.conversationIds?.length) warnings.push("candidate_limit: source enumeration may be incomplete");
+        const queryTargets = exactQueryTargets(raw, options);
+        const queryChild = !options.conversationIds?.length && options.query?.trim() && splitDevinSubagentId(options.query.trim()) ? [options.query.trim()] : undefined;
+        const targets = options.conversationIds?.length ? options.conversationIds : queryTargets || queryChild;
+        const workspaceTargets = targets?.flatMap(id => [id, splitDevinSubagentId(id)?.parentId].filter((value): value is string => Boolean(value)));
+        const workspaceCandidates = workspaceTargets ? raw.filter(candidate => workspaceTargets.some(id => candidateMatchesIdentity(candidate, id))) : raw;
         if (options.source !== "cache" && (options.source === "local" || (source === "windsurf" && options.conversationIds?.length)) && options.workspaces?.length) {
-            const hasKnownScope = Boolean(options.contextProbe?.trim()) && raw.some(candidate => workspaceMatches(candidateWorkspacesForScope(candidate, options.workspaceScope || "any"), options.workspaces || [], options.workspaceMode || "any"));
-            for (const candidate of raw) {
+            const hasKnownScope = Boolean(options.contextProbe?.trim()) && workspaceCandidates.some(candidate => workspaceMatches(candidateWorkspacesForScope(candidate, options.workspaceScope || "any"), options.workspaces || [], options.workspaceMode || "any"));
+            for (const candidate of workspaceCandidates) {
                 if (candidate.workspace || candidate.workspaces?.length) continue;
                 if (hasKnownScope) { warnings.push(`workspace_unknown_deferred:${candidate.id}`); continue; }
                 if (Date.now() >= deadlineAt || options.isCancelled?.()) { warnings.push("workspace_probe_budget: unresolved local workspaces"); break; }
@@ -784,9 +806,49 @@ export async function listConversationCandidates(options: ListConversationCandid
                 } catch (error) { warnings.push(`workspace_probe_failed:${candidate.id}:${String(error)}`); }
             }
         }
+        const explicitMainTargets = Boolean(targets?.length && targets.every(id => !splitDevinSubagentId(id)));
+        const explicitChildren = options.threadMode === "children" || options.threadMode === "all" || targets?.some(id => Boolean(splitDevinSubagentId(id)));
+        if (source === "windsurf" && options.source !== "cache" && adapters.windsurf.discoverChildren && !explicitMainTargets
+            && (explicitChildren || options.contextProbe?.trim() || options.query?.trim())) {
+            let scopedParents = raw.filter(candidate => candidate.sourceKind?.startsWith("devin-") && !candidate.isChildThread)
+                .filter(candidate => workspaceMatches(candidateWorkspacesForScope(candidate, options.workspaceScope || "any"), options.workspaces || [], options.workspaceMode || "any"));
+            let childOptions = { ...options, conversationIds: targets };
+            let parentResolved = true;
+            if (options.threadMode === "children") {
+                const resolved = resolveParentForChildrenMode(raw, normalizeConversationQuery(options.parentQuery), splitConversationQueryTerms(options.parentQuery), options);
+                warnings.push(...resolved.warnings);
+                parentResolved = Boolean(resolved.parentId);
+                if (resolved.parentId) childOptions = { ...childOptions, parentConversationId: resolved.parentId };
+            }
+            if (childOptions.parentConversationId) {
+                scopedParents = scopedParents.filter(candidate => candidateMatchesIdentity(candidate, childOptions.parentConversationId!));
+                const knownParents = raw.filter(candidate => !candidate.isChildThread && candidateMatchesIdentity(candidate, childOptions.parentConversationId!));
+                if (knownParents.length && knownParents.every(candidate => Boolean(candidate.workspace || candidate.workspaces?.length)
+                    && !workspaceMatches(candidateWorkspacesForScope(candidate, options.workspaceScope || "any"), options.workspaces || [], options.workspaceMode || "any"))) parentResolved = false;
+            }
+            if (parentResolved && explicitChildren) {
+                const children = await adapters.windsurf.discoverChildren(scopedParents, childOptions);
+                appendDevinChildren(raw, children);
+                warnings.push(...children.warnings);
+            } else if (parentResolved && scopedParents.length) {
+                if (options.contextProbe?.trim()) deferredDevinLookup = { parents: scopedParents, options: childOptions };
+                else if (raw.some(candidate => candidateMatchesQuery(candidate, normalizedQuery, queryTerms)
+                    && workspaceMatches(candidateWorkspacesForScope(candidate, options.workspaceScope || "any"), options.workspaces || [], options.workspaceMode || "any"))) {
+                    warnings.push("devin_child_discovery_deferred: metadata matches returned before child enumeration");
+                } else {
+                    const children = await adapters.windsurf.discoverChildren(scopedParents, childOptions);
+                    appendDevinChildren(raw, children);
+                    warnings.push(...children.warnings);
+                }
+            }
+        }
+        if (Date.now() >= deadlineAt || options.isCancelled?.()) warnings.push("candidate_discovery_budget: deadline or cancellation reached");
+        warnings.push(...raw.flatMap(candidateWarnings), ...raw.flatMap(candidate => candidate.discoveryWarnings || []));
+        warnings.push(...raw.filter(item => item.sourcePartial).map(item => `partial_source:${item.id}`));
         rawBySource.set(source, raw);
         let filtered = raw
             .filter(item => !options.conversationIds?.length || options.conversationIds.some(id => item.id === id || item.aliases?.includes(id) || item.uuid === id || item.sessionId === id))
+            .filter(item => !options.contextProbe?.trim() || !targets?.length || targets.some(id => candidateMatchesIdentity(item, id)))
             .filter(item => options.contextProbe?.trim() || candidateMatchesQuery(item, normalizedQuery, queryTerms))
             .filter(item => workspaceMatches(candidateWorkspacesForScope(item, options.workspaceScope || "any"), options.workspaces || [], options.workspaceMode || "any"))
             .sort((a, b) => {
@@ -824,13 +886,82 @@ export async function listConversationCandidates(options: ListConversationCandid
     });
 
     if (options.contextProbe?.trim()) {
-        const { locateConversationContext, annotateContextLocateCandidates, contextLocateResolution } = await import("./conversation-context-locate.js");
+        const { locateConversationContext, annotateContextLocateCandidates, contextLocateResolution, locatePositiveInteger } = await import("./conversation-context-locate.js");
+        const readers = options.contextAdapters || (await import("./conversation-context-locate-adapters.js")).defaultContextLocateAdapters;
+        const boundContextBudget = (budget: ContextLocateReadBudget): ContextLocateReadBudget => {
+            if (options.isCancelled?.() || Date.now() >= deadlineAt) throw new Error("context discovery deadline exceeded or cancelled");
+            return { ...budget, deadlineAt: Math.min(budget.deadlineAt, deadlineAt),
+                isCancelled: () => Boolean(options.isCancelled?.()) || Date.now() >= deadlineAt };
+        };
+        const contextAdapters: ConversationContextLocateAdapters = {
+            readRounds: (candidate, budget) => readers.readRounds(candidate, boundContextBudget(budget)),
+            scanStream: readers.scanStream ? (candidate, query, budget) => readers.scanStream!(candidate, query, boundContextBudget(budget)) : undefined,
+        };
+        const maximumFiles = locatePositiveInteger(options.candidateLimit, 50, 20_000);
+        const maximumBytes = locatePositiveInteger(options.maxBytes, 16 * 1024 * 1024);
+        const maximumHits = locatePositiveInteger(options.maxHits, Math.max(sourceLimit * 3, 20), 1000);
         const contextLocate = await locateConversationContext(collected, options.contextProbe, {
-            probe: true, source: options.source, maxFiles: options.candidateLimit || 50,
-            maxBytes: options.maxBytes, maxHits: options.maxHits || Math.max(sourceLimit * 3, 20),
+            probe: true, source: options.source, maxFiles: maximumFiles,
+            maxBytes: maximumBytes, maxHits: maximumHits,
             deadlineMs: Math.max(1, deadlineAt - Date.now()), isCancelled: options.isCancelled,
-            candidatesPartial: partial, adapters: options.contextAdapters,
+            candidatesPartial: partial, adapters: contextAdapters,
         });
+        if (deferredDevinLookup) {
+            const sourceStatus = statuses.find(status => status.dataChain === "windsurf");
+            const childWarnings: string[] = [];
+            const remainingFiles = maximumFiles - contextLocate.scannedFiles;
+            const remainingBytes = maximumBytes - contextLocate.scannedBytes;
+            const remainingHits = maximumHits - contextLocate.hits.length;
+            const exhaustedParents = new Set(contextLocate.warnings.flatMap(warning => {
+                const match = /^devin_context_source_budget:(.*):DEVIN_(?:BYTE_BUDGET|NODE_BUDGET)$/u.exec(warning);
+                return match ? [match[1]!] : [];
+            }));
+            const childParents = deferredDevinLookup.parents.filter(parent => !exhaustedParents.has(parent.id));
+            if (contextLocate.hits.some(hit => hit.dataChain === "windsurf")) {
+                childWarnings.push("devin_child_discovery_deferred: context matches returned before child enumeration");
+            } else if (!childParents.length || options.isCancelled?.() || Date.now() >= deadlineAt || remainingFiles <= 0 || remainingBytes <= 0 || remainingHits <= 0) {
+                childWarnings.push("devin_child_discovery_deferred: context discovery budget exhausted");
+            } else {
+                try {
+                    if (exhaustedParents.size) childWarnings.push("devin_child_discovery_deferred: parents that exhausted physical source budgets were not read again");
+                    const children = await adapters.windsurf.discoverChildren!(childParents, {
+                        ...deferredDevinLookup.options, maxBytes: undefined,
+                    });
+                    const raw = rawBySource.get("windsurf") || [];
+                    appendDevinChildren(raw, children);
+                    childWarnings.push(...children.warnings);
+                    const added = children.candidates.filter(candidate => !collected.some(existing => existing.dataChain === candidate.dataChain && existing.id === candidate.id))
+                        .filter(candidate => workspaceMatches(candidateWorkspacesForScope(candidate, options.workspaceScope || "any"), options.workspaces || [], options.workspaceMode || "any"));
+                    collected.push(...added);
+                    const childLocate = await locateConversationContext(added, options.contextProbe, {
+                        probe: true, source: options.source, maxFiles: remainingFiles, maxBytes: remainingBytes, maxHits: remainingHits,
+                        deadlineMs: Math.max(1, deadlineAt - Date.now()), isCancelled: options.isCancelled,
+                        candidatesPartial: partial || childWarnings.length > 0, adapters: contextAdapters,
+                    });
+                    contextLocate.hits.push(...childLocate.hits);
+                    contextLocate.scannedFiles += childLocate.scannedFiles;
+                    contextLocate.totalFiles += childLocate.totalFiles;
+                    contextLocate.scannedBytes += childLocate.scannedBytes;
+                    contextLocate.totalBytes += childLocate.totalBytes;
+                    contextLocate.truncated ||= childLocate.truncated;
+                    contextLocate.candidateFailures = [...(contextLocate.candidateFailures || []), ...(childLocate.candidateFailures || [])];
+                    contextLocate.warnings.push(...childLocate.warnings);
+                    if (childLocate.status === "cancelled") contextLocate.status = "cancelled";
+                    if (sourceStatus) sourceStatus.count += added.length;
+                } catch (error) {
+                    childWarnings.push(`devin_child_discovery_failed:${String(error)}`);
+                }
+            }
+            if (childWarnings.length) {
+                partial = true;
+                contextLocate.truncated = true;
+                contextLocate.warnings = [...new Set([...contextLocate.warnings, ...childWarnings])].slice(0, 20);
+                if (sourceStatus) {
+                    sourceStatus.partial = true;
+                    sourceStatus.warnings = [...(sourceStatus.warnings || []), ...childWarnings];
+                }
+            }
+        }
         const annotated = annotateContextLocateCandidates(collected, contextLocate);
         const selected: UnifiedConversationCandidate[] = [];
         for (const source of sources) {
@@ -844,10 +975,20 @@ export async function listConversationCandidates(options: ListConversationCandid
             }));
             if (threadResult.warnings.length) {
                 const status = statuses.find(item => item.dataChain === source);
-                if (status) status.warnings = [...(status.warnings || []), ...threadResult.warnings];
+                if (status) {
+                    status.warnings = [...(status.warnings || []), ...threadResult.warnings];
+                    status.partial = true;
+                }
+                partial = true;
             }
         }
         const matchCount = new Set(selected.map(item => `${item.dataChain}:${item.id}`)).size;
+        contextLocate.truncated ||= partial;
+        if (contextLocate.status !== "cancelled") {
+            contextLocate.status = contextLocate.truncated ? contextLocate.hits.length ? "partial_found_scanning" : "budget_exhausted"
+                : contextLocate.hits.length ? "found" : "no_hit_after_full_scan";
+            contextLocate.reason = contextLocate.truncated ? "bounded_or_incomplete_source_scan" : undefined;
+        }
         contextLocate.matchedConversationCount = matchCount;
         contextLocate.matchIdentityScope = "listed_threads";
         contextLocate.resolution = contextLocateResolution(matchCount, contextLocate.truncated);

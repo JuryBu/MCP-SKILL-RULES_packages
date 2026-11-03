@@ -1,5 +1,6 @@
 import type { CorpusSource } from "./conversation-corpus-sources.js";
-import type { CorpusConversation, CorpusFastReadRequest, CorpusProjection, CorpusRangeProvider, CorpusReadControl, CorpusSearchRequest, CorpusSourceStatus } from "./conversation-corpus-types.js";
+import type { CorpusConversation, CorpusFastReadRequest, CorpusProjection, CorpusRangeProvider, CorpusReadControl, CorpusSearchRequest, CorpusSourceStatus, CorpusVerifiedIdentity } from "./conversation-corpus-types.js";
+import { canIsolateSourceOptions, isIsolatedSourceWorker, runIsolatedSource } from "./conversation-isolated-source.js";
 import { assertHostReadActive, HOST_CORPUS_VERSION, hostConversationMatches, projectHostCorpus, validateHostRange, type HostCorpusSnapshot } from "./conversation-host-projection.js";
 import type { ClaudeCodeThreadInfo } from "./claude-code-client.js";
 import type { DshReaderOptions } from "./dsh-session-reader.js";
@@ -55,6 +56,7 @@ function defaultBackend(source: HostCorpusSource, options: HostCorpusReaderOptio
 export function createHostCorpusProvider(source: HostCorpusSource, options: HostCorpusReaderOptions = {}): CorpusRangeProvider {
     if (!["claude-code", "windsurf", "antigravity", "dsh"].includes(source)) throw new Error("Host corpus provider requires an explicit non-Codex source");
     const backend = options.backend || defaultBackend(source, options);
+    const isolated = !isIsolatedSourceWorker() && canIsolateSourceOptions(options);
     let statuses: CorpusSourceStatus[] = [];
     const assertSource = (conversation: CorpusConversation, control: CorpusReadControl) => {
         assertHostReadActive(control);
@@ -63,6 +65,16 @@ export function createHostCorpusProvider(source: HostCorpusSource, options: Host
     const read = async (conversation: CorpusConversation, request: CorpusFastReadRequest | undefined, control: CorpusReadControl): Promise<CorpusProjection> => {
         assertSource(conversation, control);
         if (request) validateHostRange(request);
+        if (isolated) {
+            const result = await runIsolatedSource<{ projection: CorpusProjection; identity?: CorpusVerifiedIdentity }>("host-read",
+                { source, options, conversation, request, messageRoles: control.messageRoles, forceRefresh: control.forceRefresh }, control,
+                { timeoutMs: request ? 30_000 : 120_000 });
+            const { restoreIsolatedCorpusIdentity } = await import("./conversation-host-binary.js");
+            restoreIsolatedCorpusIdentity(result.projection.conversation, result.identity);
+            if (!request && control.onChunk) await control.onChunk({ ...result.projection, verified: !result.projection.partial });
+            assertHostReadActive(control);
+            return result.projection;
+        }
         const snapshot = await backend.read(conversation, request, control);
         assertHostReadActive(control);
         const projection = projectHostCorpus(conversation, snapshot, request, control);
@@ -80,6 +92,11 @@ export function createHostCorpusProvider(source: HostCorpusSource, options: Host
         async list(request, control) {
             assertHostReadActive(control);
             try {
+                if (isolated) {
+                    const result = await runIsolatedSource<{ candidates: CorpusConversation[]; statuses: CorpusSourceStatus[] }>("host-list", { source, options, request }, control, { timeoutMs: 12_000 });
+                    statuses = result.statuses;
+                    return result.candidates;
+                }
                 const candidates = (await backend.list(request, control)).filter(conversation => {
                     if (conversation.source !== source) throw new Error(`Unexpected ${conversation.source} candidate from ${source}`);
                     return hostConversationMatches(conversation, request);
@@ -94,6 +111,14 @@ export function createHostCorpusProvider(source: HostCorpusSource, options: Host
         },
         async readCached(conversation, control) {
             assertSource(conversation, control);
+            if (isolated) {
+                const result = await runIsolatedSource<{ projection: CorpusProjection | null; identity?: CorpusVerifiedIdentity }>("host-cached", { source, options, conversation, messageRoles: control.messageRoles, forceRefresh: control.forceRefresh }, control);
+                if (result.projection) {
+                    const { restoreIsolatedCorpusIdentity } = await import("./conversation-host-binary.js");
+                    restoreIsolatedCorpusIdentity(result.projection.conversation, result.identity);
+                }
+                return result.projection;
+            }
             const cached = await backend.readCached?.(conversation, control);
             return cached ? projectHostCorpus(conversation, cached, undefined, control) : null;
         },

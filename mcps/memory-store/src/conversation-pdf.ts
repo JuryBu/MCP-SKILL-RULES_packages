@@ -2,7 +2,8 @@ import fs from "fs";
 import os from "os";
 import path from "path";
 import { pathToFileURL } from "url";
-import { spawn, spawnSync } from "child_process";
+import { execFile, spawn } from "child_process";
+import { randomUUID } from "node:crypto";
 import { createRequire } from "module";
 import MarkdownIt from "markdown-it";
 import katex from "katex";
@@ -425,18 +426,34 @@ async function runBrowserPrint(browserPath: string, htmlPath: string, pdfPath: s
     await runBrowserPrintCli(browserPath, htmlPath, pdfPath, exportDir, timeoutMs);
 }
 
-function findPythonCommand(): string | null {
-    for (const command of ["python", "py"]) {
-        const check = spawnSync(command, command === "py" ? ["-3", "-c", "import sys; print(sys.version)"] : ["-c", "import sys; print(sys.version)"], {
+function runPdfPython(command: string, args: string[], timeoutMs: number): Promise<{ status: number | null; stdout: string; stderr: string; error?: Error }> {
+    if (timeoutMs <= 0) return Promise.resolve({ status: null, stdout: "", stderr: "", error: new Error("PDF 附件处理超时") });
+    return new Promise(resolve => {
+        let result: { status: number | null; stdout: string; stderr: string; error?: Error };
+        const child = execFile(command, args, {
             encoding: "utf-8",
             windowsHide: true,
+            timeout: timeoutMs,
+            killSignal: "SIGKILL",
+            maxBuffer: 1024 * 1024,
+        }, (error, stdout, stderr) => {
+            result = { status: error ? (typeof error.code === "number" ? error.code : null) : 0, stdout, stderr, error: error || undefined };
         });
+        child.once("close", () => resolve(result));
+    });
+}
+
+async function findPythonCommand(deadlineAt: number): Promise<string | null> {
+    for (const command of ["python", "py"]) {
+        const remainingMs = deadlineAt - Date.now();
+        if (remainingMs <= 0) return null;
+        const check = await runPdfPython(command, command === "py" ? ["-3", "-c", "import sys; print(sys.version)"] : ["-c", "import sys; print(sys.version)"], Math.min(5_000, remainingMs));
         if (check.status === 0) return command;
     }
     return null;
 }
 
-function tryEmbedPdfAttachments(pdfPath: string, attachments: Array<{ path: string; name: string; sizeBytes?: number }>, warnings: string[]): number {
+async function tryEmbedPdfAttachments(pdfPath: string, attachments: Array<{ path: string; name: string; sizeBytes?: number }>, warnings: string[], timeoutMs: number): Promise<number> {
     const eligible = attachments.filter(item => {
         try {
             return fs.existsSync(item.path)
@@ -447,13 +464,15 @@ function tryEmbedPdfAttachments(pdfPath: string, attachments: Array<{ path: stri
         }
     });
     if (eligible.length === 0) return 0;
-    const python = findPythonCommand();
+    const deadlineAt = Date.now() + Math.min(60_000, Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : 60_000);
+    const python = await findPythonCommand(deadlineAt);
     if (!python) {
         warnings.push("未找到 Python，跳过 PDF 原生附件嵌入");
         return 0;
     }
-    const scriptPath = path.join(os.tmpdir(), `memory-store-pdf-attach-${process.pid}-${Date.now()}.py`);
-    const payloadPath = path.join(os.tmpdir(), `memory-store-pdf-attach-${process.pid}-${Date.now()}.json`);
+    const temporaryId = `${process.pid}-${randomUUID()}`;
+    const scriptPath = path.join(os.tmpdir(), `memory-store-pdf-attach-${temporaryId}.py`);
+    const payloadPath = path.join(os.tmpdir(), `memory-store-pdf-attach-${temporaryId}.json`);
     const outputPath = `${pdfPath}.attachments.tmp.pdf`;
     const script = `
 import json, sys
@@ -485,9 +504,9 @@ print(count)
             attachments: eligible.map(item => ({ path: item.path, name: item.name })),
         }), "utf-8");
         const args = python === "py" ? ["-3", scriptPath, payloadPath] : [scriptPath, payloadPath];
-        const result = spawnSync(python, args, { encoding: "utf-8", windowsHide: true, timeout: 60_000 });
+        const result = await runPdfPython(python, args, deadlineAt - Date.now());
         if (result.status !== 0) {
-            warnings.push(`PDF 原生附件嵌入不可用：${(result.stderr || result.stdout || "unknown").trim()}`);
+            warnings.push(`PDF 原生附件嵌入不可用：${(result.stderr || result.stdout || result.error?.message || "unknown").trim()}`);
             return 0;
         }
         fs.renameSync(outputPath, pdfPath);
@@ -508,6 +527,7 @@ print(count)
 
 export async function renderConversationPdf(options: PdfRenderOptions): Promise<PdfRenderResult> {
     const warnings: string[] = [];
+    const timeoutMs = options.timeoutMs ?? Number(process.env.MEMORY_STORE_CONVERSATION_EXPORT_PDF_TIMEOUT_MS || DEFAULT_PDF_TIMEOUT_MS);
     const markdown = fs.readFileSync(options.markdownPath, "utf-8");
     const html = markdownToHtml(markdown, { title: options.title });
     const htmlPath = path.join(options.exportDir, "conversation.html");
@@ -529,7 +549,7 @@ export async function renderConversationPdf(options: PdfRenderOptions): Promise<
             htmlPath,
             options.pdfPath,
             options.exportDir,
-            options.timeoutMs ?? Number(process.env.MEMORY_STORE_CONVERSATION_EXPORT_PDF_TIMEOUT_MS || DEFAULT_PDF_TIMEOUT_MS),
+            timeoutMs,
             warnings,
         );
     } catch (error) {
@@ -545,7 +565,7 @@ export async function renderConversationPdf(options: PdfRenderOptions): Promise<
     let embeddedAttachments = 0;
     const embedMode = options.embedAttachments || "auto";
     if (embedMode !== "off" && options.attachmentFiles?.length) {
-        embeddedAttachments = tryEmbedPdfAttachments(options.pdfPath, options.attachmentFiles, warnings);
+        embeddedAttachments = await tryEmbedPdfAttachments(options.pdfPath, options.attachmentFiles, warnings, timeoutMs);
         if (embedMode === "force" && embeddedAttachments === 0) {
             return {
                 ok: false,

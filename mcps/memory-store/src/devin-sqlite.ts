@@ -1,4 +1,5 @@
 import path from "node:path";
+import { isIsolatedSourceWorker, rememberIsolatedSourceIdentity, runIsolatedSource } from "./conversation-isolated-source.js";
 import fs from "node:fs";
 import type { ConversationSourceFingerprint } from "./conversation-source-cache.js";
 import type { DevinConversationSummary, DevinDesktopMessage, DevinRawConversation, DevinReadOptions, DevinDiscoveryOptions, DevinDiscoveryResult, DevinDiscoveryDiagnostic } from "./devin-types.js";
@@ -28,12 +29,21 @@ interface CatalogEntry {
 
 const verifiedAliasSummaries = new Map<string, DevinConversationSummary>();
 
+export function verifiedDevinAliasHints(): DevinConversationSummary[] {
+    return [...verifiedAliasSummaries.values()].map(summary => structuredClone(summary));
+}
+
+export function seedVerifiedDevinAliasHints(summaries: DevinConversationSummary[]): void {
+    for (const summary of summaries.slice(-64)) rememberVerifiedAliases(summary);
+}
+
 function aliasCacheKey(summary: DevinConversationSummary): string {
     return digest([devinPaths(), summary.canonicalId]);
 }
 
 function rememberVerifiedAliases(summary: DevinConversationSummary): void {
     if (!summary.identityEvidence || !summary.uuid || summary.aliases.length < 2) return;
+    rememberIsolatedSourceIdentity(summary);
     const key = aliasCacheKey(summary);
     verifiedAliasSummaries.delete(key);
     verifiedAliasSummaries.set(key, structuredClone(summary));
@@ -399,6 +409,12 @@ export function isDevinStoreAvailable(): boolean {
     }
 }
 
+export async function assertDevinSourceCapability(): Promise<void> {
+    if (!isDevinStoreAvailable()) return;
+    try { await import("node:sqlite"); }
+    catch { throw new DevinReadError("DEVIN_SQLITE_UNAVAILABLE", "Devin SQLite reading requires Node.js with node:sqlite and readOnly support (Node 22.16+ or 24+). Legacy WSF/PB reading remains available."); }
+}
+
 function discoveryPath(value: string): string {
     let normalized = value.replace(/^file:\/\/\//iu, "");
     try { normalized = decodeURIComponent(normalized); } catch {}
@@ -449,6 +465,11 @@ async function readDesktopMetadata(filename: string, budget: ReadBudget): Promis
 }
 
 export async function discoverDevinConversations(options: DevinDiscoveryOptions = {}): Promise<DevinDiscoveryResult> {
+    if (!isIsolatedSourceWorker() && !options.identityCache) {
+        await assertDevinSourceCapability();
+        const { signal, isCancelled, identityCache, ...serializable } = options;
+        return runIsolatedSource("devin-discover", { options: serializable }, { deadlineAt: options.deadlineMs, signal, isCancelled });
+    }
     const budget = new ReadBudget(options);
     const paths = devinPaths();
     const result: DevinDiscoveryResult = { conversations: [], partial: false, diagnostics: [], scannedSessions: 0, scannedDesktopFiles: 0 };
@@ -527,14 +548,29 @@ export async function discoverDevinConversations(options: DevinDiscoveryOptions 
 }
 
 export async function listDevinConversations(options: DevinReadOptions = {}): Promise<DevinConversationSummary[]> {
+    if (!isIsolatedSourceWorker() && !options.identityCache) {
+        await assertDevinSourceCapability();
+        const { signal, isCancelled, identityCache, ...serializable } = options;
+        return runIsolatedSource("devin-list", { options: serializable }, { deadlineAt: options.deadlineMs ?? Date.now() + 30_000, signal, isCancelled });
+    }
     return (await readCatalog(new ReadBudget(options))).filter(entry => !entry.excludedFromList).map(entry => entry.summary);
 }
 
 export async function listDevinConversationIdentities(options: DevinReadOptions = {}): Promise<DevinConversationSummary[]> {
+    if (!isIsolatedSourceWorker() && !options.identityCache) {
+        await assertDevinSourceCapability();
+        const { signal, isCancelled, identityCache, ...serializable } = options;
+        return runIsolatedSource("devin-identities", { options: serializable }, { deadlineAt: options.deadlineMs ?? Date.now() + 30_000, signal, isCancelled });
+    }
     return (await readCatalog(new ReadBudget(options), true)).filter(entry => !entry.excludedFromList).map(entry => entry.summary);
 }
 
 export async function resolveDevinConversation(id: string, options: DevinReadOptions = {}): Promise<DevinConversationSummary | null> {
+    if (!isIsolatedSourceWorker() && !options.identityCache) {
+        await assertDevinSourceCapability();
+        const { signal, isCancelled, identityCache, ...serializable } = options;
+        return runIsolatedSource("devin-resolve", { id, options: serializable }, { deadlineAt: options.deadlineMs, signal, isCancelled });
+    }
     if (!id.trim()) throw new DevinReadError("DEVIN_INVALID_ID", "A non-empty Devin conversation ID is required.");
     const budget = new ReadBudget(options);
     const entry = findEntry((await readIdentityCatalog(id, budget, options)).entries, id);
@@ -543,6 +579,11 @@ export async function resolveDevinConversation(id: string, options: DevinReadOpt
 }
 
 export async function readDevinRawConversation(id: string, options: DevinReadOptions = {}): Promise<DevinRawConversation | null> {
+    if (!isIsolatedSourceWorker() && !options.identityCache) {
+        await assertDevinSourceCapability();
+        const { signal, isCancelled, identityCache, ...serializable } = options;
+        return runIsolatedSource("devin-raw", { id, options: serializable }, { deadlineAt: options.deadlineMs, signal, isCancelled });
+    }
     const startedAt = performance.now();
     if (!id.trim()) throw new DevinReadError("DEVIN_INVALID_ID", "A non-empty Devin conversation ID is required.");
     if (options.roundRange) validateDevinRoundRange(options.roundRange);
@@ -611,5 +652,10 @@ export async function readDevinRawConversation(id: string, options: DevinReadOpt
 }
 
 export async function fingerprintDevinConversation(id: string, options: DevinReadOptions = {}): Promise<ConversationSourceFingerprint | null> {
+    if (!isIsolatedSourceWorker() && !options.identityCache) {
+        await assertDevinSourceCapability();
+        const { signal, isCancelled, identityCache, ...serializable } = options;
+        return runIsolatedSource("devin-fingerprint", { id, options: serializable }, { deadlineAt: options.deadlineMs, signal, isCancelled });
+    }
     return (await readDevinRawConversation(id, options))?.fingerprint ?? null;
 }

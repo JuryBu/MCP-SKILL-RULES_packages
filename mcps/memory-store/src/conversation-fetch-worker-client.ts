@@ -1,4 +1,4 @@
-import { fork } from "node:child_process";
+import { execFile, fork, type ChildProcess } from "node:child_process";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
@@ -135,6 +135,22 @@ export interface CodexFetchWorkerRunOptions {
     cancelGraceMs?: number;
 }
 
+async function terminateFetchWorkerTree(child: ChildProcess): Promise<void> {
+    if (child.pid === undefined) return;
+    if (process.platform === "win32") {
+        if (child.exitCode != null || child.signalCode != null) throw new Error("owned worker exited before tree termination; descendants are unverified");
+        await new Promise<void>((resolve, reject) => {
+            execFile("taskkill.exe", ["/PID", String(child.pid), "/T", "/F"], { windowsHide: true, timeout: 5_000, killSignal: "SIGKILL" }, error => {
+                if (error) reject(error);
+                else resolve();
+            });
+        });
+    } else {
+        try { process.kill(-child.pid, "SIGKILL"); }
+        catch (error) { if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error; }
+    }
+}
+
 export async function runCodexFetchWorker(
     payload: CodexFetchWorkerPayload,
     taskContext: Pick<BackgroundTaskContext, "updateProgress" | "isCancelled" | "isSettled">,
@@ -158,11 +174,16 @@ export async function runCodexFetchWorker(
             cwd: path.dirname(target.file),
             env: process.env,
             execArgv: target.execArgv || [],
+            detached: process.platform !== "win32",
             stdio: ["ignore", "ignore", "pipe", "ipc"],
         });
         let settled = false;
         let cancellationRequested = false;
         let artifactPath: string | undefined;
+        let result: CodexFetchWorkerResult | undefined;
+        let failure: Error | undefined;
+        let termination: Promise<void> | undefined;
+        let cleanupFailure: Error | undefined;
         let hardKillTimer: NodeJS.Timeout | undefined;
         let stderrTail = "";
         const clearTimers = (): void => {
@@ -189,19 +210,23 @@ export async function runCodexFetchWorker(
         const cancellationError = (): Error => new Error(taskContext.isCancelled()
             ? "conversation fetch worker cancelled"
             : "conversation fetch worker stopped after task settlement");
+        const forceStop = (): void => {
+            termination ??= terminateFetchWorkerTree(child).catch(error => {
+                cleanupFailure = new Error(`conversation fetch worker process-tree cleanup unconfirmed: ${String(error)}`);
+                try { taskContext.updateProgress({ stage: "cleanup_failed", detail: cleanupFailure.message }); } catch {}
+            });
+        };
         const requestCancellation = (): void => {
             if (cancellationRequested || settled) return;
             cancellationRequested = true;
-            if (child.connected) {
-                child.send({ type: "cancel" }, error => {
-                    if (error && !child.killed) child.kill();
-                });
-            }
+            try {
+                if (child.connected) child.send({ type: "cancel" }, error => { if (error) forceStop(); });
+            } catch { forceStop(); }
             const configured = options.cancelGraceMs
                 ?? Number(process.env.MEMORY_STORE_CODEX_FETCH_CANCEL_GRACE_MS || DEFAULT_CANCEL_GRACE_MS);
             const graceMs = Number.isFinite(configured) && configured >= 0 ? configured : DEFAULT_CANCEL_GRACE_MS;
             hardKillTimer = setTimeout(() => {
-                if (!settled && !child.killed) child.kill();
+                if (!settled) forceStop();
             }, graceMs);
             hardKillTimer.unref?.();
         };
@@ -225,39 +250,43 @@ export async function runCodexFetchWorker(
             }
             if (message.type === "result") {
                 artifactPath = message.result.artifact.tempPath;
+                result = message.result;
                 if (cancellationRequested || taskContext.isCancelled() || taskContext.isSettled()) {
                     requestCancellation();
-                    finishReject(cancellationError(), true);
-                    return;
                 }
-                finishResolve(message.result);
                 return;
             }
             if (message.type === "error") {
                 const stderr = stderrTail.trim() ? `\nstderr tail:\n${stderrTail.trim()}` : "";
-                const error = new Error(`${message.name}: ${message.message}${stderr}`);
-                error.name = message.name || "Error";
-                if (message.stack) error.stack = `${message.stack}${stderr}`;
-                finishReject(cancellationRequested ? cancellationError() : error, cancellationRequested);
+                failure = new Error(`${message.name}: ${message.message}${stderr}`);
+                failure.name = message.name || "Error";
+                if (message.stack) failure.stack = `${message.stack}${stderr}`;
             }
         });
-        child.on("error", error => finishReject(cancellationRequested ? cancellationError() : error, cancellationRequested));
-        child.on("exit", (code, signal) => {
+        child.on("error", error => { failure ??= error; forceStop(); });
+        child.on("close", async (code, signal) => {
             if (settled) return;
-            if (cancellationRequested) {
+            const stopped = cancellationRequested || taskContext.isCancelled() || taskContext.isSettled();
+            await termination;
+            if (cleanupFailure) {
+                finishReject(cleanupFailure);
+                return;
+            }
+            if (stopped) {
                 finishReject(cancellationError(), true);
                 return;
             }
+            if (failure) { finishReject(failure); return; }
+            if (code === 0 && result) { finishResolve(result); return; }
             const detail = stderrTail.trim() ? `; stderr=${stderrTail.trim()}` : "";
-            finishReject(new Error(`conversation fetch worker exited before result (code=${code}, signal=${signal})${detail}`));
+            finishReject(new Error(`conversation fetch worker exited ${result ? "after" : "before"} result (code=${code}, signal=${signal})${detail}`));
         });
         if (taskContext.isCancelled() || taskContext.isSettled()) {
             requestCancellation();
-            finishReject(cancellationError(), true);
             return;
         }
-        child.send({ type: "run", payload }, error => {
-            if (error) finishReject(error);
-        });
+        try { child.send({ type: "run", payload }, error => {
+            if (error) { failure ??= error; forceStop(); }
+        }); } catch (error) { failure ??= error instanceof Error ? error : new Error(String(error)); forceStop(); }
     });
 }

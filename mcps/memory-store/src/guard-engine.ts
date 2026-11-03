@@ -1174,18 +1174,23 @@ export function collectGuardExecutionEvidence(rounds: Iterable<ConversationRound
     return { text, startRound, firstIncludedRound, lastIncludedRound, includedRounds: parts.length, sourceChars: header.length + sourceChars, includedChars: text.length, sourceCharsKnown, coverageGaps };
 }
 
-async function getConversationExecutionRecord(
+export async function getConversationExecutionRecord(
     conversationId: string,
     startRound: number,
     charBudget: number,
     dataChain: DataChain = "auto",
+    control: { deadlineAt?: number; isCancelled?: () => boolean; allowUnavailable?: boolean } = {},
 ): Promise<GuardExecutionEvidence> {
     const unavailable = (reason: string): GuardExecutionEvidence => ({ text: "", startRound, includedRounds: 0, sourceChars: 0, includedChars: 0, sourceCharsKnown: false, coverageGaps: [`executionRecord: ${reason}`] });
     if (charBudget > 10_000) {
         try {
+            const { isIsolatedSourceWorker, runIsolatedSource } = await import("./conversation-isolated-source.js");
+            if (!isIsolatedSourceWorker()) return await runIsolatedSource("guard-record", { conversationId, startRound, charBudget, dataChain, allowUnavailable: control.allowUnavailable }, control, { timeoutMs: 30_000 });
             const loaded = await loadConversationData(dataChain || "auto", conversationId, {
                 link: "summary",
                 includeRounds: false,
+                isCancelled: control.isCancelled,
+                sourceReadBudget: { deadlineMs: control.deadlineAt, isCancelled: control.isCancelled },
                 ...(dataChain === "dsh" ? { source: "cache" as const } : {}),
             });
             if (dataChain === "windsurf" && !loaded) throw new Error("Guard refuses missing WSF conversation execution evidence");
@@ -1204,7 +1209,7 @@ async function getConversationExecutionRecord(
             }
             return unavailable("conversation source unavailable");
         } catch (err) {
-            if (dataChain === "windsurf") throw err;
+            if (dataChain === "windsurf" && !control.allowUnavailable && (err as { code?: string }).code !== "SOURCE_WORKER_DEADLINE") throw err;
             console.error(`[guard-engine] 对话原文获取失败: ${err}`);
             return unavailable(`source read failed: ${err instanceof Error ? err.message : String(err)}`);
         }
@@ -1618,7 +1623,11 @@ export async function runGuardCheck(
         ? getRecordContext(state.conversationId, state.stageId, RECORD_CONTEXT_BUDGET, scopeSelectors)
         : "";
     const conversationExecution = state.conversationId
-        ? await getConversationExecutionRecord(state.conversationId, state.startRound, EXECUTION_RECORD_BUDGET, state.chain || "auto")
+        ? await getConversationExecutionRecord(state.conversationId, state.startRound, EXECUTION_RECORD_BUDGET, state.chain || "auto", {
+            deadlineAt: Date.now() + (options.executionEvidenceRole === "reference" ? 5_000 : 30_000),
+            isCancelled: () => shouldAbortGuardRun(options),
+            allowUnavailable: options.executionEvidenceRole === "reference",
+        })
         : { text: "", startRound: state.startRound, includedRounds: 0, sourceChars: 0, includedChars: 0, sourceCharsKnown: true, coverageGaps: [] };
 
     const externalEvidence = await buildGuardEvidenceIndexes(options.evidenceAssets, {

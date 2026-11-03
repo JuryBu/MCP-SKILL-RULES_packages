@@ -198,6 +198,7 @@ async function scanRounds(candidate: UnifiedConversationCandidate, query: string
         if (budget.isCancelled()) return { hits, scannedBytes, partial: true, cancelled: true };
         if (++roundCount > budget.maxRounds || Date.now() >= budget.deadlineAt) { partial = true; break; }
         for (const message of roundMessages(round)) {
+            if (budget.probe && message.role !== "user" && message.role !== "assistant") continue;
             if (Date.now() >= budget.deadlineAt || budget.isCancelled()) { budgetStopped = true; partial = true; break; }
             const bytes = Buffer.byteLength(message.text, "utf8");
             if (bytes > budget.maxBytes - scannedBytes) { budgetStopped = true; partial = true; break; }

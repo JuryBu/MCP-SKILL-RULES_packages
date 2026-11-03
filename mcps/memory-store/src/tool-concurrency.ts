@@ -1,7 +1,7 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 
 export type ToolQueueClass = "light" | "mixed";
-export type ToolRequestClass = ToolQueueClass | "auto-background";
+export type ToolRequestClass = ToolQueueClass | "auto-background" | "control";
 
 type ReleaseFn = () => void;
 type QueuedAcquire = {
@@ -69,7 +69,12 @@ export interface ToolConcurrencyOptions<T> {
 }
 
 const bypassStorage = new AsyncLocalStorage<boolean>();
+const requestStorage = new AsyncLocalStorage<{ deadlineAt?: number; signal?: AbortSignal }>();
 let semaphores: Partial<Record<ToolQueueClass, AsyncSemaphore>> = {};
+
+export function currentToolRequestControl(): { deadlineAt?: number; signal?: AbortSignal } {
+    return requestStorage.getStore() || {};
+}
 
 function envLimit(names: string | string[], fallback: number): number {
     for (const name of Array.isArray(names) ? names : [names]) {
@@ -105,7 +110,7 @@ export function isToolConcurrencyBypassed(): boolean {
 }
 
 export async function runWithoutToolConcurrency<T>(fn: () => Promise<T> | T): Promise<T> {
-    return bypassStorage.run(true, async () => fn());
+    return bypassStorage.run(true, () => requestStorage.run({}, async () => fn()));
 }
 
 export function formatBusyMessage(queueClass: ToolQueueClass, label: string, timeoutMs = defaultToolQueueTimeoutMs()): string {
@@ -141,7 +146,7 @@ export async function withToolConcurrency<T>(
 }
 
 export function classifyToolRequest(name: string, args: Record<string, unknown> = {}): ToolRequestClass {
-    if (name === "background_task_status" || name === "background_task_cancel") return "light";
+    if (name === "background_task_status" || name === "background_task_cancel") return "control";
     if (name === "memory_read" || name === "memory_delete") return "light";
     if (name === "memory_write" || name === "memory_update" || name === "memory_batch") return "mixed";
     if (name === "memory_stats") return args.action === "enhance" ? "mixed" : "light";
@@ -156,8 +161,9 @@ export function classifyToolRequest(name: string, args: Record<string, unknown> 
         return "light";
     }
     if (name === "conversation_golden_extract") return args.taskId ? "light" : "auto-background";
-    if (name === "stage_guard") return args.action === "check" && !args.taskId ? "mixed" : "light";
+    if (name === "stage_guard") return args.action === "status" || args.action === "cancel" ? "control" : args.action === "check" && !args.taskId ? "mixed" : "light";
     if (name === "conversation_read_original") {
+        if (["prepare_status", "prepare_cancel", "search_all_status", "search_all_cancel", "deep_locate_status", "deep_locate_cancel"].includes(String(args.action))) return "control";
         if (args.action === "deep_locate") return "auto-background";
         if (args.action === "deep_locate_status" || args.action === "deep_locate_cancel") return "light";
         if (args.action === "export" && args.exportBatch === true) return "auto-background";
@@ -183,15 +189,19 @@ export function installToolConcurrency(server: { tool: (...args: any[]) => unkno
         const wrapped = async (args: Record<string, unknown> = {}, extra?: unknown) => {
             const queueClass = classifyToolRequest(name, args);
             const action = typeof args.action === "string" ? `.${args.action}` : "";
-            if (queueClass === "auto-background") {
+            if (queueClass === "auto-background" || queueClass === "control") {
                 return handler(args, extra);
             }
-            return withToolConcurrency(
+            const requested = Number(args.deadlineMs);
+            const fallback = name === "conversation_read_original" ? args.action === "list" ? 12_000 : args.action === "read_fast" ? 30_000 : 120_000 : undefined;
+            const timeoutMs = Number.isFinite(requested) && requested > 0 ? requested : fallback;
+            const signal = (extra as { signal?: AbortSignal } | undefined)?.signal;
+            return requestStorage.run({ deadlineAt: timeoutMs === undefined ? undefined : Date.now() + timeoutMs, signal }, () => withToolConcurrency(
                 queueClass,
                 `${name}${action}`,
                 () => handler(args, extra),
-                { onBusy: toolConcurrencyBusyResponse },
-            );
+                { onBusy: toolConcurrencyBusyResponse, timeoutMs: Math.min(timeoutMs ?? Infinity, defaultToolQueueTimeoutMs()) },
+            ));
         };
         return originalTool(name, description, schema, wrapped);
     };

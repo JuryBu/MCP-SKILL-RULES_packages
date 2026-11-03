@@ -41,7 +41,8 @@ const callsBeforePending = calls.length;
 await assert.rejects(() => runCorpusAction({ action: "read_hit", conversationId: "target", sourceRevision: "pending:source-a", startRound: 1 }, api), /暂计/u);
 assert.equal(calls.length, callsBeforePending);
 const fast = await runCorpusAction({ action: "read_fast", conversationId: "target", startRound: 3, endRound: 3 }, api) as any;
-assert.equal(calls.at(-1)?.operation, "fast");
+assert.equal(calls.at(-2)?.operation, "fast");
+assert.equal(calls.at(-1)?.operation, "prepare");
 assert.equal(fast.requestedRangeComplete, true);
 assert.equal(fast.fullSourceProjectionComplete, false);
 assert.equal(fast.complete, false);
@@ -51,9 +52,9 @@ const truncated = await runCorpusAction({ action: "read_fast", conversationId: "
 assert.equal(truncated.requestedRangeComplete, false);
 assert.equal(fast.cachePreparation.taskId, "preparation-a");
 await runCorpusAction({ action: "read_fast", conversationId: "caller-a", conversationIds: ["target"], lastRounds: 1 }, api);
-assert.equal(calls.at(-2)?.operation, "prepare");
-assert.equal(calls.at(-2)?.args.ownerId, "caller-a");
-assert.equal(calls.at(-2)?.args.conversationId, "target");
+assert.equal(calls.at(-1)?.operation, "prepare");
+assert.equal(calls.at(-1)?.args.ownerId, "caller-a");
+assert.equal(calls.at(-1)?.args.conversationId, "target");
 for (const target of ["target", " codex://threads/target ", " CODEX://threads/TARGET "]) {
     await runCorpusAction({ action: "read_fast", conversationId: "caller-a", conversationIds: [target], lastRounds: 1, prepareCache: false }, api);
     assert.equal(calls.at(-1)?.args.target.id, "target");

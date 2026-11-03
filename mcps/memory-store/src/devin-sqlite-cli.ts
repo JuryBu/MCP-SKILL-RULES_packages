@@ -44,9 +44,9 @@ async function readChain(database: DatabaseSync, sessionId: string, head: number
         : "chat_message";
     const statement = database.prepare(`WITH RECURSIVE reachable(node_id) AS (
         SELECT ? UNION
-        SELECT nodes.parent_node_id FROM message_nodes AS nodes JOIN reachable ON nodes.node_id=reachable.node_id
+        SELECT nodes.parent_node_id FROM reachable CROSS JOIN message_nodes AS nodes ON nodes.node_id=reachable.node_id
             WHERE nodes.session_id=? AND nodes.parent_node_id IS NOT NULL UNION
-        SELECT json_extract(nodes.metadata,'$.summarized_from') FROM message_nodes AS nodes JOIN reachable ON nodes.node_id=reachable.node_id
+        SELECT json_extract(nodes.metadata,'$.summarized_from') FROM reachable CROSS JOIN message_nodes AS nodes ON nodes.node_id=reachable.node_id
             WHERE nodes.session_id=? AND json_valid(nodes.metadata) AND json_type(nodes.metadata,'$.summarized_from')='integer'
             LIMIT ?), original AS (SELECT node_id, parent_node_id, created_at, metadata, chat_message,
             ${identityOnly ? "CASE WHEN json_valid(chat_message) THEN jsonb(chat_message) END" : "NULL"} AS message_blob
