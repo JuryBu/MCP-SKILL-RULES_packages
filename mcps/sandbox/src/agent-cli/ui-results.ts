@@ -34,5 +34,7 @@ export function interactiveResultLines(execution: CommandExecution, options: { r
         const summary = conversationSummary(execution.result.data, options.titleHint);
         if (summary) return summary;
     }
-    return humanJson(execution.result.data ?? {}).split('\n');
+    const data = record(execution.result.data);
+    const estimated = record(data.quotaLimit).amountMode === 'estimated' || record(data.budget).effectiveAmountMode === 'estimated';
+    return [...(estimated ? ['估计金额累计模式：单次实际费用可能超过预估，未知收费待核实后继续。'] : []), ...humanJson(execution.result.data ?? {}).split('\n')];
 }

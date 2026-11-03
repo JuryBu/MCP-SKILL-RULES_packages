@@ -603,6 +603,7 @@ export class InteractiveCli {
         if (!METHOD_SPECS['budgets.configureLimit']) { this.log('供应商总限额能力尚未安装'); return; }
         const quotaLimitId = String(profile?.quotaLimitId ?? 'limit-' + randomUUID());
         this.openForm('供应商总限额（所有关联根任务共同使用）', [
+            { key: 'amountMode', label: '金额约束（estimated允许单次实际费超估算）', choices: ['hard', 'estimated'], defaultValue: 'hard', required: true },
             { key: 'id', label: '总限额ID', defaultValue: quotaLimitId, required: true },
             { key: 'currency', label: '三字母币种', defaultValue: 'USD', required: true },
             { key: 'amount', label: '总金额上限（币种单位）', required: true },
@@ -612,7 +613,8 @@ export class InteractiveCli {
             let quotaScopeIds: unknown;
             try { quotaScopeIds = JSON.parse(values.scopes); } catch { throw usage('账户额度组须为JSON数组'); }
             const definition = { quotaLimitId: values.id, currency: values.currency.toUpperCase(), maxCostMicros: amountMicros(values.amount), quotaScopeIds, sourceRef: values.source };
-            const configured = await this.client.request('budgets.configureLimit', { definition });
+            const configured = await this.client.request('budgets.configureLimit', { definition: { ...definition,
+                ...(values.amountMode === 'estimated' ? { amountMode: 'estimated' } : {}) } });
             this.showResult({ result: configured });
             if (!configured.ok || !profile) return;
             const current = await this.client.request('profiles.get', { profileId: profile.profileId });

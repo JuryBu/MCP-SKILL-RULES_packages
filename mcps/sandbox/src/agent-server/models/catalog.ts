@@ -5,6 +5,7 @@ import { validatePrice } from '../accounting/usage.js';
 import type { PriceEntry } from '../accounting/usage.js';
 import { immutableJson, objectValue, stringValue } from '../providers/assemble.js';
 import { normalizeCompatibleChatMetadata } from '../providers/compatible-chat.js';
+import { normalizeProgrokMetadata } from './progrok.js';
 import type { ProviderAdapter, ProviderProfile, ProviderProtocol, SendContext } from '../providers/types.js';
 import { requireEvidence, validateEvidence } from './evidence.js';
 import type { Evidence, EvidenceScope } from './evidence.js';
@@ -17,6 +18,8 @@ export interface ParameterSpec {
     default?: JsonValue;
     required?: boolean;
     wirePath: string;
+    outputLimitKind?: 'visible_tokens' | 'all_output_tokens';
+    outputLimitSourceRef?: string;
     schema?: JsonObject;
 }
 
@@ -85,6 +88,7 @@ export function entryFromMetadata(profile: ProviderProfile, metadata: JsonObject
         maxOutputTokens: count(profile.protocol === 'gemini' ? metadata.outputTokenLimit : undefined),
         inputModalities: unknown(), outputModalities: unknown(), tools: unknown(), streaming: unknown(), parameters: {},
         pricing: unknown(), rawMetadata: metadata, retired: false, contextLimitMode: profile.protocol === 'gemini' ? 'separate' : 'combined' };
+    if (profile.protocol === 'progrok') return normalizeProgrokMetadata(profile, entry);
     return profile.protocol === 'compatible_chat' ? normalizeCompatibleChatMetadata(entry) : entry;
 }
 
@@ -116,6 +120,7 @@ export function validateModelEntry(entry: ModelEntry, profile: ProviderProfile):
         const specification = item.value!;
         if (!objectValue(specification) || !['number', 'integer', 'string', 'boolean', 'object', 'array'].includes(specification.type)
             || typeof specification.wirePath !== 'string' || !specification.wirePath
+            || (specification.outputLimitKind !== undefined && !['visible_tokens', 'all_output_tokens'].includes(specification.outputLimitKind))
             || (['object', 'array'].includes(specification.type) && !objectValue(specification.schema))
             || (specification.min !== undefined && !Number.isFinite(specification.min))
             || (specification.max !== undefined && !Number.isFinite(specification.max))
@@ -318,6 +323,19 @@ export function resolveParameters(entry: ModelEntry, profile: ProviderProfile, o
     return immutableJson(output);
 }
 
+export function resolveRuntimeOutputBudget(entry: ModelEntry, profile: ProviderProfile, requested: number, now = Date.now()): number {
+    if (!Number.isSafeInteger(requested) || requested < 1) throw new AgentFault('E_CONTEXT_LIMIT', '运行输出预算须为正安全整数');
+    const scope = modelScope(profile, entry.modelId, entry.routeId);
+    if (entry.maxOutputTokens.status !== 'unknown') return Math.min(requested, requireEvidence(entry.maxOutputTokens, scope, now));
+    const evidence = entry.parameters.maxOutputTokens;
+    if (!evidence) throw new AgentFault('E_CAPABILITY_UNKNOWN', '未知模型输出上限需要有效的运行输出参数声明');
+    const specification = requireEvidence(evidence, scope, now);
+    if (!specification.outputLimitKind || specification.type !== 'integer' || !parameterMatches(requested, specification)) {
+        throw new AgentFault('E_CAPABILITY_UNKNOWN', '运行输出参数缺少明确的限制语义或合法整数范围');
+    }
+    return requested;
+}
+
 export function validateCapabilities(entry: ModelEntry, profile: ProviderProfile, input: {
     inputModalities: string[]; outputModalities: string[]; usesTools: boolean; inputTokenUpperBound: number;
     maxOutputTokens: number; now?: number;
@@ -333,7 +351,7 @@ export function validateCapabilities(entry: ModelEntry, profile: ProviderProfile
     }
     if (input.usesTools && !requireEvidence(entry.tools, scope, now)) throw new AgentFault('E_PARAMETER_UNSUPPORTED', '模型未支持工具调用');
     const context = requireEvidence(entry.contextWindow, scope, now);
-    const maximum = requireEvidence(entry.maxOutputTokens, scope, now);
+    const maximum = resolveRuntimeOutputBudget(entry, profile, input.maxOutputTokens, now);
     if (![input.inputTokenUpperBound, input.maxOutputTokens, context, maximum].every(value => Number.isSafeInteger(value) && value >= 0)
         || input.maxOutputTokens < 1 || input.maxOutputTokens > maximum
         || (entry.contextLimitMode === 'separate' ? input.inputTokenUpperBound > context : input.inputTokenUpperBound + input.maxOutputTokens > context)) {

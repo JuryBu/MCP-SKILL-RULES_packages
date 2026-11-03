@@ -152,16 +152,17 @@ export class AccountingTransactions {
         }
         state.quotaCarry = {};
         for (const quota of Object.values(state.quotaLimits)) {
-            const total = this.database.prepare('SELECT COALESCE(SUM(spent_micros),0) AS spentMicros,COALESCE(SUM(held_micros),0) AS heldMicros,COALESCE(SUM(spent_calls),0) AS spentCalls,COALESCE(SUM(held_calls),0) AS heldCalls FROM budgets WHERE quota_limit_id = ?')
+            const total = this.database.prepare("SELECT COALESCE(SUM(spent_micros),0) AS spentMicros,COALESCE(SUM(held_micros),0) AS heldMicros,COALESCE(SUM(spent_calls),0) AS spentCalls,COALESCE(SUM(held_calls),0) AS heldCalls,COALESCE(SUM(COALESCE(json_extract(record_json,'$.unsettledCalls'),0)),0) AS unsettledCalls FROM budgets WHERE quota_limit_id = ?")
                 .get(quota.quotaLimitId)!;
             const included = Object.values(state.budgets).filter(budget => budget.quotaLimitId === quota.quotaLimitId);
             const carry = { spentMicros: Number(total.spentMicros), heldMicros: Number(total.heldMicros),
-                spentCalls: Number(total.spentCalls), heldCalls: Number(total.heldCalls) };
+                spentCalls: Number(total.spentCalls), heldCalls: Number(total.heldCalls), unsettledCalls: Number(total.unsettledCalls) };
             for (const budget of included) {
                 carry.spentMicros -= budget.spentMicros;
                 carry.heldMicros -= budget.heldMicros;
                 carry.spentCalls -= budget.spentCalls;
                 carry.heldCalls -= budget.heldCalls;
+                carry.unsettledCalls -= budget.unsettledCalls ?? 0;
             }
             if (Object.values(carry).some(value => !Number.isSafeInteger(value) || value < 0)) {
                 throw new AgentFault('STORAGE_ACCOUNTING_LIMIT', '已有费用聚合与当前根预算统计无法精确对应，原账本未改变');

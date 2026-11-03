@@ -7,6 +7,7 @@ import type { ExecutionPlan } from '../execution.js';
 import type { StateMutationPort, StateMutationScope, StorePort, StoreRecord, StoreTransition, TransitionExpected } from '../storage/port.js';
 import type { ProviderDispatcher } from '../providers/dispatch.js';
 import type { createProviderServices } from '../providers/services.js';
+import { resolveRuntimeOutputBudget } from '../models/catalog.js';
 import type { NativeSendView, NormalizedResponse, ProviderProfile, RequestSnapshot } from '../providers/types.js';
 import { ProviderFault } from '../providers/types.js';
 import type { UpperBound } from '../accounting/budget-ledger.js';
@@ -432,8 +433,8 @@ export function createContextServerAdapter(options: ContextServerAdapterOptions)
         const profile = await options.provider.profiles.get(profileId);
         if (!profile) throw new ContextFault('MODEL_STALE', '压缩API配置不可用');
         const { entry } = await options.provider.models.get(profileId, selected.modelId, selected.routeId ?? null);
-        if (entry.contextWindow.value === null || entry.maxOutputTokens.value === null) throw new ContextFault('CONFIG_INVALID', '压缩模型需要可核实的窗口和输出上限');
-        const maxOutputTokens = Math.min(selected.maxOutputTokens ?? 2048, rootMaximum, entry.maxOutputTokens.value);
+        if (entry.contextWindow.value === null) throw new ContextFault('CONFIG_INVALID', '压缩模型需要可核实的窗口');
+        const maxOutputTokens = resolveRuntimeOutputBudget(entry, profile, Math.min(selected.maxOutputTokens ?? 2048, rootMaximum), now());
         const parameters: JsonObject = { ...(profileId === plan.profile.profileId && selected.modelId === plan.modelId ? plan.parameters : {}),
             ...selected.parameters, maxOutputTokens };
         if (Array.isArray(parameters.responseModalities)) parameters.responseModalities = ['TEXT'];
@@ -577,10 +578,11 @@ export function createContextServerAdapter(options: ContextServerAdapterOptions)
             const modelId = typeof selectedOptions.modelId === 'string' ? selectedOptions.modelId : profile.defaultModel;
             if (!modelId) return null;
             const { entry } = await options.provider.models.get(profile.profileId, modelId);
-            if (entry.contextWindow.value === null || entry.maxOutputTokens.value === null) throw new ContextFault('CONFIG_INVALID', '当前模型需要可核实的窗口与输出上限');
+            if (entry.contextWindow.value === null) throw new ContextFault('CONFIG_INVALID', '当前模型需要可核实的窗口');
             const parameters = selectedOptions.parameters && typeof selectedOptions.parameters === 'object' ? selectedOptions.parameters as JsonObject : {};
             const root = capture.execution ? await options.provider.ledger.read(contextRootBudgetId(run!)) : null;
-            const requestedMaximum = root?.budget.maxOutputTokens ?? budget?.maxOutputTokens ?? parameters.maxOutputTokens ?? Math.min(4096, entry.maxOutputTokens.value);
+            const requestedMaximum = root?.budget.maxOutputTokens ?? budget?.maxOutputTokens ?? parameters.maxOutputTokens
+                ?? (entry.maxOutputTokens.value === null ? null : Math.min(4096, entry.maxOutputTokens.value));
             if (!Number.isSafeInteger(requestedMaximum) || Number(requestedMaximum) < 1) throw new ContextFault('CONFIG_INVALID', '手动压缩最大输出须为正安全整数');
             const maximum = Number(requestedMaximum);
             const current = { profile, modelId, parameters };

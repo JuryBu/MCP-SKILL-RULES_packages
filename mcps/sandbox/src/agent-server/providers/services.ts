@@ -85,6 +85,7 @@ export function createProviderServices(options: ProviderServiceOptions) {
         }
         const account = await ledger.read(input.rootBudgetId);
         if (!account.budget.quotaLimitId || !account.quotaLimit) throw new AgentFault('E_GLOBAL_BUDGET_REQUIRED', '正式Provider必须关联跨全部根任务的供应商总限额');
+        const estimatedAmountMode = account.budget.mode === 'estimated' && account.quotaLimit.amountMode === 'estimated';
         if (input.maxOutputTokens > account.budget.maxOutputTokens) throw new AgentFault('E_BUDGET_EXCEEDED', '请求最大输出超过根预算上限');
         validateCapabilities(entry, profile, { inputModalities: input.inputModalities, outputModalities: input.outputModalities,
             usesTools: Boolean(input.view.tools?.length), inputTokenUpperBound: input.inputTokenUpperBound,
@@ -97,6 +98,15 @@ export function createProviderServices(options: ProviderServiceOptions) {
             ? (parameters.generationConfig as JsonObject | undefined)?.maxOutputTokens
             : parameters.max_tokens ?? parameters.max_completion_tokens ?? parameters.max_output_tokens;
         if (nativeMaximum !== input.maxOutputTokens) throw new AgentFault('E_BUDGET_UNBOUNDED', '实际请求必须包含与预算一致的最大输出限制');
+        let billableOutputMaximum = input.maxOutputTokens;
+        let billableOutputReliable = true;
+        const outputSpecification = entry.parameters.maxOutputTokens?.value;
+        const visibleOutputOnly = outputSpecification?.outputLimitKind === 'visible_tokens'
+            || profile.protocol === 'progrok' && outputSpecification?.wirePath === 'max_tokens' && outputSpecification.outputLimitKind !== 'all_output_tokens';
+        if (visibleOutputOnly) {
+            if (!estimatedAmountMode) throw new AgentFault('BUDGET_UNBOUNDED', '可见回答限额之外的计费输出缺少可核实上界');
+            billableOutputReliable = false;
+        }
         const scope = modelScope(profile, entry.modelId, entry.routeId);
         if (entry.pricing.source === 'verified_fixture' && !['127.0.0.1', '[::1]'].includes(new URL(profile.baseUrl).hostname)) {
             throw new AgentFault('BUDGET_UNBOUNDED', 'fixture价格只用于本地确定性端点，真实服务需要人工或官方的有效计价证据');
@@ -107,12 +117,15 @@ export function createProviderServices(options: ProviderServiceOptions) {
         if (price && price.coversAllParameters !== true && price.parameterHash !== sha256(canonicalJson(parameters))) {
             throw new AgentFault('E_PRICE_SCOPE', '冻结价格没有覆盖本次实际参数或明确的最坏情况');
         }
-        const estimate = price ? estimateUpperBound({ price, maxInputTokens: input.inputTokenUpperBound, maxOutputTokens: input.maxOutputTokens,
+        const estimate = price ? estimateUpperBound({ price, maxInputTokens: input.inputTokenUpperBound, maxOutputTokens: billableOutputMaximum,
             maxCacheWriteTokens: input.inputTokenUpperBound,
             includesMedia: input.inputModalities.concat(input.outputModalities).some(modality => modality !== 'text'), now: now() }) : null;
         if (price && price.currency !== account.budget.currency) throw new AgentFault('E_CURRENCY_MISMATCH', '模型价格与根预算币种不同');
-        const reliable = Boolean(input.inputUpperBoundReliable && estimate?.amountMicros !== null && estimate?.amountMicros !== undefined);
-        if ((account.budget.mode === 'hard' || account.quotaLimit) && !reliable) throw new AgentFault('BUDGET_UNBOUNDED', '本次请求缺少可靠输入或费用上界');
+        const reliable = Boolean(input.inputUpperBoundReliable && billableOutputReliable && estimate?.amountMicros !== null && estimate?.amountMicros !== undefined);
+        if (!estimatedAmountMode && !reliable) throw new AgentFault('BUDGET_UNBOUNDED', '本次请求缺少可靠输入或费用上界');
+        if (estimatedAmountMode && (estimate?.amountMicros === null || estimate?.amountMicros === undefined || estimate.amountMicros < 1)) {
+            throw new AgentFault('BUDGET_UNBOUNDED', '估计金额累计模式需要有效单价和有限非零预留金额');
+        }
         const deadline = Math.min(Date.parse(account.budget.deadlineAt), input.deadlineAt ? Date.parse(input.deadlineAt) : Infinity);
         if (!Number.isFinite(deadline) || deadline <= now()) throw new AgentFault('E_BUDGET_DEADLINE', '请求期限无效或已到期');
         const snapshot = freezeRequest({ adapter, profile, versions: { ...input.versions, catalogVersion: catalog.catalogVersion,
@@ -120,8 +133,11 @@ export function createProviderServices(options: ProviderServiceOptions) {
             view: input.view, parameters, rootBudgetId: input.rootBudgetId, pricingSnapshot: price ?? undefined,
             requirePricingSnapshot: account.budget.mode === 'hard' || Boolean(account.quotaLimit), frozenAt: new Date(now()).toISOString(),
             timeoutMs: input.timeoutMs, deadlineAt: new Date(deadline).toISOString() });
-        return { adapter, snapshot, upperBound: { currency: account.budget.currency, amountMicros: reliable ? estimate!.amountMicros : null,
+        return { adapter, snapshot, upperBound: { currency: account.budget.currency, amountMicros: estimate?.amountMicros ?? null,
             reliable, source: reliable ? 'price_table' : 'estimated', sourceRef: price?.sourceRef ?? 'explicit-estimated-root-budget',
+            ...(!reliable ? { estimateBasis: { inputTokens: input.inputTokenUpperBound, outputTokens: billableOutputMaximum,
+                outputLimitKind: visibleOutputOnly ? 'visible_tokens' : entry.parameters.maxOutputTokens?.value?.outputLimitKind ?? 'all_output_tokens',
+                missingHardBounds: [...(!input.inputUpperBoundReliable ? ['input_tokens'] : []), ...(!billableOutputReliable ? ['billable_output_tokens'] : [])] } } : {}),
             ...(price ? { expiresAt: price.expiresAt } : {}) }, missingPricing: estimate?.missing ?? ['price'] };
     };
 

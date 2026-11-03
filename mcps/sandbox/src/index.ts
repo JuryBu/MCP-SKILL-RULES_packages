@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * MCP Sandbox Server v1.19.0
+ * MCP Sandbox Server v1.19.1
  *
  * 代码执行沙箱，解决 Antigravity IDE 中 run_command 的痛点。
  *
@@ -45,7 +45,7 @@ import { initParentLs } from "./ls-client.js";
 // 创建 MCP Server 实例
 const server = new McpServer({
     name: "sandbox-mcp-server",
-    version: "1.19.0",
+    version: "1.19.1",
 });
 
 // 注册所有 8 个工具
@@ -72,7 +72,7 @@ server.resource(
         contents: [
             {
                 uri: "sandbox://guide",
-            text: `# MCP Sandbox v1.19.0 使用指南
+            text: `# MCP Sandbox v1.19.1 使用指南
 
 默认实时水位调度：实际物理/提交余量和Windows压力信号决定接纳，不再因1536MB预估记账或2048MB总观测线单独拒绝；显式24MB按24MB记账。已开始任务经过默认1秒启动观察窗口、被后续系统采样覆盖后退出预估扣账；新增观测增长继续保留到下一采样。小请求在黄色水位继续前进，红色水位、过期采样和恢复未完成仍暂停新执行。单进程树maxMemoryMB硬保护不变。错误正文与结构化结果同时解释有效请求、真实阻断和水位。SANDBOX_ADMISSION_MODE=fixed仅供显式选择旧额度模式。
 
@@ -91,6 +91,8 @@ sandbox_agent显式传callerHost/callerConversationId/action/params，前两项�
 内部子任务默认关闭，明确启用后最多一层，主调用方指定模型、推理强度、冻结规则、写入范围和预算。模型规则优先options.modelRulesRef，未提供时取API Profile的globalModelRulesRef；明确提供但无效时返回错误。内部模型禁止递归调用模型工具。
 
 先查看脱敏profile与精确model目录，模型和推理强度分别按实际参数声明选择。执行需要有限根预算及供应商跨任务累计上限；Council的provider=api选择已有profileId/model/params/budget，只讨论准备好的材料并关闭执行工具。
+
+费用默认hard，旧累计额度省略amountMode时保持原定义和回执。只有新累计额度definition.amountMode=estimated与本次根budget.costMode=estimated同时显式时才按估计运行；单次实际费用可能超过估计，完整入账并按累计阈值停止新增。在estimated累计额度下，费用未知或未结算时，原预留保留，其它根任务也停止新增预留和派发。CLI用budget configure-limit --amount-mode estimated设置新额度；已有额度ID切换模式须另建ID。Progrok的max_tokens约束可见输出，完整计费上界缺失时hard会在发送前返回具体缺项。
 
 断连或结果未知时沿原clientCommandId、conversationId、runId、expectedRunEpoch及预算查回，停止自动重发收费动作。原outcome_unknown执行的本地工作和所属资源确认释放后，主调用方可显式runs.cancel(acknowledgeUnknown=true)结束本地等待。waitEnded=true时CLI仍返回7，原结果、副作用与费用未知状态及预留继续保留；旧error回执保持，新确认使用独立稳定命令号，新任务另行明确提交。
 
@@ -584,7 +586,7 @@ async function heartbeatCheck(): Promise<void> {
 
 // === 启动 ===
 async function main(): Promise<void> {
-console.error(`[sandbox] MCP Server v1.19.0 启动中... (ppid=${process.ppid})`);
+console.error(`[sandbox] MCP Server v1.19.1 启动中... (ppid=${process.ppid})`);
     logStdinEvent("STARTED");
 
     // 初始化数据目录
@@ -644,7 +646,7 @@ console.error(`[sandbox] MCP Server v1.19.0 启动中... (ppid=${process.ppid})`
     const transport = new StdioServerTransport();
     await server.connect(transport);
 
-console.error(`[sandbox] MCP Server v1.19.0 已启动，绑定父 LS PID=${process.ppid}`);
+console.error(`[sandbox] MCP Server v1.19.1 已启动，绑定父 LS PID=${process.ppid}`);
     logStdinEvent(`BOUND to parent LS PID=${process.ppid}`);
 
     // === 非 LS 环境兜底超时 ===

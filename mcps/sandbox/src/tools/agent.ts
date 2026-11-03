@@ -101,6 +101,7 @@ export function registerAgent(server: McpServer): void {
         + 'action为正式RPC方法，params按该方法schema填写，server.info返回实际已安装能力。创建须选temporary/ttl/archive，ttl须给时长。'
         + '普通资料按当前账号权限读取，写入限批准根，危险动作交主调用方批准。内部子任务默认关闭，明确启用后最多一层，规则、模型、权限及预算由主调用方指定；内部模型禁止调用模型类MCP工具。'
         + '写命令保留稳定clientCommandId；临时新建省略时由共同客户端取得服务端命令号，显式旧号沿原号查询。控制租约由共同客户端取得，接管须显式takeover。'
+        + '费用默认hard；只有新累计额度definition.amountMode=estimated与根budget.costMode=estimated同时显式时才按估计运行，单次实际费用可超过估计。estimated累计额度的未知费用保留原预留并阻止同额度新增预留和派发。'
         + '未知结果先查原回执、执行及预算，停止自动重发。runs.cancel的acknowledgeUnknown=true仅在所属资源确认释放后结束本地等待，waitEnded=true时原结果和费用未知继续保留。'
         + '命令、规则选择、保存与恢复示例见包内src/agent-cli/README.md。';
     const handler = async (params: unknown) => {

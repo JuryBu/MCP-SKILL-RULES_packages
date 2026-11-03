@@ -98,7 +98,7 @@ export const COMMAND_SPECS: CommandSpec[] = installLifecycleCommandSpecs([
     command('model refresh', 'models.refresh', '显式联网刷新模型目录，不发送模型任务', [], [...MUTATION_OPTIONS, 'profile']),
     command('model declare', 'models.declare', '提交带来源依据的精确模型条目，参数使用--params', [], [...MUTATION_OPTIONS, 'profile']),
     command('model set', 'conversations.update', '切换当前会话下一次请求的模型', [], [...MUTATION_OPTIONS, 'profile', 'model', 'revision']),
-    command('budget configure-limit', 'budgets.configureLimit', '配置供应商跨根任务总金额上限', [], [...MUTATION_OPTIONS, 'quota-limit-id', 'currency', 'max-cost-micros', 'quota-scope-ids', 'source-ref']),
+    command('budget configure-limit', 'budgets.configureLimit', '配置供应商跨根任务总金额上限', [], [...MUTATION_OPTIONS, 'quota-limit-id', 'currency', 'max-cost-micros', 'quota-scope-ids', 'source-ref', 'amount-mode']),
     command('budget get', 'budgets.get', '读取原根预算与总限额账本', ['rootBudgetId'], ['params']),
     command('approvals', 'interactions.list', '查看真实待批或提问', [], [...PAGE_OPTIONS, 'run-id', 'params']),
     command('approve', 'interactions.respond', '答复待批动作，默认仅本次', ['interactionId'], [...MUTATION_OPTIONS, 'decision', 'answer', 'scope-hash', 'action-hash', 'policy-revision', 'revision']),
@@ -435,6 +435,7 @@ export async function executeCommand(command: ParsedCommand, context: ExecuteCon
             let quotaScopeIds: unknown;
             try { quotaScopeIds = JSON.parse(stringOption('quota-scope-ids') ?? '[]'); } catch { throw usage('--quota-scope-ids需要账户额度组ID数组的JSON'); }
             params.definition = { quotaLimitId: stringOption('quota-limit-id'), currency: stringOption('currency'), maxCostMicros: options['max-cost-micros'], quotaScopeIds, sourceRef: stringOption('source-ref') };
+            if (stringOption('amount-mode')) params.definition = { ...params.definition as Record<string, unknown>, amountMode: stringOption('amount-mode') };
             delete params.maxCostMicros;
         }
     }

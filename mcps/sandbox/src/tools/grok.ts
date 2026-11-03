@@ -131,6 +131,7 @@ export function registerGrok(server: McpServer): void {
         + '用户指定或任务确需外部模型时使用；普通辅助沿宿主原生工具。action/params使用正式RPC，callerHost/callerConversationId显式标识外部主调用方。'
         + '仅创建、更新会话或runs.start可选profileId/modelId；未指定时优先沿用原会话，再选唯一Progrok配置及其默认模型，多配置须明确选择。'
         + 'runs.start须给有限budget及Grok供应商累计上限；本入口保持显式配置，不自动建预算、改estimated、重试、fallback或发模型探测。'
+        + '费用默认hard并要求完整计费上界；估计运行须显式新quota amountMode=estimated及根costMode=estimated，单笔实收可超过估计。max_tokens约束可见输出，estimated累计额度的未知费用按原账本停发。'
         + '交互用interactions.list/respond，查询和取消沿原conversationId/runId/expectedRunEpoch，写操作保留稳定clientCommandId，未知结果先server.getReceipt。'
         + '普通读取、批准根写入、危险动作批准和默认关闭的单层内部子任务沿用Agent规则。保存方式及acknowledgeUnknown结束等待的原结果、费用保留合同见包内src/agent-cli/README.md；内部Agent禁止调用模型类MCP工具。';
     const handler = async (params: unknown) => {

@@ -92,7 +92,11 @@ sandbox_agent exec --text <正文> --budget <JSON对象> --detach --command-id <
 
 根预算字段包含 `wallMs/maxModelCalls/maxOutputTokens/costMode/currency/maxCostMicros`。预算在提交前按核心校验规则检查。`exec` 新建会话使用默认归档方式；同一显式命令 ID 对应确定的创建子命令 ID，重复提交可查询原创建和原执行回执。已有或新建的临时会话均不接受 `--detach`。
 
-`hard` 费用模式需要明确金额与币种，`estimated` 由调用方显式选择，供应商累计上限持续有效。金额以微货币单位表示，1.00 个货币单位为 `1000000`。内部子任务和压缩使用对应根预算，未知费用保留原预留。
+累计额度的 `definition.amountMode` 与根预算的 `costMode` 默认均为 `hard`，执行前需要可靠的完整计费上界。旧额度省略 `amountMode` 时保持原定义和旧回执；显式写 `hard` 仍对应同一额度定义。金额以微货币单位表示，1.00 个货币单位为 `1000000`。
+
+需要按估计金额运行时，通过 `budget configure-limit --amount-mode estimated` 创建新的累计额度，并在本次根预算中显式设置 `costMode="estimated"`；两处同时选择才接受有来源、有限非零的估计。已有额度 ID 的模式保持固定，切换模式须创建新 ID。CLI 表单和查询结果会显示所选模式及单次费用可能超出估计的提示。
+
+已发送请求按完整实际费用入账，累计达到金额阈值后停止新增；单次实收高于原估计时继续按累计金额判断。在 `estimated` 累计额度下，费用未知或未结算时，保留原预留，并停止其它根任务的新增预留和派发，沿原请求查清后才能继续。内部子任务和压缩使用对应根预算。Progrok 的 `max_tokens` 仅约束可见输出，完整计费上界未知时，`hard` 在发送前保留具体缺项。
 
 `runs get` 和 `exec` 会按 `resultContentId` 读取实际结果。`input list`、队列编辑和历史页会解析内容引用。原文分片逐页核对 MIME、字节数、偏移和 SHA256，再解码 JSON；默认每页 256 KiB、单次内存恢复上限 32 MiB。`artifact show/save` 可显式读取或保存原字节，保存默认保留已有目标文件，覆盖需要 `--force`。
 

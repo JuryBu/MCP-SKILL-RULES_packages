@@ -362,6 +362,8 @@ export function createAgentRuntime(options: AgentRuntimeOptions = {}) {
             return { ...run, budget: { ...budget, spentModelCalls: actual.spentCalls, heldModelCalls: actual.heldCalls,
                 spentCostMicros: actual.spentMicros, heldCostMicros: actual.heldMicros, maxModelCalls: actual.maxModelCalls,
                 maxCostMicros: actual.maxCostMicros, currency: actual.currency, amountUnknown: actual.amountUnknown,
+                quotaAmountMode: view.quotaLimit?.amountMode ?? 'hard', unsettledModelCalls: actual.unsettledCalls ?? 0,
+                effectiveAmountMode: actual.mode === 'estimated' && view.quotaLimit?.amountMode === 'estimated' ? 'estimated' : 'hard',
                 usageSource: 'accounting', usageStatus: 'available', usageRevision: actual.version } };
         } catch (error) {
             const code = error && typeof error === 'object' && 'code' in error && typeof error.code === 'string' ? error.code : 'ACCOUNTING_UNAVAILABLE';

@@ -66,9 +66,30 @@ export class ProgrokAdapter implements ProviderAdapter {
 
     async discover(profile: ProviderProfile, cursor: string | null, context: SendContext, signal?: AbortSignal): Promise<DiscoveryPage> {
         const headers = localHeaders(context);
-        return this.chat.discover({ ...profile, baseUrl: localApiBase(profile) }, cursor, {
-            transport: { request(request, requestSignal) { return context.transport.request({ ...request, headers }, requestSignal); } },
-        }, signal);
+        const base = localApiBase(profile);
+        const [page, languageResponse] = await Promise.all([
+            this.chat.discover({ ...profile, baseUrl: base }, cursor, {
+                transport: { request(request, requestSignal) { return context.transport.request({ ...request, headers }, requestSignal); } },
+            }, signal),
+            context.transport.request({ method: 'GET', url: `${base}/language-models`, headers, timeoutMs: 10_000,
+                maxResponseBytes: 4 * 1024 * 1024 }, signal),
+        ]);
+        if ([404, 405].includes(languageResponse.status)) return page;
+        const languageCatalog = decodeResponse(languageResponse).json;
+        if (!Array.isArray(languageCatalog.models) || languageCatalog.models.some(model => !objectValue(model) || !stringValue(objectValue(model)?.id))
+            || languageCatalog.has_more === true || stringValue(languageCatalog.next_cursor)) {
+            throw new AgentFault('E_CATALOG_INCOMPLETE', 'Progrok语言模型目录缺少完整models数组');
+        }
+        const languages = new Map<string, JsonObject>();
+        for (const model of languageCatalog.models as JsonObject[]) {
+            const modelId = stringValue(model.id)!;
+            if (languages.has(modelId)) throw new AgentFault('E_CATALOG_INCOMPLETE', 'Progrok语言模型目录含重复精确ID');
+            languages.set(modelId, model);
+        }
+        return { ...page, models: page.models.map(model => {
+            const language = languages.get(stringValue(model.id) ?? '');
+            return language ? { ...model, progrokLanguageModel: language } : model;
+        }) };
     }
 
     continueView(view: NativeSendView, response: NormalizedResponse, results: ToolResult[]): NativeSendView {

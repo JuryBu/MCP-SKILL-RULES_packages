@@ -1,4 +1,4 @@
-# MCP Sandbox v1.19.0
+# MCP Sandbox v1.19.1
 
 > Grok / ProGrok 支持仅包含客户端桥接代码；本包不提供代理服务、账号、API Key，也不会自动安装、启动或修补接收方的 ProGrok。任何 `yolo` / 自动批准模式都属于高权限执行选项，通用安装不要默认启用。
 
@@ -45,6 +45,10 @@ MCP 调用显式提供 `callerHost/callerConversationId/action/params`，前两�
 先用 `profile list/get/validate` 查看已有脱敏配置，再用 `model list/get` 查看精确模型目录。上下文窗口、输出上限、模态、参数和价格随来源及版本记录，未获声明的能力显示 `unknown`。联网刷新目录使用显式 `model refresh`。执行需要有限根预算和供应商跨任务累计上限，模型与推理强度分别按当前条目选择。
 
 `sandbox_grok` 复用已有 `protocol=progrok` 配置，多个配置时显式选择 `profileId`。创建、更新会话或 `runs.start` 可指定 `modelId`；查询、交互和取消沿用原会话及执行身份。Grok 入口沿用 Agent 的权限、保存、预算和回执合同。
+
+供应商累计额度默认 `amountMode=hard`，旧配置省略该字段时保持原有行为，执行前需要可核实的完整计费上界。采用估计金额时，调用方须给新累计额度显式设置 `amountMode=estimated`，并给本次根预算设置 `costMode=estimated`；两处同时选择才生效。已有额度 ID 保持原模式，切换模式需使用新 ID。已发送请求的实际费用可能超过单次估计，账本完整记录实收，累计达到阈值后停止新增；在 `estimated` 累计额度下，费用未知或未结算时，其它任务也停止新增预留和派发，直到原费用查清。
+
+Progrok 刷新合并实际模型目录与可选的语言模型详情，保留价格来源、原始用量和接口回报费用。缺失的协议能力可由带版本与来源的维护者声明补充，目录明示不支持或更窄的参数范围保持原值。`max_tokens` 约束可见输出，完整计费上界缺失时 `hard` 会在发送前返回具体缺项，调用方可据需求显式选择上述双 `estimated` 模式。
 
 ### 未知结果、保存与恢复
 

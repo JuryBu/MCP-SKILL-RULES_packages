@@ -241,6 +241,7 @@ export const METHOD_SPECS: Record<string, MethodSpec> = {
     'events.subscribe': spec({ ...conversationFields, afterCursor: z.string().max(2048).optional() }, false, 'conversation', '订阅当前会话事件'),
     'events.unsubscribe': spec({ subscriptionId: identifier }, false, 'none', '取消本客户端订阅'),
     'budgets.configureLimit': spec({ ...commandFields, ...controlFields, definition: z.object({
+        amountMode: z.enum(['hard', 'estimated']).optional().describe('默认hard；estimated需根任务同时明确选择，单次实际收费可能超出估计金额'),
         quotaLimitId: identifier, currency: z.string().regex(/^[A-Z]{3}$/), maxCostMicros: z.number().int().safe().nonnegative(),
         quotaScopeIds: z.array(z.string().min(1).max(512)).min(1).max(128), sourceRef: z.string().min(1).max(8192),
     }).strict() }, true, 'server', '配置跨全部根任务共享且不可静默提高的供应商费用上限'),

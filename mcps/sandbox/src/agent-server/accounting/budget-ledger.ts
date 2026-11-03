@@ -16,6 +16,7 @@ export interface BudgetDefinition {
 
 export interface QuotaLimitDefinition {
     quotaLimitId: string;
+    amountMode?: 'hard' | 'estimated';
     currency: string;
     maxCostMicros: number;
     quotaScopeIds: string[];
@@ -23,6 +24,8 @@ export interface QuotaLimitDefinition {
 }
 
 export interface QuotaLimitRecord extends QuotaLimitDefinition {
+    unsettledCalls?: number;
+    estimateNotice?: 'single_request_cost_may_exceed_estimate';
     spentMicros: number;
     heldMicros: number;
     spentCalls: number;
@@ -35,6 +38,7 @@ export interface QuotaLimitRecord extends QuotaLimitDefinition {
 
 export interface BudgetRecord extends BudgetDefinition {
     mode: 'hard' | 'estimated';
+    unsettledCalls?: number;
     spentCalls: number;
     heldCalls: number;
     spentMicros: number;
@@ -53,6 +57,7 @@ export interface UpperBound {
     source: 'price_table' | 'account_cap' | 'fixture' | 'estimated';
     sourceRef: string;
     expiresAt?: string;
+    estimateBasis?: { inputTokens: number; outputTokens: number; outputLimitKind: string; missingHardBounds: string[] };
 }
 
 export interface PostResponseUpperBound {
@@ -77,6 +82,7 @@ export type ReservationInput = { rootBudgetId: string; attemptId: string; action
     upperBound: UpperBound; foregroundCallFloor?: 1 } & ReservationIdentity;
 
 export type ReservationRecord = ReservationIdentity & {
+    amountMode?: 'estimated';
     attemptId: string;
     rootBudgetId: string;
     actionId: string;
@@ -125,7 +131,7 @@ export interface AccountingState {
     reservations: Record<string, ReservationRecord>;
     charges: Record<string, ChargeRecord>;
     quotaLimits: Record<string, QuotaLimitRecord>;
-    quotaCarry?: Record<string, { spentMicros: number; heldMicros: number; spentCalls: number; heldCalls: number }>;
+    quotaCarry?: Record<string, { spentMicros: number; heldMicros: number; spentCalls: number; heldCalls: number; unsettledCalls?: number }>;
 }
 
 export type AccountingCommand =
@@ -202,6 +208,7 @@ function refreshTotals(state: AccountingState): void {
         limit.heldMicros = carry?.heldMicros ?? 0;
         limit.spentCalls = carry?.spentCalls ?? 0;
         limit.heldCalls = carry?.heldCalls ?? 0;
+        if (limit.amountMode === 'estimated') limit.unsettledCalls = carry?.unsettledCalls ?? 0;
     }
     for (const budget of Object.values(state.budgets)) {
         budget.spentCalls = 0;
@@ -209,6 +216,7 @@ function refreshTotals(state: AccountingState): void {
         budget.spentMicros = 0;
         budget.heldMicros = 0;
         budget.amountUnknown = false;
+        if (budget.quotaLimitId && quotaLimitFor(state, budget.quotaLimitId).amountMode === 'estimated') budget.unsettledCalls = 0;
     }
     for (const charge of Object.values(state.charges)) {
         const budget = budgetFor(state, charge.rootBudgetId);
@@ -220,6 +228,7 @@ function refreshTotals(state: AccountingState): void {
         budget.heldCalls += reservation.callHeld ? 1 : 0;
         budget.heldMicros = safeAdd(budget.heldMicros, reservation.heldMicros);
         if (!['settled', 'rejected'].includes(reservation.state) && reservation.amountUnknown) budget.amountUnknown = true;
+        if (budget.unsettledCalls !== undefined && ['unknown', 'unsettled'].includes(reservation.state) && reservation.amountUnknown) budget.unsettledCalls++;
     }
     for (const budget of Object.values(state.budgets)) {
         budget.overdrawn = budget.overdrawn || (budget.maxCostMicros !== null && budget.spentMicros + budget.heldMicros > budget.maxCostMicros);
@@ -229,6 +238,7 @@ function refreshTotals(state: AccountingState): void {
             limit.heldMicros = safeAdd(limit.heldMicros, budget.heldMicros);
             limit.spentCalls += budget.spentCalls;
             limit.heldCalls += budget.heldCalls;
+            if (limit.amountMode === 'estimated') limit.unsettledCalls = (limit.unsettledCalls ?? 0) + (budget.unsettledCalls ?? 0);
             if (budget.overdrawn) limit.overdrawn = true;
         }
     }
@@ -247,7 +257,7 @@ function releaseKnownCosts(state: AccountingState, reservation: ReservationRecor
     reservation.state = complete ? 'settled' : 'unsettled';
     reservation.callHeld = false;
     reservation.dispatched = true;
-    if ((reservation.postResponseUpperBound || reservation.upperMicros !== null) && known > effectiveUpper) {
+    if (reservation.amountMode !== 'estimated' && (reservation.postResponseUpperBound || reservation.upperMicros !== null) && known > effectiveUpper) {
         budgetFor(state, reservation.rootBudgetId).overdrawn = true;
     }
 }
@@ -300,13 +310,18 @@ export function applyAccountingCommand(previous: AccountingState, command: Accou
             const definition = command.definition;
             requiredIdentity(definition.quotaLimitId);
             if (!/^[A-Z]{3}$/.test(definition.currency) || !exactAmount(definition.maxCostMicros) || !definition.sourceRef
-                || !definition.quotaScopeIds.length || definition.quotaScopeIds.some(scope => !scope)) {
+                || !definition.quotaScopeIds.length || definition.quotaScopeIds.some(scope => !scope)
+                || (definition.amountMode !== undefined && !['hard', 'estimated'].includes(definition.amountMode))
+                || (definition.amountMode === 'estimated' && definition.maxCostMicros < 1)) {
                 throw new AgentFault('E_GLOBAL_BUDGET_REQUIRED', '供应商总限额必须明确币种、金额、账户配额组和授权来源');
             }
             const existing = state.quotaLimits[key(definition.quotaLimitId)];
-            if (existing && existing.definitionHash !== hash(definition)) throw new AgentFault('E_GLOBAL_BUDGET_CONFLICT', '同一供应商总限额不能被重新创建为新额度');
+            const { amountMode, ...hardDefinition } = definition;
+            const definitionHash = hash(amountMode === 'estimated' ? definition : hardDefinition);
+            if (existing && existing.definitionHash !== definitionHash) throw new AgentFault('E_GLOBAL_BUDGET_CONFLICT', '同一供应商总限额不能被重新创建为新额度');
             limit = existing ?? { ...definition, spentMicros: 0, heldMicros: 0, spentCalls: 0, heldCalls: 0,
-                blockedReason: null, overdrawn: false, definitionHash: hash(definition), version: 1 };
+                ...(amountMode === 'estimated' ? { unsettledCalls: 0, estimateNotice: 'single_request_cost_may_exceed_estimate' as const } : {}),
+                blockedReason: null, overdrawn: false, definitionHash, version: 1 };
             replayed = Boolean(existing);
             state.quotaLimits[key(definition.quotaLimitId)] = limit;
         } else {
@@ -340,6 +355,8 @@ export function applyAccountingCommand(previous: AccountingState, command: Accou
         if (definition.quotaLimitId) {
             const globalLimit = quotaLimitFor(state, definition.quotaLimitId);
             if (globalLimit.currency !== definition.currency) throw new AgentFault('E_CURRENCY_MISMATCH', '根预算与供应商总限额币种不同');
+            if (globalLimit.amountMode === 'estimated' && definition.mode === 'estimated'
+                && (definition.maxCostMicros === null || definition.maxCostMicros < 1)) throw new AgentFault('BUDGET_REQUIRED', '估计金额累计模式需要根预算的有限正金额');
             if (globalLimit.blockedReason || globalLimit.overdrawn) throw new AgentFault('E_GLOBAL_BUDGET_HALTED', '供应商总限额已停止新增请求');
         }
         const existing = state.budgets[key(definition.rootBudgetId)];
@@ -378,9 +395,13 @@ export function applyAccountingCommand(previous: AccountingState, command: Accou
         }
         const upper = command.upperBound;
         const globalLimit = budget.quotaLimitId ? quotaLimitFor(state, budget.quotaLimitId) : null;
+        const estimatedAmountMode = budget.mode === 'estimated' && globalLimit?.amountMode === 'estimated';
         if (!globalLimit && upper.source !== 'fixture') throw new AgentFault('E_GLOBAL_BUDGET_REQUIRED', '真实模型请求必须关联跨全部根任务的供应商总限额');
         if (globalLimit && (!globalLimit.quotaScopeIds.includes(command.quotaScopeId) || globalLimit.blockedReason || globalLimit.overdrawn)) {
             throw new AgentFault('E_GLOBAL_BUDGET_HALTED', '供应商总限额不可用于该账户或已经停止新增请求');
+        }
+        if (globalLimit?.amountMode === 'estimated' && (globalLimit.unsettledCalls ?? 0) > 0) {
+            throw new AgentFault('E_GLOBAL_BUDGET_HALTED', '供应商估计金额账本仍有未知收费，先核对原请求');
         }
         if (upper.currency !== budget.currency) throw new AgentFault('E_CURRENCY_MISMATCH', '请求计价币种与根预算不同');
         if (upper.amountMicros !== null && !exactAmount(upper.amountMicros)) throw new AgentFault('E_PRICE_UNKNOWN', '预留金额必须为非负整数微金额');
@@ -390,8 +411,12 @@ export function applyAccountingCommand(previous: AccountingState, command: Accou
         if (budget.mode === 'hard' && (upper.amountMicros === null || !upper.reliable || upper.source === 'estimated')) {
             throw new AgentFault('BUDGET_UNBOUNDED', '该动作缺少可靠费用上界，硬预算阻止付费');
         }
-        if (globalLimit && (upper.amountMicros === null || !upper.reliable || upper.source === 'estimated')) {
+        if (globalLimit && !estimatedAmountMode && (upper.amountMicros === null || !upper.reliable || upper.source === 'estimated')) {
             throw new AgentFault('BUDGET_UNBOUNDED', '供应商总限额为硬上限，根任务的estimated模式不能绕过可靠上界');
+        }
+        if (estimatedAmountMode && (upper.amountMicros === null || upper.amountMicros < 1
+            || (!upper.reliable && upper.source !== 'estimated'))) {
+            throw new AgentFault('BUDGET_UNBOUNDED', '估计金额累计模式需要有明确来源的有限非零预留');
         }
         if (Date.parse(budget.deadlineAt) <= now) throw new AgentFault('E_BUDGET_DEADLINE', '根预算已经到期');
         if (budget.blockedReason) throw new AgentFault('E_BUDGET_HALTED', '该根预算已停止新增模型请求', { reason: budget.blockedReason });
@@ -408,6 +433,7 @@ export function applyAccountingCommand(previous: AccountingState, command: Accou
         const attempts = Object.values(state.reservations).filter(entry => entry.rootBudgetId === command.rootBudgetId && entry.actionId === command.actionId);
         if (attempts.length >= 3) throw new AgentFault('E_ATTEMPT_LIMIT', '同一动作最多提交三次尝试');
         reservation = { attemptId: command.attemptId, rootBudgetId: command.rootBudgetId, actionId: command.actionId,
+            ...(estimatedAmountMode ? { amountMode: 'estimated' as const } : {}),
             quotaScopeId: command.quotaScopeId, ...reservationIdentity, upperMicros: upper.amountMicros, originalUpperBound: structuredClone(upper),
             heldMicros: upper.amountMicros ?? 0, amountUnknown: upper.amountMicros === null || !upper.reliable,
             state: 'reserved', dispatched: false, callHeld: true, intentHash: hash(command),
@@ -427,6 +453,9 @@ export function applyAccountingCommand(previous: AccountingState, command: Accou
                 if (budget.quotaLimitId) {
                     const limit = quotaLimitFor(state, budget.quotaLimitId);
                     if (limit.blockedReason || limit.overdrawn) throw new AgentFault('E_GLOBAL_BUDGET_HALTED', '供应商总限额已停止新增请求');
+                    if (limit.amountMode === 'estimated' && (limit.unsettledCalls ?? 0) > 0) {
+                        throw new AgentFault('E_GLOBAL_BUDGET_HALTED', '供应商估计金额账本仍有未知收费，尚未发送的请求继续保留预留');
+                    }
                 }
                 reservation.dispatched = true;
                 reservation.callHeld = false;

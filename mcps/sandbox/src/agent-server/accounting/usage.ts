@@ -20,7 +20,13 @@ export interface NormalizedUsage {
 }
 
 export function normalizeProgrokUsage(raw: JsonValue | undefined): NormalizedUsage {
-    const normalized = normalizeUsage('compatible_chat', raw);
+    const normalized = { ...normalizeUsage('compatible_chat', raw), outputIncludesReasoning: false };
+    if ([normalized.inputTokens, normalized.outputTokens, normalized.reasoningTokens, normalized.totalTokens].every(value => value !== null)) {
+        const bucketTotal = normalized.inputTokens! + normalized.outputTokens! + normalized.reasoningTokens!;
+        if (!Number.isSafeInteger(bucketTotal) || bucketTotal !== normalized.totalTokens) {
+            normalized.issues = [...normalized.issues, 'progrok_total_token_bucket_mismatch'];
+        }
+    }
     const source = record(raw);
     const value = source.cost_in_usd_ticks;
     if (value === undefined || value === null) return normalized;

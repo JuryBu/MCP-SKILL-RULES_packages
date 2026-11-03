@@ -23,7 +23,7 @@ export const OPTION_TYPES: Record<string, OptionKind> = {
     'policy-revision': 'number', graphics: 'string', color: 'string', 'reduce-motion': 'boolean', accessible: 'boolean',
     'cell-size': 'string', renderer: 'string', 'image-cache': 'string',
     cancel: 'boolean', 'acknowledge-unknown': 'boolean',
-    'quota-limit-id': 'string', 'quota-scope-ids': 'string', 'source-ref': 'string', 'root-budget-id': 'string',
+    'quota-limit-id': 'string', 'quota-scope-ids': 'string', 'source-ref': 'string', 'root-budget-id': 'string', 'amount-mode': 'string',
     'secret-format': 'string', 'secret-field': 'string',
     terminal: 'boolean', force: 'boolean',
     query: 'string', host: 'string', 'source-id': 'string', 'tool-id': 'string',
