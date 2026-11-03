@@ -39,12 +39,46 @@ export interface ContextCandidateData extends Record<string, unknown> {
     pendingAttemptId?: string | null;
 }
 
+export interface ContextSummaryReadInput {
+    conversationId: string;
+    historyEpoch: number;
+    nodeId: string;
+    hash?: string;
+    signal?: AbortSignal;
+}
+
+export interface ContextSummaryArchiveData extends Record<string, unknown> {
+    kind: 'context_summary_archive';
+    schemaVersion: 1;
+    conversationId: string;
+    historyEpoch: number;
+    nodeId: string;
+    nodeHash: string;
+    contentId: string;
+    contentHash: string;
+    byteLength: number;
+    firstSeq: number;
+    lastSeq: number;
+}
+
+export const MAX_CONTEXT_SUMMARY_NODE_BYTES = 2 * 1024 * 1024;
+export const MAX_CONTEXT_SUMMARY_ARCHIVE_BYTES = 16 * 1024 * 1024;
+export const MAX_CONTEXT_SUMMARY_ARCHIVE_NODES = 4096;
+
 export type ContextTransactionPort = Pick<StorePort, 'getRecord' | 'readContent' | 'getReceipt' | 'commitTransition' | 'mutateState'>;
 
 export const contextStateKey = (conversationId: string): StoreKey => ({ conversationId, kind: 'step', id: `context:state:${conversationId}` });
 export const contextCandidateKey = (conversationId: string, candidateId: string): StoreKey => ({ conversationId, kind: 'step', id: `context:candidate:${candidateId}` });
 export const contextConversationKey = (conversationId: string): StoreKey => ({ conversationId, kind: 'conversation', id: conversationId });
 export const contextRunKey = (conversationId: string, runId: string): StoreKey => ({ conversationId, kind: 'run', id: runId });
+export const contextFeedbackStateKey = (conversationId: string, historyEpoch: number): StoreKey =>
+    ({ conversationId, kind: 'step', id: `context:feedback:${historyEpoch}` });
+export const contextFeedbackTargetKey = (conversationId: string, historyEpoch: number, target: unknown): StoreKey =>
+    ({ conversationId, kind: 'step', id: `context:feedback-target:${historyEpoch}:${hashContext(target)}` });
+export const contextFeedbackHitKey = (conversationId: string, historyEpoch: number, hitId: string): StoreKey =>
+    ({ conversationId, kind: 'step', id: `context:feedback-hit:${historyEpoch}:${hashContext(hitId)}` });
+export const contextSummaryKey = (conversationId: string, historyEpoch: number, nodeId: string, hash?: string): StoreKey =>
+    ({ conversationId, kind: 'step', id: `context:summary:${historyEpoch}:${hashContext(nodeId)}:${hash ?? 'latest'}` });
 
 export function initialContextState(): ContextStateData {
     return { kind: 'context_state', schemaVersion: 1, compressionGeneration: 'unclaimed', effectiveModelFingerprint: '',

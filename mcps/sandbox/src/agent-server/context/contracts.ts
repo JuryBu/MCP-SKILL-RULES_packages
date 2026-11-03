@@ -76,6 +76,7 @@ export interface RoundBoundary {
     lastSeq: number;
     lastStepSeq: number;
     nativePairing: 'complete' | 'pending' | 'conflict';
+    terminalOutcome?: { state: 'succeeded' | 'failed' | 'cancelled'; stopReason: string | null };
 }
 
 export interface SourceBlock {
@@ -139,6 +140,28 @@ export type CandidateState = 'snapshotting' | 'generating' | 'ready' | 'publishi
     | 'published' | 'discarded' | 'cancelled' | 'failed' | 'unknown';
 export type SchedulerState = 'idle' | 'cooldown' | 'circuitBroken' | 'hardPaused';
 
+export type HistoryFeedbackTarget = { kind: 'node' | 'round'; id: string };
+
+export interface HistoryFeedbackEntry {
+    target: HistoryFeedbackTarget;
+    hitCount: number;
+    lastHitStep: number;
+    feedbackRevision: number;
+}
+
+export interface HistoryFeedbackSnapshot {
+    historyEpoch: number;
+    revision: number;
+    entries: HistoryFeedbackEntry[];
+}
+
+export interface PublishedHistoryFeedback {
+    hitCount: number;
+    lastHitStep: number;
+    publishedAtStep: number;
+    level: 'body' | 'skeleton';
+}
+
 export interface CompactionSnapshot {
     candidateId: string;
     conversationId: string;
@@ -168,7 +191,24 @@ export interface CompactionSnapshot {
     referenceBlocks: SourceBlock[];
     execution: ExecutionLease;
     config: FrozenCompressionConfig;
+    historyFeedback?: HistoryFeedbackSnapshot;
+    requirementSourceMetadata?: RequirementSourceMetadata[];
+    requestBudget?: CompactionRequestBudget;
 }
+
+export interface CompactionRequestBudget {
+    target: number;
+    inputBudget?: number;
+    summaryBudget: number;
+    fixedInputTokens: number;
+    nativeViewHash: string;
+    modelId: string;
+    adapterVersion: string | null;
+}
+
+export type CompactionViewEstimator = (snapshot: CompactionSnapshot, summary: { coveredEndSeq: number; text: string; tokens: number }, signal?: AbortSignal) => Promise<{
+    estimate: ContextEstimate; nativeViewHash: string; modelId: string; adapterVersion: string | null;
+}>;
 
 export interface CoverageEntry {
     span: SourceSpan;
@@ -181,6 +221,24 @@ export interface RequirementAnchor {
     quote: string;
     source: SourceSpan;
     resolvedBy?: SourceSpan[];
+    resolution?: { status: 'fulfilled' | 'superseded'; conversationId: string; historyEpoch: number; replacementRequirementId?: string; remainingIds: string[] };
+    parentRequirementId?: string;
+}
+
+export interface RequirementSourceMetadata {
+    itemId: string;
+    seq: number;
+    role: HistoryItem['role'];
+    roundId: string | null;
+    terminalOutcome?: RoundBoundary['terminalOutcome'];
+}
+
+export interface RequirementResolution {
+    requirementId: string;
+    status: 'fulfilled' | 'superseded';
+    resolvedQuote: string;
+    evidence: { quote: string; source: SourceSpan }[];
+    replacementRequirementId?: string;
 }
 
 export interface DigestText {
@@ -188,6 +246,7 @@ export interface DigestText {
     skeleton: string;
     title: string;
     unresolved: RequirementAnchor[];
+    resolutions?: RequirementResolution[];
 }
 
 export interface CompressionChunk {
@@ -199,6 +258,7 @@ export interface CompressionChunk {
     body: string;
     inputBodyHash: string;
     inputTokens: number;
+    requirementAnchors?: RequirementAnchor[];
 }
 
 export interface CompressionRequest {
@@ -213,6 +273,11 @@ export interface CompressionRequest {
     chunk: CompressionChunk;
     maxOutputTokens: number;
     inputBodyHash: string;
+    validationRepair?: {
+        previousAttemptId: string;
+        validationError: string;
+        previousResponse: string;
+    };
 }
 
 export interface CompressionResult {
@@ -254,6 +319,8 @@ export interface SummaryBatch extends DigestText {
     parentBatchIds: string[];
     modelFingerprint: string;
     anchors: SourceBlock[];
+    historyFeedback?: PublishedHistoryFeedback;
+    feedbackSourceNodeIds?: string[];
 }
 
 export interface FoldNode extends Omit<SummaryBatch, 'kind'> {
@@ -268,6 +335,11 @@ export interface SummaryView {
     historyEpoch: number;
     coveredEndSeq: number;
     nodes: SummaryNode[];
+    historyFeedbackRevision?: number;
+    requirementGuidanceCursor?: number;
+    summaryBudget?: number;
+    fitEvidence?: { inputTokens: number; target: number; inputBudget: number | null;
+        targetReached: boolean; optimizationStoppedAtMinimum?: boolean };
 }
 
 export interface ContextCapture {
@@ -303,6 +375,11 @@ export interface CompactionCandidate {
     chunks: ChunkDigest[];
     pendingRequest: CompressionRequest | null;
     failedResult: CompressionResult | null;
+    validationRepair?: {
+        request: CompressionRequest;
+        failedResult: CompressionResult;
+        repairAttemptId: string;
+    };
     batch: SummaryBatch | null;
     folds: FoldNode[];
     nextView: SummaryView | null;
@@ -339,7 +416,11 @@ export interface SchedulerCheckpoint {
 }
 
 export interface CompactionPort extends ContextHistoryPort {
+    readRequirementSourceMetadata?(input: { conversationId: string; historyEpoch: number; itemIds: string[] }): Promise<{
+        historyEpoch: number; items: RequirementSourceMetadata[];
+    }>;
     inspect(conversationId: string): Promise<ContextCapture>;
+    readHistoryFeedback?(input: { conversationId: string; historyEpoch: number; nodes: SummaryNode[]; roundIds?: string[] }): Promise<HistoryFeedbackSnapshot>;
     claim(input: {
         conversationId: string;
         expectedHistoryEpoch: number;

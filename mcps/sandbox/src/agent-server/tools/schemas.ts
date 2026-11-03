@@ -4,6 +4,36 @@ import { fileOperationSchemas, FILE_OPERATION_SCHEMAS } from '../workspace/file-
 
 const filePath = z.string().min(1).max(32768);
 const byteOffset = z.number().int().min(0).max(Number.MAX_SAFE_INTEGER);
+const historyRound = z.number().int().min(1).max(Number.MAX_SAFE_INTEGER);
+const historyCursor = z.string().min(1).max(16384);
+const historyBudget = z.number().int().min(4096).max(262144).default(65536);
+const historyRange = { startRound: historyRound.optional(), endRound: historyRound.optional() };
+
+const historyReadSchema = z.object({ summaryId: z.string().min(1).max(256).optional(), artifactId: z.string().min(1).max(256).optional(),
+    offset: byteOffset.optional(), ...historyRange, cursor: historyCursor.optional(), limit: z.number().int().min(1).max(100).default(20),
+    maxBytes: historyBudget, direction: z.enum(['forward', 'backward']).default('forward') }).strict().superRefine((value, refinement) => {
+    if (value.startRound !== undefined && value.endRound !== undefined && value.startRound > value.endRound) {
+        refinement.addIssue({ code: 'custom', message: '起始轮不得晚于结束轮' });
+    }
+    if (value.summaryId && value.artifactId || (value.summaryId || value.artifactId) && (value.startRound !== undefined || value.endRound !== undefined)
+        || value.artifactId && value.cursor || value.offset !== undefined && !value.artifactId) {
+        refinement.addIssue({ code: 'custom', message: '摘要、正文分片和按轮分页分别选择一个入口' });
+    }
+});
+
+const historySearchSchema = z.object({ query: z.string().min(1).max(512), ...historyRange, cursor: historyCursor.optional(),
+    limit: z.number().int().min(1).max(100).default(10), maxBytes: historyBudget,
+    scanBytes: z.number().int().min(8192).max(1048576).default(131072) }).strict().superRefine((value, refinement) => {
+    if (value.startRound !== undefined && value.endRound !== undefined && value.startRound > value.endRound) {
+        refinement.addIssue({ code: 'custom', message: '起始轮不得晚于结束轮' });
+    }
+});
+
+const historyHitSchema = z.object({ summaryId: z.string().min(1).max(256).optional(), roundHit: historyRound.optional() }).strict().superRefine((value, refinement) => {
+    if ([value.summaryId, value.roundHit].filter(entry => entry !== undefined).length !== 1) {
+        refinement.addIssue({ code: 'custom', message: '选择一个摘要或轮锚点标记有用命中' });
+    }
+});
 
 export const localArgumentSchemas = {
     read_file: z.object({ path: filePath, offset: byteOffset.default(0), limit: z.number().int().min(1).max(262144).default(65536),
@@ -19,6 +49,9 @@ export const localArgumentSchemas = {
         limit: z.number().int().min(1).max(100).default(24) }).strict(),
     tool_describe: z.object({ name: z.string().min(1).max(256) }).strict(),
     tool_load: z.object({ names: z.array(z.string().min(1).max(256)).min(1).max(32) }).strict(),
+    history_read: historyReadSchema,
+    history_search: historySearchSchema,
+    mark_history_hit: historyHitSchema,
     ...fileOperationSchemas,
 };
 
@@ -59,6 +92,23 @@ export const MODEL_FUNCTION_SCHEMAS: readonly ModelFunctionSchema[] = [
     { type: 'function', name: 'tool_load', description: '按名称选择加载至多32个目录工具，新增定义从下一次模型请求生效，返回名称和固定hash。只加载任务需要的工具；身份、权限、版本与资源归属继续由可信核心绑定。',
         parameters: { type: 'object', additionalProperties: false, required: ['names'], properties: {
             names: { type: 'array', minItems: 1, maxItems: 32, items: { type: 'string', minLength: 1, maxLength: 256 } },
+        } } },
+    { type: 'function', name: 'history_read', description: '查回当前Core会话自身历史。按轮号与cursor分页读取原文，正文省略时用返回的contentId作为artifactId分片读取；看到read=summary:<id>时传summaryId="summary:<id>"展开完整摘要JSON，含正文、来源hash、序列、轮锚点和sourceSpans。摘要分片沿原summaryId与cursor继续，正文分片沿artifactId与offset继续。读取不增加有用命中，确实有用时再调用mark_history_hit。',
+        parameters: { type: 'object', additionalProperties: false, properties: {
+            summaryId: { type: 'string', minLength: 1, maxLength: 256 }, artifactId: { type: 'string', minLength: 1, maxLength: 256 },
+            offset: { type: 'integer', minimum: 0 }, startRound: { type: 'integer', minimum: 1 }, endRound: { type: 'integer', minimum: 1 },
+            cursor: { type: 'string', maxLength: 16384 }, limit: { type: 'integer', minimum: 1, maximum: 100 },
+            maxBytes: { type: 'integer', minimum: 4096, maximum: 262144 }, direction: { type: 'string', enum: ['forward', 'backward'] },
+        } } },
+    { type: 'function', name: 'history_search', description: '在当前Core会话原文的canonical JSON中作字面搜索，返回来源itemId/contentId/hash/序列/轮锚点及可直接调用的history_read参数。每次只扫描有界分片，空结果且hasMore=true时用相同query、轮范围及nextCursor继续；complete仅覆盖固定历史水位。搜索不增加有用命中。',
+        parameters: { type: 'object', additionalProperties: false, required: ['query'], properties: {
+            query: { type: 'string', minLength: 1, maxLength: 512 }, startRound: { type: 'integer', minimum: 1 }, endRound: { type: 'integer', minimum: 1 },
+            cursor: { type: 'string', maxLength: 16384 }, limit: { type: 'integer', minimum: 1, maximum: 100 },
+            maxBytes: { type: 'integer', minimum: 4096, maximum: 262144 }, scanBytes: { type: 'integer', minimum: 8192, maximum: 1048576 },
+        } } },
+    { type: 'function', name: 'mark_history_hit', description: '明确标记刚查回的摘要或历史轮对当前任务确实有用，供下一次BPC发布调整保留程度。summaryId、roundHit（从1起的历史轮号）二选一，取自查回结果；只读取、看见或搜索匹配时不调用。会话、动作身份和反馈存储由可信Core绑定。',
+        parameters: { type: 'object', additionalProperties: false, properties: {
+            summaryId: { type: 'string', minLength: 1, maxLength: 256 }, roundHit: { type: 'integer', minimum: 1 },
         } } },
     ...FILE_OPERATION_SCHEMAS,
 ];

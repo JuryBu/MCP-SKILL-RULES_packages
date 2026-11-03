@@ -2,12 +2,12 @@ import { randomUUID } from 'node:crypto';
 import type { ReceiptKey } from '../storage/port.js';
 import { AgentFault } from '../protocol.js';
 import type { JsonObject } from '../protocol.js';
-import type { CompactionCandidate, CompactionPort, CompactionReason, ContextCapture, ContextEstimate, ContextLimits, ContextSourcePort,
+import type { CompactionCandidate, CompactionPort, CompactionReason, CompactionViewEstimator, ContextCapture, ContextEstimate, ContextLimits, ContextSourcePort,
     ExecutionLease, FrozenCompressionConfig, MaintenanceCallbacks, Publication, SchedulerCheckpoint, TokenCounter, CompressionModelPort, SummaryView } from './contracts.js';
 import { checkContextGate, totalContextTokens } from './budget.js';
 import { freezeValue, hashContext } from './config.js';
 import { contextFailure, ContextFault } from './errors.js';
-import { generateCompaction, prepareCompaction, previewCompaction, validateCompressionResult, verifyManifestSources, verifyRequirements } from './compaction.js';
+import { generateCompaction, prepareCompaction, previewCompaction, fitCompactionSummary, validateCompressionResult, verifyManifestSources, verifyRequirements } from './compaction.js';
 import type { CompactionPreview } from './compaction.js';
 import { createSourceManifest, readSelectedHistory } from './rounds.js';
 import { validatePublication } from './view.js';
@@ -17,6 +17,7 @@ interface ActiveCompaction {
     abort: AbortController;
     completion: Promise<CompactionCandidate>;
     settled: boolean;
+    estimateCompaction?: CompactionViewEstimator;
 }
 
 export interface CompactionHandle {
@@ -119,7 +120,8 @@ export class ContextCompactor {
         return (await this.options.port.inspect(conversationId)).view;
     }
 
-    async start(input: { conversationId: string; config: FrozenCompressionConfig; execution: ExecutionLease; reason: CompactionReason }): Promise<CompactionHandle> {
+    async start(input: { conversationId: string; config: FrozenCompressionConfig; execution: ExecutionLease; reason: CompactionReason;
+        limits?: ContextLimits; estimateCompaction?: CompactionViewEstimator }): Promise<CompactionHandle> {
         if (this.active.has(input.conversationId) || this.starting.has(input.conversationId) || this.recovering.has(input.conversationId)) throw new ContextFault('COMPACTION_BUSY', '会话已有压缩所有者');
         const abort = new AbortController();
         let finishStarting: () => void = () => {};
@@ -139,8 +141,23 @@ export class ContextCompactor {
             const capture = await this.options.port.claim({ conversationId: input.conversationId, expectedHistoryEpoch: current.historyEpoch,
                 expectedViewRevision: current.viewRevision, expectedGeneration: current.compressionGeneration,
                 compressionGeneration: randomUUID(), execution: input.execution });
-            const candidate = await prepareCompaction({ port: this.options.port, sources: this.options.sources, capture,
+            let candidate = await prepareCompaction({ port: this.options.port, sources: this.options.sources, capture,
                 config: input.config, execution: input.execution, reason: input.reason, signal: abort.signal, now: this.now() });
+            if (input.estimateCompaction && input.limits) {
+                const fixed = await input.estimateCompaction(candidate.snapshot, { coveredEndSeq: candidate.snapshot.coveredEndSeq, text: '', tokens: 0 }, abort.signal);
+                const fixedInputTokens = totalContextTokens(fixed.estimate);
+                const target = Math.min(input.limits.target, input.limits.inputBudget);
+                const targetRemaining = target - fixedInputTokens - 1;
+                const summaryBudget = Math.min(input.limits.summaryBudget, targetRemaining > 0 || input.reason === 'background'
+                    ? targetRemaining : input.limits.inputBudget - fixedInputTokens - 1);
+                if (summaryBudget <= 0) throw new ContextFault('SUMMARY_BUDGET', input.reason === 'background'
+                    ? '保留原文、当前输入及工具schema已占满后台压缩目标，摘要模型尚未调用'
+                    : '保留原文、当前输入及工具schema已占满安全输入预算，摘要模型尚未调用',
+                    { fixedInputTokens, target, inputBudget: input.limits.inputBudget, summaryBudget, conversationId: input.conversationId, historyEpoch: candidate.snapshot.historyEpoch,
+                        appendSeq: candidate.snapshot.snapshotAppendSeq, nativeViewHash: fixed.nativeViewHash });
+                candidate = { ...candidate, snapshot: freezeValue({ ...candidate.snapshot, requestBudget: { target, inputBudget: input.limits.inputBudget, summaryBudget, fixedInputTokens,
+                    nativeViewHash: fixed.nativeViewHash, modelId: fixed.modelId, adapterVersion: fixed.adapterVersion } }) };
+            }
             if (abort.signal.aborted) throw new ContextFault('CANCELLED', '压缩快照已取消');
             await this.options.port.saveCandidate(structuredClone(candidate));
             if (abort.signal.aborted) {
@@ -148,14 +165,14 @@ export class ContextCompactor {
                     generation: candidate.snapshot.compressionGeneration, state: 'cancelled' });
                 throw new ContextFault('CANCELLED', '压缩快照已取消');
             }
-            return this.run(candidate, capture, abort);
+            return this.run(candidate, capture, abort, input.estimateCompaction);
         } finally { this.starting.delete(input.conversationId); finishStarting(); }
     }
 
-    private run(candidate: CompactionCandidate, capture: ContextCapture, abort: AbortController): CompactionHandle {
+    private run(candidate: CompactionCandidate, capture: ContextCapture, abort: AbortController, estimateCompaction?: CompactionViewEstimator): CompactionHandle {
         let settled = false;
         const completion = generateCompaction({ candidate, priorView: capture.view, port: this.options.port, sources: this.options.sources,
-            model: this.options.model, signal: abort.signal, countTokens: this.options.countTokens, now: this.now }).then(async result => {
+            model: this.options.model, signal: abort.signal, countTokens: this.options.countTokens, now: this.now, estimateCompaction }).then(async result => {
             if (result.snapshot.execution.kind === 'maintenance') {
                 await this.publish(candidate.conversationId, capture.stepSeq);
                 await this.finishMaintenance(candidate, 'published');
@@ -163,6 +180,20 @@ export class ContextCompactor {
             return result;
         }).catch(async error => {
             let failure = error;
+            if (!abort.signal.aborted && candidate.reason === 'background' && !candidate.pendingRequest
+                && candidate.snapshot.execution.kind !== 'maintenance' && error instanceof ContextFault
+                && !error.mayHaveStarted && (error.code === 'CONTEXT_SUMMARY_BUDGET'
+                    || error.code === 'CONTEXT_SOURCE_GAP' && error.details?.knownInvalidDigest === true
+                        && candidate.state === 'failed' && candidate.error?.details?.knownInvalidDigest === true)) {
+                const checkpoint = await this.checkpoint(candidate.conversationId);
+                checkpoint.state = 'circuitBroken';
+                checkpoint.lastFailure = contextFailure(error);
+                await this.persist(candidate.conversationId, checkpoint);
+                if (this.active.get(candidate.conversationId)?.candidate.candidateId === candidate.candidateId) {
+                    this.active.delete(candidate.conversationId);
+                }
+                return candidate;
+            }
             if (!abort.signal.aborted && candidate.reason === 'background' && !candidate.pendingRequest
                 && error instanceof AgentFault && !error.mayHaveStarted && error.code === 'E_BACKGROUND_BUDGET_DEFERRED'
                 && candidate.error?.details?.budgetReservationRejected === true) {
@@ -174,7 +205,9 @@ export class ContextCompactor {
                     checkpoint.state = 'idle';
                     checkpoint.lastFailure = candidate.error;
                     await this.persist(candidate.conversationId, checkpoint);
-                    this.active.delete(candidate.conversationId);
+                    if (this.active.get(candidate.conversationId)?.candidate.candidateId === candidate.candidateId) {
+                        this.active.delete(candidate.conversationId);
+                    }
                     return candidate;
                 } catch {
                     failure = new ContextFault('COMMIT_UNKNOWN', '后台预算延期的候选收尾尚未确认',
@@ -194,7 +227,7 @@ export class ContextCompactor {
             }
             throw failure;
         }).finally(() => { settled = true; });
-        this.active.set(candidate.conversationId, { candidate, abort, completion, get settled() { return settled; } });
+        this.active.set(candidate.conversationId, { candidate, abort, completion, estimateCompaction, get settled() { return settled; } });
         void completion.catch(() => {});
         return { candidateId: candidate.candidateId, execution: candidate.snapshot.execution, completion };
     }
@@ -240,7 +273,7 @@ export class ContextCompactor {
         }
     }
 
-    async publish(conversationId: string, stepSeq: number, receiptKey?: ReceiptKey): Promise<Publication | null> {
+    async publish(conversationId: string, stepSeq: number, receiptKey?: ReceiptKey, estimateCompaction?: CompactionViewEstimator): Promise<Publication | null> {
         const active = this.active.get(conversationId);
         const capture = await this.options.port.inspect(conversationId);
         const candidate = active?.candidate ?? (capture.candidateId ? await this.options.port.getCandidate(conversationId, capture.candidateId) : null);
@@ -253,6 +286,14 @@ export class ContextCompactor {
         if (!candidate.coverage?.completeRoundIds.length || !candidate.nextView || !candidate.batch
             || candidate.nextView.coveredEndSeq !== candidate.coverage.coveredEndSeq || candidate.batch.lastSeq !== candidate.coverage.coveredEndSeq) {
             throw new ContextFault('SOURCE_GAP', '候选尚未形成真实连续覆盖视图');
+        }
+        if (candidate.snapshot.requestBudget) {
+            const estimator = estimateCompaction ?? active?.estimateCompaction;
+            if (!estimator) throw new ContextFault('CONFIG_INVALID', '带原生请求预算的候选发布需要当前只读完整请求估计');
+            const fitted = await fitCompactionSummary({ snapshot: candidate.snapshot, nodes: candidate.nextView.nodes,
+                coveredEndSeq: candidate.nextView.coveredEndSeq, countTokens: this.options.countTokens,
+                summaryBudget: candidate.nextView.summaryBudget, estimateCompaction: estimator, signal: active?.abort.signal });
+            candidate.nextView = freezeValue({ ...candidate.nextView, summaryBudget: fitted.budget });
         }
         candidate.publicationReceiptKey = receiptKey ?? this.receipt(candidate);
         await this.options.port.saveCandidate(structuredClone(candidate));
@@ -373,23 +414,28 @@ export class ContextCompactor {
     }
 
     async beforeRequest(input: { conversationId: string; execution: ExecutionLease; config: FrozenCompressionConfig;
-        stepSeq: number; limits: ContextLimits; estimate(): Promise<ContextEstimate> }): Promise<{ estimate: ContextEstimate; inputTokens: number; backgroundCandidateId: string | null }> {
+        stepSeq: number; limits: ContextLimits; estimateCompaction?: CompactionViewEstimator;
+        estimate(): Promise<ContextEstimate> }): Promise<{ estimate: ContextEstimate; inputTokens: number; backgroundCandidateId: string | null }> {
         let checkpoint = await this.checkpoint(input.conversationId);
         if (checkpoint.state === 'hardPaused') {
             const failure = checkpoint.lastFailure;
+            if (failure?.code === 'CONTEXT_SUMMARY_BUDGET' && !failure.mayHaveStarted) {
+                throw new ContextFault('SUMMARY_BUDGET', failure.message, failure.details);
+            }
             if (failure?.details?.budgetReservationRejected === true && !failure.mayHaveStarted
                 && ['E_BUDGET_EXCEEDED', 'E_GLOBAL_BUDGET_EXCEEDED'].includes(failure.code)) {
                 throw new AgentFault(failure.code, failure.message, failure.details);
             }
             throw new ContextFault('ATTEMPT_UNKNOWN', '压缩结果或占用需要显式恢复', { failure });
         }
-        await this.publish(input.conversationId, input.stepSeq);
+        await this.publish(input.conversationId, input.stepSeq, undefined, input.estimateCompaction);
         let estimate = await input.estimate();
         let gate = checkContextGate(estimate, input.limits);
         let active = this.active.get(input.conversationId);
-        if (active && active.candidate.state === 'generating' && input.stepSeq >= active.candidate.snapshot.targetReplaceStep && gate.allowed) {
+        if (active && active.candidate.state === 'generating'
+            && (!gate.allowed || input.stepSeq >= active.candidate.snapshot.targetReplaceStep)) {
             await active.completion;
-            await this.publish(input.conversationId, input.stepSeq);
+            await this.publish(input.conversationId, input.stepSeq, undefined, input.estimateCompaction);
             estimate = await input.estimate();
             gate = checkContextGate(estimate, input.limits);
             active = this.active.get(input.conversationId);
@@ -407,16 +453,17 @@ export class ContextCompactor {
                     estimate, estimateConfidence: estimate.confidence, localContextWindowTokens: input.config.policy.localContextWindowTokens,
                     recovery: [input.config.policy.localContextWindowTokens === null ? 'select_model_with_larger_verified_window' : 'clear_or_raise_explicit_local_window_limit',
                         'reduce_or_split_unconsumed_input', 'keep_completed_tool_results_and_artifacts'] });
-            const handle = await this.start({ conversationId: input.conversationId, config: input.config, execution: input.execution, reason: 'hard' });
+            const handle = await this.start({ conversationId: input.conversationId, config: input.config, execution: input.execution, reason: 'hard',
+                limits: input.limits, estimateCompaction: input.estimateCompaction });
             await handle.completion;
-            await this.publish(input.conversationId, input.stepSeq);
+            await this.publish(input.conversationId, input.stepSeq, undefined, input.estimateCompaction);
             estimate = await input.estimate();
             gate = checkContextGate(estimate, input.limits);
-            if (!gate.allowed || gate.inputTokens >= input.limits.target) {
+            if (!gate.allowed) {
                 checkpoint = await this.checkpoint(input.conversationId);
                 checkpoint.state = 'hardPaused';
-                checkpoint.lastFailure = { code: 'CONTEXT_SUMMARY_BUDGET', message: '本次压缩后完整请求仍未低于目标水位，暂停相同输入的自动重生成',
-                    mayHaveStarted: false, details: { estimate, inputTokens: gate.inputTokens, target: input.limits.target } };
+                checkpoint.lastFailure = { code: 'CONTEXT_SUMMARY_BUDGET', message: `压缩后完整输入${gate.inputTokens} token达到或超过有效输入预算${input.limits.inputBudget}，压缩目标为${input.limits.target}，暂停相同输入的自动重生成`,
+                    mayHaveStarted: false, details: { estimate, inputTokens: gate.inputTokens, inputBudget: input.limits.inputBudget, target: input.limits.target } };
                 await this.persist(input.conversationId, checkpoint);
                 throw new ContextFault('SUMMARY_BUDGET', checkpoint.lastFailure.message, checkpoint.lastFailure.details);
             }
@@ -426,7 +473,7 @@ export class ContextCompactor {
     }
 
     async postStep(input: { conversationId: string; execution: ExecutionLease; config: FrozenCompressionConfig;
-        stepSeq: number; limits: ContextLimits; estimate: ContextEstimate }): Promise<{ backgroundCandidateId: string | null }> {
+        stepSeq: number; limits: ContextLimits; estimate: ContextEstimate; estimateCompaction?: CompactionViewEstimator }): Promise<{ backgroundCandidateId: string | null }> {
         const checkpoint = await this.checkpoint(input.conversationId);
         if (checkpoint.lastFailure?.code === 'E_BACKGROUND_BUDGET_DEFERRED'
             && checkpoint.lastFailure.details?.rootBudgetId === input.execution.rootBudgetId) {
@@ -445,7 +492,17 @@ export class ContextCompactor {
             await this.persist(input.conversationId, checkpoint);
             if (checkpoint.state === 'idle') {
                 const preview = await this.preview(input.conversationId, input.config);
-                if (preview.roundIds.length) await this.start({ conversationId: input.conversationId, config: input.config, execution: input.execution, reason: 'background' });
+                if (preview.roundIds.length) {
+                    try {
+                        await this.start({ conversationId: input.conversationId, config: input.config, execution: input.execution, reason: 'background',
+                            limits: input.limits, estimateCompaction: input.estimateCompaction });
+                    } catch (error) {
+                        if (!(error instanceof ContextFault) || error.code !== 'CONTEXT_SUMMARY_BUDGET'
+                            || typeof error.details?.fixedInputTokens !== 'number') throw error;
+                        checkpoint.lastFailure = contextFailure(error);
+                        await this.persist(input.conversationId, checkpoint);
+                    }
+                }
             }
         }
         return { backgroundCandidateId: this.active.get(input.conversationId)?.candidate.candidateId ?? null };
@@ -500,7 +557,26 @@ export class ContextCompactor {
                 const cancelled = await this.cancel(conversationId, { human: false });
                 return { state: cancelled.state === 'unknown' ? 'unconfirmed' : 'released', candidateId };
             }
-            await this.publish(conversationId, stepSeq);
+            try {
+                await this.publish(conversationId, stepSeq);
+            } catch (error) {
+                const failure = contextFailure(error);
+                if (state.candidate.reason !== 'background' || !(error instanceof ContextFault)
+                    || error.code !== 'CONTEXT_SUMMARY_BUDGET' || error.mayHaveStarted
+                    || state.candidate.pendingRequest || state.candidate.publicationReceiptKey) throw error;
+                const current = await this.context(conversationId);
+                if (current.candidate?.candidateId !== candidateId || current.candidate.state !== 'ready'
+                    || current.candidate.pendingRequest || current.candidate.publicationReceiptKey) throw error;
+                const candidate = { ...current.candidate, error: failure };
+                await this.options.port.saveCandidate(structuredClone(candidate));
+                await this.options.port.discardCandidate({ conversationId, candidateId,
+                    generation: candidate.snapshot.compressionGeneration, state: 'discarded' });
+                const checkpoint = await this.checkpoint(conversationId);
+                checkpoint.state = 'circuitBroken';
+                checkpoint.lastFailure = failure;
+                await this.persist(conversationId, checkpoint);
+                if (this.active.get(conversationId)?.candidate.candidateId === candidateId) this.active.delete(conversationId);
+            }
             return { state: 'released', candidateId };
         }
         if (['snapshotting', 'generating', 'publishing', 'unknown'].includes(state.candidate.state) || state.candidate.pendingRequest) {

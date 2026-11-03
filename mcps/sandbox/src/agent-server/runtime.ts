@@ -10,6 +10,7 @@ import type { ContentWrite, InteractionData, ReceiptKey, RetentionSweepResult, S
 import { ExecutionRegistry, SerialScheduler } from './scheduler.js';
 import { isTerminal, requireRunEpoch, transitionRun, validateBudget } from './state-machine.js';
 import { recoverRun } from './recovery.js';
+import { isStoppedUnknownWait } from './cleanup-reconciliation.js';
 import { ProviderFault } from './providers/types.js';
 import type { Acceptance, NormalizedResponse, ProviderProtocol, ToolCall, ToolResult } from './providers/types.js';
 import type { HistoryPage, HistoryQuery } from './storage/port.js';
@@ -679,6 +680,9 @@ export function createAgentRuntime(options: AgentRuntimeOptions = {}) {
     async function stopRun(conversation: StoreRecord<ConversationData>, record: StoreRecord<RunData>, target: 'paused' | 'cancelled',
         reason: string, command?: CommandContext): Promise<RpcResult> {
         const run = record.value;
+        if (target === 'cancelled' && command?.params.acknowledgeUnknown === true && isStoppedUnknownWait(run)) {
+            return endUnknownWait(conversation, record, command);
+        }
         if (isTerminal(run)) return command ? commit(conversation, [], [], { ...run }, command) : { ok: true, data: run };
         if (run.state === 'outcome_unknown') {
             if (target === 'cancelled' && command?.params.acknowledgeUnknown === true) return endUnknownWait(conversation, record, command);
@@ -747,7 +751,8 @@ export function createAgentRuntime(options: AgentRuntimeOptions = {}) {
         const ownCleanupState = cleanupState;
         if (cleanupState === 'released' && !await internalChildren.released(record.value)) cleanupState = 'unconfirmed';
         const run = transitionRun(record.value, target, { cleanupState, internalOwnCleanupState: ownCleanupState,
-            resultStatus: target === 'cancelled' ? 'cancelled' : record.value.resultStatus, phase: null, updatedAt: timestamp(now()) });
+            resultStatus: record.value.effectState === 'unknown' || record.value.resultStatus === 'unknown' ? 'unknown'
+                : target === 'cancelled' ? 'cancelled' : record.value.resultStatus, phase: null, updatedAt: timestamp(now()) });
         if (target === 'cancelled') endRun(conversation.value, run);
         await commit(conversation, [{ ...record, revision: record.revision + 1, value: run }],
             [{ type: `run.${target}`, payload: { cleanupState }, run }], { ...run });
@@ -838,7 +843,8 @@ export function createAgentRuntime(options: AgentRuntimeOptions = {}) {
                 if (!['no_resources_created', 'resources_released'].includes(evidence)) continue;
                 const current = await getRun(conversationId, run.runId);
                 if (current.value.runEpoch !== run.runEpoch || current.value.cleanupState !== 'unconfirmed' || !isTerminal(current.value)) continue;
-                const reconciled = { ...current.value, cleanupState: 'released' as const, updatedAt: timestamp(now()) };
+                const reconciled = { ...current.value, cleanupState: 'released' as const,
+                    internalOwnCleanupState: 'released' as const, updatedAt: timestamp(now()) };
                 endRun(conversation.value, reconciled);
                 await commit(conversation, [{ ...current, revision: current.revision + 1, value: reconciled }],
                     [{ type: 'run.cleanup', payload: { cleanupState: 'released', evidence, source: 'close_retry' }, run: reconciled }], null);
@@ -1399,17 +1405,22 @@ export function createAgentRuntime(options: AgentRuntimeOptions = {}) {
                 if (closed) return false;
                 let record = await getRun(conversationId, runId);
                 if (record.value.runEpoch !== prepared.run.runEpoch || record.value.state === 'stopping') {
-                    if (childAllocation(record.value) && outcome.effectState === 'unknown' && record.value.effectState !== 'unknown') {
+                    const stoppedEpoch = record.value.runEpoch === prepared.run.runEpoch + 1
+                        && ['stopping', 'cancelled', 'paused'].includes(record.value.state)
+                        && ['cancelled', 'paused'].includes(String(record.value.stopTarget));
+                    if ((childAllocation(record.value) || stoppedEpoch) && (outcome.effectState === 'unknown' || outcome.status === 'outcome_unknown')
+                        && (record.value.effectState !== 'unknown' || record.value.resultStatus !== 'unknown' || outcome.failure && !record.value.failure)) {
                         const conversation = await getConversation(conversationId, undefined, true);
-                        const facts = { ...record.value, effectState: 'unknown' as const, failure: outcome.failure ?? record.value.failure };
+                        const facts = { ...record.value, effectState: 'unknown' as const, resultStatus: 'unknown' as const,
+                            failure: outcome.failure ?? record.value.failure };
                         await commit(conversation, [{ ...record, revision: record.revision + 1, value: facts }],
-                            [{ type: 'run.childLateFacts', payload: { sourceRunEpoch: prepared.run.runEpoch,
+                            [{ type: childAllocation(record.value) ? 'run.childLateFacts' : 'run.lateFacts', payload: { sourceRunEpoch: prepared.run.runEpoch,
                                 effectState: 'unknown' }, run: facts }], null);
                         await reconcileInternalParent(facts);
                         record = await getRun(conversationId, runId);
                     }
-                    if (record.value.state === 'stopping') await finalizeStop(conversationId, runId, outcome.cleanupState === 'released' || outcome.cleanupState === 'not_needed' ? 'released' : 'unconfirmed');
-                    else if (record.value.cleanupState === 'unconfirmed' && (outcome.cleanupState === 'released' || outcome.cleanupState === 'not_needed')) {
+                    if (stoppedEpoch && record.value.state === 'stopping') await finalizeStop(conversationId, runId, outcome.cleanupState === 'released' || outcome.cleanupState === 'not_needed' ? 'released' : 'unconfirmed');
+                    else if (stoppedEpoch && record.value.cleanupState === 'unconfirmed' && (outcome.cleanupState === 'released' || outcome.cleanupState === 'not_needed')) {
                         const conversation = await getConversation(conversationId, undefined, true);
                         const reconciled = { ...record.value, cleanupState: 'released' as const };
                         if (isTerminal(reconciled)) endRun(conversation.value, reconciled);
@@ -1793,8 +1804,8 @@ export function createAgentRuntime(options: AgentRuntimeOptions = {}) {
             const ended = run.unknownWaitEnd as Record<string, unknown> | null | undefined;
             return !(options.allowEndedUnknownWait && run.state === 'cancelled' && run.waitEnded === true
                 && run.stopReason === 'CALLER_ENDED_UNKNOWN_WAIT' && run.cleanupState === 'released'
-                && ended?.originalState === 'outcome_unknown' && Number.isSafeInteger(ended.originalRunEpoch)
-                && Number(ended.originalRunEpoch) + 1 === run.runEpoch);
+                && ['outcome_unknown', 'cancelled'].includes(String(ended?.originalState)) && Number.isSafeInteger(ended?.originalRunEpoch)
+                && Number(ended?.originalRunEpoch) + 1 === run.runEpoch);
         };
         const hasResources = (conversationId: string): boolean => {
             if (workspaceStops.has(conversationId) || pendingConversationClosures.has(conversationId)) return true;

@@ -19,12 +19,14 @@ import type { CatalogPort } from './models/catalog.js';
 import type { NormalizedResponse, ProviderProfile } from './providers/types.js';
 import type { QuotaLimitDefinition } from './accounting/budget-ledger.js';
 import type { createAgentRuntime, ExecutorContext } from './runtime.js';
+import { ExecutorFailure } from './runtime.js';
 import { createProviderExecutor } from './execution.js';
 import type { ExecutionPlan } from './execution.js';
 import { ToolRouter } from './tools/router.js';
 import type { BoundToolContext, TrustedToolContext } from './tools/types.js';
 import { ApprovalLedger } from './security/approvals.js';
 import { createContextServerAdapter } from './context/server-adapter.js';
+import { recordHistoryHit } from './context/feedback.js';
 import { injectSummaryText } from './context/service.js';
 import type { StorePort } from './storage/port.js';
 import type { RetentionSweepResult } from './storage/port.js';
@@ -44,7 +46,7 @@ import type { CoreRestorePort } from './workspace/restore.js';
 import { createWorkspaceServerAdapter } from './workspace/server-adapter.js';
 import { settlementForResponse } from './accounting/settlement.js';
 import { releaseExecutionResources } from './execution-cleanup.js';
-import { reconcileRunCleanup } from './cleanup-reconciliation.js';
+import { isStoppedUnknownWait, reconcileRunCleanup } from './cleanup-reconciliation.js';
 import type { RunCleanupInput } from './cleanup-reconciliation.js';
 import { appendCouncilUser } from '../council/api-input.js';
 import { InputAttachmentService } from './media/input-attachments.js';
@@ -290,6 +292,32 @@ export async function createAgentServices(options: ServerServiceOptions) {
                             selectionSource: selectedInputSource(context) }, signal: context.signal }),
                 ...(nativeGemini ? { estimateView } : {}) };
         } });
+    tools.setHistory({
+        readHistory: query => workspaceHistory.readHistory(query),
+        readArtifact: query => options.store.readArtifact(query),
+        inspect: conversationId => contextService.compactionPort.inspect(conversationId),
+        readSummary: input => contextService.compactionPort.readSummary(input),
+        markHit: async (hit, context) => {
+            await context.assertCurrent?.();
+            if (context.signal.aborted) throw new AgentFault('TOOL_CANCELLED', '历史命中记录已取消');
+            const capture = await contextService.compactionPort.inspect(context.conversationId);
+            if (hit.conversationId !== context.conversationId || hit.historyEpoch !== capture.historyEpoch
+                || hit.viewRevision !== capture.viewRevision) throw new AgentFault('PARENT_STALE', '历史查回来源已经变化，请重新查回当前原文或摘要');
+            if (!hit.summaryId && hit.roundIds.length !== 1) throw new AgentFault('INVALID_PARAMS', '历史命中须对应一个明确原轮或摘要');
+            if (hit.summaryId) {
+                const node = capture.view.nodes.find(entry => entry.nodeId === hit.summaryId && entry.hash === hit.summaryHash)
+                    ?? await contextService.compactionPort.readSummary({ conversationId: context.conversationId,
+                        historyEpoch: capture.historyEpoch, nodeId: hit.summaryId, hash: hit.summaryHash, signal: context.signal });
+                if (!node || node.hash !== hit.summaryHash || node.firstSeq !== hit.firstSeq || node.lastSeq !== hit.lastSeq
+                    || canonicalJson(node.roundIds) !== canonicalJson(hit.roundIds)) {
+                    throw new AgentFault('SOURCE_GAP', '历史命中须对应查回摘要的实际版本与原轮范围');
+                }
+            }
+            return recordHistoryHit(contextStore, { conversationId: context.conversationId, historyEpoch: capture.historyEpoch,
+                currentStep: capture.stepSeq, hitId: hit.hitId, signal: context.signal,
+                ...(hit.summaryId ? { nodeId: hit.summaryId } : { roundId: hit.roundIds[0] }) });
+        },
+    });
     await options.runtime.setAccountingPort(accountingPort);
     cancelMaintenance = async execution => {
         const current = await contextService.compactionPort.readExecutionForCleanup(execution.conversationId);
@@ -542,7 +570,7 @@ export async function createAgentServices(options: ServerServiceOptions) {
         return selected;
     };
 
-    const executor = createProviderExecutor({ plan, dispatcher, tools, toolContext,
+    const providerExecutor = createProviderExecutor({ plan, dispatcher, tools, toolContext,
         renderToolResults: (context, selected, view, results) => renderMcpToolResults({
             conversationId: context.snapshot.conversationId, view, results, attachments: inputAttachments,
             selection: inputSelections.get(selected), signal: context.signal }),
@@ -583,6 +611,34 @@ export async function createAgentServices(options: ServerServiceOptions) {
             () => contextService.finishExecution(context),
             async () => tools.release(await toolContext(context))),
     });
+
+    const executor: typeof providerExecutor = { ...providerExecutor, async execute(context) {
+        let cancellation: Promise<'released' | 'unconfirmed'> | undefined;
+        const abort = (): void => {
+            cancellation ??= (async () => {
+                const execution = await contextService.compactionPort.readExecutionForCleanup(context.snapshot.conversationId);
+                if (!execution || execution.runId !== context.snapshot.runId || execution.runEpoch !== context.snapshot.runEpoch
+                    || execution.rootBudgetId !== String(context.snapshot.rootRunId ?? context.snapshot.runId)) return 'released' as const;
+                const result = await contextService.service.compactor!.cancel(context.snapshot.conversationId, { human: false });
+                return result.state === 'unknown' ? 'unconfirmed' as const : 'released' as const;
+            })().catch(() => 'unconfirmed' as const);
+        };
+        context.signal.addEventListener('abort', abort, { once: true });
+        if (context.signal.aborted) abort();
+        try {
+            const outcome = await providerExecutor.execute(context);
+            return await cancellation === 'unconfirmed' ? { ...outcome, status: 'outcome_unknown', effectState: 'unknown', cleanupState: 'unconfirmed' } : outcome;
+        } catch (error) {
+            if (await cancellation !== 'unconfirmed') throw error;
+            return { status: 'outcome_unknown', effectState: 'unknown', cleanupState: 'unconfirmed',
+                stopReason: error instanceof AgentFault ? error.code : 'EXECUTION_ERROR',
+                ...(error instanceof ExecutorFailure ? { failure: { error: error.originalError.toJSON(), acceptance: error.facts.acceptance,
+                    cleanupEvidence: 'unconfirmed' as const, actionId: error.facts.actionId ?? null, attemptId: error.facts.attemptId ?? null } }
+                    : error instanceof AgentFault ? { failure: { error: error.toJSON(), acceptance: 'unknown' as const,
+                        cleanupEvidence: 'unconfirmed' as const, actionId: null, attemptId: null } } : {}) };
+        }
+        finally { context.signal.removeEventListener('abort', abort); await cancellation; }
+    } };
 
     const dispatch = async (method: string, params: Record<string, unknown>, client: ClientIdentity): Promise<RpcResult> => {
         try {
@@ -836,10 +892,28 @@ export async function createAgentServices(options: ServerServiceOptions) {
             releaseTools: async cleanup => cleanup.preserveUnknownOutcome === true
                 ? tools.confirmReleased(await toolContext({ ...cleanup, signal: AbortSignal.abort('unknown wait ended') }))
                 : tools.release(await toolContext({ ...cleanup, signal: AbortSignal.abort('cleanup reconciliation') })),
-            releaseContext: cleanup => cleanup.preserveUnknownOutcome === true
-                ? contextService.confirmUnknownCleanup({ conversationId: cleanup.snapshot.conversationId, runId: cleanup.snapshot.runId,
-                    runEpoch: cleanup.snapshot.runEpoch, rootBudgetId: String(cleanup.snapshot.rootRunId ?? cleanup.snapshot.runId) })
-                : contextService.reconcileCleanup({ conversationId: cleanup.snapshot.conversationId, runId: cleanup.snapshot.runId }),
+            releaseContext: async cleanup => {
+                if (cleanup.preserveUnknownOutcome !== true) return contextService.reconcileCleanup({
+                    conversationId: cleanup.snapshot.conversationId, runId: cleanup.snapshot.runId });
+                const rootBudgetId = String(cleanup.snapshot.rootRunId ?? cleanup.snapshot.runId);
+                if (isStoppedUnknownWait(cleanup.snapshot)) {
+                    const state = await contextService.service.compactor!.context(cleanup.snapshot.conversationId);
+                    const pending = state.candidate?.pendingRequest;
+                    if (pending) {
+                        const budget = await accountingPort.read(rootBudgetId);
+                        const reservation = budget.reservations.find(item => item.attemptId === pending.attemptId);
+                        const recorded = reservation ? await journal.readAttempt(reservation.attemptId) : undefined;
+                        if (!reservation || reservation.state !== 'unknown' || reservation.rootBudgetId !== rootBudgetId
+                            || !recorded || recorded.state !== 'unknown' || recorded.attempt.attemptId !== pending.attemptId
+                            || recorded.attempt.rootBudgetId !== rootBudgetId || recorded.attempt.snapshot.actionId !== pending.actionId
+                            || recorded.attempt.snapshot.conversationId !== cleanup.snapshot.conversationId
+                            || recorded.attempt.snapshot.runId !== cleanup.snapshot.runId
+                            || recorded.attempt.snapshot.runEpoch !== cleanup.snapshot.runEpoch - 1) return false;
+                    }
+                }
+                return contextService.confirmUnknownCleanup({ conversationId: cleanup.snapshot.conversationId, runId: cleanup.snapshot.runId,
+                    runEpoch: cleanup.snapshot.runEpoch, rootBudgetId });
+            },
         }),
         onConversationClosed: async (conversation: { conversationId: string; retention: import('./protocol.js').RetainPolicy }) => {
             let resourceOwner: { conversationId: string; principalId: string } | undefined;

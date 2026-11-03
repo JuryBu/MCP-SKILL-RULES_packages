@@ -13,3 +13,4 @@ export * from './artifact-source.js';
 export * from './server-controls.js';
 export * from './input-estimate.js';
 export * from './maintenance-budget.js';
+export * from './feedback.js';

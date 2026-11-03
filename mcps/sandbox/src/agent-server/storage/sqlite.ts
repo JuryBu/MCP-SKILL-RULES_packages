@@ -6,8 +6,8 @@ import { AgentFault } from '../protocol.js';
 import type { AgentError, AgentEvent, JsonValue } from '../protocol.js';
 import type { ReceiptKey, StoredReceipt, StoreCapabilities, StoreCommitResult, StoreEventQuery,
     StoreKey, StorePage, StorePort, StoreRecord, StoreRecordQuery, StoreTransition, HistoryQuery, HistoryPage,
-    ArtifactQuery, ArtifactChunk, StateMutationPort, StateMutationScope } from './port.js';
-import { DEFAULT_ARTIFACT_BYTES, MAX_ARTIFACT_BYTES } from './port.js';
+    ArtifactQuery, ArtifactChunk, StateMutationPort, StateMutationScope, HistoryMetadataQuery, HistoryMetadataResult } from './port.js';
+import { DEFAULT_ARTIFACT_BYTES, MAX_ARTIFACT_BYTES, normalizeHistoryMetadataQuery } from './port.js';
 import type { RetentionSweepOptions, RetentionSweepResult } from './port.js';
 import type { ModelStepPairing, ModelStepPairingQuery } from './port.js';
 import { validateModelStepPairingQuery } from './model-step-pairing.js';
@@ -151,7 +151,7 @@ export class SqliteStore implements StorePort {
             if (method === 'readModelStepPairings') return (params as ModelStepPairingQuery).stepIds.map(() => 'incomplete') as Result;
             if (method === 'listRecords') return { items: [], nextCursor: null, hasMore: false } as Result;
             if (method === 'readEvents') return { items: [], nextCursor: (params as StoreEventQuery).afterSeq, hasMore: false } as Result;
-            if (method === 'readHistory') throw new AgentFault('NOT_FOUND', '找不到历史所属会话');
+            if (method === 'readHistory' || method === 'readHistoryMetadata') throw new AgentFault('NOT_FOUND', '找不到历史所属会话');
             if (method === 'readArtifact') throw new AgentFault('NOT_FOUND', '找不到该会话内的正文引用');
             if (method === 'accounting.read') throw new AgentFault('BUDGET_REQUIRED', '必须先创建明确的根预算');
             if (method === 'profile.get' || method === 'secret.get' || method === 'catalog.read') return null as Result;
@@ -260,6 +260,10 @@ export class SqliteStore implements StorePort {
 
     readHistory(query: HistoryQuery): Promise<HistoryPage> {
         return this.request('readHistory', query);
+    }
+
+    async readHistoryMetadata(query: HistoryMetadataQuery): Promise<HistoryMetadataResult> {
+        return this.request('readHistoryMetadata', normalizeHistoryMetadataQuery(query));
     }
 
     executeMedia(command: MediaCommand): Promise<MediaResult> {

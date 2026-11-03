@@ -4,7 +4,8 @@ import { AgentFault, canonicalJson } from '../protocol.js';
 import type { JsonValue } from '../protocol.js';
 import { MAX_PAGE_BYTES } from './internal.js';
 import type { SqlDatabase, SqlRow } from './internal.js';
-import type { HistoryItem, HistoryMetadata, HistoryPage, HistoryQuery } from './port.js';
+import type { HistoryItem, HistoryMetadata, HistoryPage, HistoryQuery, HistoryMetadataQuery, HistoryMetadataResult } from './port.js';
+import { normalizeHistoryMetadataQuery, projectHistoryMetadata } from './port.js';
 import { ObjectFiles, sha256, storagePath } from './objects.js';
 
 const HISTORY_PAGE_WORK_MS = 10;
@@ -20,6 +21,33 @@ interface HistoryCursor {
     effectiveOnly: boolean;
     startRound: number | null;
     endRound: number | null;
+}
+
+export function readHistoryMetadata(database: SqlDatabase, input: HistoryMetadataQuery): HistoryMetadataResult {
+    const query = normalizeHistoryMetadataQuery(input);
+    const epochStatement = database.prepare('SELECT history_epoch FROM conversations WHERE cid = ?');
+    const requireEpoch = () => {
+        const conversation = epochStatement.get(query.conversationId);
+        if (!conversation) throw new AgentFault('NOT_FOUND', '找不到历史所属会话');
+        const historyEpoch = Number(conversation.history_epoch);
+        if (historyEpoch !== query.historyEpoch) throw new AgentFault('STORAGE_CURSOR_STALE', '历史版本已经变化');
+        return historyEpoch;
+    };
+    requireEpoch();
+    const statement = query.itemIds.length ? database.prepare("SELECT item_id,seq,round_id,history_json FROM items WHERE rowid = (SELECT rowid FROM items WHERE item_id = ?) AND cid = ? AND history_indexed = 1 AND history_view = 'raw' AND history_effective = 1") : null;
+    const items: HistoryMetadataResult['items'] = [];
+    for (const itemId of query.itemIds) {
+        const row = statement!.get(itemId, query.conversationId);
+        if (!row) continue;
+        let metadata: HistoryMetadata;
+        try { metadata = JSON.parse(String(row.history_json)) as HistoryMetadata; }
+        catch { throw new AgentFault('STORAGE_SEGMENT_CORRUPT', '历史来源元数据不可读'); }
+        if (!metadata || metadata.roundId !== row.round_id || row.item_id !== itemId) {
+            throw new AgentFault('STORAGE_SEGMENT_CORRUPT', '历史来源元数据身份不一致');
+        }
+        items.push(projectHistoryMetadata({ ...metadata, itemId, seq: Number(row.seq) }));
+    }
+    return { historyEpoch: requireEpoch(), items };
 }
 
 export function readHistory(database: SqlDatabase, files: ObjectFiles, root: string, query: HistoryQuery): HistoryPage {

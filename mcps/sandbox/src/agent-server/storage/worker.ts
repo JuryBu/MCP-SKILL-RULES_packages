@@ -8,7 +8,7 @@ import { receiptKey, storeKey } from './port.js';
 import type { ModelStepPairingQuery } from './port.js';
 import { modelStepPairing, validateModelStepPairingQuery } from './model-step-pairing.js';
 import type { ReceiptKey, StoredReceipt, StoreCommitResult, StoreEventQuery, StoreKey,
-    StorePage, StoreRecord, StoreRecordQuery, StoreTransition, HistoryQuery, ArtifactQuery } from './port.js';
+    StorePage, StoreRecord, StoreRecordQuery, StoreTransition, HistoryQuery, ArtifactQuery, HistoryMetadataQuery } from './port.js';
 import { DEFAULT_MAX_OBJECT_BYTES, MAX_METADATA_BYTES, MAX_PAGE_BYTES, MAX_WRITE_BATCH } from './internal.js';
 import type { SqlDatabase, StorageOptions, WorkerRequest, WorkerResponse } from './internal.js';
 import { loadMigrations, migrateDatabase, validateDatabaseVersion, STORAGE_SCHEMA_VERSION } from './migrations.js';
@@ -19,7 +19,7 @@ import type { PreparedSegment } from './segments.js';
 import { acquireStorageLock, recoverSegments } from './recovery.js';
 import { assertRunMayStart, recordRetention, refreshRetention, scanExpired, recordRetentionOwnership, purgeExpiredConversation, collectRetentionGarbage, sweepRetention } from './retention.js';
 import type { RetentionSweepOptions } from './port.js';
-import { readHistory } from './history.js';
+import { readHistory, readHistoryMetadata } from './history.js';
 import { ProviderTransactions } from './provider-transactions.js';
 import type { AccountingCommand, UpperBound } from '../accounting/budget-ledger.js';
 import type { ProviderAttempt, NormalizedResponse } from '../providers/types.js';
@@ -425,6 +425,7 @@ function dispatch(request: WorkerRequest): unknown {
         }
         case 'readEvents': return readEvents(request.params as StoreEventQuery);
         case 'readHistory': return readHistory(database!, files, options.dataDir, request.params as HistoryQuery);
+        case 'readHistoryMetadata': return readHistoryMetadata(database!, request.params as HistoryMetadataQuery);
         case 'accounting.execute': return providerTransactions.executeAccounting(request.params as AccountingCommand);
         case 'accounting.read': return providerTransactions.readAccounting((request.params as { rootBudgetId: string }).rootBudgetId);
         case 'provider.prepareAttempt': {

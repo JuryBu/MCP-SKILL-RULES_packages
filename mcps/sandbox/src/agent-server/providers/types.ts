@@ -210,6 +210,7 @@ export interface ProviderAdapter {
     readonly version: string;
     endpoint(profile: ProviderProfile, modelId: string): string;
     encode(view: NativeSendView, modelId: string, parameters: JsonObject): JsonObject;
+    encodeForMeasurement?(view: NativeSendView, modelId: string, parameters: JsonObject): JsonObject;
     validate(snapshot: RequestSnapshot): void;
     send(attempt: ProviderAttempt, context: SendContext, signal?: AbortSignal): Promise<NormalizedResponse>;
     discover(profile: ProviderProfile, cursor: string | null, context: SendContext, signal?: AbortSignal): Promise<DiscoveryPage>;

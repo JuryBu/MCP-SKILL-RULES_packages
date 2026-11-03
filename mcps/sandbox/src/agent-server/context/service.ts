@@ -1,10 +1,11 @@
+import { setTimeout as waitForAppend } from 'node:timers/promises';
 import { canonicalJson } from '../protocol.js';
 import type { JsonObject, JsonValue } from '../protocol.js';
 import type { ExecutorContext } from '../runtime.js';
 import type { ExecutionPlan, PreparedExecutionView } from '../execution.js';
 import type { FunctionTool, NativeSendView, NormalizedResponse, ProviderAdapter, ToolResult } from '../providers/types.js';
 import type { HistoryItem, HistoryPage } from '../storage/port.js';
-import type { ContextEstimate, ContextEstimateBasis, ContextHistoryPort, ContextLimits, ContextPolicy, ContextVersionState, ContextViewEstimator, ExecutionLease, FrozenCompressionConfig, SummaryView, TokenCounter } from './contracts.js';
+import type { CompactionViewEstimator, ContextEstimate, ContextEstimateBasis, ContextHistoryPort, ContextLimits, ContextPolicy, ContextVersionState, ContextViewEstimator, ExecutionLease, FrozenCompressionConfig, SummaryView, TokenCounter } from './contracts.js';
 import type { CompactionPreview } from './compaction.js';
 import { ContextCompactor } from './bpc.js';
 import type { CompactionHandle } from './bpc.js';
@@ -38,14 +39,16 @@ export interface ContextStepInput {
     stepSeq: number;
     limits: ContextLimits;
     estimate: ContextEstimate;
+    estimateCompaction?: CompactionViewEstimator;
 }
 
 export interface ContextBuildViewInput {
     conversationId: string;
     context: Pick<ExecutorContext, 'readHistory' | 'readContent' | 'signal'>;
-    adapter: NativeHistoryAdapter & Partial<Pick<ProviderAdapter, 'version'>>;
+    adapter: NativeHistoryAdapter & Partial<Pick<ProviderAdapter, 'version' | 'encode' | 'encodeForMeasurement'>>;
     modelId: string;
     baseView: NativeSendView;
+    parameters?: JsonObject;
     summaryView?: SummaryView;
     summaryBudget?: number;
     maxViewBytes?: number;
@@ -68,6 +71,12 @@ interface CachedReadTail {
     pages: HistoryPage[];
     values: Map<string, JsonValue>;
     bytes: number;
+}
+
+class PendingNativeToolStep extends Error {
+    constructor(readonly history: ContextVersionState) {
+        super('Current native tool step is still being recorded');
+    }
 }
 
 export interface ContextBuildViewResult {
@@ -168,7 +177,8 @@ export class ContextService {
         let result = await this.buildRawView(input);
         if (input.compression) {
             if (!this.compactor) throw new ContextFault('CONFIG_INVALID', '尚未注入压缩存储及模型端口');
-            await this.compactor.beforeRequest({ ...input.compression, conversationId: input.conversationId, estimate: async () => {
+            await this.compactor.beforeRequest({ ...input.compression, conversationId: input.conversationId,
+                estimateCompaction: this.createCompactionEstimator(input, input.compression.execution), estimate: async () => {
                 checkAbort(input.context.signal);
                 const current = await this.readVersionState(input);
                 checkAbort(input.context.signal);
@@ -179,6 +189,57 @@ export class ContextService {
             } });
         }
         return result;
+    }
+
+    createCompactionEstimator(input: ContextBuildViewInput, execution: ExecutionLease): CompactionViewEstimator {
+        return async (snapshot, summary, signal) => {
+            const effectiveSignal = signal ? AbortSignal.any([input.context.signal, signal]) : input.context.signal;
+            const currentInput = { ...input, context: { signal: effectiveSignal,
+                readHistory: input.context.readHistory.bind(input.context), readContent: input.context.readContent.bind(input.context) } };
+            checkAbort(effectiveSignal);
+            if (snapshot.conversationId !== input.conversationId || execution.conversationId !== input.conversationId
+                || snapshot.execution.conversationId !== input.conversationId || snapshot.execution.kind !== execution.kind
+                || snapshot.execution.runId !== execution.runId || snapshot.execution.runEpoch !== execution.runEpoch
+                || snapshot.execution.rootBudgetId !== execution.rootBudgetId || snapshot.execution.roundId !== execution.roundId
+                || snapshot.execution.deadlineAt !== execution.deadlineAt
+                || summary.coveredEndSeq < snapshot.coveredStartSeq || summary.coveredEndSeq > snapshot.coveredEndSeq) {
+                throw new ContextFault('HISTORY_STALE', '摘要余量估计必须属于同一会话、来源覆盖和执行租约');
+            }
+            const compactionInput = { ...currentInput, compression: undefined, readTailReuse: undefined,
+                summaryView: { revision: snapshot.parentViewRevision, historyEpoch: snapshot.historyEpoch,
+                    coveredEndSeq: summary.coveredEndSeq, nodes: [] } };
+            let built: ContextBuildViewResult;
+            for (;;) {
+                try { built = await this.buildRawView(compactionInput, summary, execution); break; }
+                catch (error) {
+                    if (!(error instanceof PendingNativeToolStep)) throw error;
+                    const deadline = Date.parse(execution.deadlineAt);
+                    if (!Number.isFinite(deadline)) throw new ContextFault('CONFIG_INVALID', '等待当前工具步骤需要有效的原任务期限');
+                    let delay = 25;
+                    for (;;) {
+                        checkAbort(effectiveSignal);
+                        const remaining = deadline - Date.now();
+                        if (remaining <= 0) throw new ContextFault('CANCELLED', '等待当前工具步骤时原任务期限已到');
+                        try { await waitForAppend(Math.min(delay, remaining), undefined, { signal: effectiveSignal }); }
+                        catch (waitingError) { checkAbort(effectiveSignal); throw waitingError; }
+                        const current = await this.readVersionState(currentInput);
+                        if (current.historyEpoch !== error.history.historyEpoch || current.viewRevision !== error.history.viewRevision
+                            || current.appendSeq !== error.history.appendSeq) break;
+                        delay = Math.min(delay * 2, 250);
+                    }
+                }
+            }
+            if (built.history.historyEpoch !== snapshot.historyEpoch || built.history.viewRevision !== snapshot.parentViewRevision
+                || built.history.appendSeq < snapshot.snapshotAppendSeq) throw new ContextFault('HISTORY_STALE', '摘要余量估计的历史版本或追加边界已改变');
+            let estimate = built.estimate;
+            const encodeForMeasurement = input.adapter.encodeForMeasurement ?? input.adapter.encode;
+            if (!input.estimateView && encodeForMeasurement && estimate.confidence !== 'unknown') {
+                estimate = { rules: 0, schema: 0, native: this.countTokens(JSON.stringify(encodeForMeasurement.call(input.adapter, built.view, input.modelId, input.parameters ?? {}))),
+                    summary: 0, retained: 0, media: 0, protocol: 0, confidence: 'conservative' };
+            }
+            checkAbort(effectiveSignal);
+            return { estimate, nativeViewHash: hashContext(built.view), modelId: input.modelId, adapterVersion: input.adapter.version ?? null };
+        };
     }
 
     releaseReadTail(conversationId: string): void {
@@ -207,14 +268,17 @@ export class ContextService {
         this.readTailBytes += tail.bytes;
     }
 
-    private async buildRawView(input: ContextBuildViewInput): Promise<ContextBuildViewResult> {
+    private async buildRawView(input: ContextBuildViewInput, renderedSummary?: { text: string; tokens: number },
+        pendingExecution?: ExecutionLease): Promise<ContextBuildViewResult> {
         checkAbort(input.context.signal);
         if (input.baseView.protocol !== input.adapter.protocol) throw new ContextFault('PROTOCOL_INCOMPATIBLE', '发送视图与Provider适配器协议不同');
         const summary = input.summaryView ?? await this.options.readSummaryView?.(input.conversationId)
             ?? (this.compactor ? await this.compactor.readView(input.conversationId) : undefined);
         const coveredEndSeq = summary?.coveredEndSeq ?? 0;
         const policy = input.policy ? validateContextPolicy(input.policy) : input.compression?.config.policy ?? this.policy;
-        const rendered = renderSummary(summary?.nodes ?? [], policy, input.summaryBudget ?? input.compression?.limits.summaryBudget ?? Number.MAX_SAFE_INTEGER, this.countTokens);
+        const rendered = renderedSummary ? { ...renderedSummary, hash: hashBytes(renderedSummary.text) }
+            : renderSummary(summary?.nodes ?? [], policy, Math.min(summary?.summaryBudget ?? Number.MAX_SAFE_INTEGER,
+                input.summaryBudget ?? summary?.summaryBudget ?? input.compression?.limits.summaryBudget ?? Number.MAX_SAFE_INTEGER), this.countTokens);
         const selected: HistoryItem[] = [];
         const values = new Map<string, JsonValue>();
         const cursorSet = new Set<string>();
@@ -294,11 +358,12 @@ export class ContextService {
         } while (cursor);
         if (!metadata) throw new ContextFault('SOURCE_GAP', '历史页缺少版本身份');
         if (coveredEndSeq > metadata.appendSeq) throw new ContextFault('PARENT_STALE', '摘要覆盖位置超过当前历史');
+        const historyVersion = metadata;
         const rawTail = selected.reverse();
         const attachmentManifest: { itemId: string; objectHash: string; references?: JsonValue; nativeMedia?: JsonValue }[] = [];
         let view = await (input.injectSummary ?? injectSummaryText)(structuredClone(input.baseView), rendered.text);
         let pending: { item: HistoryItem; content: Record<string, unknown>; response: NormalizedResponse; results: ToolResult[] } | null = null;
-        const flush = async () => {
+        const flush = async (finalTail = false) => {
             if (!pending) return;
             const { item, content, response, results } = pending;
             if (!response.complete || !Array.isArray(response.replayMessages)) throw new ContextFault('NATIVE_PAIRING', '历史模型往返缺少完整原生replayMessages', { itemId: item.itemId });
@@ -306,6 +371,13 @@ export class ContextService {
                 const group = input.resolveHistoricalToolResults
                     ? historicalToolGroup(input.conversationId, item, content, response, results, input.context.signal) : null;
                 const resolved = group ? await input.resolveHistoricalToolResults!(group) ?? results : results;
+                if (finalTail && pendingExecution && item.runId === pendingExecution.runId && item.runEpoch === pendingExecution.runEpoch
+                    && item.roundId === pendingExecution.roundId && item.stepId && resolved.length < response.toolCalls.length
+                    && new Set(response.toolCalls.map(call => call.callId)).size === response.toolCalls.length
+                    && new Set(resolved.map(result => result.callId)).size === resolved.length
+                    && resolved.every(result => response.toolCalls.some(call => call.callId === result.callId && call.name === result.name))) {
+                    throw new PendingNativeToolStep(historyVersion);
+                }
                 const nativeResults = input.renderToolResults ? await input.renderToolResults(view, resolved) : resolved;
                 view = appendNativeHistoryView(input.adapter, view, response, nativeResults);
             }
@@ -345,7 +417,7 @@ export class ContextService {
                 pending.results.push(content.result as unknown as ToolResult);
             } else throw new ContextFault('PROTOCOL_INCOMPATIBLE', '历史项目缺少可重放的原生类型', { itemId: item.itemId, kind: item.kind });
         }
-        await flush();
+        await flush(true);
         if (Buffer.byteLength(canonicalJson(view)) > maxViewBytes) throw new ContextFault('INPUT_BUDGET', '完整原生发送视图超过明确内存预算', { maxViewBytes });
         view = freezeNativeHistoryView(view);
         const estimate = input.estimateView ? await input.estimateView(view, { baseView: input.baseView, summaryTokens: rendered.tokens })
@@ -386,7 +458,7 @@ export class ContextService {
             const baseView = { ...(overrides.baseView ?? { protocol: plan.adapter.protocol }), ...(input?.tools ? { tools: input.tools } : {}) };
             const result = await this.buildView({ ...overrides, conversationId: context.snapshot.conversationId,
                 context, adapter: plan.adapter, modelId: plan.modelId,
-                baseView });
+                parameters: plan.parameters, baseView });
             onBuilt?.(result, { conversationId: context.snapshot.conversationId, modelId: plan.modelId, configFingerprint: overrides.compression?.config.configFingerprint ?? null,
                 estimateBasis: result.estimate.tokenCountEvidence ? 'provider_native_count_tokens'
                     : overrides.estimateView || this.countTokens !== conservativeTextTokens ? 'injected_estimator' : 'native_view_utf8_upper_bound' });

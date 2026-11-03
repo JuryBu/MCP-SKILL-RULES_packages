@@ -1,18 +1,23 @@
 import { randomUUID } from 'node:crypto';
-import type { StateMutationPort, StorePort, StoreRecord, HistoryItem, HistoryQuery, ReceiptKey, StoredReceipt } from './port.js';
+import type { StateMutationPort, StorePort, StoreRecord, HistoryItem, HistoryQuery, ReceiptKey, StoredReceipt, StoreTransition, HistoryMetadataQuery } from './port.js';
 import type { AgentEvent, JsonValue } from '../protocol.js';
-import { AgentFault } from '../protocol.js';
+import { AgentFault, canonicalJson } from '../protocol.js';
 import type { CompactionCandidate, CompactionPort, ContextCapture, ExecutionLease, FrozenCompressionConfig, Publication,
-    RoundBoundary, SchedulerCheckpoint, SummaryView, UnknownContextCleanupInput } from '../context/contracts.js';
-import { hashContext } from '../context/config.js';
+    RoundBoundary, SchedulerCheckpoint, SummaryNode, SummaryView, UnknownContextCleanupInput, RequirementSourceMetadata } from '../context/contracts.js';
+import { hashBytes, hashContext } from '../context/config.js';
 import { ContextFault } from '../context/errors.js';
 import { validateCoverage } from '../context/compaction.js';
 import { validatePublication, validateSummaryNodes } from '../context/view.js';
+import { applyPublishedHistoryFeedback, readHistoryFeedbackSnapshot } from '../context/feedback.js';
 import { ContextTransactions, contextCandidateKey, contextContent, contextConversationKey, contextRunKey, contextStateKey,
-    nextContextRecord, requireContextExecution, contextRootBudgetId } from './context-transactions.js';
-import type { ContextCandidateData, ContextStateData } from './context-transactions.js';
+    nextContextRecord, requireContextExecution, contextRootBudgetId, contextFeedbackStateKey, contextSummaryKey,
+    MAX_CONTEXT_SUMMARY_NODE_BYTES, MAX_CONTEXT_SUMMARY_ARCHIVE_BYTES, MAX_CONTEXT_SUMMARY_ARCHIVE_NODES } from './context-transactions.js';
+import type { ContextCandidateData, ContextStateData, ContextSummaryArchiveData, ContextSummaryReadInput } from './context-transactions.js';
 import type { ModelStepPairing } from './port.js';
 import { MAX_MODEL_STEP_PAIRINGS, modelStepPairing } from './model-step-pairing.js';
+import { measureCanonicalJsonBytes } from '../media/temporary-budget.js';
+import { MAX_WRITE_BATCH } from './internal.js';
+import { isStoppedUnknownWait } from '../cleanup-reconciliation.js';
 
 interface HistoryIndex { historyEpoch: number; appendSeq: number; coveredEndSeq: number; stepSeq: number; items: HistoryItem[] }
 
@@ -49,6 +54,51 @@ export class StoreCompactionPort implements CompactionPort {
         for (const item of page.items) this.itemOwners.set(item, query.conversationId);
         return page;
     }
+
+    async readRequirementSourceMetadata(input: HistoryMetadataQuery): Promise<{ historyEpoch: number; items: RequirementSourceMetadata[] }> {
+        if (!input || typeof input.conversationId !== 'string' || !input.conversationId.trim()
+            || !Number.isSafeInteger(input.historyEpoch) || input.historyEpoch < 0 || !Array.isArray(input.itemIds)) {
+            throw new AgentFault('INVALID_PARAMS', '要求来源元数据查询参数无效');
+        }
+        const query = { conversationId: input.conversationId, historyEpoch: input.historyEpoch, itemIds: [...new Set(input.itemIds)] };
+        if (query.itemIds.length > 64 || query.itemIds.some(itemId => typeof itemId !== 'string' || !itemId.trim())) {
+            throw new AgentFault('INVALID_PARAMS', '要求来源查询须包含最多64个唯一有效项目ID');
+        }
+        const requireEpoch = async () => {
+            const conversation = await this.conversation(query.conversationId);
+            if (Number(conversation.value.historyEpoch) !== query.historyEpoch) throw new ContextFault('HISTORY_STALE', '要求来源的历史代次已经变化');
+        };
+        await requireEpoch();
+        const result = this.store.readHistoryMetadata ? await this.store.readHistoryMetadata(query) : { historyEpoch: query.historyEpoch, items: [] };
+        if (result.historyEpoch !== query.historyEpoch) throw new ContextFault('HISTORY_STALE', '要求来源的历史代次已经变化');
+        const requested = new Set(query.itemIds);
+        const runs = new Map<string, StoreRecord | undefined>();
+        const items: RequirementSourceMetadata[] = [];
+        for (const item of result.items) {
+            if (!requested.delete(item.itemId) || !Number.isSafeInteger(item.seq) || item.seq < 1
+                || !['user', 'assistant', 'tool', 'system'].includes(item.role)
+                || !(item.roundId === null || typeof item.roundId === 'string' && item.roundId.length > 0)) {
+                throw new ContextFault('SOURCE_GAP', '要求来源元数据与请求不一致');
+            }
+            const source: RequirementSourceMetadata = { itemId: item.itemId, seq: item.seq, role: item.role, roundId: item.roundId };
+            if (item.runId && item.roundId) {
+                if (!runs.has(item.runId)) runs.set(item.runId, await this.store.getRecord(contextRunKey(query.conversationId, item.runId)));
+                const run = runs.get(item.runId);
+                const state = run?.value.state;
+                if (run?.key.conversationId === query.conversationId && run.key.kind === 'run' && run.key.id === item.runId
+                    && run.value.conversationId === query.conversationId && run.value.runId === item.runId
+                    && (run.value.activeRoundId === null || run.value.activeRoundId === item.roundId)
+                    && (state === 'succeeded' || state === 'failed' || state === 'cancelled')
+                    && (run.value.cleanupState === 'not_needed' || run.value.cleanupState === 'released')
+                    && run.value.internalOwnCleanupState === 'released') {
+                    source.terminalOutcome = { state, stopReason: typeof run.value.stopReason === 'string' ? run.value.stopReason : null };
+                }
+            }
+            items.push(source);
+        }
+        await requireEpoch();
+        return { historyEpoch: query.historyEpoch, items };
+    }
     ownerOf(item: HistoryItem): string | undefined { return this.itemOwners.get(item); }
     releaseConversation(conversationId: string): void { this.index.delete(conversationId); }
     cacheSnapshot(): { conversations: number; items: number; maximumConversations: number } {
@@ -69,22 +119,48 @@ export class StoreCompactionPort implements CompactionPort {
     }
 
     async confirmUnknownExecutionCleanup(input: UnknownContextCleanupInput): Promise<boolean> {
-        return this.transactions.mutateState(input.conversationId, async port => {
+        return this.retry(() => this.transactions.mutateState(input.conversationId, async port => {
             const conversation = await port.getRecord(contextConversationKey(input.conversationId));
             const run = await port.getRecord(contextRunKey(input.conversationId, input.runId));
+            const stopped = run ? isStoppedUnknownWait(run.value) : false;
             if (!conversation || !['open', 'closing'].includes(String(conversation.value.state))
-                || conversation.value.activeRunId !== input.runId || !run || run.value.state !== 'outcome_unknown'
+                || conversation.value.activeRunId !== input.runId || !run || run.value.state !== 'outcome_unknown' && !stopped
                 || run.value.conversationId !== input.conversationId || run.value.runId !== input.runId
                 || !Number.isSafeInteger(input.runEpoch) || run.value.runEpoch !== input.runEpoch
                 || typeof input.rootBudgetId !== 'string' || !input.rootBudgetId
                 || contextRootBudgetId(run) !== input.rootBudgetId) return false;
             const state = await this.transactions.readState(input.conversationId, port);
             const execution = state.value.execution;
-            return state.value.candidateId === null && (execution === null
-                || execution.conversationId === input.conversationId && execution.runId === input.runId
-                && execution.runEpoch === input.runEpoch && execution.rootBudgetId === input.rootBudgetId
-                && execution.kind === run.value.kind);
-        });
+            const sourceRunEpoch = input.runEpoch - (stopped ? 1 : 0);
+            const ownedExecution = execution !== null && execution.conversationId === input.conversationId && execution.runId === input.runId
+                && execution.runEpoch === sourceRunEpoch && execution.rootBudgetId === input.rootBudgetId
+                && execution.kind === run.value.kind;
+            if (state.value.candidateId === null) return execution === null || ownedExecution;
+            if (!ownedExecution) return false;
+            const candidateRecord = await port.getRecord<ContextCandidateData>(contextCandidateKey(input.conversationId, state.value.candidateId));
+            if (!candidateRecord || !['unknown', 'failed', 'cancelled', 'discarded', 'published'].includes(candidateRecord.value.state)) return false;
+            const candidate = await this.transactions.readObject<CompactionCandidate>(input.conversationId,
+                candidateRecord.value.contentId, candidateRecord.value.contentHash);
+            if (candidate.state !== candidateRecord.value.state || candidate.state === 'unknown' && !candidate.pendingRequest
+                || candidate.snapshot.runId !== input.runId || candidate.snapshot.runEpoch !== sourceRunEpoch
+                || candidate.snapshot.execution.conversationId !== input.conversationId || candidate.snapshot.execution.runId !== input.runId
+                || candidate.snapshot.execution.runEpoch !== sourceRunEpoch || candidate.snapshot.execution.kind !== run.value.kind
+                || candidate.snapshot.execution.rootBudgetId !== input.rootBudgetId
+                || candidate.snapshot.historyEpoch !== conversation.value.historyEpoch
+                || candidate.snapshot.compressionGeneration !== state.value.compressionGeneration
+                || candidate.pendingRequest && (candidate.pendingRequest.execution.runId !== input.runId
+                    || candidate.pendingRequest.execution.runEpoch !== sourceRunEpoch
+                    || candidate.pendingRequest.execution.rootBudgetId !== input.rootBudgetId)) return false;
+            const next = nextContextRecord(contextStateKey(input.conversationId), state.record, { ...state.value,
+                execution: null, candidateId: null, compressionGeneration: randomUUID(), checkpoint: null, checkpointContentId: null,
+                lastUnknownWaitEnd: { runId: input.runId, runEpoch: input.runEpoch, candidateId: candidate.candidateId,
+                    attemptId: candidate.pendingRequest?.attemptId ?? null, compressionGeneration: state.value.compressionGeneration,
+                    historyEpoch: candidate.snapshot.historyEpoch, at: new Date(this.now()).toISOString() } });
+            await this.transactions.commit({ expected: [{ key: conversation.key, revision: conversation.revision },
+                { key: run.key, revision: run.revision }, { key: next.key, revision: state.record?.revision ?? null },
+                { key: candidateRecord.key, revision: candidateRecord.revision }], records: [next] }, port);
+            return true;
+        }));
     }
 
     async reconcileExecutionCleanup(input: { conversationId: string; runId: string }):
@@ -277,9 +353,25 @@ export class StoreCompactionPort implements CompactionPort {
                 if (pairing === 'incomplete' || pairing === undefined) { nativePairing = 'pending'; break; }
                 if (pairing !== 'complete') nativePairing = pairing;
             }
+            let terminalOutcome: RoundBoundary['terminalOutcome'];
+            const sourceRunId = items[0].runId;
+            if (!models.length && roundId !== activeRoundId && nativePairing === 'complete' && sourceRunId
+                && items.every(item => item.role === 'user' && item.runId === sourceRunId)) {
+                const sourceRun = await this.store.getRecord(contextRunKey(conversationId, sourceRunId));
+                const terminalState = sourceRun?.value.state;
+                if (sourceRun?.value.conversationId === conversationId && sourceRun.value.runId === sourceRunId
+                    && (sourceRun.value.activeRoundId === null || sourceRun.value.activeRoundId === roundId)
+                    && ['succeeded', 'failed', 'cancelled'].includes(String(terminalState))
+                    && ['not_needed', 'released'].includes(String(sourceRun.value.cleanupState))
+                    && sourceRun.value.internalOwnCleanupState === 'released') {
+                    terminalOutcome = { state: terminalState as 'succeeded' | 'failed' | 'cancelled',
+                        stopReason: typeof sourceRun.value.stopReason === 'string' ? sourceRun.value.stopReason : null };
+                }
+            }
             stepSeq += items.filter(item => item.role === 'user' || item.role === 'assistant').length;
             rounds.push({ roundId, itemIds: items.map(item => item.itemId), firstSeq: items[0].seq, lastSeq: items.at(-1)!.seq,
-                lastStepSeq: stepSeq, complete: roundId !== activeRoundId && models.length > 0 && nativePairing === 'complete', nativePairing });
+                lastStepSeq: stepSeq, complete: roundId !== activeRoundId && (models.length > 0 || terminalOutcome !== undefined)
+                    && nativePairing === 'complete', nativePairing, ...(terminalOutcome ? { terminalOutcome } : {}) });
         }
         return { conversationId, historyEpoch, appendSeq: index.appendSeq, viewRevision,
             workspaceRevision: Number(conversation.value.workspaceRevision ?? 0), compressionGeneration: state.value.compressionGeneration,
@@ -341,6 +433,133 @@ export class StoreCompactionPort implements CompactionPort {
         return index ? this.transactions.readObject<CompactionCandidate>(conversationId, index.value.contentId, index.value.contentHash) : null;
     }
 
+    private summaryReadCurrent(input: ContextSummaryReadInput): Promise<StoreRecord> {
+        if (input.signal?.aborted) throw new AgentFault('TOOL_CANCELLED', '摘要归档查回已取消');
+        return this.conversation(input.conversationId).then(conversation => {
+            if (input.signal?.aborted) throw new AgentFault('TOOL_CANCELLED', '摘要归档查回已取消');
+            if (conversation.value.historyEpoch !== input.historyEpoch) throw new ContextFault('HISTORY_STALE', '摘要归档的历史代次已变化');
+            return conversation;
+        });
+    }
+
+    async readSummary(input: ContextSummaryReadInput): Promise<SummaryNode | null> {
+        if (typeof input.conversationId !== 'string' || !input.conversationId || !Number.isSafeInteger(input.historyEpoch) || input.historyEpoch < 0
+            || typeof input.nodeId !== 'string' || !input.nodeId || input.nodeId.length > 4096
+            || input.hash !== undefined && (typeof input.hash !== 'string' || !/^[a-f0-9]{64}$/.test(input.hash))) throw new AgentFault('INVALID_PARAMS', '摘要归档查回须提供有效会话、历史代次、节点和可选哈希');
+        const conversation = await this.summaryReadCurrent(input);
+        const key = contextSummaryKey(input.conversationId, input.historyEpoch, input.nodeId, input.hash);
+        const record = await this.store.getRecord<ContextSummaryArchiveData>(key);
+        await this.summaryReadCurrent(input);
+        if (!record) return null;
+        const index = record.value;
+        if (hashContext(record.key) !== hashContext(key) || !index || typeof index !== 'object' || index.kind !== 'context_summary_archive' || index.schemaVersion !== 1
+            || index.conversationId !== input.conversationId || index.historyEpoch !== input.historyEpoch || index.nodeId !== input.nodeId
+            || !/^[a-f0-9]{64}$/.test(index.nodeHash) || input.hash !== undefined && input.hash !== index.nodeHash
+            || !/^[a-f0-9]{64}$/.test(index.contentHash) || typeof index.contentId !== 'string' || !index.contentId
+            || !Number.isSafeInteger(index.byteLength) || index.byteLength < 1 || index.byteLength > MAX_CONTEXT_SUMMARY_NODE_BYTES
+            || !Number.isSafeInteger(index.firstSeq) || !Number.isSafeInteger(index.lastSeq) || index.firstSeq < 1
+            || index.lastSeq < index.firstSeq || index.lastSeq > Number(conversation.value.appendSeq)) {
+            throw new ContextFault('SOURCE_GAP', '摘要归档索引的会话、版本、范围或大小无效');
+        }
+        if (input.hash === undefined) {
+            const version = await this.store.getRecord<ContextSummaryArchiveData>(contextSummaryKey(input.conversationId, input.historyEpoch, input.nodeId, index.nodeHash));
+            if (input.signal?.aborted) throw new AgentFault('TOOL_CANCELLED', '摘要归档查回已取消');
+            if (!version || hashContext(version.value) !== hashContext(index)) throw new ContextFault('SOURCE_GAP', '摘要归档最新指针与不可变版本不同');
+        }
+        const bytes = Buffer.allocUnsafe(index.byteLength);
+        let offset = 0;
+        while (offset < bytes.length) {
+            if (input.signal?.aborted) throw new AgentFault('TOOL_CANCELLED', '摘要归档查回已取消');
+            const size = Math.min(this.maxReadBytes, bytes.length - offset);
+            const chunk = await this.store.readArtifact({ conversationId: input.conversationId, artifactId: index.contentId, offset, maxBytes: size });
+            if (input.signal?.aborted) throw new AgentFault('TOOL_CANCELLED', '摘要归档查回已取消');
+            if (chunk.artifactId !== index.contentId || chunk.totalBytes !== bytes.length || chunk.sha256 !== index.contentHash
+                || chunk.offset !== offset || typeof chunk.dataBase64 !== 'string' || chunk.dataBase64.length > Math.ceil(size / 3) * 4) {
+                throw new ContextFault('SOURCE_GAP', '摘要归档正文分片与固定对象不同');
+            }
+            const fragment = Buffer.from(chunk.dataBase64, 'base64');
+            if (fragment.length !== size || chunk.complete !== (offset + size === bytes.length)
+                || chunk.nextOffset !== (offset + size === bytes.length ? null : offset + size)) {
+                throw new ContextFault('SOURCE_GAP', '摘要归档正文分片未连续覆盖');
+            }
+            fragment.copy(bytes, offset);
+            offset += fragment.length;
+        }
+        if (hashBytes(bytes) !== index.contentHash) throw new ContextFault('SOURCE_GAP', '摘要归档正文哈希不一致');
+        let node: SummaryNode;
+        try {
+            node = JSON.parse(bytes.toString('utf8')) as SummaryNode;
+            validateSummaryNodes([node]);
+            if (!['batch', 'fold'].includes(node.kind) || node.nodeId !== input.nodeId || node.hash !== index.nodeHash || node.firstSeq !== index.firstSeq || node.lastSeq !== index.lastSeq
+                || !Array.isArray(node.roundIds) || !node.roundIds.length || node.roundIds.some(roundId => typeof roundId !== 'string' || !roundId)
+                || hashContext(node) !== index.contentHash) throw new Error('summary archive source mismatch');
+        } catch { throw new ContextFault('SOURCE_GAP', '摘要归档节点的原哈希或来源范围无效'); }
+        const current = await this.summaryReadCurrent(input);
+        if (node.lastSeq > Number(current.value.appendSeq)) throw new ContextFault('HISTORY_STALE', '摘要归档来源已超出当前有效历史范围');
+        return node;
+    }
+
+    private async archiveSummaryNodes(conversationId: string, historyEpoch: number, nodes: SummaryNode[]): Promise<Required<Pick<StoreTransition, 'expected' | 'records' | 'contents'>>> {
+        if (nodes.length > MAX_CONTEXT_SUMMARY_ARCHIVE_NODES) throw new ContextFault('INPUT_BUDGET', '单次发布摘要归档节点超过有界上限');
+        const versions = new Map<string, { node: SummaryNode; index: ContextSummaryArchiveData }>();
+        const latest = new Map<string, string>();
+        let totalBytes = 0;
+        for (const node of nodes) {
+            if (!['batch', 'fold'].includes(node.kind) || !Number.isSafeInteger(node.firstSeq) || !Number.isSafeInteger(node.lastSeq)
+                || node.firstSeq < 1 || node.lastSeq < node.firstSeq || !Array.isArray(node.roundIds) || !node.roundIds.length
+                || node.roundIds.some(roundId => typeof roundId !== 'string' || !roundId)) throw new ContextFault('SOURCE_GAP', '待归档摘要的节点类型或来源范围无效');
+            const identity = hashContext([node.nodeId, node.hash]);
+            latest.set(node.nodeId, identity);
+            if (versions.has(identity)) continue;
+            let byteLength: number;
+            try {
+                byteLength = measureCanonicalJsonBytes(node, { maxBytes: Math.min(MAX_CONTEXT_SUMMARY_NODE_BYTES,
+                    MAX_CONTEXT_SUMMARY_ARCHIVE_BYTES - totalBytes) });
+            } catch (error) {
+                if (!(error instanceof AgentFault) || error.code !== 'TEMPORARY_CONTENT_LIMIT') throw error;
+                throw new ContextFault('INPUT_BUDGET', '摘要归档在分配正文缓冲前达到字节或结构上限',
+                    { nodeId: node.nodeId, totalBytes, maxNodeBytes: MAX_CONTEXT_SUMMARY_NODE_BYTES,
+                        maxArchiveBytes: MAX_CONTEXT_SUMMARY_ARCHIVE_BYTES });
+            }
+            validateSummaryNodes([node]);
+            const bytes = Buffer.from(canonicalJson(node));
+            if (bytes.length !== byteLength) throw new ContextFault('SOURCE_GAP', '摘要归档的正文编码与预先计量不同');
+            totalBytes += byteLength;
+            versions.set(identity, { node, index: { kind: 'context_summary_archive', schemaVersion: 1,
+                conversationId, historyEpoch, nodeId: node.nodeId, nodeHash: node.hash, contentId: randomUUID(),
+                contentHash: hashBytes(bytes), byteLength: bytes.length, firstSeq: node.firstSeq, lastSeq: node.lastSeq } });
+        }
+        const transition: Required<Pick<StoreTransition, 'expected' | 'records' | 'contents'>> = { expected: [], records: [], contents: [] };
+        for (const entry of versions.values()) {
+            const key = contextSummaryKey(conversationId, historyEpoch, entry.node.nodeId, entry.node.hash);
+            const previous = await this.store.getRecord<ContextSummaryArchiveData>(key);
+            if (previous) {
+                const { contentId: _previousId, ...stored } = previous.value;
+                const { contentId: _newId, ...expected } = entry.index;
+                if (hashContext(stored) !== hashContext(expected)) throw new ContextFault('SOURCE_GAP', '已有摘要归档版本与发布节点不同');
+                entry.index = previous.value;
+            } else {
+                transition.expected.push({ key, revision: null });
+                transition.records.push(nextContextRecord(key, undefined, entry.index));
+                transition.contents.push({ conversationId, contentId: entry.index.contentId, kind: 'context_summary_node',
+                    indexHistory: false, value: entry.node as unknown as JsonValue });
+            }
+        }
+        for (const [nodeId, identity] of latest) {
+            const index = versions.get(identity)!.index;
+            const key = contextSummaryKey(conversationId, historyEpoch, nodeId);
+            const previous = await this.store.getRecord<ContextSummaryArchiveData>(key);
+            if (previous && hashContext(previous.value) === hashContext(index)) continue;
+            transition.expected.push({ key, revision: previous?.revision ?? null });
+            transition.records.push(nextContextRecord(key, previous, index));
+        }
+        if (transition.records.length + transition.contents.length + 6 > MAX_WRITE_BATCH) {
+            throw new ContextFault('INPUT_BUDGET', '摘要归档与发布合并后超过单次存储事务上限，保持原视图',
+                { archiveRecords: transition.records.length, archiveContents: transition.contents.length, maxWriteBatch: MAX_WRITE_BATCH });
+        }
+        return transition;
+    }
+
     async getPublication(receiptKey: ReceiptKey): Promise<Publication | null> {
         const receipt = await this.store.getReceipt(receiptKey);
         const data = receipt?.result.ok ? receipt.result.data as unknown as Publication : null;
@@ -387,7 +606,16 @@ export class StoreCompactionPort implements CompactionPort {
             if (previous?.value.state !== 'ready' || previous.value.contentHash !== hashContext(candidate) || state.value.candidateId !== candidate.candidateId) {
                 throw new ContextFault('PARENT_STALE', '候选在发布事务前已被取消或替换');
             }
-            const published = { ...candidate, state: 'published' as const, publishedViewRevision: candidate.nextView.revision };
+            const feedback = await this.readHistoryFeedback({ conversationId: candidate.conversationId,
+                historyEpoch: capture.historyEpoch, nodes: candidate.nextView.nodes });
+            const nextView = applyPublishedHistoryFeedback(candidate.nextView, feedback, capture.stepSeq);
+            const publishedNodes = new Map(nextView.nodes.map(node => [node.nodeId, node]));
+            const published = { ...candidate, nextView, batch: publishedNodes.get(candidate.batch.nodeId) ?? candidate.batch,
+                folds: candidate.folds.map(node => publishedNodes.get(node.nodeId) ?? node),
+                state: 'published' as const, publishedViewRevision: nextView.revision };
+            const archive = await this.archiveSummaryNodes(candidate.conversationId, capture.historyEpoch,
+                [...capture.view.nodes, candidate.batch, ...candidate.folds, ...candidate.nextView.nodes,
+                    published.batch, ...published.folds, ...nextView.nodes]);
             const candidateContentId = randomUUID();
             const viewContentId = randomUUID();
             const candidateRecord = nextContextRecord(previous!.key, previous, { ...previous!.value, state: 'published', contentId: candidateContentId,
@@ -406,14 +634,20 @@ export class StoreCompactionPort implements CompactionPort {
                 type: 'context.published', payload: { candidateId: candidate.candidateId, viewRevision: publication.viewRevision, coveredEndSeq: publication.coveredEndSeq } };
             const result = await this.transactions.commit({ expected: [{ key: conversation.key, revision: conversation.revision },
                 { key: previous!.key, revision: previous!.revision }, { key: stateRecord.key, revision: state.record?.revision ?? null },
-                { key: run!.key, revision: run!.revision }], records: [conversationRecord, stateRecord, candidateRecord],
+                { key: run!.key, revision: run!.revision },
+                { key: contextFeedbackStateKey(candidate.conversationId, capture.historyEpoch), revision: feedback.revision || null },
+                ...archive.expected], records: [conversationRecord, stateRecord, candidateRecord, ...archive.records],
                 contents: [contextContent(candidate.conversationId, candidateContentId, 'context_candidate', published),
-                    contextContent(candidate.conversationId, viewContentId, 'context_view', candidate.nextView)], receipt, events: [event] });
+                    contextContent(candidate.conversationId, viewContentId, 'context_view', nextView), ...archive.contents], receipt, events: [event] });
             if (!result.replayed) return publication;
             const replay = result.receipt?.result.ok ? result.receipt.result.data as unknown as Publication : await this.getPublication(input.receiptKey);
             if (!replay) throw new ContextFault('COMMIT_UNKNOWN', '发布已重放但原回执尚不可取', undefined, true);
             return { ...replay, replayed: true };
         });
+    }
+
+    async readHistoryFeedback(input: Parameters<NonNullable<CompactionPort['readHistoryFeedback']>>[0]) {
+        return readHistoryFeedbackSnapshot(this.store, input);
     }
 
     async discardCandidate(input: Parameters<CompactionPort['discardCandidate']>[0]): Promise<void> {

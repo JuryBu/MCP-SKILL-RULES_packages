@@ -134,11 +134,19 @@ async function endpointAlive(endpoint: string): Promise<boolean> {
     });
 }
 
+async function descriptorReady(dataDir: string, descriptor: ServerDescriptor): Promise<boolean> {
+    if (!processAlive(descriptor.pid) || !await endpointAlive(descriptor.endpoint)) return false;
+    const published = await readServerDescriptor(dataDir);
+    return published?.serverInstanceId === descriptor.serverInstanceId
+        && published.pid === descriptor.pid && processAlive(published.pid);
+}
+
 export async function ensureAgentServer(options: EnsureServerOptions = {}): Promise<ServerDescriptor> {
     const dataDir = resolve(options.dataDir ?? defaultDataDir());
     const deadline = Date.now() + (options.startupTimeoutMs ?? 10_000);
     let descriptor = await readServerDescriptor(dataDir);
-    if (descriptor && await endpointAlive(descriptor.endpoint)) return descriptor;
+    const previousInstanceId = descriptor?.serverInstanceId;
+    if (descriptor && await descriptorReady(dataDir, descriptor)) return descriptor;
     if (descriptor && processAlive(descriptor.pid)) {
         throw new AgentFault('SERVER_UNAVAILABLE', '原核心进程仍在，保留它并核对连接状态', { pid: descriptor.pid }, false, true);
     }
@@ -155,7 +163,7 @@ export async function ensureAgentServer(options: EnsureServerOptions = {}): Prom
     while (Date.now() < deadline) {
         if (startupState.error) throw new AgentFault('SERVER_START_FAILED', '无法启动本包核心进程', { cause: startupState.error.message });
         descriptor = await readServerDescriptor(dataDir);
-        if (descriptor && await endpointAlive(descriptor.endpoint)) return descriptor;
+        if (descriptor && descriptor.serverInstanceId !== previousInstanceId && await descriptorReady(dataDir, descriptor)) return descriptor;
         await new Promise(resolveWait => setTimeout(resolveWait, 50));
     }
     throw new AgentFault('SERVER_START_TIMEOUT', '核心启动尚未确认，保留原PID后查询，未重复启动', { pid: child.pid ?? null }, true, true);

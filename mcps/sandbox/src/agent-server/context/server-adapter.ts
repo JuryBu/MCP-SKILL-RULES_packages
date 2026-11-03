@@ -28,6 +28,7 @@ import { createContextServerControls } from './server-controls.js';
 import type { ContextPreparedMeasurement, ContextServerCompactInput, ContextServerCompactResult, ContextServerControlInput, ContextServerControlResult, ContextServerStatus, ContextServerStatusInput } from './server-controls.js';
 import { createContextMaintenanceCallbacks } from './maintenance-budget.js';
 import { createHistoricalToolResultResolver } from './history-tool-outcomes.js';
+import { parseRequirementResolutions } from './requirements.js';
 import type { ContextMaintenanceBudgetOptions } from './maintenance-budget.js';
 
 export type ContextProviderServices = ReturnType<typeof createProviderServices>;
@@ -108,36 +109,100 @@ function dispatchKey(request: CompressionRequest) {
 function requestIdentity(request: CompressionRequest): string {
     return hashContext({ attemptId: request.attemptId, actionId: request.actionId, stepId: request.stepId,
         execution: request.execution, chunkId: request.chunk.chunkId, inputBodyHash: request.inputBodyHash,
-        modelFingerprint: request.snapshot.effectiveModelFingerprint, compressionGeneration: request.snapshot.compressionGeneration });
+        modelFingerprint: request.snapshot.effectiveModelFingerprint, compressionGeneration: request.snapshot.compressionGeneration,
+        ...(request.validationRepair ? { validationRepair: request.validationRepair } : {}) });
 }
 
-function parseDigest(request: CompressionRequest, response: NormalizedResponse): { digest: CompressionResult['digest']; valid: boolean } {
+export const COMPRESSION_INSTRUCTIONS = [
+    'Create durable working memory for an ongoing task. Return exactly one JSON object with string fields body, skeleton, title and array unresolved. Never emit tool calls or Markdown fences.',
+    'The body must preserve the current user goal, accepted constraints, key decisions and their reasons, exact identifiers, numbers, units, formulas, file/artifact locations, verified results, failures and unfinished work that later steps need.',
+    'Keep corrections, rejected proposals and superseded values distinguishable from the current decision. Preserve why a value changed. Do not present a plan, a test fixture result, an unverified claim or a failed action as a completed real result.',
+    'A sourceRoundOutcome closes a stopped local round, not its unfinished user goal. Preserve its actual failure/cancellation and outstanding requirements; never infer that requested work was performed merely because the round terminated.',
+    'Summarize tools by their relevant inputs, actual outputs, side effects and remaining uncertainty. Preserve the source item/block identifiers needed to retrieve exact details. Media bytes, native signatures and raw tool records remain in their original stores; retain their retrieval anchors without inventing their contents.',
+    'The skeleton is a compact factual index that retains essential current constraints, conclusions and source identifiers even when the full body is not sent. The title should identify the actual topic so the model can find it later.',
+    'For every still-active user requirement or unresolved question in targets, include an unresolved entry with its exact quote and source itemId/blockId. Include startByte when the quote is repeated. Quote only the exact target substring, not a paraphrase. Do not use an empty unresolved array while target requirements remain unfinished.',
+    'Each unresolved entry must use this JSON shape: {"quote":"an exact contiguous substring of ONE targets entry text","source":{"itemId":"that targets entry span.itemId","blockId":"that targets entry span.blockId"}}. Omit source.startByte for a unique quote: the host computes its exact UTF-8 byte offset from the frozen source. Prefer a longer unique quote over calculating an offset. A repeated quote requires its correct absolute UTF-8 byte offset, not a character index. Never add unresolved entries quoted only from references or priorGuidance; those sources remain outside this target delta.',
+    'Use references and priorGuidance only to understand the target delta and preserve continuity. Compress only targets; do not turn reference-only material into new facts. When folding summaries, preserve their still-active obligations, source anchors and relationships.',
+    'Read useful-history feedback as a relevance signal, retaining the facts that made that source useful. Keep unresolved obligations accessible even when their source has no hits. Follow the supplied rules and output budget.',
+    'When requestBudget is present, summaryBudget is the remaining TOTAL encoded summary allowance in the complete task request after retained originals, current input, rules and tool schemas. Share that allowance across all active summaries, including folds, titles, anchors and verbatim unresolved obligations. It is not a per-chunk output allowance. Preserve all still-active obligations while making body, skeleton and title concise enough for that complete request.',
+    'Do not replace concrete facts with generic statements such as details are stored elsewhere. Put the facts needed for the next task step in body and skeleton, then retain anchors for the remaining detail.',
+    'You may also return resolutions: [{requirementId,status:"fulfilled"|"superseded",resolvedQuote,evidence:[{quote,source:{itemId,blockId}}],replacementRequirementId?}]. Use only exact IDs in priorGuidance.activeRequirements. Choose the smallest exact resolvedQuote: the contiguous part of the OLD requirement actually resolved by later evidence. The host preserves the original record and all text outside that part as active remainder obligations. Evidence must quote actual later targets/references or a known later requirement. Missing or uncertain evidence means keep the obligation. No resolutions field is required for an ordinary digest.',
+    'Use superseded only for an explicit correction, withdrawal or phase continuation from a trusted later user source. Cite the exact user words that change the old obligation, not an assistant or tool restatement, acknowledgment, promise or summary. A later requirement ID is optional and must itself have user provenance; repeating an obligation preserves it. For a numerical threshold change inside a mixed requirement, resolve only the obsolete threshold; the original format and unfinished deliverable remain active unless the user explicitly changes them too.',
+    'Use fulfilled only when exact later evidence demonstrates the requested work was actually done: a successful action/read-back, delivered content, or a trusted successfully closed assistant reply that itself completes conversational work. A successful assistant round may fulfill a simple request to confirm or briefly explain scope. For a substantive deliverable, acknowledgment is not delivery: an intent or promise to write, preserve or finish it later leaves it pending. Plans, fixtures, failed/cancelled actions and round termination do not fulfill unfinished work.',
+    'For a mixed instruction to briefly explain the scope and keep an unfinished final report, fulfill only the scope-explanation clause after the actual reply; the ongoing report remains active. Keeping a task pending does not complete it. Split independent obligations into exact contiguous unresolved quotes when possible; never retire a whole mixed requirement because just one clause was satisfied or corrected. Phase-scoped waits and confirmation-only turns can be superseded by an actual later user continuation. Preserve ongoing substantive constraints when retiring a phase. The activeRequirements list rotates within a bounded byte budget; requirements not shown on this page remain active.',
+].join('\n');
+
+function parseDigest(request: CompressionRequest, response: NormalizedResponse): { digest: CompressionResult['digest']; valid: boolean;
+    validationError?: string; repairable?: boolean; omittedReferenceRequirements?: Array<CompressionRequest['chunk']['sourceSpans'][number]>;
+    normalizedRequirementSources?: Array<{ itemId: string; blockId: string; providedStartByte: number; startByte: number; endByte: number }> } {
     const text = response.blocks.filter(block => block.type === 'text' && !block.thought).map(block => block.text ?? '').join('\n').trim();
+    let parsingResponse = true;
     try {
         const cleaned = text.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '');
         const value = JSON.parse(cleaned) as Record<string, unknown>;
+        parsingResponse = false;
         if (!value || typeof value.body !== 'string' || typeof value.skeleton !== 'string' || typeof value.title !== 'string'
-            || !Array.isArray(value.unresolved)) throw new Error('digest shape');
-        const targets = (JSON.parse(request.chunk.body) as { targets: { text: string; span: CompressionRequest['chunk']['sourceSpans'][number] }[] }).targets;
-        const unresolved = value.unresolved.map(raw => {
-            const item = raw as { quote?: unknown; source?: { itemId?: string; blockId?: string; startByte?: number } };
+            || (request.reason !== 'fold' && !Array.isArray(value.unresolved))
+            || !value.body.trim() || !value.skeleton.trim() || !value.title.trim()) throw new Error('digest shape');
+        if (request.reason === 'fold') return { digest: { body: value.body, skeleton: value.skeleton,
+            title: value.title, unresolved: [] }, valid: true };
+        type DigestPart = { text: string; span: CompressionRequest['chunk']['sourceSpans'][number] };
+        const payload = JSON.parse(request.chunk.body) as { targets: DigestPart[]; references?: DigestPart[] };
+        const targets = payload.targets;
+        const omittedReferenceRequirements: Array<CompressionRequest['chunk']['sourceSpans'][number]> = [];
+        const normalizedRequirementSources: Array<{ itemId: string; blockId: string; providedStartByte: number; startByte: number; endByte: number }> = [];
+        const unresolved = (value.unresolved as unknown[]).flatMap(raw => {
+            if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw new Error('unresolved quote');
+            const item = raw as { quote?: unknown; itemId?: string; blockId?: string; startByte?: number;
+                source?: { itemId?: string; blockId?: string; startByte?: number } };
             if (typeof item.quote !== 'string' || !item.quote) throw new Error('unresolved quote');
             const quote = item.quote;
-            const matches = targets.flatMap(target => {
-                if ((item.source?.itemId && item.source.itemId !== target.span.itemId) || (item.source?.blockId && item.source.blockId !== target.span.blockId)) return [];
+            const source = item.source ?? { itemId: item.itemId, blockId: item.blockId, startByte: item.startByte };
+            if (typeof source.itemId !== 'string' || !source.itemId || typeof source.blockId !== 'string' || !source.blockId) {
+                throw new Error('unresolved source identity');
+            }
+            const findMatches = (parts: DigestPart[]) => parts.flatMap(target => {
+                if ((source.itemId && source.itemId !== target.span.itemId) || (source.blockId && source.blockId !== target.span.blockId)) return [];
                 const positions: number[] = [];
                 for (let position = target.text.indexOf(quote); position >= 0; position = target.text.indexOf(quote, position + 1)) positions.push(position);
                 return positions.map(position => {
                     const startByte = target.span.startByte + Buffer.byteLength(target.text.slice(0, position));
                     const span = { ...target.span, startByte, endByte: startByte + Buffer.byteLength(quote), sha256: hashBytes(quote) };
                     return { span, quote };
-                }).filter(match => item.source?.startByte === undefined || item.source.startByte === match.span.startByte);
+                });
             });
-            if (matches.length !== 1) throw new Error('unresolved source ambiguous');
-            return { id: derivedContextId(['requirement', matches[0].span, quote]), quote, source: matches[0].span };
+            const targetMatches = findMatches(targets);
+            let matches = targetMatches.filter(match => source.startByte === undefined || source.startByte === match.span.startByte);
+            if (!matches.length && typeof source.itemId === 'string' && source.itemId && typeof source.blockId === 'string' && source.blockId
+                && Number.isSafeInteger(source.startByte) && source.startByte! >= 0 && targetMatches.length === 1) {
+                matches = targetMatches;
+                normalizedRequirementSources.push({ itemId: source.itemId, blockId: source.blockId, providedStartByte: source.startByte!,
+                    startByte: matches[0].span.startByte, endByte: matches[0].span.endByte });
+            }
+            if (matches.length === 1) return [{ id: derivedContextId(['requirement', matches[0].span, quote]), quote, source: matches[0].span }];
+            const referenceMatches = findMatches(payload.references ?? []).filter(match => source.startByte === undefined || source.startByte === match.span.startByte);
+            const reference = referenceMatches.length === 1 ? referenceMatches[0] : null;
+            const referenceBlock = reference && request.snapshot.referenceBlocks?.find(block => block.itemId === reference.span.itemId
+                && block.blockId === reference.span.blockId && block.sha256 === reference.span.blockHash);
+            const targetEnd = request.snapshot.manifest?.rounds.at(-1)?.lastSeq;
+            if (matches.length === 0 && source.itemId && source.blockId && !targets.some(target => target.text.includes(quote))
+                && reference && reference.span.purpose === 'reference' && referenceBlock && targetEnd !== undefined
+                && referenceBlock.seq > targetEnd && reference.span.startByte >= 0 && reference.span.endByte <= referenceBlock.byteLength) {
+                omittedReferenceRequirements.push(reference.span);
+                return [];
+            }
+            throw new Error('unresolved source ambiguous');
         });
-        return { digest: { body: value.body, skeleton: value.skeleton, title: value.title, unresolved }, valid: true };
-    } catch { return { digest: { body: text, skeleton: '', title: '', unresolved: [] }, valid: false }; }
+        if (omittedReferenceRequirements.length && !unresolved.length) throw new Error('reference-only requirements without a verified target requirement');
+        const resolutions = parseRequirementResolutions(value.resolutions, request, unresolved);
+        return { digest: { body: value.body, skeleton: value.skeleton, title: value.title, unresolved,
+            ...(resolutions.length ? { resolutions } : {}) }, valid: true,
+            ...(omittedReferenceRequirements.length ? { omittedReferenceRequirements } : {}),
+            ...(normalizedRequirementSources.length ? { normalizedRequirementSources } : {}) };
+    } catch (error) { return { digest: { body: text, skeleton: '', title: '', unresolved: [] }, valid: false,
+        repairable: (parsingResponse && error instanceof SyntaxError) || (error instanceof Error && ['digest shape', 'unresolved quote',
+            'unresolved source identity', 'unresolved source ambiguous', 'reference-only requirements without a verified target requirement'].includes(error.message)),
+        validationError: error instanceof Error ? error.message : 'digest validation failed' }; }
 }
 
 export class ProviderCompressionModelPort implements CompressionModelPort {
@@ -148,15 +213,23 @@ export class ProviderCompressionModelPort implements CompressionModelPort {
         this.now = options.now ?? Date.now;
     }
 
-    private result(request: CompressionRequest, response: NormalizedResponse, snapshot: RequestSnapshot): CompressionResult {
+    private result(request: CompressionRequest, response: NormalizedResponse, snapshot: RequestSnapshot, committed = false): CompressionResult {
         const parsed = parseDigest(request, response);
+        const terminalText = committed && response.complete && response.toolCalls.length === 0
+            && response.problems.length === 0 && !response.blocks.some(block => block.type === 'refusal');
+        const completed = terminalText && response.stop.kind === 'completed';
         return { attemptId: response.attemptId, requestAttemptId: request.attemptId, inputBodyHash: request.chunk.inputBodyHash,
             modelFingerprint: request.snapshot.effectiveModelFingerprint,
             complete: parsed.valid && response.complete && response.stop.kind === 'completed' && response.toolCalls.length === 0 && response.problems.length === 0,
             digest: parsed.digest, coverage: request.chunk.sourceSpans.map(span => ({ span,
                 status: span.purpose === 'nativeAnchor' ? 'anchorOnly' as const : 'complete' as const, gaps: [] })),
             usage: JSON.parse(canonicalJson({ providerAttemptId: response.attemptId, requestAttemptId: request.attemptId,
-                providerResponseId: response.providerResponseId, bodyHash: snapshot.bodyHash, reason: request.reason, usage: response.usage })) as JsonValue };
+                providerResponseId: response.providerResponseId, bodyHash: snapshot.bodyHash, reason: request.reason, usage: response.usage,
+                digestValidation: parsed.validationError ?? 'valid', providerComplete: response.complete, providerStop: response.stop.kind,
+                providerOutputTruncated: terminalText && response.stop.kind === 'truncated',
+                validationRepairEligible: completed && !parsed.valid && parsed.repairable === true && parsed.digest.body.trim().length > 0,
+                omittedReferenceRequirements: parsed.omittedReferenceRequirements ?? [],
+                normalizedRequirementSources: parsed.normalizedRequirementSources ?? [] })) as JsonValue };
     }
 
     private async link(request: CompressionRequest): Promise<StoreRecord<DispatchLink> | undefined> {
@@ -203,8 +276,13 @@ export class ProviderCompressionModelPort implements CompressionModelPort {
         if (hashBytes(request.chunk.body) !== request.inputBodyHash || request.inputBodyHash !== request.chunk.inputBodyHash) {
             throw new ContextFault('SOURCE_GAP', '压缩分块实际字节与冻结指纹不同');
         }
-        const view = appendPlainUser(injectSummaryText({ protocol: profile.protocol },
-            'Return exactly one JSON object with string fields body, skeleton, title and array unresolved. Each unresolved entry has the exact quote and source itemId/blockId, with startByte when repeated. Never emit tools. Keep original unresolved requirements and source retrieval anchors.'), request.chunk.body);
+        const instructions = request.reason === 'fold' ? `${COMPRESSION_INSTRUCTIONS}\nFor this fold, return only body, skeleton and title. The system inherits every child requirement and its resolution state, source proof and identity unchanged. Do not add, resolve or re-source requirements.` : COMPRESSION_INSTRUCTIONS;
+        let view = appendPlainUser(injectSummaryText({ protocol: profile.protocol }, instructions), request.chunk.body);
+        if (request.validationRepair) view = appendPlainUser(view, canonicalJson({ validationRepair: {
+            previousAttemptId: request.validationRepair.previousAttemptId, validationError: request.validationRepair.validationError,
+            instructions: 'Return one corrected JSON digest for the same frozen targets. Preserve all active requirements. Use exact source identities and a longer unique verbatim quote, or an exact absolute UTF-8 byte offset for repeated quotes. Return body, skeleton, title and unresolved. The previous response below failed validation.',
+            previousResponse: request.validationRepair.previousResponse,
+        } }));
         const versions = { conversationId: request.execution.conversationId, runId: request.execution.runId, runEpoch: request.execution.runEpoch,
                 roundId: request.execution.roundId, stepId: request.stepId, actionId: request.actionId,
                 historyEpoch: request.snapshot.historyEpoch, appendSeq: request.snapshot.snapshotAppendSeq,
@@ -236,12 +314,12 @@ export class ProviderCompressionModelPort implements CompressionModelPort {
             const response = await this.options.dispatcher.execute(prepared.adapter, prepared.snapshot, request.execution.rootBudgetId,
                 prepared.upperBound, { signal, attemptId: request.attemptId });
             const persisted = await this.options.journal.readAttempt(response.attemptId);
-            if (!persisted || persisted.state !== 'committed' || persisted.attempt.rootBudgetId !== request.execution.rootBudgetId
+            if (!persisted || persisted.state !== 'committed' || !persisted.response || persisted.attempt.rootBudgetId !== request.execution.rootBudgetId
                 || persisted.attempt.snapshot.actionId !== request.actionId || persisted.attempt.snapshot.bodyHash !== prepared.snapshot.bodyHash) {
                 throw new ContextFault('USAGE_MISMATCH', '压缩结果缺少同根预算及同请求的持久Provider回执', { attemptId: response.attemptId }, true);
             }
             link = await this.updateLink(request, link, { providerAttemptId: response.attemptId, state: 'committed' });
-            return this.result(request, response, prepared.snapshot);
+            return this.result(request, persisted.response, prepared.snapshot, true);
         } catch (error) {
             if (error instanceof AgentFault && !error.mayHaveStarted && error.details?.budgetReservationRejected === true
                 && error.details.rootBudgetId === request.execution.rootBudgetId) {
@@ -271,7 +349,7 @@ export class ProviderCompressionModelPort implements CompressionModelPort {
                 || providerAttempt.attempt.snapshot.bodyHash !== material.snapshot.bodyHash) {
                 throw new ContextFault('USAGE_MISMATCH', '恢复的Provider回执不属于原压缩请求', { attemptId: request.attemptId });
             }
-            return { status: 'found', result: this.result(request, providerAttempt.response, providerAttempt.attempt.snapshot) };
+            return { status: 'found', result: this.result(request, providerAttempt.response, providerAttempt.attempt.snapshot, true) };
         }
         if (link.value.state === 'notAccepted') return { status: 'notAccepted' };
         if (this.active.has(request.attemptId)) return { status: 'pending' };
@@ -479,7 +557,7 @@ export function createContextServerAdapter(options: ContextServerAdapterOptions)
     const prepareView = service.createPrepareView(async (context, plan, input) => {
         const binding = await bind(context, plan);
         const overrides = await options.resolveView?.(context, plan, input) ?? {};
-        return { ...overrides, readTailReuse: 'consume', policy: binding.config.policy, summaryBudget: binding.limits.summaryBudget,
+        return { ...overrides, readTailReuse: 'consume', policy: binding.config.policy,
             resolveHistoricalToolResults: overrides.resolveHistoricalToolResults ?? createHistoricalToolResultResolver(options.store),
             readItem: overrides.readItem ?? ((item, bounds) => item.value !== undefined ? Promise.resolve(item.value) : readHistoryArtifact(options.store,
                 { conversationId: context.snapshot.conversationId, item, maxReadBytes: bounds.maxReadBytes, signal: bounds.signal })),
@@ -497,18 +575,21 @@ export function createContextServerAdapter(options: ContextServerAdapterOptions)
         const binding = await bind(context, plan);
         const overrides = await options.resolveView?.(context, plan, input) ?? {};
         try {
-            const built = await service.buildView({ ...overrides, readTailReuse: 'offer', conversationId: context.snapshot.conversationId, context, adapter: plan.adapter,
+            const viewInput = { ...overrides, readTailReuse: 'offer' as const, conversationId: context.snapshot.conversationId, context, adapter: plan.adapter,
                 resolveHistoricalToolResults: overrides.resolveHistoricalToolResults ?? createHistoricalToolResultResolver(options.store),
                 readItem: overrides.readItem ?? ((item, bounds) => item.value !== undefined ? Promise.resolve(item.value) : readHistoryArtifact(options.store,
                     { conversationId: context.snapshot.conversationId, item, maxReadBytes: bounds.maxReadBytes, signal: bounds.signal })),
-                modelId: plan.modelId, baseView: { ...(overrides.baseView ?? { protocol: plan.adapter.protocol }), ...(input?.tools ? { tools: input.tools } : {}) } });
+                modelId: plan.modelId, parameters: plan.parameters,
+                baseView: { ...(overrides.baseView ?? { protocol: plan.adapter.protocol }), ...(input?.tools ? { tools: input.tools } : {}) } };
+            const built = await service.buildView(viewInput);
             if (built.estimate.confidence !== 'unknown') rememberMeasurement(context.snapshot.conversationId,
                 { ...built.history, configFingerprint: binding.config.configFingerprint, viewHash: hashContext(built.view), modelId: plan.modelId,
                     inputTokens: totalContextTokens(built.estimate), confidence: built.estimate.confidence,
                     basis: built.estimate.tokenCountEvidence ? 'provider_native_count_tokens' : overrides.estimateView ? 'injected_estimator' : 'native_view_utf8_upper_bound',
                     ...(built.estimate.tokenCountEvidence ? { tokenCountEvidence: built.estimate.tokenCountEvidence } : {}) });
             else measurements.delete(context.snapshot.conversationId);
-            return service.postStep({ ...binding, conversationId: context.snapshot.conversationId, estimate: built.estimate });
+            return service.postStep({ ...binding, conversationId: context.snapshot.conversationId, estimate: built.estimate,
+                estimateCompaction: service.createCompactionEstimator(viewInput, binding.execution) });
         } catch (error) {
             if (error instanceof AgentFault && error.code === 'CONTEXT_NATIVE_PAIRING') return { backgroundCandidateId: null };
             throw error;

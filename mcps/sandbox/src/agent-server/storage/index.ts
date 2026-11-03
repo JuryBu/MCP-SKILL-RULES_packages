@@ -5,12 +5,12 @@ import { SqliteStore } from './sqlite.js';
 import type { SqliteStateMutationPort } from './sqlite.js';
 import { recordRetention } from './retention.js';
 import type { ReceiptKey, StoredReceipt, StoreCapabilities, StoreCommitResult, StoreEventQuery,
-    StoreKey, StorePage, StorePort, StoreRecord, StoreRecordQuery, StoreTransition, HistoryQuery, HistoryPage,
+    StoreKey, StorePage, StorePort, StoreRecord, StoreRecordQuery, StoreTransition, HistoryQuery, HistoryPage, HistoryMetadataQuery, HistoryMetadataResult,
     ArtifactQuery, ArtifactChunk, StateMutationPort, StateMutationScope,
     TemporaryMetadataUsage, TemporaryMetadataSweepOptions, TemporaryMetadataSweepResult } from './port.js';
 import type { StorageOptions } from './internal.js';
 import { MAX_PAGE_BYTES } from './internal.js';
-import { storeKey } from './port.js';
+import { storeKey, normalizeHistoryMetadataQuery } from './port.js';
 import type { ModelStepPairing, ModelStepPairingQuery } from './port.js';
 import { modelStepPairing, validateModelStepPairingQuery } from './model-step-pairing.js';
 import type { MediaCommand, MediaQuery, MediaResult } from './media-port.js';
@@ -185,6 +185,14 @@ export class AgentStore implements StorePort {
         this.assertOpen();
         const backend = await this.conversationStore(query.conversationId);
         return backend.readHistory(query);
+    }
+
+    async readHistoryMetadata(input: HistoryMetadataQuery): Promise<HistoryMetadataResult> {
+        this.assertOpen();
+        const query = normalizeHistoryMetadataQuery(input);
+        const backend = await this.conversationStore(query.conversationId);
+        if (!backend.readHistoryMetadata) throw new AgentFault('STORAGE_UNAVAILABLE', '当前会话存储未提供来源元数据查询');
+        return backend.readHistoryMetadata(query);
     }
 
     executeMedia(command: MediaCommand): Promise<MediaResult> {

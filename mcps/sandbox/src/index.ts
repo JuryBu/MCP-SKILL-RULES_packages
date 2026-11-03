@@ -1,10 +1,10 @@
 #!/usr/bin/env node
 /**
- * MCP Sandbox Server v1.19.2
+ * MCP Sandbox Server v1.19.3
  *
  * 代码执行沙箱，解决 Antigravity IDE 中 run_command 的痛点。
  *
- * 8 个 MCP 工具：
+ * 10 个 MCP 工具：
  *   - sandbox_exec: 执行代码片段或系统命令（硬超时、内存限制、输出截断）
  *   - sandbox_session: 持久 REPL 会话（变量状态跨调用保持）
  *   - sandbox_batch: 一次调用并行执行多任务
@@ -13,6 +13,8 @@
  *   - sandbox_launch: 长任务脱离执行（模型训练、大规模数据处理，进程独立于 MCP）
  *   - smart_search: 三模式代码搜索（exact/fuzzy/smart，支持后台与模型链路）
  *   - sandbox_council: 多模型审议（主持模型控节奏、有限工具、讨论副本落盘）
+ *   - sandbox_agent: 外部 API 模型会话与 Agent Server 控制
+ *   - sandbox_grok: 现有 Progrok 链路的 Agent 会话入口
  */
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -45,10 +47,10 @@ import { initParentLs } from "./ls-client.js";
 // 创建 MCP Server 实例
 const server = new McpServer({
     name: "sandbox-mcp-server",
-    version: "1.19.2",
+    version: "1.19.3",
 });
 
-// 注册所有 8 个工具
+// 注册所有 10 个工具
 registerExec(server);
 registerSession(server);
 registerBatch(server);

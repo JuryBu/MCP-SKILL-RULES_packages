@@ -153,12 +153,12 @@ export class TerminalRenderer {
         const elapsed = Math.max(0, Date.now() - view.stateStartedAt);
         const frameKey = this.assets.frameKey(view.state, compact, elapsed, this.options.reducedMotion);
         const cells: Cell[][] = Array.from({ length: rows }, () => Array.from({ length: columns }, () => ({ text: ' ', foreground: theme.foreground, background: theme.background })));
-        const put = (column: number, row: number, value: unknown, tone = theme.foreground, background = theme.background, bold = false, limit = columns - column) => {
+        const put = (column: number, row: number, value: unknown, tone = theme.foreground, background = theme.background, bold = false, limit = columns - column - 1) => {
             if (row < 0 || row >= rows || column < 0 || column >= columns) return;
             let position = column;
             for (const text of graphemes(fitText(value, Math.max(0, limit), this.options.ambiguousWidth))) {
                 const size = characterWidth(text, this.options.ambiguousWidth);
-                if (!size || position + size > columns) break;
+                if (!size || position + size >= columns) break;
                 cells[row][position] = { text, foreground: tone, background, bold };
                 for (let extra = 1; extra < size; extra += 1) cells[row][position + extra] = { text: '', foreground: tone, background, continuation: true };
                 position += size;
@@ -209,13 +209,15 @@ export class TerminalRenderer {
         const output = cells.map(line => {
             let previousStyle = '';
             let result = '';
-            for (const cell of line) {
+            let end = line.length;
+            while (end && line[end - 1].text === ' ' && line[end - 1].background === theme.background) end -= 1;
+            for (const cell of line.slice(0, end)) {
                 if (cell.continuation) continue;
                 const nextStyle = this.options.color ? style(cell.foreground, cell.background, cell.bold) : '';
                 if (nextStyle !== previousStyle) { result += nextStyle; previousStyle = nextStyle; }
                 result += cell.text;
             }
-            return result + (this.options.color ? '\x1b[0m' : '');
+            return result + (this.options.color ? style(theme.foreground, theme.background) : '') + '\x1b[K' + (this.options.color ? '\x1b[0m' : '');
         });
         const dirty = output.map((line, index) => this.options.fullRedraw || line !== this.previous[index]);
         let result = output.map((line, index) => dirty[index] ? `\x1b[${index + 1};1H${line}` : '').join('');

@@ -5,6 +5,7 @@ import type { ChunkDigest, ContextCapture, ContextPolicy, FoldNode, RequirementA
 import { conservativeTextTokens } from './budget.js';
 import { freezeValue, hashBytes, hashContext } from './config.js';
 import { ContextFault } from './errors.js';
+import { activeRequirements, mergeRequirementRecords } from './requirements.js';
 
 export function hasNativeSignature(value: unknown): boolean {
     if (Array.isArray(value)) return value.some(hasNativeSignature);
@@ -14,15 +15,7 @@ export function hasNativeSignature(value: unknown): boolean {
 }
 
 export function mergeRequirements(groups: RequirementAnchor[][]): RequirementAnchor[] {
-    const requirements = new Map<string, RequirementAnchor>();
-    for (const group of groups) for (const requirement of group) {
-        const existing = requirements.get(requirement.id);
-        if (existing && (existing.quote !== requirement.quote || hashContext(existing.source) !== hashContext(requirement.source))) {
-            throw new ContextFault('SOURCE_GAP', '未决要求身份对应的原句或来源发生冲突', { requirementId: requirement.id });
-        }
-        if (!existing) requirements.set(requirement.id, structuredClone(requirement));
-    }
-    return [...requirements.values()];
+    return mergeRequirementRecords(groups);
 }
 
 export function sealSummaryNode<Node extends SummaryNode>(node: Omit<Node, 'hash'>): Node {
@@ -43,6 +36,12 @@ export function validateSummaryNodes(nodes: SummaryNode[]): void {
                 throw new ContextFault('SOURCE_GAP', '折叠节点缺少完整子来源范围', { nodeId: node.nodeId });
             }
         }
+        if (node.historyFeedback && (!Number.isSafeInteger(node.historyFeedback.hitCount) || node.historyFeedback.hitCount < 1
+            || !Number.isSafeInteger(node.historyFeedback.lastHitStep) || node.historyFeedback.lastHitStep < 0
+            || !Number.isSafeInteger(node.historyFeedback.publishedAtStep) || node.historyFeedback.publishedAtStep < 0
+            || !['body', 'skeleton'].includes(node.historyFeedback.level))) throw new ContextFault('SOURCE_GAP', '摘要命中档位状态无效');
+        if (node.feedbackSourceNodeIds && (new Set(node.feedbackSourceNodeIds).size !== node.feedbackSourceNodeIds.length
+            || node.feedbackSourceNodeIds.some(nodeId => typeof nodeId !== 'string' || !nodeId))) throw new ContextFault('SOURCE_GAP', '摘要命中来源节点无效');
         ids.add(node.nodeId);
         previousEnd = node.lastSeq;
     }
@@ -73,13 +72,36 @@ export interface RenderedSummary {
     hash: string;
 }
 
+function renderRequirements(requirements: RequirementAnchor[]): string {
+    const items = [...new Set(requirements.map(requirement => requirement.source.itemId))];
+    let prefix = items[0] ?? '';
+    for (const item of items) {
+        const characters = [...prefix];
+        while (!item.startsWith(characters.join(''))) characters.pop();
+        prefix = characters.join('');
+    }
+    if (prefix.length < 16) prefix = '';
+    const indexes = new Map(items.map((item, index) => [item, index]));
+    return ['Unresolved requirements (verbatim):',
+        `Source items: ${canonicalJson({ prefix, suffixes: items.map(item => item.slice(prefix.length)) })}`,
+        'Resolve source itemId as prefix + suffixes[sourceItemIndex].',
+        'Rows=[requirementId,verbatimQuote,sourceItemIndex,blockId,startByte,endByte] (UTF-8 bytes, end exclusive):',
+        ...requirements.map(requirement => canonicalJson([requirement.id, requirement.quote, indexes.get(requirement.source.itemId)!,
+            requirement.source.blockId, requirement.source.startByte, requirement.source.endByte]))].join('\n');
+}
+
 export function renderSummary(nodes: SummaryNode[], policy: ContextPolicy, budget = Number.MAX_SAFE_INTEGER,
     countTokens: TokenCounter = conservativeTextTokens): RenderedSummary {
     validateSummaryNodes(nodes);
     const middleEnd = nodes.length - policy.stableTailBatches;
     const levels: SummaryLevel[] = nodes.map((_, index) => index < policy.stableHeadBatches || index >= middleEnd ? 'body'
         : index < middleEnd - policy.middleSkeletonBatches ? 'title' : 'skeleton');
-    const requirements = mergeRequirements(nodes.map(node => node.unresolved));
+    const rank = { title: 0, skeleton: 1, body: 2 };
+    for (const [index, node] of nodes.entries()) {
+        const retained = node.historyFeedback?.level;
+        if (retained && rank[retained] > rank[levels[index]]) levels[index] = retained;
+    }
+    const requirements = activeRequirements(mergeRequirements(nodes.map(node => node.unresolved)));
     const nativeAnchors = new Map<string, { itemId: string; blockId: string; sha256: string; retrieval: SummaryNode['anchors'][number]['retrieval'] }>();
     for (const node of nodes) for (const anchor of node.anchors) {
         if (anchor.mediaType || typeof anchor.retrieval.nativeType === 'string') nativeAnchors.set(JSON.stringify([anchor.itemId, anchor.blockId, anchor.sha256]),
@@ -87,9 +109,7 @@ export function renderSummary(nodes: SummaryNode[], policy: ContextPolicy, budge
     }
     const render = () => {
         const parts = nodes.map((node, index) => `[summary ${node.nodeId}; seq=${node.firstSeq}..${node.lastSeq}; hash=${node.hash}; read=summary:${node.nodeId}]\n${node[levels[index]]}`);
-        if (requirements.length) parts.push(`Unresolved requirements (verbatim):\n${requirements.map(requirement => canonicalJson({
-            id: requirement.id, quote: requirement.quote, source: requirement.source,
-        })).join('\n')}`);
+        if (requirements.length) parts.push(renderRequirements(requirements));
         if (nativeAnchors.size) parts.push(`Native source anchors (original content retained):\n${[...nativeAnchors.values()].map(anchor => canonicalJson(anchor)).join('\n')}`);
         return parts.join('\n\n');
     };
@@ -97,12 +117,22 @@ export function renderSummary(nodes: SummaryNode[], policy: ContextPolicy, budge
     const original = [...levels];
     const middle = nodes.map((_, index) => index).filter(index => index >= policy.stableHeadBatches && index < middleEnd);
     const edges = nodes.map((_, index) => index).filter(index => !middle.includes(index));
-    for (const level of ['skeleton', 'title'] as const) {
-        for (const index of [...middle, ...edges]) {
-            if (countTokens(text) <= budget) break;
-            if (levels[index] === 'title' || (level === 'skeleton' && levels[index] !== 'body')) continue;
-            levels[index] = level;
-            text = render();
+    const degradationOrder = [...middle, ...edges].sort((left, right) => {
+        const leftFeedback = nodes[left].historyFeedback;
+        const rightFeedback = nodes[right].historyFeedback;
+        return Number(Boolean(leftFeedback)) - Number(Boolean(rightFeedback))
+            || (leftFeedback?.hitCount ?? 0) - (rightFeedback?.hitCount ?? 0)
+            || (leftFeedback?.lastHitStep ?? 0) - (rightFeedback?.lastHitStep ?? 0);
+    });
+    for (const useful of [false, true]) {
+        const group = degradationOrder.filter(index => Boolean(nodes[index].historyFeedback) === useful);
+        for (const level of ['skeleton', 'title'] as const) {
+            for (const index of group) {
+                if (countTokens(text) <= budget) break;
+                if (levels[index] === 'title' || (level === 'skeleton' && levels[index] !== 'body')) continue;
+                levels[index] = level;
+                text = render();
+            }
         }
     }
     const tokens = countTokens(text);

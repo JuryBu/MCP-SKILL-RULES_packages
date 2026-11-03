@@ -1,4 +1,5 @@
 import type { AgentEvent, JsonValue, RetainPolicy, RpcResult } from '../protocol.js';
+import { AgentFault } from '../protocol.js';
 
 export type StoreKind = 'conversation' | 'run' | 'input' | 'step' | 'interaction' | 'control' | 'eventAck';
 
@@ -143,6 +144,42 @@ export interface HistoryPage extends StorePage<HistoryItem> {
     viewRevision: number;
 }
 
+export interface HistoryMetadataQuery {
+    conversationId: string;
+    historyEpoch: number;
+    itemIds: string[];
+}
+
+export type HistoryMetadataItem = Pick<HistoryItem, 'itemId' | 'seq' | 'role' | 'roundId' | 'runId' | 'runEpoch'>;
+
+export interface HistoryMetadataResult {
+    historyEpoch: number;
+    items: HistoryMetadataItem[];
+}
+
+export function normalizeHistoryMetadataQuery(query: HistoryMetadataQuery): HistoryMetadataQuery {
+    if (!query || typeof query.conversationId !== 'string' || !query.conversationId.trim()
+        || !Number.isSafeInteger(query.historyEpoch) || query.historyEpoch < 0 || !Array.isArray(query.itemIds)) {
+        throw new AgentFault('INVALID_PARAMS', '历史元数据查询参数无效');
+    }
+    const itemIds = [...new Set(query.itemIds)];
+    if (itemIds.length > 64 || itemIds.some(itemId => typeof itemId !== 'string' || !itemId.trim())) {
+        throw new AgentFault('INVALID_PARAMS', '历史元数据查询须包含最多64个唯一有效项目ID');
+    }
+    return { conversationId: query.conversationId, historyEpoch: query.historyEpoch, itemIds };
+}
+
+export function projectHistoryMetadata(item: HistoryMetadata & { itemId: string; seq: number }): HistoryMetadataItem {
+    if (item.view !== 'raw' || item.effective !== true || !Number.isSafeInteger(item.seq) || item.seq < 1
+        || !['user', 'assistant', 'tool', 'system'].includes(item.role)
+        || !(item.roundId === null || typeof item.roundId === 'string' && item.roundId.length > 0)
+        || !(item.runId === null || typeof item.runId === 'string' && item.runId.length > 0)
+        || !(item.runEpoch === null || Number.isSafeInteger(item.runEpoch) && item.runEpoch >= 0)) {
+        throw new AgentFault('STORAGE_SEGMENT_CORRUPT', '历史来源元数据无效');
+    }
+    return { itemId: item.itemId, seq: item.seq, role: item.role, roundId: item.roundId, runId: item.runId, runEpoch: item.runEpoch };
+}
+
 export const DEFAULT_ARTIFACT_BYTES = 256 * 1024;
 export const MAX_ARTIFACT_BYTES = 512 * 1024;
 
@@ -250,6 +287,7 @@ export interface StorePort {
     readContent(conversationId: string, contentId: string): Promise<JsonValue | undefined>;
     readEvents(query: StoreEventQuery): Promise<StorePage<AgentEvent>>;
     readHistory(query: HistoryQuery): Promise<HistoryPage>;
+    readHistoryMetadata?(query: HistoryMetadataQuery): Promise<HistoryMetadataResult>;
     readArtifact(query: ArtifactQuery): Promise<ArtifactChunk>;
     commitTransition(transition: StoreTransition): Promise<StoreCommitResult>;
     mutateState?<Value>(scope: StateMutationScope, operation: (port: StateMutationPort) => Promise<Value>): Promise<Value>;

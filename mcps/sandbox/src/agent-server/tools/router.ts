@@ -24,6 +24,8 @@ import type { SharedMcpCatalog } from './catalog.js';
 import type { BoundToolContext, ModelFunctionSchema, ToolCatalogEntry, ToolCleanupResult, ToolExecutionContext, ToolExecutionResult } from './types.js';
 import type { DelegationTools } from './delegation.js';
 import { ModelToolDiscovery } from './discovery.js';
+import { HistoryRecallTools, isHistoryRecallTool } from './history.js';
+import type { HistoryRecallPort } from './history.js';
 
 export interface ToolRouterOptions {
     files?: ControlledFiles;
@@ -38,6 +40,7 @@ export interface ToolRouterOptions {
     protectedPaths?: readonly string[];
     pendingTools?: PendingToolStorePort;
     delegation?: DelegationTools;
+    history?: HistoryRecallPort;
 }
 
 export class ToolRouter {
@@ -57,6 +60,7 @@ export class ToolRouter {
     private readonly closedRuns = new Set<string>();
     private commandCapability?: CommandCapability;
     private delegation?: DelegationTools;
+    private history?: HistoryRecallTools;
     private readonly discovery: ModelToolDiscovery;
 
     constructor(options: ToolRouterOptions = {}) {
@@ -72,6 +76,7 @@ export class ToolRouter {
         this.commands.attachResources?.(this.resources);
         this.shared = options.shared;
         this.delegation = options.delegation;
+        this.history = options.history ? new HistoryRecallTools(options.history) : undefined;
         this.onApprovalRequested = options.onApprovalRequested;
         this.protectedPaths = Object.freeze([...(options.protectedPaths ?? [])]);
         const pendingStore = options.pendingTools ?? (this.journal instanceof SqliteWorkspaceJournal ? new SqlitePendingToolStore(this.journal.store) : new MemoryPendingToolStore());
@@ -79,13 +84,17 @@ export class ToolRouter {
         this.discovery = new ModelToolDiscovery(this);
     }
 
-    get modelFunctionSchemas(): readonly ModelFunctionSchema[] { return [...structuredClone(MODEL_FUNCTION_SCHEMAS),
+    private historyAvailable(name: string): boolean { return !!this.history && (name !== 'mark_history_hit' || this.history.canMarkHit); }
+
+    private localSchemas(): readonly ModelFunctionSchema[] { return MODEL_FUNCTION_SCHEMAS.filter(schema => !isHistoryRecallTool(schema.name) || this.historyAvailable(schema.name)); }
+
+    get modelFunctionSchemas(): readonly ModelFunctionSchema[] { return [...structuredClone(this.localSchemas()),
         ...(this.delegation?.modelFunctionSchemas ?? []), ...(this.shared?.modelFunctionSchemas() ?? [])]; }
 
     modelFunctionSchemasFor(trustedContext: ToolExecutionContext): readonly ModelFunctionSchema[] {
         const context = this.bind(trustedContext);
         if (context.signal.aborted) throw new AgentFault('TOOL_CANCELLED', '工具定义读取已取消');
-        return [...structuredClone(MODEL_FUNCTION_SCHEMAS), ...(context.runId === context.rootRunId ? this.delegation?.modelFunctionSchemas ?? [] : []),
+        return [...structuredClone(this.localSchemas()), ...(context.runId === context.rootRunId ? this.delegation?.modelFunctionSchemas ?? [] : []),
             ...(this.shared?.modelFunctionSchemas(context) ?? [])];
     }
 
@@ -96,6 +105,11 @@ export class ToolRouter {
     setDelegation(delegation: DelegationTools | undefined): void {
         if ([...this.executions.values()].some(execution => execution.pending.size > 0)) throw new AgentFault('INVALID_STATE', '工具动作在途时不能替换内部派发适配器');
         this.delegation = delegation;
+    }
+
+    setHistory(history: HistoryRecallPort | undefined): void {
+        if ([...this.executions.values()].some(execution => execution.pending.size > 0)) throw new AgentFault('INVALID_STATE', '工具动作在途时不能替换历史查回端口');
+        this.history = history ? new HistoryRecallTools(history) : undefined;
     }
 
     get definitions(): FunctionTool[] {
@@ -110,12 +124,14 @@ export class ToolRouter {
     list(): ToolCatalogEntry[] {
         const local: ToolCatalogEntry[] = MODEL_FUNCTION_SCHEMAS.map(schema => ({ toolId: `local.${schema.name}`, serviceId: 'local', name: schema.name,
             summary: schema.description, effectKinds: this.fileOperations.handles(schema.name) ? FILE_OPERATION_EFFECT_KINDS[schema.name]
-                : schema.name === 'write_file' ? ['write'] : schema.name === 'run_command' ? ['process', 'network'] : ['read'],
+                : schema.name === 'write_file' || schema.name === 'mark_history_hit' ? ['write'] : schema.name === 'run_command' ? ['process', 'network'] : ['read'],
             modelEffect: 'none', resourceKind: schema.name === 'run_command' ? 'process' : null,
             schemaHash: createHash('sha256').update(canonicalJson(schema.parameters)).digest('hex'), adapterVersion: '1',
-            availability: schema.name === 'run_command' && !(this.commandCapability?.available === true
+            availability: isHistoryRecallTool(schema.name) && !this.historyAvailable(schema.name) ? 'unavailable' : schema.name === 'run_command' && !(this.commandCapability?.available === true
                 && this.commandCapability.commandCapability === 'cooperative_windows_job') ? 'unavailable' : 'available',
-            reason: schema.name === 'run_command' ? this.commandCapability?.reason ?? '命令执行器尚待按需检查；正常命令遵守当前任务与工作区规则' : null }));
+            reason: isHistoryRecallTool(schema.name) && !this.historyAvailable(schema.name)
+                ? this.history ? '历史有用命中的持久反馈端口尚未接入' : 'Core历史查回端口尚未接入'
+                : schema.name === 'run_command' ? this.commandCapability?.reason ?? '命令执行器尚待按需检查；正常命令遵守当前任务与工作区规则' : null }));
         return [...local, ...(this.delegation?.modelFunctionSchemas ?? []).map((schema): ToolCatalogEntry => ({
             toolId: `local.${schema.name}`, serviceId: 'local', name: schema.name, summary: schema.description,
             effectKinds: schema.name === 'child_wait' ? ['read'] : ['external'],
@@ -267,7 +283,11 @@ export class ToolRouter {
             const parsed = schema.safeParse(args);
             if (!parsed.success) throw new AgentFault('INVALID_PARAMS', '工具参数不符合当前结构定义', { issues: parsed.error.issues.map(issue => ({ path: issue.path, code: issue.code })) });
             let data: unknown;
-            if (this.discovery.handles(localName)) data = await this.discovery.execute(localName, parsed.data, context);
+            if (isHistoryRecallTool(localName)) {
+                if (!this.history) throw new AgentFault('TOOL_UNAVAILABLE', 'Core历史查回端口尚未接入');
+                data = await this.history.execute(localName, parsed.data, context);
+            }
+            else if (this.discovery.handles(localName)) data = await this.discovery.execute(localName, parsed.data, context);
             else if (localName === 'read_file') data = await this.read(localArgumentSchemas.read_file.parse(args), context);
             else if (localName === 'write_file') data = await this.write(localArgumentSchemas.write_file.parse(args), context,
                 createHash('sha256').update(canonicalJson({ name, args })).digest('hex'));

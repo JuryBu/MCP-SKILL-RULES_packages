@@ -1,6 +1,6 @@
-# MCP Sandbox v1.19.2
+# MCP Sandbox v1.19.3
 
-本版修复显式 `server.shutdown` 成功后，客户端残留的控制租约续期重新启动闲置核心的问题。确认关闭后清空租约并停止续期，后续显式调用仍可重新连接。原回执、未知结果和费用沿原命令查询。
+本版补齐 Agent 历史查回与有用命中反馈，修复完整原生请求的压缩余量计算、已发布摘要预算复用，以及工具结果交错和已停止执行的清理。活动要求按来源和实际完成情况更新，用户更正只替换相应部分。原回执、未知结果和费用沿原命令查询。
 
 > Grok / ProGrok 支持仅包含客户端桥接代码；本包不提供代理服务、账号、API Key，也不会自动安装、启动或修补接收方的 ProGrok。任何 `yolo` / 自动批准模式都属于高权限执行选项，通用安装不要默认启用。
 
@@ -63,6 +63,8 @@ Progrok 刷新合并实际模型目录与可选的语言模型详情，保留价
 | 长期归档 | `--mode archive` | 持久保留原文及原件，按实际状态关闭和重开 |
 
 保存方式变更先预览，再带原 `previewToken/policyRevision` 确认。BPC（后台渐进压缩）整理后续请求所用的较早内容，依次选择会话压缩模型、API 配置的全局压缩模型、当前任务模型；未另配时沿用当前模型。完整原文、媒体及原生响应引用按所选保存生命周期保留，通过 `history` 和 `artifact list/show/save` 查回并校验。临时会话关闭后的内容清理、原费用未知和压缩原候选恢复各按自身状态处理，详细步骤见 [CLI 使用说明](src/agent-cli/README.md)。
+
+Agent 可用 `history_search` 定位自身历史，再用 `history_read` 读取原文；确认内容有用后调用 `mark_history_hit`，供下一次 BPC 调整保留程度。完整原生请求始终按当前模型窗口和明确的本地窗口限制检查。
 
 ## 核心优势（vs run_command）
 
@@ -340,6 +342,14 @@ Windsurf / WSF 通过本机共享 HTTP broker 使用 Sandbox MCP，不新增任�
 npm install
 npm run build
 ```
+
+Agent 定点回归使用 Node.js >=24.12.0、完整开发依赖及 TS Worker 注册入口：
+
+```bash
+node --import ./tests/agent/local/file-operations-register.mjs --test tests/agent/local/context-native-headroom.mjs tests/agent/local/context-requirement-evidence.mjs tests/agent/local/context-requirement-lifecycle.mjs tests/agent/local/context-summary-instructions.mjs tests/agent/local/context-background-finish.mjs tests/agent/local/runtime-stop-epoch.mjs tests/agent/local/cleanup-reconciliation.mjs
+```
+
+`context-native-headroom` 的外置历史原件检查仅在设置 `CONTEXT_HEADROOM_ORIGINAL` 时执行，其余测试默认可独立运行。原件目录须含 `result.json`、`current-native-view.json` 和 `future-input-minimum-view.json`，身份断言可另设 `CONTEXT_HEADROOM_EXPECTED_CID`；这些本机原件不随源码发布。
 
 ## 相关文档
 

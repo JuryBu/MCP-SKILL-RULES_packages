@@ -17,10 +17,38 @@ export interface CleanupReconciliationPorts {
     releaseContext(input: RunCleanupInput): Promise<boolean>;
 }
 
+export function isStoppedUnknownWait(snapshot: Partial<RunSnapshot>): boolean {
+    return snapshot.kind === 'task' && snapshot.state === 'cancelled' && snapshot.cleanupState === 'unconfirmed'
+        && snapshot.stopTarget === 'cancelled' && ['BUDGET_EXCEEDED', 'runs.cancel'].includes(String(snapshot.stopReason))
+        && ['cancelled', 'unknown'].includes(String(snapshot.resultStatus)) && Number.isSafeInteger(snapshot.runEpoch)
+        && Number(snapshot.runEpoch) > 1 && (snapshot.rootRunId == null || snapshot.rootRunId === snapshot.runId);
+}
+
+async function hasStoppedUnknownAttempt(input: RunCleanupInput, ports: CleanupReconciliationPorts): Promise<boolean> {
+    if (!isStoppedUnknownWait(input.snapshot)) return false;
+    const rootBudgetId = input.snapshot.runId;
+    const budget = await ports.readBudget(rootBudgetId);
+    if (budget.budget.rootBudgetId !== rootBudgetId || budget.budget.amountUnknown !== true) return false;
+    let matched = false;
+    for (const reservation of budget.reservations) {
+        if (reservation.callHeld || ['reserved', 'dispatched'].includes(reservation.state)) return false;
+        if (reservation.state !== 'unknown') continue;
+        const recorded = await ports.readAttempt(reservation.attemptId);
+        if (reservation.rootBudgetId !== rootBudgetId || reservation.dispatched !== true || !recorded
+            || recorded.state !== 'unknown' || recorded.attempt.rootBudgetId !== rootBudgetId
+            || recorded.attempt.snapshot.conversationId !== input.snapshot.conversationId
+            || recorded.attempt.snapshot.runId !== input.snapshot.runId
+            || recorded.attempt.snapshot.runEpoch !== input.snapshot.runEpoch - 1
+            || !recorded.failure || !['accepted', 'unknown'].includes(recorded.failure.acceptance)) return false;
+        matched = true;
+    }
+    return matched;
+}
+
 export async function reconcileRunCleanup(input: RunCleanupInput, ports: CleanupReconciliationPorts): Promise<CleanupEvidence> {
     if (input.snapshot.rootRunId !== undefined && input.snapshot.rootRunId !== null && typeof input.snapshot.rootRunId !== 'string') return 'unconfirmed';
     if (input.preserveUnknownOutcome === true) {
-        if (input.snapshot.state !== 'outcome_unknown') return 'unconfirmed';
+        if (input.snapshot.state !== 'outcome_unknown' && !await hasStoppedUnknownAttempt(input, ports)) return 'unconfirmed';
         const tools = await ports.releaseTools(input);
         if (tools === 'unconfirmed' || !await ports.releaseContext(input)) return 'unconfirmed';
         return 'resources_released';

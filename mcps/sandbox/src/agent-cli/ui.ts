@@ -60,7 +60,7 @@ export class InteractiveCli {
     private logs: string[] = [];
     private details: string[] = [];
     private detailsOffset = 0;
-    private detailCache?: { source: string[]; width: number; lines: string[] };
+    private detailCache?: { source: string[]; width: number; ambiguousWidth?: AmbiguousWidth; lines: string[] };
     private state: MascotState = 'idle';
     private stateStartedAt = Date.now();
     private status = '空闲 · 草稿可直接输入';
@@ -167,7 +167,7 @@ export class InteractiveCli {
                 this.preferencesRevision = preferences.revision;
                 this.detailCache = undefined;
                 this.renderer.reset();
-                if (!this.terminal.linear) await this.terminal.write('\x1b[0m\x1b[2J\x1b[H');
+                if (!this.terminal.linear) await this.terminal.write('\x1b[0m\x1b[H\x1b[0J');
                 if (this.disposed || generation !== this.preferencesGeneration) return;
                 await this.negotiateGraphics();
                 this.scheduleRender(true);
@@ -271,7 +271,10 @@ export class InteractiveCli {
         else if (key.name === 'redo') target.redo();
         else if (key.name === 'newline') target.insert('\n');
         else if (key.name === 'menu') this.showCommands();
-        else if (key.name === 'pageup' || key.name === 'pagedown') this.detailsOffset = Math.max(0, Math.min(Math.max(0, this.detailLines().length - 1), this.detailsOffset + (key.name === 'pageup' ? -7 : 7)));
+        else if (key.name === 'pageup' || key.name === 'pagedown') {
+            const { pageRows, maxOffset } = this.detailPage();
+            this.detailsOffset = Math.max(0, Math.min(maxOffset, Math.min(maxOffset, this.detailsOffset) + (key.name === 'pageup' ? -pageRows : pageRows)));
+        }
         else if (key.name === 'tab') this.completeCommand(target);
         else if (key.name === 'up' || key.name === 'down') {
             if (this.form?.fields[this.form.index].choices) {
@@ -1043,7 +1046,7 @@ export class InteractiveCli {
     private async resizeTerminal(): Promise<void> {
         if (this.disposed) return;
         this.renderer.options.graphics = this.terminal.linear ? 'none' : 'blocks';
-        if (!this.terminal.linear) await this.terminal.write('\x1b[2J\x1b[H');
+        if (!this.terminal.linear) await this.terminal.write('\x1b[H\x1b[0J');
         this.renderer.reset(); this.scheduleRender(true);
         await this.negotiateGraphics();
         this.scheduleRender();
@@ -1112,10 +1115,16 @@ export class InteractiveCli {
 
     private async printTranscript(text: string): Promise<void> {
         if (this.editing) return;
-        if (!this.terminal.linear) await this.terminal.write(`\x1b[${this.terminal.height};1H\x1b[0m\r\n`);
-        await new Promise<void>((resolveWrite, rejectWrite) => this.streams.stdout.write(terminalSafeText(text) + '\n', error => error ? rejectWrite(error) : resolveWrite()));
-        if (!this.terminal.linear) await this.terminal.write('\n'.repeat(this.terminal.height));
-        this.renderer.reset();
+        const transcript = terminalSafeText(text);
+        if (this.terminal.linear || !this.streams.stdout.isTTY) {
+            await new Promise<void>((resolveWrite, rejectWrite) => this.streams.stdout.write(transcript + '\n', error => error ? rejectWrite(error) : resolveWrite()));
+        }
+        if (!this.terminal.linear) {
+            this.details = transcript.split('\n');
+            this.detailsOffset = 0;
+            this.detailCache = undefined;
+            this.scheduleRender();
+        }
     }
 
     private showResult(execution: CommandExecution, options: { raw?: boolean; titleHint?: string } = {}): void {
@@ -1136,7 +1145,9 @@ export class InteractiveCli {
     private log(message: string): void { if (this.logs.at(-1) !== message) this.logs.push(message); this.logs = this.logs.slice(-50); }
 
     private view(): TerminalView {
-        let details = this.detailLines().slice(this.detailsOffset);
+        const { lines, maxOffset } = this.detailPage();
+        this.detailsOffset = Math.max(0, Math.min(maxOffset, this.detailsOffset));
+        let details = lines.slice(this.detailsOffset);
         if (this.menu) {
             const geometry = this.renderer.geometry(this.terminal.width, this.terminal.height);
             const pageSize = Math.max(3, geometry.bodyRows - 3);
@@ -1161,11 +1172,23 @@ export class InteractiveCli {
     private detailLines(): string[] {
         const geometry = this.renderer.geometry(this.terminal.width, this.terminal.height);
         const sprite = geometry.canDraw && this.renderer.options.graphics !== 'none' && this.renderer.assets.sprites ? geometry.graphicColumns : 0;
-        const width = Math.max(8, this.terminal.width - (sprite ? sprite + 9 : 4));
-        if (this.detailCache?.source === this.details && this.detailCache.width === width) return this.detailCache.lines;
-        const lines = this.details.flatMap(line => wrapText(line, width, this.renderer.options.ambiguousWidth));
-        this.detailCache = { source: this.details, width, lines };
+        const columns = Math.max(20, Math.min(300, Math.floor(this.terminal.width)));
+        const width = Math.max(8, columns - (sprite ? sprite + 9 : 4));
+        const ambiguousWidth = this.renderer.options.ambiguousWidth;
+        if (this.detailCache?.source === this.details && this.detailCache.width === width && this.detailCache.ambiguousWidth === ambiguousWidth) return this.detailCache.lines;
+        const lines = this.details.flatMap(line => wrapText(line, width, ambiguousWidth));
+        this.detailCache = { source: this.details, width, ambiguousWidth, lines };
         return lines;
+    }
+
+    private detailPage(): { lines: string[]; pageRows: number; maxOffset: number } {
+        const lines = this.detailLines();
+        const geometry = this.renderer.geometry(this.terminal.width, this.terminal.height);
+        const rows = Math.max(10, Math.min(100, Math.floor(this.terminal.height)));
+        const pageRows = geometry.canDraw ? geometry.bodyRows : Math.max(1, rows - (this.renderer.options.graphics === 'none' ? 12 : 13));
+        let end = lines.length;
+        while (end > 0 && !lines[end - 1].trim()) end -= 1;
+        return { lines, pageRows, maxOffset: Math.max(0, end - pageRows) };
     }
 
     private get pendingDraft(): PendingDraft | undefined { return this.conversation ? this.pendingDrafts.get(String(this.conversation.conversationId)) : undefined; }
@@ -1182,7 +1205,10 @@ export class InteractiveCli {
                     const view = this.view();
                     const frame = [view.connection, ...view.details, view.status, ...view.logs.slice(-1), view.inputLabel ?? '输入', view.hidden ? '（隐藏）' : view.draft.text].join('\n') + '\n';
                     if (frame !== this.lastLinearFrame) { await this.terminal.write(terminalSafeText(frame)); this.lastLinearFrame = frame; }
-                } else await this.terminal.write(this.renderer.render(this.view(), this.terminal.width, this.terminal.height));
+                } else {
+                    const geometry = { width: this.terminal.width, height: this.terminal.height };
+                    await this.terminal.write(this.renderer.render(this.view(), geometry.width, geometry.height), geometry);
+                }
             } catch { await this.finish(4); }
             finally {
                 this.renderInFlight = false;

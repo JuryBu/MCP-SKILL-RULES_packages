@@ -1,10 +1,10 @@
 import { AgentFault, canonicalJson } from '../protocol.js';
 import { randomUUID } from 'node:crypto';
 import type { AgentEvent, JsonValue } from '../protocol.js';
-import { DEFAULT_ARTIFACT_BYTES, MAX_ARTIFACT_BYTES, receiptKey, storeKey } from './port.js';
+import { DEFAULT_ARTIFACT_BYTES, MAX_ARTIFACT_BYTES, receiptKey, storeKey, normalizeHistoryMetadataQuery, projectHistoryMetadata } from './port.js';
 import type { ReceiptKey, StoredReceipt, StoreCapabilities, StoreCommitResult, StoreEventQuery,
     StoreKey, StorePage, StorePort, StoreRecord, StoreRecordQuery, StoreTransition, HistoryItem, HistoryPage, HistoryQuery,
-    ArtifactChunk, ArtifactQuery } from './port.js';
+    ArtifactChunk, ArtifactQuery, HistoryMetadataQuery, HistoryMetadataResult } from './port.js';
 import type { TemporaryMetadataSweepOptions, TemporaryMetadataSweepResult, TemporaryMetadataUsage } from './port.js';
 import type { ModelStepPairing, ModelStepPairingQuery } from './port.js';
 import { modelStepPairing, validateModelStepPairingQuery } from './model-step-pairing.js';
@@ -37,6 +37,7 @@ export class MemoryStore implements StorePort {
     private contents = new Map<string, MemoryContent>();
     private events = new Map<string, AgentEvent[]>();
     private history = new Map<string, HistoryItem[]>();
+    private readonly historyItems = new Map<string, Map<string, HistoryItem>>();
     private readonly temporaryBudget: TemporaryBudgetPort;
     private readonly metadataHolds = new Map<object, MetadataHold>();
     private closed = false;
@@ -312,6 +313,26 @@ export class MemoryStore implements StorePort {
         return { items: this.readCopy(items, query.conversationId), nextCursor: items.at(-1)?.eventSeq ?? query.afterSeq, hasMore: items.length < matching.length };
     }
 
+    async readHistoryMetadata(input: HistoryMetadataQuery): Promise<HistoryMetadataResult> {
+        this.assertOpen();
+        const query = normalizeHistoryMetadataQuery(input);
+        const requireEpoch = () => {
+            const conversation = this.records.get(storeKey({ conversationId: query.conversationId, kind: 'conversation', id: query.conversationId }));
+            if (!conversation) throw new AgentFault('NOT_FOUND', '找不到历史所属会话');
+            const historyEpoch = Number(conversation.value.historyEpoch ?? 1);
+            if (historyEpoch !== query.historyEpoch) throw new AgentFault('STORAGE_CURSOR_STALE', '历史版本已经变化');
+            return historyEpoch;
+        };
+        requireEpoch();
+        const indexed = this.historyItems.get(query.conversationId);
+        const items: HistoryMetadataResult['items'] = [];
+        for (const itemId of query.itemIds) {
+            const item = indexed?.get(itemId);
+            if (item?.view === 'raw' && item.effective === true) items.push(projectHistoryMetadata(item));
+        }
+        return { historyEpoch: requireEpoch(), items };
+    }
+
     async readHistory(query: HistoryQuery): Promise<HistoryPage> {
         this.assertOpen();
         const conversation = this.records.get(storeKey({ conversationId: query.conversationId, kind: 'conversation', id: query.conversationId }));
@@ -445,6 +466,7 @@ export class MemoryStore implements StorePort {
             createdMetadata.push({ value: stored, conversationId, bytes });
             return stored;
         };
+        const appendedHistory: { conversationId: string; item: HistoryItem }[] = [];
         let committed = false;
         try {
         if (transition.purgeConversationId) {
@@ -487,9 +509,13 @@ export class MemoryStore implements StorePort {
                 if (indexed) {
                     const { itemId: _itemId, seq: _seq, contentId: _contentId, kind: _kind, objectRef: _ref, ...metadata } = indexed;
                     if (canonicalJson(metadata) !== canonicalJson(content.history)) throw new AgentFault('COMMAND_CONFLICT', '同一历史内容不能改变来源元数据');
-                } else history.set(content.conversationId, [...previous, holdMetadata({ ...content.history, itemId: randomUUID(),
-                    seq: (previous.at(-1)?.seq ?? 0) + 1, contentId: content.contentId, kind: content.kind,
-                    objectRef: { hash, rawBytes: bytes } }, content.conversationId)]);
+                } else {
+                    const item = holdMetadata({ ...content.history, itemId: randomUUID(),
+                        seq: (previous.at(-1)?.seq ?? 0) + 1, contentId: content.contentId, kind: content.kind,
+                        objectRef: { hash, rawBytes: bytes } }, content.conversationId);
+                    history.set(content.conversationId, [...previous, item]);
+                    appendedHistory.push({ conversationId: content.conversationId, item });
+                }
             }
         }
         for (const event of transition.events ?? []) {
@@ -525,6 +551,12 @@ export class MemoryStore implements StorePort {
         this.contents = contents;
         this.events = events;
         this.history = history;
+        if (transition.purgeConversationId) this.historyItems.delete(transition.purgeConversationId);
+        for (const { conversationId, item } of appendedHistory) {
+            let indexed = this.historyItems.get(conversationId);
+            if (!indexed) { indexed = new Map(); this.historyItems.set(conversationId, indexed); }
+            indexed.set(item.itemId, item);
+        }
         for (const record of transition.records ?? []) this.nextTemporaryMetadataExpiry = Math.min(this.nextTemporaryMetadataExpiry, this.closedTemporaryExpiry(record));
         committed = true;
         for (const [value, hold] of nextHolds) if (!owners.has(value)) {
@@ -615,10 +647,14 @@ export class MemoryStore implements StorePort {
                 if (encoded.sha256 !== content.sha256 || encoded.bytes.length !== content.rawBytes) { encoded.release(); throw new AgentFault('STORAGE_SEGMENT_CORRUPT', '内容快照与原SHA或字节数不同'); }
                 contents.set(key, { ...encoded, kind: content.kind });
             }
+            const historyItems = new Map<string, HistoryItem>();
             const history = snapshot.history.map((item, index) => {
                 const content = contents.get(JSON.stringify([conversationId, item.contentId]));
                 if (item.seq !== index + 1 || !content || item.objectRef.hash !== content.sha256 || item.objectRef.rawBytes !== content.bytes.length || item.kind !== content.kind) throw new AgentFault('STORAGE_SEGMENT_CORRUPT', '历史快照的原序号或正文引用不同');
-                return hold(item);
+                const stored = hold(item);
+                if (historyItems.has(stored.itemId)) throw new AgentFault('STORAGE_SNAPSHOT_INVALID', '历史快照存在重复项目ID');
+                historyItems.set(stored.itemId, stored);
+                return stored;
             });
             const events = snapshot.events.map((event, index) => {
                 if (event.conversationId !== conversationId || BigInt(event.eventSeq) !== BigInt(index + 1)) throw new AgentFault('STORAGE_SNAPSHOT_INVALID', '事件快照的原序号或归属不同');
@@ -633,6 +669,7 @@ export class MemoryStore implements StorePort {
                 for (const [key, receipt] of receipts) this.receipts.set(key, receipt);
                 for (const [key, content] of contents) this.contents.set(key, content);
                 this.history.set(conversationId, history); this.events.set(conversationId, events);
+                this.historyItems.set(conversationId, historyItems);
                 for (const entry of holds) this.metadataHolds.set(entry.value, entry);
                 this.indexConversationMetadata();
             } };
@@ -645,6 +682,7 @@ export class MemoryStore implements StorePort {
         for (const [key, receipt] of this.receipts) if (lifecycleReceiptOwner(receipt) === conversationId) this.receipts.delete(key);
         for (const [key, content] of this.contents) if ((JSON.parse(key) as string[])[0] === conversationId) { this.contents.delete(key); content.release(); }
         this.events.delete(conversationId); this.history.delete(conversationId);
+        this.historyItems.delete(conversationId);
         const owners = this.metadataOwners(this.records, this.receipts, this.events, this.history);
         for (const [value, entry] of this.metadataHolds) if (!owners.has(value)) { this.metadataHolds.delete(value); this.temporaryBudget.release(entry.conversationId, entry.bytes); }
         this.indexConversationMetadata();
@@ -694,6 +732,7 @@ export class MemoryStore implements StorePort {
         this.contents.clear();
         this.events.clear();
         this.history.clear();
+        this.historyItems.clear();
         this.lifecycleFrozenIds.clear();
         this.conversationMetadata.clear(); this.temporaryMetadataCandidates.clear();
         this.temporaryMetadataScan = undefined; this.temporaryMetadataPending = undefined;

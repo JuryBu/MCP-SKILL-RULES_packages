@@ -40,12 +40,15 @@ export class TerminalSession extends EventEmitter {
         this.input.once('end', this.endListener);
         this.input.resume();
         this.output.on('resize', this.resizeListener);
-        if (!this.linear) await this.write('\x1b[?25l\x1b[?2004h\x1b[2J\x1b[H');
+        if (!this.linear) await this.write('\x1b[?25l\x1b[?2004h\x1b[H\x1b[0J');
     }
 
-    write(text: string): Promise<void> {
+    write(text: string, geometry?: { width: number; height: number }): Promise<void> {
         const writing = this.chain.then(() => new Promise<void>((resolveWrite, rejectWrite) => {
             if (this.output.destroyed) { resolveWrite(); return; }
+            if (geometry && (geometry.width !== this.width || geometry.height !== this.height)) {
+                this.emit('resize'); resolveWrite(); return;
+            }
             this.output.write(text, error => error ? rejectWrite(error) : resolveWrite());
         }));
         this.chain = writing.catch(() => {});

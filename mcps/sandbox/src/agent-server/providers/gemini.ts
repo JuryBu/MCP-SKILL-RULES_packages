@@ -24,7 +24,7 @@ export function encodeGeminiCountTokensRequest(view: NativeSendView, modelId: st
     const model = modelId.replace(/^models\//, '');
     if (!model || !/^[a-zA-Z0-9._-]+$/.test(model)) throw new AgentFault('E_MODEL_INVALID', 'Gemini模型ID格式无效');
     return { generateContentRequest: { model: `models/${model}`,
-        ...(parameters === undefined ? geminiContentFields(view) : new GeminiAdapter().encode(view, modelId, parameters)) } };
+        ...(parameters === undefined ? geminiContentFields(view) : new GeminiAdapter().encodeForMeasurement(view, modelId, parameters)) } };
 }
 
 function normalizeGeminiResponse(attemptId: string, raw: RawProviderResponse): NormalizedResponse {
@@ -121,6 +121,14 @@ export class GeminiAdapter implements ProviderAdapter {
     }
 
     encode(view: NativeSendView, modelId: string, parameters: JsonObject): JsonObject {
+        return this.encodeRequest(view, modelId, parameters, false);
+    }
+
+    encodeForMeasurement(view: NativeSendView, modelId: string, parameters: JsonObject): JsonObject {
+        return this.encodeRequest(view, modelId, parameters, true);
+    }
+
+    private encodeRequest(view: NativeSendView, modelId: string, parameters: JsonObject, completedTailForMeasurement: boolean): JsonObject {
         const contentFields = geminiContentFields(view);
         for (const key of Object.keys(parameters)) if (reserved.has(key)) throw new AgentFault('E_PARAMETER_CONFLICT', `参数${key}由核心固定`);
         let generation = objectValue(parameters.generationConfig);
@@ -134,7 +142,7 @@ export class GeminiAdapter implements ProviderAdapter {
                 || !level || !['LOW', 'MEDIUM', 'HIGH'].includes(level)) {
                 throw new AgentFault('E_PARAMETER_UNSUPPORTED', 'Gemini 3.8 thinkingLevel只接受low、medium或high，不能使用thinkingBudget或minimal');
             }
-            if (view.contents?.at(-1)?.role === 'model') throw new AgentFault('E_PARAMETER_UNSUPPORTED', 'Gemini 3.8不接受预填model轮次');
+            if (!completedTailForMeasurement && view.contents?.at(-1)?.role === 'model') throw new AgentFault('E_PARAMETER_UNSUPPORTED', 'Gemini 3.8不接受预填model轮次');
             generation = { ...generation, thinkingConfig: { ...thinking, thinkingLevel: level } };
         }
         if (generation?.candidateCount !== undefined && generation.candidateCount !== 1) {
