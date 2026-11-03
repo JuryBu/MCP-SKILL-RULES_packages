@@ -33,6 +33,7 @@ export interface AgentRequestOptions {
     clientCommandId?: string;
     acquireControl?: boolean;
     recoverReceipt?: boolean;
+    connectedOnly?: boolean;
 }
 
 export interface ControlLease {
@@ -54,6 +55,8 @@ interface CommandRecord {
     uncertain: boolean;
     submitted: boolean;
     serverInstanceId?: string;
+    controlLeaseId?: string;
+    controlEpoch?: number;
 }
 
 export function clientFailure(error: unknown, mayHaveStarted = false): RpcResult {
@@ -175,7 +178,10 @@ export class AgentClient extends EventEmitter {
         if (previous) {
             if (previous.hash !== hash) return clientFailure(new AgentFault('COMMAND_CONFLICT', '同一命令ID已用于不同的方法或参数', { clientCommandId })) as RpcResult<Data>;
             if (previous.promise) return previous.promise as Promise<RpcResult<Data>>;
-            if (previous.uncertain) return this.recoverCommand(previous) as Promise<RpcResult<Data>>;
+            if (previous.uncertain) {
+                if (options.recoverReceipt === false) return this.unknownReceipt(previous, '原命令结果待显式查询') as RpcResult<Data>;
+                return this.recoverCommand(previous) as Promise<RpcResult<Data>>;
+            }
             return previous.result as RpcResult<Data>;
         }
         this.trimCommandCache(MAX_TRACKED_COMMANDS - 1);
@@ -217,12 +223,12 @@ export class AgentClient extends EventEmitter {
         return lease ? { ...lease } : undefined;
     }
 
-    async renewControl(scope: 'server' | 'conversation', conversationId?: string): Promise<RpcResult<ControlLease>> {
+    async renewControl(scope: 'server' | 'conversation', conversationId?: string, options: AgentRequestOptions = {}): Promise<RpcResult<ControlLease>> {
         const lease = this.getControlLease(scope, conversationId);
         if (!lease) return clientFailure(new AgentFault('CONTROL_REQUIRED', '客户端没有可续期的控制租约')) as RpcResult<ControlLease>;
         return this.request<ControlLease>('server.renewControl', {
             scope, ...(conversationId ? { conversationId } : {}), controlLeaseId: lease.controlLeaseId, controlEpoch: lease.controlEpoch,
-        }, { acquireControl: false });
+        }, { ...options, acquireControl: false });
     }
 
     async releaseControl(scope: 'server' | 'conversation', conversationId?: string): Promise<RpcResult> {
@@ -242,7 +248,7 @@ export class AgentClient extends EventEmitter {
             if (this.renewalInFlight || this.disposed || this.leases.size === 0) return;
             this.renewalInFlight = true;
             void Promise.all([...this.leases.values()].map(async lease => {
-                const result = await this.renewControl(lease.scope, lease.conversationId);
+                const result = await this.renewControl(lease.scope, lease.conversationId, { connectedOnly: true, recoverReceipt: false });
                 if (!result.ok) this.invalidateLease(lease.scope, lease.conversationId, result.error?.code ?? 'CONTROL_REQUIRED', lease);
             })).finally(() => { this.renewalInFlight = false; });
         }, intervalMs);
@@ -421,11 +427,14 @@ export class AgentClient extends EventEmitter {
 
     private async sendCommand(record: CommandRecord, params: Record<string, unknown>, options: AgentRequestOptions): Promise<RpcResult> {
         let sent = false;
+        const renewalConnection = options.connectedOnly ? this.control : null;
         try {
             const spec = METHOD_SPECS[record.method];
             const preliminary = spec.schema.safeParse(params);
             if (!preliminary.success) return this.invalidParams(record.method, preliminary.error.issues);
-            await this.connect();
+            if (options.connectedOnly) {
+                if (!renewalConnection?.connected || this.disposed) return clientFailure(new AgentFault('IPC_UNAVAILABLE', '后台续期等待已有连接，不启动新核心'));
+            } else await this.connect();
             const outgoing = { ...preliminary.data } as Record<string, unknown>;
             if (spec.scope !== 'none' && options.acquireControl !== false && outgoing.controlLeaseId === undefined) {
                 let lease = this.getControlLease(spec.scope, record.conversationId);
@@ -448,9 +457,15 @@ export class AgentClient extends EventEmitter {
             sent = true;
             record.submitted = true;
             record.serverInstanceId = this.server?.serverInstanceId;
-            const result = await this.control!.request(record.method, outgoing, { writes: true, timeoutMs });
-            if (result.ok && record.serverInstanceId === this.server?.serverInstanceId) this.captureLease(result.data, outgoing, record.method);
-            else if (result.error && ['CONTROL_REQUIRED', 'CONTROL_CONFLICT'].includes(result.error.code)) {
+            record.controlLeaseId = typeof outgoing.controlLeaseId === 'string' ? outgoing.controlLeaseId : undefined;
+            record.controlEpoch = typeof outgoing.controlEpoch === 'number' ? outgoing.controlEpoch : undefined;
+            const result = await (renewalConnection ?? this.control)!.request(record.method, outgoing, { writes: true, timeoutMs });
+            const scope = outgoing.scope === 'server' ? 'server' : 'conversation';
+            const currentLease = this.leases.get(this.leaseKey(scope, record.conversationId));
+            const currentRenewal = !options.connectedOnly || renewalConnection === this.control
+                && currentLease !== undefined && currentLease.controlLeaseId === outgoing.controlLeaseId && currentLease.controlEpoch === outgoing.controlEpoch;
+            if (currentRenewal && result.ok && record.serverInstanceId === this.server?.serverInstanceId) this.captureLease(result.data, outgoing, record.method);
+            else if (currentRenewal && result.error && ['CONTROL_REQUIRED', 'CONTROL_CONFLICT'].includes(result.error.code)) {
                 const scope = spec.scope !== 'none' ? spec.scope : outgoing.scope === 'server' ? 'server' : 'conversation';
                 this.invalidateLease(scope, record.conversationId, result.error.code);
             }
@@ -488,8 +503,15 @@ export class AgentClient extends EventEmitter {
     }
 
     private captureLease(data: unknown, params: Record<string, unknown>, method: string): void {
+        if (method === 'server.shutdown') {
+            this.leases.clear(); this.stopUnusedRenewal(); return;
+        }
         if (method === 'conversations.close' && typeof params.conversationId === 'string') {
             this.leases.delete(this.leaseKey('conversation', params.conversationId)); this.stopUnusedRenewal(); return;
+        }
+        if (method === 'server.renewControl') {
+            const current = this.leases.get(this.leaseKey(params.scope === 'server' ? 'server' : 'conversation', typeof params.conversationId === 'string' ? params.conversationId : undefined));
+            if (!current || current.controlLeaseId !== params.controlLeaseId || current.controlEpoch !== params.controlEpoch) return;
         }
         if (!['conversations.create', 'server.claimControl', 'server.renewControl', 'server.releaseControl'].includes(method)) return;
         if (method === 'server.releaseControl') {
@@ -553,7 +575,7 @@ export class AgentClient extends EventEmitter {
         if (record.serverInstanceId !== this.server?.serverInstanceId) return;
         const data = record.result?.data;
         const scope = record.controlScope ?? (data && typeof data === 'object' ? (data as Record<string, unknown>).scope : undefined);
-        this.captureLease(data, { conversationId: record.conversationId, scope }, record.method);
+        this.captureLease(data, { conversationId: record.conversationId, scope, controlLeaseId: record.controlLeaseId, controlEpoch: record.controlEpoch }, record.method);
     }
 
     private invalidateLease(scope: 'server' | 'conversation', conversationId: string | undefined, code: string, expected?: ControlLease): void {
