@@ -1,4 +1,4 @@
-import { execFile, fork } from "node:child_process";
+import { execFile, fork, type ChildProcess } from "node:child_process";
 import { promisify } from "node:util";
 import fs from "node:fs";
 import path from "node:path";
@@ -17,6 +17,7 @@ export interface IsolatedSourceControl {
 export interface IsolatedSourceOptions {
     target?: { file: string; execArgv?: string[] };
     timeoutMs?: number;
+    terminateProcessTree?: (child: ChildProcess) => Promise<void>;
 }
 export interface SourcePatch {
     type: "set" | "append" | "text";
@@ -41,6 +42,25 @@ export function rememberIsolatedSourceIdentity(summary: DevinConversationSummary
 export async function closeIsolatedSourceWorkers(): Promise<void> {
     closing = true;
     await Promise.all([...activeWorkers.values()].map(close => close()));
+}
+
+export async function waitForIsolatedSourceExit(child: ChildProcess, timeoutMs = 250): Promise<boolean> {
+    const exited = (): boolean => child.exitCode !== null || child.signalCode !== null;
+    if (exited()) return true;
+    return new Promise<boolean>(resolve => {
+        let settled = false;
+        const finish = (confirmed: boolean): void => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(timer);
+            child.removeListener("exit", onExit);
+            resolve(confirmed);
+        };
+        const onExit = (): void => finish(exited());
+        const timer = setTimeout(() => finish(exited()), timeoutMs);
+        child.once("exit", onExit);
+        if (exited()) finish(true);
+    });
 }
 
 export function isIsolatedSourceWorker(): boolean {
@@ -129,11 +149,14 @@ export async function runIsolatedSource<Result>(operation: IsolatedSourceOperati
                 failure ??= error;
                 if (termination || child.pid === undefined || child.exitCode !== null || child.signalCode !== null) return;
                 termination = (async () => {
-                    if (process.platform === "win32") await execFileAsync("taskkill.exe", ["/PID", String(child.pid), "/T", "/F"], { windowsHide: true, timeout: 5000 });
+                    if (options.terminateProcessTree) await options.terminateProcessTree(child);
+                    else if (process.platform === "win32") await execFileAsync("taskkill.exe", ["/PID", String(child.pid), "/T", "/F"], { windowsHide: true, timeout: 5000 });
                     else process.kill(-child.pid!, "SIGKILL");
-                })().catch(error => {
-                    if (child.exitCode === null && child.signalCode === null) {
-                        failure = sourceError("SOURCE_WORKER_CLEANUP", `History source process-tree cleanup failed: ${String(error)}`);
+                })().catch(async error => {
+                    if (!await waitForIsolatedSourceExit(child)) {
+                        const originalFailure = failure;
+                        const originalCode = (originalFailure as NodeJS.ErrnoException | undefined)?.code || originalFailure?.name || "unknown";
+                        failure = Object.assign(sourceError("SOURCE_WORKER_CLEANUP", `History source process-tree cleanup failed: ${String(error)}; original failure: ${originalCode}: ${originalFailure?.message || "unknown"}`), { cause: originalFailure, cleanupCause: error });
                         child.kill("SIGKILL");
                     }
                 });

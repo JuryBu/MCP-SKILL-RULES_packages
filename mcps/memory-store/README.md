@@ -1,4 +1,4 @@
-# MCP Memory Store v1.27.2
+# MCP Memory Store v1.27.3
 
 历史定位、来源重读取与控制请求的补修见[故障隔离说明](docs/history-source-isolation.md)：包含WSF递归查询、候选先查近期范围、独立源执行器、期限与整树取消、状态/取消的独立通路，以及查询前缀、旧Codex元数据和PDF子进程的同类修复。
 
