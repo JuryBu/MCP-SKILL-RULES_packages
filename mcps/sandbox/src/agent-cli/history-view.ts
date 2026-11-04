@@ -1,5 +1,20 @@
 import { terminalSafeText } from './renderer.js';
 
+export const MAX_TRANSCRIPT_CHARACTERS = 256 * 1024;
+
+export function appendTranscriptLines(previous: readonly string[], text: string, replace = false): string[] {
+    const lines = [...(replace ? [] : previous), ...(!replace && previous.length ? [''] : []), ...terminalSafeText(text).split('\n')];
+    let characters = 0;
+    let start = lines.length;
+    while (start > 0 && lines.length - start < 2000) {
+        const length = lines[start - 1].length + 1;
+        if (characters + length > MAX_TRANSCRIPT_CHARACTERS) break;
+        characters += length;
+        start -= 1;
+    }
+    return start === lines.length ? [lines.at(-1)!.slice(-MAX_TRANSCRIPT_CHARACTERS)] : lines.slice(start);
+}
+
 function record(value: unknown): Record<string, unknown> {
     return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {};
 }

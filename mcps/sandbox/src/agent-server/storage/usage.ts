@@ -53,6 +53,8 @@ export function readUsageSummary(database: SqlDatabase, query: UsageQuery): Usag
             + CASE WHEN json_extract(usage,'$.inputIncludesCache') = 0
                 THEN COALESCE(json_extract(usage,'$.cacheReadTokens'),0) + COALESCE(json_extract(usage,'$.cacheWriteTokens'),0) ELSE 0 END) AS input_tokens,
         SUM(COALESCE(json_extract(usage,'$.outputTokens'),0)) AS output_tokens,
+        SUM(CASE WHEN json_extract(usage,'$.outputIncludesReasoning') = 0
+            THEN COALESCE(json_extract(usage,'$.reasoningTokens'),0) ELSE 0 END) AS additional_reasoning_tokens,
         SUM(COALESCE(json_extract(usage,'$.cacheReadTokens'),0)) AS cached_tokens,
         SUM(CASE WHEN json_extract(usage,'$.cacheReadTokens') IS NULL THEN 1 ELSE 0 END) AS unknown_cache_tokens,
         SUM(CASE WHEN json_extract(usage,'$.inputTokens') IS NULL OR json_extract(usage,'$.outputTokens') IS NULL THEN 1 ELSE 0 END) AS unknown_tokens
@@ -63,7 +65,7 @@ export function readUsageSummary(database: SqlDatabase, query: UsageQuery): Usag
     const unknown = Number(unknownCharges?.count ?? 0) + Number(pending?.count ?? 0) > 0;
     const unknownTokens = Number(tokens?.unknown_tokens ?? 0);
     const unknownCache = Number(tokens?.unknown_cache_tokens ?? 0);
-    return { inputTokens, outputTokens, cachedInputTokens: Number(tokens?.cached_tokens ?? 0), totalTokens: inputTokens + outputTokens,
+    return { inputTokens, outputTokens, cachedInputTokens: Number(tokens?.cached_tokens ?? 0), totalTokens: inputTokens + outputTokens + Number(tokens?.additional_reasoning_tokens ?? 0),
         costs, amountStatus: unknown ? costs.length ? 'partial' : 'unknown' : 'known',
         tokensStatus: unknownTokens ? unknownTokens === Number(tokens?.count ?? 0) ? 'unknown' : 'partial' : 'known',
         cacheStatus: unknownCache ? unknownCache === Number(tokens?.count ?? 0) ? 'unknown' : 'partial' : 'known' };

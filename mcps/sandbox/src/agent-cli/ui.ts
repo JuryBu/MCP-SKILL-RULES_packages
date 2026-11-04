@@ -19,7 +19,7 @@ import { readConfigurationCliPreferences, refreshSavedProfileCatalog } from './c
 import type { AmbiguousWidth } from './configuration-width.js';
 import { directoryPage, filePreview } from './selection.js';
 import { usageOverviewLines, type UsageOverview } from './usage-view.js';
-import { historyMessage, modelHistoryText } from './history-view.js';
+import { appendTranscriptLines, historyMessage, modelHistoryText } from './history-view.js';
 import { FolderPickerError, pickDirectory } from './folder-picker.js';
 import { PartialAnswerBuffer, type PartialAnswerState } from './partial-answer.js';
 import { runFailureLines } from './run-view.js';
@@ -68,6 +68,8 @@ export class InteractiveCli {
     private readonly conversationUpdateReceipts = new Map<string, CommandExecution>();
     private logs: string[] = [];
     private details: string[] = [];
+    private transcript: string[] = [];
+    private transcriptFollow = true;
     private detailsOffset = 0;
     private detailCache?: { source: string[]; width: number; ambiguousWidth?: AmbiguousWidth; lines: string[] };
     private state: MascotState = 'idle';
@@ -346,6 +348,7 @@ export class InteractiveCli {
             const { pageRows, maxOffset } = this.detailPage();
             this.detailsOffset = Math.max(0, Math.min(maxOffset, Math.min(maxOffset, this.detailsOffset) + (key.name === 'pageup' ? -pageRows : pageRows)));
             if (this.partialVisible) this.partialFollow = key.name === 'pagedown' && this.detailsOffset === maxOffset;
+            else if (!this.details.length && this.transcript.length) this.transcriptFollow = key.name === 'pagedown' && this.detailsOffset === maxOffset;
         }
         else if (key.name === 'tab') {
             if (this.form?.fields[this.form.index].key === 'path') await this.completePath(this.form);
@@ -602,6 +605,7 @@ export class InteractiveCli {
         this.restoreSelection(result.data);
         this.usageOverview = undefined; this.usageLoadedAt = 0;
         if (!preserveDetails) {
+            this.transcript = []; this.transcriptFollow = true;
             this.details = conversationSummary(result.data) ?? [];
             this.detailsOffset = 0; this.detailCache = undefined;
         }
@@ -683,7 +687,7 @@ export class InteractiveCli {
             if (text) sections.push(text);
         }
         this.historyCursor = typeof page.nextCursor === 'string' ? page.nextCursor : undefined;
-        if (sections.length) await this.printTranscript(sections.join('\n\n'));
+        if (sections.length) await this.printTranscript(sections.join('\n\n'), !cursor);
         if (omitted || page.hasMore) this.log(`${omitted ? omitted + '条较长原文尚未载入 · ' : ''}${page.hasMore ? '/history继续读取本次历史下一页' : '/history查看原文页'}`);
     }
 
@@ -1285,7 +1289,7 @@ export class InteractiveCli {
             else this.log('当前没有已选执行，可用/run list查看记录');
             return;
         }
-        if (name === 'clear') { this.commandDraft = undefined; this.logs = []; this.details = []; this.renderer.reset(); return; }
+        if (name === 'clear') { this.commandDraft = undefined; this.logs = []; this.details = []; this.transcript = []; this.transcriptFollow = true; this.detailCache = undefined; this.renderer.reset(); return; }
         if (name === 'editor') { this.commandDraft = undefined; await this.editDraft(); return; }
         if (name === 'reconnect') {
             this.commandDraft = undefined; this.connection = '正在恢复原连接与游标'; this.scheduleRender(true);
@@ -1799,17 +1803,18 @@ export class InteractiveCli {
         if (closed) await this.openConversation(targetId, observe);
     }
 
-    private async printTranscript(text: string): Promise<void> {
+    private async printTranscript(text: string, replace = false): Promise<void> {
         if (this.editing) return;
         const transcript = terminalSafeText(text);
+        this.transcript = appendTranscriptLines(this.transcript, transcript, replace);
+        if (replace) this.transcriptFollow = true;
         this.partialVisible = false;
         this.printingTranscript = true;
         this.hideNativeGraphics();
         try {
             if (this.terminal.linear) await new Promise<void>((resolveWrite, rejectWrite) => this.streams.stdout.write(transcript + '\n', error => error ? rejectWrite(error) : resolveWrite()));
-            else await this.terminal.write(this.renderer.appendTranscript(transcript, this.terminal.height));
-            this.details = []; this.detailsOffset = 0; this.detailCache = undefined;
-        } finally { this.printingTranscript = false; this.scheduleRender(); }
+            this.details = []; if (this.transcriptFollow) this.detailsOffset = 0; this.detailCache = undefined;
+        } finally { this.printingTranscript = false; this.renderer.reset(); this.scheduleRender(true); }
     }
 
     private showResult(execution: CommandExecution, options: { raw?: boolean; titleHint?: string } = {}): void {
@@ -1839,7 +1844,8 @@ export class InteractiveCli {
 
     private view(): TerminalView {
         const { lines, maxOffset } = this.detailPage();
-        this.detailsOffset = this.showingPartial && this.partialFollow ? maxOffset : Math.max(0, Math.min(maxOffset, this.detailsOffset));
+        const followTranscript = !this.terminal.linear && !this.showingPartial && !this.details.length && this.transcript.length > 0 && this.transcriptFollow;
+        this.detailsOffset = this.showingPartial && this.partialFollow || followTranscript ? maxOffset : Math.max(0, Math.min(maxOffset, this.detailsOffset));
         let details = lines.slice(this.detailsOffset);
         if (this.showingPartial && this.terminal.linear && this.partialAnswer?.current?.state === 'receiving') details = [this.partialAnswer.caption, '完成后显示正式全文；已接片段在本轮临时区保留'];
         if (this.showingPartial && this.partialAnswer?.runId === this.run?.runId && this.failureDetails.length) {
@@ -1886,7 +1892,7 @@ export class InteractiveCli {
         const columns = Math.max(20, Math.min(300, Math.floor(this.terminal.width)));
         const width = Math.max(8, columns - (sprite ? sprite + 9 : 4));
         const ambiguousWidth = this.renderer.options.ambiguousWidth;
-        const source = this.showingPartial ? this.partialAnswer!.lines() : this.details;
+        const source = this.showingPartial ? this.partialAnswer!.lines() : this.details.length || this.terminal.linear ? this.details : this.transcript;
         if (this.detailCache?.source === source && this.detailCache.width === width && this.detailCache.ambiguousWidth === ambiguousWidth) return this.detailCache.lines;
         const lines = source.flatMap(line => wrapText(line, width, ambiguousWidth));
         this.detailCache = { source, width, ambiguousWidth, lines };
