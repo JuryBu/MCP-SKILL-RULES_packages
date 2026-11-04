@@ -16,21 +16,23 @@ export function budgetDefinitionFromRun(input: {
     const value = input.budget;
     const now = input.now ?? Date.now();
     const mode = value.costMode ?? value.mode ?? 'hard';
-    const quotaLimitId = resolveQuotaLimitId(value, input.profile, input.quotaLimitId);
+    const selectedQuota = value.quotaLimitId ?? input.quotaLimitId ?? input.profile?.quotaLimitId;
+    const quotaLimitId = mode === 'metered' && !selectedQuota ? undefined : resolveQuotaLimitId(value, input.profile, input.quotaLimitId);
+    const currency = mode === 'metered' && (value.currency === undefined || value.currency === null) ? 'XXX' : value.currency;
     const wallMs = value.wallMs ?? 3_600_000;
     const deadlineTime = typeof value.deadlineAt === 'string' ? Date.parse(value.deadlineAt) : now + Number(wallMs);
     if (!Number.isFinite(deadlineTime)) throw new AgentFault('BUDGET_REQUIRED', '执行预算需要有限有效期限');
     const deadlineAt = new Date(deadlineTime).toISOString();
     const maxOutputTokens = value.maxOutputTokens ?? input.maxOutputTokens;
-    if (!input.rootBudgetId || !input.sourceRef || !['hard', 'estimated'].includes(String(mode))
+    if (!input.rootBudgetId || !input.sourceRef || !['hard', 'estimated', 'metered'].includes(String(mode))
         || !Number.isFinite(Date.parse(deadlineAt)) || Date.parse(deadlineAt) <= now
         || !Number.isSafeInteger(value.maxModelCalls) || Number(value.maxModelCalls) < 1
         || !Number.isSafeInteger(maxOutputTokens) || Number(maxOutputTokens) < 1
-        || typeof value.currency !== 'string' || !/^[A-Z]{3}$/.test(value.currency)
+        || typeof currency !== 'string' || !/^[A-Z]{3}$/.test(currency)
         || (mode === 'hard' && (!Number.isSafeInteger(value.maxCostMicros) || Number(value.maxCostMicros) < 0))) {
         throw new AgentFault('BUDGET_REQUIRED', '执行预算缺少全局限额引用、输出上限、币种、次数或期限');
     }
-    return { rootBudgetId: input.rootBudgetId, quotaLimitId, mode: mode as 'hard' | 'estimated', currency: value.currency,
+    return { rootBudgetId: input.rootBudgetId, ...(quotaLimitId ? { quotaLimitId } : {}), mode: mode as 'hard' | 'estimated' | 'metered', currency,
         maxCostMicros: value.maxCostMicros === null || value.maxCostMicros === undefined ? null : Number(value.maxCostMicros),
         maxModelCalls: Number(value.maxModelCalls), maxOutputTokens: Number(maxOutputTokens), deadlineAt, sourceRef: input.sourceRef };
 }

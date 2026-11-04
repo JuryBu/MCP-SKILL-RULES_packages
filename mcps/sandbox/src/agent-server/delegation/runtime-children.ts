@@ -13,12 +13,15 @@ import type { ChildLimits, ChildReceipt, ChildSelection, InternalDelegationPort,
 import { selectChildTools } from './tool-policy.js';
 import type { ChildToolSelectionPolicy } from './tool-policy.js';
 
-export interface ChildLink { childRunId: string; childConversationId: string; callKey: string; requestHash: string; inputHash: string }
+export interface ChildLink { childRunId: string; childConversationId: string; callKey: string; requestHash: string; inputHash: string;
+    parentRoundId?: string; parentActionId?: string }
 interface ChildAttempt { attemptId: string; snapshotHash: string; upperBound: UpperBound }
 export interface ChildAllocation {
     parentConversationId: string;
     parentRunId: string;
     parentRunEpoch: number;
+    parentRoundId?: string;
+    parentActionId?: string;
     rulesHash: string;
     maxContextTokens: number;
     attempts: ChildAttempt[];
@@ -52,9 +55,12 @@ export function rememberChildChange(run: RunData, step: ExecutorStepWrite): void
     const result = step.result.result;
     if (!result || typeof result !== 'object' || Array.isArray(result)) return;
     const data = result.data;
-    if (result.ok !== true || !data || typeof data !== 'object' || Array.isArray(data) || typeof data.workspaceRevision !== 'number') return;
+    if (result.ok !== true || !data || typeof data !== 'object' || Array.isArray(data)) return;
+    const coverage = data.coverage && typeof data.coverage === 'object' && !Array.isArray(data.coverage) ? data.coverage : {};
+    const actionIds = Array.isArray(coverage.actionIds) ? coverage.actionIds.filter((value): value is string => typeof value === 'string') : [];
+    if (typeof data.workspaceRevision !== 'number' && !actionIds.length) return;
     const previous = Array.isArray(run.internalChangedActionIds) ? run.internalChangedActionIds as string[] : [];
-    run.internalChangedActionIds = [...new Set([...previous, step.actionId])];
+    run.internalChangedActionIds = [...new Set([...previous, ...(actionIds.length ? actionIds : [step.actionId])])];
 }
 const settled = (run: RunData): boolean => ['succeeded', 'failed', 'cancelled'].includes(run.state)
     && ['released', 'not_needed'].includes(run.cleanupState);
@@ -190,7 +196,8 @@ export class InternalChildren implements InternalDelegationPort {
                 delegatedToolSelection: structuredClone(toolSelection.decisions),
                 rootBudgetDefinition: structuredClone(root), modelRulesSnapshot: structuredClone(plan.rulesDocument),
                 delegationContext: { refs: plan.contextRefs, provenance: selection.provenance, contextTokens: selection.contextTokens,
-                    maxContextTokens: limits.maxContextTokens }, parentConversationId: context.conversationId };
+                    maxContextTokens: limits.maxContextTokens }, parentConversationId: context.conversationId,
+                parentRunId: context.runId, parentRoundId: context.roundId, parentActionId: context.actionId };
             const conversation: ConversationData = { ...structuredClone(parent.conversation.value), conversationId, options: childOptions,
                 state: 'open', retention: { ...parent.conversation.value.retention, activeRuns: 1, lastRunEnd: null, lastClose: null, expiresAt: null },
                 createdAt: time, updatedAt: time, historyEpoch: 1, appendSeq: 0, viewRevision: 0, workspaceRevision: 0,
@@ -198,7 +205,8 @@ export class InternalChildren implements InternalDelegationPort {
                 configRevision: 1, cleanupState: 'not_needed', cleanupError: null, closeCleanupCompleted: false };
             delete conversation.closeReceiptKeys;
             const allocation: ChildAllocation = { parentConversationId: context.conversationId, parentRunId: context.runId,
-                parentRunEpoch: context.runEpoch, rulesHash: plan.rulesHash, maxContextTokens: limits.maxContextTokens, attempts: [] };
+                parentRunEpoch: context.runEpoch, parentRoundId: context.roundId, parentActionId: context.actionId,
+                rulesHash: plan.rulesHash, maxContextTokens: limits.maxContextTokens, attempts: [] };
             const run: RunData = { conversationId, runId: plan.childRunId, rootRunId: plan.rootRunId, parentRunId: plan.parentRunId,
                 kind: 'task', runEpoch: 1, state: 'queued', phase: 'admitting', resultStatus: null, stopReason: null, effectState: 'none',
                 cleanupState: 'not_needed', activeRoundId: null, activeStepId: null, pendingInteractionIds: [],
@@ -212,6 +220,7 @@ export class InternalChildren implements InternalDelegationPort {
             const input = this.hooks.createInput(conversationId, run.runId, { ...selected,
                 text: typeof selected.text === 'string' && selected.text ? `${plan.task}\n\n${selected.text}` : plan.task });
             const link: ChildLink = { childRunId: run.runId, childConversationId: conversationId, callKey, requestHash,
+                parentRoundId: context.roundId, parentActionId: context.actionId,
                 inputHash: childInputHash({ taskKind: plan.taskKind, task: plan.task, contextRefs: plan.contextRefs, writeRoots: roots, limits }) };
             const parentRun = { ...parent.run.value, internalChildren: [...childLinks(parent.run.value), link] };
             await this.hooks.commit(parent.conversation, [{ ...parent.run, revision: parent.run.revision + 1, value: parentRun },

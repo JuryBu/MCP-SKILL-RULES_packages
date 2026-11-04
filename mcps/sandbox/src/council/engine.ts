@@ -23,6 +23,7 @@ import type {
 } from "./types.js";
 import { normalizeCouncilModelConfig, normalizeCouncilProvider } from "./types.js";
 import { AgentCouncilSession, type CouncilApiClientFactory } from "./api-session.js";
+import { councilMediaDescription, readyCouncilImages } from "./api-results.js";
 
 const DEFAULT_MAX_ROUNDS = Number(process.env.SANDBOX_COUNCIL_MAX_ROUNDS || 4);
 const DEFAULT_MAX_TOOL_CALLS = Number(process.env.SANDBOX_COUNCIL_MAX_TOOL_CALLS || 6);
@@ -157,7 +158,7 @@ function buildParticipantContext(
 function formatHistory(rounds: CouncilTranscript["rounds"]): string {
     const text = rounds.map((round) => {
         const messages = round.messages.map((message) => {
-            const body = message.error ? `ERROR: ${message.error}` : `${message.text}${message.metadata?.media ? `\n原生媒体结果: ${JSON.stringify(message.metadata.media)}` : ""}`;
+            const body = message.error ? `ERROR: ${message.error}` : [message.text, councilMediaDescription(message.metadata)].filter(Boolean).join("\n");
             return `[${message.participantId}/${message.role}]\n${body}`;
         }).join("\n\n");
         const moderatorSteps = round.moderatorSteps && round.moderatorSteps.length > 0
@@ -170,7 +171,7 @@ function formatHistory(rounds: CouncilTranscript["rounds"]): string {
             const afterToolInstruction = step.afterToolInstruction
                 ? `\n\n[moderator-step:${index + 1}:afterToolInstruction]\n${step.afterToolInstruction}`
                 : "";
-            return `[moderator-step:${index + 1}:${step.action}]\n${step.summary}${tools}${afterToolInstruction}`;
+            return `[moderator-step:${index + 1}:${step.action}]\n${step.summary}${tools}${afterToolInstruction}\n${councilMediaDescription(step.metadata)}`;
         }).join("\n\n");
         return `Round ${round.round}\n${messages}\n\n${moderatorText}`;
     }).join("\n\n---\n\n");
@@ -204,7 +205,7 @@ function moderatorPrompt(
         webFetchText: params.tools?.webFetchText !== false,
         simpleScript: params.tools?.simpleScript !== false,
     }).filter(([, enabled]) => enabled).map(([name]) => name).join(", ");
-    const currentMessages = messages.map((message) => `[${message.participantId}/${message.role}]\n${message.error ? `ERROR: ${message.error}` : message.text}${message.metadata?.media ? `\n原生媒体结果: ${JSON.stringify(message.metadata.media)}` : ""}`).join("\n\n");
+    const currentMessages = messages.map((message) => `[${message.participantId}/${message.role}]\n${message.error ? `ERROR: ${message.error}` : message.text}\n${councilMediaDescription(message.metadata)}`).join("\n\n");
     const currentToolResults = roundToolResults.length > 0
         ? `# 本轮已执行工具\n${roundToolResults.map((toolResult, index) => `[tool:${index + 1}:${toolResult.tool}:${toolResult.ok ? "ok" : "error"}]\n${toolResult.text}`).join("\n\n")}`
         : "";
@@ -442,7 +443,7 @@ function buildModeratorFailureDecision(messages: CouncilTurnMessage[], err: unkn
     };
 }
 
-async function buildImageObservations(params: CouncilRunParams): Promise<string> {
+async function buildImageObservations(params: CouncilRunParams, sources = ""): Promise<string> {
     throwIfCouncilAborted(params.signal);
     const imagePaths = params.images || [];
     if (imagePaths.length === 0) return "";
@@ -457,14 +458,47 @@ async function buildImageObservations(params: CouncilRunParams): Promise<string>
         const prompt = [
             "请把这些图片转述成可供多模型文本讨论使用的观察记录。",
             "要求：描述可见文字、布局、数据、异常、可能不确定处；不要做身份识别。",
+            sources,
         ].join("\n");
         const result = await callCouncilModel({ ...model, supportsVision: true }, prompt, imagePaths, DEFAULT_COUNCIL_MODEL_TIMEOUT_MS, params.signal, params.runId, params.apiSession);
-        return result.text;
+        return result.text.trim() || "图像转述模型未返回文字摘要；纯文本成员尚无这些图片的视觉观察。";
     } catch (err) {
         throwIfCouncilAborted(params.signal);
         if (model.profileId || model.provider === "api") throw err;
         return `多模态转述失败: ${err instanceof Error ? err.message : String(err)}`;
     }
+}
+
+interface CouncilMediaSource { label: string; metadata?: Record<string, unknown> }
+
+function roundMediaSources(rounds: CouncilTranscript["rounds"]): CouncilMediaSource[] {
+    return rounds.flatMap(round => [
+        ...round.messages.map(message => ({ label: `Round ${round.round} / ${message.participantId} / ${message.model ?? message.provider}`, metadata: message.metadata })),
+        ...(round.moderatorSteps?.length ? round.moderatorSteps : [round.moderator]).map((step, index) => ({
+            label: `Round ${round.round} / moderator / step ${index + 1}`, metadata: step.metadata,
+        })),
+    ]);
+}
+
+async function prepareSharedCouncilImages(params: CouncilRunParams, sources: CouncilMediaSource[]): Promise<{ paths: string[]; observations: string }> {
+    const images = sources.flatMap(source => readyCouncilImages(source.metadata).map(image => ({ ...image, source })));
+    const fresh = images.filter(image => {
+        const summary = image.source.metadata?.councilImageSummary as { text?: unknown; sha256s?: unknown } | undefined;
+        return typeof summary?.text !== "string" || !Array.isArray(summary.sha256s) || !summary.sha256s.includes(image.sha256);
+    });
+    if (fresh.length && hasOnlyTextActors(params)) {
+        const paths = [...new Set(fresh.map(image => image.path))];
+        const sourceText = fresh.map(image => `${image.source.label}: ${image.path}, SHA256=${image.sha256}`).join("\n");
+        const text = await buildImageObservations({ ...params, images: paths }, `图片来源及顺序:\n${sourceText}`);
+        for (const image of fresh) {
+            image.source.metadata!.councilImageSummary = { text, sha256s: fresh.map(item => item.sha256), sources: sourceText };
+        }
+    }
+    const observations = [...new Set(images.map(image => {
+        const summary = image.source.metadata?.councilImageSummary as { text?: unknown; sources?: unknown } | undefined;
+        return `${image.source.label}: ${image.path}, SHA256=${image.sha256}\n${typeof summary?.text === "string" ? summary.text : "暂无图像文字摘要，纯文本成员只能引用来源，尚未读取原图。"}`;
+    }))].join("\n\n");
+    return { paths: [...new Set(images.map(image => image.path))], observations };
 }
 
 function hasOnlyTextActors(params: CouncilRunParams): boolean {
@@ -633,6 +667,8 @@ async function runCouncilWithinArtifactRun(params: CouncilRunParams): Promise<Co
 
     for (let round = startRound; round <= maxRounds; round++) {
         throwIfCouncilAborted(effectiveParams.signal);
+        const priorMedia = await prepareSharedCouncilImages(effectiveParams, roundMediaSources(transcript.rounds));
+        const participantImages = [...new Set([...imagePaths, ...priorMedia.paths])];
         writeCheckpoint(params, transcript, {
             taskId: params.resumeState?.sourceTaskId,
             currentRound: round,
@@ -651,8 +687,10 @@ async function runCouncilWithinArtifactRun(params: CouncilRunParams): Promise<Co
         emitProgress(params, transcript, `Round ${round}: 正在调用 ${participantsToCall.length} 个参与模型。`);
         const messages = await Promise.all(participantsToCall.map(async (participant): Promise<CouncilTurnMessage> => {
             try {
-                const prompt = participantPrompt(effectiveParams, participant.id, participant.role, participantContexts.get(participant.id) || sharedContext, history, extraInstruction);
-                const result = await callCouncilModel(participant, prompt, supportsDirectImageInput(participant) ? imagePaths : [], modelTimeoutMs, effectiveParams.signal, effectiveParams.runId, effectiveParams.apiSession);
+                const context = [participantContexts.get(participant.id) || sharedContext,
+                    !supportsDirectImageInput(participant) && priorMedia.observations ? `# 已生成图片的转述与来源\n${priorMedia.observations}` : ""].filter(Boolean).join("\n\n");
+                const prompt = participantPrompt(effectiveParams, participant.id, participant.role, context, history, extraInstruction);
+                const result = await callCouncilModel(participant, prompt, supportsDirectImageInput(participant) ? participantImages : [], modelTimeoutMs, effectiveParams.signal, effectiveParams.runId, effectiveParams.apiSession);
                 completedParticipants++;
                 params.onProgress?.(`Round ${round}: ${participant.id}/${participant.role} 已返回 (${completedParticipants}/${participantsToCall.length})，模型=${result.model}\n摘要: ${summarizeForProgress(result.text)}`);
                 return {
@@ -711,9 +749,16 @@ async function runCouncilWithinArtifactRun(params: CouncilRunParams): Promise<Co
         let moderatorStep = 0;
         while (true) {
             moderatorStep++;
-            const modPrompt = moderatorPrompt(effectiveParams, moderatorContext, history, messages, toolCallsUsed, maxToolCalls, roundToolResults, moderatorStep);
+            const currentSources = [...roundMediaSources(transcript.rounds),
+                ...messages.map(message => ({ label: `Round ${round} / ${message.participantId} / ${message.model ?? message.provider}`, metadata: message.metadata })),
+                ...moderatorSteps.map((step, index) => ({ label: `Round ${round} / moderator / step ${index + 1}`, metadata: step.metadata }))];
+            const sharedMedia = await prepareSharedCouncilImages(effectiveParams, currentSources);
+            const moderatorImages = [...new Set([...imagePaths, ...sharedMedia.paths])];
+            const context = [moderatorContext, !supportsDirectImageInput(effectiveParams.moderator) && sharedMedia.observations
+                ? `# 已生成图片的转述与来源\n${sharedMedia.observations}` : ""].filter(Boolean).join("\n\n");
+            const modPrompt = moderatorPrompt(effectiveParams, context, history, messages, toolCallsUsed, maxToolCalls, roundToolResults, moderatorStep);
             try {
-                const moderatorResult = await callCouncilModel(effectiveParams.moderator, modPrompt, supportsDirectImageInput(effectiveParams.moderator) ? imagePaths : [], modelTimeoutMs, effectiveParams.signal, effectiveParams.runId, effectiveParams.apiSession);
+                const moderatorResult = await callCouncilModel(effectiveParams.moderator, modPrompt, supportsDirectImageInput(effectiveParams.moderator) ? moderatorImages : [], modelTimeoutMs, effectiveParams.signal, effectiveParams.runId, effectiveParams.apiSession);
                 moderator = !moderatorResult.text && moderatorResult.response?.blocks.some(block => ["image", "audio", "video", "file"].includes(block.type))
                     ? { action: "terminate", summary: "", rawText: "" } : parseModeratorDecision(moderatorResult.text);
                 moderator.metadata = moderatorResult.metadata;

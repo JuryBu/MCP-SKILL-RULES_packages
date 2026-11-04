@@ -8,6 +8,8 @@ import { captureFile, ControlledFiles } from './versions.js';
 import type { FileVersion, RestoreCreatedFileProof } from './versions.js';
 import type { RestorePlanStorePort, StoredRestorePlan } from '../storage/workspace-port.js';
 import { fileHunks, reverseTextChange } from './text-restore.js';
+import { assertChildWorkspaceRevisions, mergeRestoreActions, readJournalActions } from './round-children.js';
+import type { RestoreSelection } from './round-children.js';
 
 export type RestoreMode = 'files_only' | 'round_restart';
 
@@ -33,8 +35,9 @@ export interface RestorePathResult {
 }
 
 export interface CoreRestorePort {
-    validatePreview?(input: RestorePreviewInput, context: BoundToolContext): Promise<{ roundIds?: string[] }>;
-    quiesce(input: { restorePlanId: string; mode: RestoreMode; expectedHistoryEpoch: number; expectedWorkspaceRevision: number; targetRoundId?: string | null }, context: BoundToolContext): Promise<{ release(): Promise<void> }>;
+    validatePreview?(input: RestorePreviewInput, context: BoundToolContext): Promise<RestoreSelection>;
+    quiesce(input: { restorePlanId: string; mode: RestoreMode; expectedHistoryEpoch: number; expectedWorkspaceRevision: number;
+        targetRoundId?: string | null; childConversationIds?: string[] }, context: BoundToolContext): Promise<{ release(): Promise<void> }>;
     commitHistory(input: { restorePlanId: string; mode: RestoreMode; expectedHistoryEpoch: number; workspaceRevision: number;
         targetRoundId: string | null; actionIds: string[]; files: RestorePathResult[] }, context: BoundToolContext): Promise<Record<string, unknown>>;
 }
@@ -59,6 +62,7 @@ interface RestorePlan {
     policyRevision: number;
     rootsHash: string;
     actionIds: string[];
+    childRevisions?: Record<string, number>;
     operations: RestoreOperation[];
     state: 'preview' | 'committing' | 'complete' | 'pending';
     results: RestorePathResult[];
@@ -106,14 +110,21 @@ export class WorkspaceRestorer {
         if (previous) return previous;
         if (await this.journal.revision(context.conversationId) !== input.expectedWorkspaceRevision) throw new AgentFault('VERSION_CONFLICT', '工作区版本已变化，请重新预览');
         const selection = await this.core?.validatePreview?.(input, context);
-        const all = await this.journal.list(context.conversationId);
+        const all = mergeRestoreActions(await readJournalActions(this.journal, context.conversationId,
+            input.mode === 'round_restart' && !selection?.roundIds ? undefined : action => this.select([action], input, selection?.roundIds).length > 0), selection);
         const selected = this.select(all, input, selection?.roundIds);
         if (!selected.length && input.mode !== 'round_restart') throw new AgentFault('INVALID_PARAMS', '没有符合条件的已记录修改');
         if (input.hunks?.some(selection => !selected.some(action => action.actionId === selection.actionId))) throw new AgentFault('INVALID_PARAMS', '所选片段的动作不在本次恢复范围');
         const groups = new Map<string, ChangeAction[]>();
-        for (const action of selected) groups.set(action.path, [...(groups.get(action.path) ?? []), action]);
+        for (const action of selected) {
+            const identity = pathIdentity(action.path);
+            const group = groups.get(identity) ?? [];
+            group.push(action);
+            groups.set(identity, group);
+        }
         const operations: RestoreOperation[] = [];
-        for (const [filePath, actions] of [...groups].reverse()) {
+        for (const actions of [...groups.values()].reverse()) {
+            const filePath = actions[actions.length - 1].path;
             requirePolicy({ kinds: ['write'], writePaths: [filePath] }, context);
             const last = actions[actions.length - 1];
             const first = actions[0];
@@ -153,7 +164,8 @@ export class WorkspaceRestorer {
         }
         const plan: RestorePlan = { restorePlanId: restorePlanId ?? randomUUID(), input: structuredClone(input), principalId: context.principalId,
             conversationId: context.conversationId, policyRevision: context.policyRevision, rootsHash: this.rootsHash(context),
-            actionIds: selected.map(action => action.actionId), operations, state: 'preview', results: [], revision: 0 };
+            actionIds: selected.map(action => action.actionId), childRevisions: selection?.childRevisions,
+            operations, state: 'preview', results: [], revision: 0 };
         try { await this.save(plan, null); }
         catch (error) {
             if (error instanceof AgentFault && error.code === 'WORKSPACE_CAS_CONFLICT') {
@@ -217,7 +229,7 @@ export class WorkspaceRestorer {
         return { restorePlanId: plan.restorePlanId, mode: plan.input.mode, state: plan.state, revision: plan.revision,
             policyRevision: plan.policyRevision, rootsHash: plan.rootsHash,
             expectedHistoryEpoch: plan.input.expectedHistoryEpoch, expectedWorkspaceRevision: plan.input.expectedWorkspaceRevision,
-            actionIds: plan.actionIds, operations: plan.operations.map(operation => ({ path: operation.path,
+            actionIds: plan.actionIds, childConversationIds: Object.keys(plan.childRevisions ?? {}), operations: plan.operations.map(operation => ({ path: operation.path,
                 targetSha256: operation.target === null ? null : createHash('sha256').update(operation.target).digest('hex'),
                 currentVersion: operation.current, conflict: operation.code ?? null,
                 operation: operation.removeCreated ? 'remove_created_file' : 'restore_file' })), results: structuredClone(plan.results),
@@ -236,10 +248,12 @@ export class WorkspaceRestorer {
         if (!this.core) throw new AgentFault('RESTORE_PENDING', '撤回文件前需要核心绑定安全停止点和历史事务端口', { restorePlanId: planId });
         if (context.signal.aborted) throw new AgentFault('TOOL_CANCELLED', '撤回开始前已取消');
         const guard = await this.core.quiesce({ restorePlanId: planId, mode: plan.input.mode,
-            expectedHistoryEpoch: plan.input.expectedHistoryEpoch, expectedWorkspaceRevision: plan.input.expectedWorkspaceRevision, targetRoundId: plan.input.roundId ?? null }, context);
+            expectedHistoryEpoch: plan.input.expectedHistoryEpoch, expectedWorkspaceRevision: plan.input.expectedWorkspaceRevision,
+            targetRoundId: plan.input.roundId ?? null, childConversationIds: Object.keys(plan.childRevisions ?? {}) }, context);
         try {
             return await this.coordinator.withPaths(plan.operations.map(operation => operation.path), async () => {
                 if (await this.journal.revision(context.conversationId) !== plan.input.expectedWorkspaceRevision) throw new AgentFault('VERSION_CONFLICT', '预览后的工作区版本变化，请重新预览');
+                await assertChildWorkspaceRevisions(this.journal, plan.childRevisions);
                 plan.commandId = clientCommandId;
                 plan.state = 'committing';
                 await this.save(plan);
@@ -313,10 +327,12 @@ export class WorkspaceRestorer {
         if (context.signal.aborted) throw new AgentFault('TOOL_CANCELLED', '撤回恢复已取消');
         const currentRevision = await this.journal.revision(context.conversationId);
         const guard = await this.core.quiesce({ restorePlanId: planId, mode: plan.input.mode,
-            expectedHistoryEpoch: plan.input.expectedHistoryEpoch, expectedWorkspaceRevision: currentRevision, targetRoundId: plan.input.roundId ?? null }, context);
+            expectedHistoryEpoch: plan.input.expectedHistoryEpoch, expectedWorkspaceRevision: currentRevision,
+            targetRoundId: plan.input.roundId ?? null, childConversationIds: Object.keys(plan.childRevisions ?? {}) }, context);
         try {
             return await this.coordinator.withPaths(plan.operations.map(operation => operation.path), async () => {
                 if (await this.journal.revision(context.conversationId) !== currentRevision) throw new AgentFault('VERSION_CONFLICT', '撤回恢复期间工作区版本变化');
+                await assertChildWorkspaceRevisions(this.journal, plan.childRevisions);
                 const ownActions = new Set(plan.operations.map(operation => operation.actionId));
                 const later = (await this.journal.list(context.conversationId)).filter(action => (action.workspaceRevisionAfter ?? -1) > plan.input.expectedWorkspaceRevision
                     || action.state === 'prepared' || action.state === 'unknown');

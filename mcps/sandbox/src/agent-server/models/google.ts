@@ -88,6 +88,7 @@ export function enrichGoogleCatalogEntry(profile: ProviderProfile, entry: ModelE
     return { ...entry, contextWindow, maxOutputTokens,
         inputModalities: declared(document ? [...document.inputModalities] : flash38 ? ['text', 'image', 'video', 'audio', 'pdf'] : ['text', 'image'], document?.sourceRef ?? modelSource),
         outputModalities: declared(image ? ['text', 'image'] : ['text'], document?.sourceRef ?? modelSource),
+        streaming: entry.streaming.status === 'unknown' ? declared(true, 'https://ai.google.dev/api/generate-content#method:-models.streamgeneratecontent') : entry.streaming,
         ...(document ? { tools: declared(!image, document.sourceRef) } : flash || flash38 ? { tools: declared(true, functionSource) } : {}),
         parameters: { ...entry.parameters, ...parameters }, pricing: declared(price) };
 }

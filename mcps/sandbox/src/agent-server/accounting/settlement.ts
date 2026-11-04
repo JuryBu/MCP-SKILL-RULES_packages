@@ -46,19 +46,25 @@ export function pricingContextForSnapshot(snapshot: RequestSnapshot): UsagePrici
 export function settlementForResponse(input: {
     attempt: ProviderAttempt; response: NormalizedResponse; currency: string; usageRevision?: number;
 }): Omit<Extract<AccountingCommand, { type: 'settle' }>, 'type'> {
-    const { attempt, response, currency } = input;
+    const { attempt, response } = input;
     if (response.attemptId !== attempt.attemptId) throw new AgentFault('E_ATTEMPT_CONFLICT', '原生响应与费用尝试身份不匹配');
     const price = attempt.snapshot.pricingSnapshot ?? attempt.snapshot.price;
     if (price && price.priceVersion !== attempt.snapshot.priceVersion) throw new AgentFault('E_PRICE_SCOPE', '结算价格与原请求冻结版本不一致');
-    if (price && price.currency !== currency) throw new AgentFault('E_CURRENCY_MISMATCH', '冻结价格与根预算币种不同');
+    if (price && input.currency !== 'XXX' && price.currency !== input.currency) throw new AgentFault('E_CURRENCY_MISMATCH', '冻结价格与根预算币种不同');
+    const reportedCurrency = response.usage.providerCostCurrency;
+    const reportedCost = tokenCount(response.usage.providerCostMicros);
+    const nativeCurrency = reportedCost !== null && typeof reportedCurrency === 'string'
+        && /^[A-Z]{3}$/.test(reportedCurrency) && reportedCurrency !== 'XXX' ? reportedCurrency : null;
+    const currency = input.currency === 'XXX' ? nativeCurrency ?? price?.currency ?? input.currency : input.currency;
     const settlementKnown = response.complete && response.problems.length === 0;
     const context = pricingContextForSnapshot(attempt.snapshot);
     const estimate = price && settlementKnown ? priceUsage(response.usage, price, Date.parse(attempt.snapshot.frozenAt), context) : null;
     const conservativeEstimate = price && settlementKnown && estimate?.amountMicros === null
         ? priceUsage(response.usage, price, Date.parse(attempt.snapshot.frozenAt), { ...context, inputCachePolicy: 'conservative_upper_bound' }) : null;
-    const nativeCost = response.usage.providerCostCurrency === currency ? response.usage.providerCostMicros : null;
+    const nativeCost = nativeCurrency === currency ? reportedCost : null;
     const amountMicros = settlementKnown ? nativeCost ?? estimate?.amountMicros ?? null : null;
-    const postResponseUpperBound = amountMicros === null ? postResponseUpperBoundForResponse({ attempt, response, usageRevision: input.usageRevision ?? 1 }) : null;
+    const postResponseUpperBound = amountMicros === null && input.currency !== 'XXX'
+        ? postResponseUpperBoundForResponse({ attempt, response, usageRevision: input.usageRevision ?? 1 }) : null;
     return { attemptId: attempt.attemptId, usageRevision: input.usageRevision ?? 1,
         providerExecutionId: response.providerResponseId, complete: amountMicros !== null,
         ...(postResponseUpperBound ? { postResponseUpperBound } : {}),

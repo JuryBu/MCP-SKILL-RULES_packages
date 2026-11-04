@@ -3,6 +3,7 @@ import type { JsonObject } from '../protocol.js';
 import { normalizeUsage } from '../accounting/usage.js';
 import { arrayObjects, assembleResponse, checkToolResults, freezeOwned, gateDeclaredTools, immutableJson, mediaBlock, objectValue, requireRoute, stringValue, validateTools, verifySnapshot } from './assemble.js';
 import { attemptTimeout, decodeResponse, endpointUrl } from './http.js';
+import { requestProviderResponse } from './streaming.js';
 import type { DiscoveryPage, NativeBlock, NativeSendView, NormalizedResponse, ProviderAdapter, ProviderAttempt, ProviderProfile, RawProviderResponse, RequestSnapshot, SendContext, StopKind, ToolCall, ToolResult } from './types.js';
 
 const reserved = new Set(['model', 'messages', 'input', 'contents', 'tools', 'stream', 'system', 'headers']);
@@ -60,7 +61,7 @@ export class AnthropicAdapter implements ProviderAdapter {
         for (const name of Object.keys(parameters)) if (reserved.has(name)) throw new AgentFault('E_PARAMETER_CONFLICT', `参数${name}由核心固定`);
         if (!Number.isSafeInteger(parameters.max_tokens) || Number(parameters.max_tokens) < 1) throw new AgentFault('E_PARAMETER_INVALID', 'Anthropic请求必须明确正整数max_tokens');
         validateTools(view);
-        const body: JsonObject = { ...parameters, model: modelId, messages: view.messages, stream: false };
+        const body: JsonObject = { ...parameters, model: modelId, messages: view.messages, stream: view.stream === true };
         if (view.system !== undefined) body.system = view.system;
         if (view.tools?.length) body.tools = view.tools.map(tool => ({ name: tool.name, input_schema: tool.parameters,
             ...(tool.description !== undefined ? { description: tool.description } : {}), ...(tool.strict !== undefined ? { strict: tool.strict } : {}) }));
@@ -72,15 +73,15 @@ export class AnthropicAdapter implements ProviderAdapter {
         requireRoute(snapshot);
         if (snapshot.profile.routePolicy.kind !== 'direct') throw new AgentFault('E_ROUTE_UNVERIFIED', 'Anthropic首版只接明确原生端点');
         const body = JSON.parse(snapshot.body) as JsonObject;
-        if (body.model !== snapshot.modelId || body.stream !== false || !Array.isArray(body.messages) || !body.messages.length) throw new AgentFault('E_REQUEST_SCHEMA', '冻结的Anthropic请求不完整');
+        if (body.model !== snapshot.modelId || body.stream !== (snapshot.streaming === true) || !Array.isArray(body.messages) || !body.messages.length) throw new AgentFault('E_REQUEST_SCHEMA', '冻结的Anthropic请求不完整');
     }
 
     async send(attempt: ProviderAttempt, context: SendContext, signal?: AbortSignal): Promise<NormalizedResponse> {
         this.validate(attempt.snapshot);
         if (context.credential !== undefined && (!context.credential || /[\r\n]/.test(context.credential))) throw new AgentFault('E_AUTH', '凭据内容无效');
-        const raw = decodeResponse(await context.transport.request({ method: 'POST', url: attempt.snapshot.endpoint,
+        const raw = await requestProviderResponse(attempt, context, { method: 'POST', url: attempt.snapshot.endpoint,
             headers: { 'Content-Type': 'application/json', 'anthropic-version': '2023-06-01', ...(context.credential ? { 'x-api-key': context.credential } : {}) },
-            body: attempt.snapshot.body, timeoutMs: attemptTimeout(attempt) }, signal));
+            body: attempt.snapshot.body, timeoutMs: attemptTimeout(attempt) }, normalizeAnthropicResponse, signal);
         const names = arrayObjects((JSON.parse(attempt.snapshot.body) as JsonObject).tools).map(tool => stringValue(tool.name) ?? '');
         return gateDeclaredTools(assembleResponse(attempt.attemptId, raw, normalizeAnthropicResponse), names);
     }

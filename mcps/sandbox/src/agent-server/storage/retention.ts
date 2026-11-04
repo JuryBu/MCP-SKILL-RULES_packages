@@ -33,15 +33,17 @@ export function refreshRetention(database: SqlDatabase, conversationId: string):
     database.prepare('UPDATE conversations SET active_runs = ?, last_run_end = ?, expires_at = ? WHERE cid = ?')
         .run(Number(active?.total ?? 0), lastRunEnd ?? null, expiresAt, conversationId);
     const root = retentionRoot(database, conversationId);
-    const members = retentionFamily(database, root);
-    if (members.length > 200) return;
-    const placeholders = members.map(() => '?').join(',');
-    const latest = database.prepare(`SELECT MAX(anchor) AS anchor FROM (
-        SELECT last_run_end AS anchor FROM conversations WHERE cid IN (${placeholders})
-        UNION ALL SELECT last_close AS anchor FROM conversations WHERE cid IN (${placeholders}))`).get(...members, ...members);
+    let latestAnchor: string | undefined;
+    for (const members of retentionFamilyPages(database, root)) {
+        const placeholders = members.map(() => '?').join(',');
+        const latest = database.prepare(`SELECT MAX(anchor) AS anchor FROM (
+            SELECT last_run_end AS anchor FROM conversations WHERE cid IN (${placeholders})
+            UNION ALL SELECT last_close AS anchor FROM conversations WHERE cid IN (${placeholders}))`).get(...members, ...members);
+        if (latest?.anchor && (!latestAnchor || String(latest.anchor) > latestAnchor)) latestAnchor = String(latest.anchor);
+    }
     const rootPolicy = database.prepare('SELECT mode,ttl_ms FROM conversations WHERE cid = ?').get(root);
     if (rootPolicy?.mode === 'ttl') database.prepare('UPDATE conversations SET expires_at = ? WHERE cid = ?')
-        .run(latest?.anchor ? new Date(Date.parse(String(latest.anchor)) + Number(rootPolicy.ttl_ms)).toISOString() : null, root);
+        .run(latestAnchor ? new Date(Date.parse(latestAnchor) + Number(rootPolicy.ttl_ms)).toISOString() : null, root);
 }
 
 export function assertRunMayStart(database: SqlDatabase, conversationId: string, now: string): void {
@@ -59,7 +61,7 @@ export function assertRunMayStart(database: SqlDatabase, conversationId: string,
 export function scanExpired(database: SqlDatabase, now: string, limit = 50): { conversationId: string; policyRevision: number; deferred: boolean }[] {
     const rows = database.prepare(`SELECT cid, policy_rev FROM conversations WHERE mode = 'ttl' AND expires_at <= ? AND state NOT IN ('tombstoned','deleted','purging') AND ${rootRetentionOwner} ORDER BY expires_at,cid LIMIT ?`)
         .all(now, limit);
-    const result = rows.map(row => ({ conversationId: String(row.cid), policyRevision: Number(row.policy_rev), deferred: Boolean(retentionBlocker(database, retentionFamily(database, String(row.cid)))) }));
+    const result = rows.map(row => ({ conversationId: String(row.cid), policyRevision: Number(row.policy_rev), deferred: Boolean(retentionBlocker(database, String(row.cid))) }));
     for (const item of result) {
         if (!item.deferred) database.prepare('UPDATE conversations SET state = ? WHERE cid = ? AND policy_rev = ? AND active_runs = 0')
             .run('expiryPending', item.conversationId, item.policyRevision);
@@ -80,12 +82,20 @@ function retentionRoot(database: SqlDatabase, conversationId: string): string {
     throw new AgentFault('RETENTION_TRANSITION_BUSY', '保存归属链尚未确认，保留原会话内容');
 }
 
-function retentionFamily(database: SqlDatabase, conversationId: string): string[] {
-    return database.prepare(`WITH RECURSIVE ownership(cid,parent) AS (
+const retentionFamilyCte = `WITH RECURSIVE ownership(cid,parent) AS (
         SELECT id,json_extract(value_json,'$.parentConversationId') FROM server_state WHERE kind = 'retentionOwner'
         UNION SELECT cid,json_extract(value_json,'$.options.parentConversationId') FROM store_records WHERE kind = 'conversation' AND json_extract(value_json,'$.options.parentConversationId') IS NOT NULL),
-        family(cid) AS (SELECT ? UNION SELECT ownership.cid FROM ownership JOIN family ON ownership.parent = family.cid)
-        SELECT cid FROM family LIMIT 201`).all(conversationId).map(row => String(row.cid));
+        family(cid) AS (SELECT ? UNION SELECT ownership.cid FROM ownership JOIN family ON ownership.parent = family.cid)`;
+
+function* retentionFamilyPages(database: SqlDatabase, conversationId: string): Generator<string[]> {
+    let cursor = '';
+    while (true) {
+        const members = database.prepare(`${retentionFamilyCte} SELECT cid FROM family WHERE cid > ? ORDER BY cid LIMIT 200`)
+            .all(conversationId, cursor).map(row => String(row.cid));
+        if (!members.length) return;
+        yield members;
+        cursor = members[members.length - 1];
+    }
 }
 
 const rootRetentionOwner = `NOT EXISTS (SELECT 1 FROM server_state WHERE kind = 'retentionOwner' AND id = conversations.cid)
@@ -107,7 +117,7 @@ export function recordRetentionOwnership(database: SqlDatabase, record: StoreRec
     if (!parentRecord || JSON.parse(String(parentRecord.value_json)).principalId !== record.value.principalId) throw new AgentFault('POLICY_CHANGED', '父子保存归属需要同一已确认主体');
     if (policy.mode !== parent.mode || (policy.ttlDurationMs ?? null) !== parent.ttl_ms) throw new AgentFault('POLICY_CHANGED', '派生会话须继承父会话保存方式与限时时长');
     const root = retentionRoot(database, parentId);
-    if (retentionFamily(database, root).includes(record.key.id) && !previous) throw new AgentFault('INVALID_PARAMS', '派生会话保存归属重复');
+    if (!previous && database.prepare(`${retentionFamilyCte} SELECT 1 FROM family WHERE cid = ? LIMIT 1`).get(root, record.key.id)) throw new AgentFault('INVALID_PARAMS', '派生会话保存归属重复');
     database.prepare("INSERT INTO server_state (kind,id,revision,value_json) VALUES ('retentionOwner',?,1,?) ON CONFLICT(kind,id) DO NOTHING")
         .run(record.key.id, JSON.stringify({ parentConversationId: parentId, rootConversationId: root }));
 }
@@ -115,7 +125,7 @@ export function recordRetentionOwnership(database: SqlDatabase, record: StoreRec
 function webResourceRecords(database: SqlDatabase, members: string[]): { id: string; value_json: string }[] {
     const placeholders = members.map(() => '?').join(',');
     const selection = `kind = 'control' AND json_extract(value_json,'$.conversationId') IN (${placeholders})
-        AND json_extract(value_json,'$.adapterId') IN ('web-native-sessions-v1','web-table-artifacts-v1')`;
+        AND json_extract(value_json,'$.adapterId') IN ('web-native-sessions-v1','web-table-artifacts-v1','native.command')`;
     return database.prepare(`SELECT record_id AS id,value_json FROM store_records WHERE cid IS NULL
         AND record_id GLOB 'web-resource:*' AND ${selection}
         UNION SELECT id,value_json FROM server_state WHERE id GLOB 'web-resource:*' AND ${selection}`)
@@ -140,11 +150,36 @@ function removeReleasedWebResources(database: SqlDatabase, conversationId: strin
         database.prepare(`DELETE FROM server_state WHERE kind = 'control'
             AND (id = ? OR id GLOB 'web-resource-operation:*' AND json_extract(value_json,'$.resourceId') = ?)`)
             .run(record.id, resource.resourceId);
+        const outputPrefix = 'web-resource-command-output:' + resource.resourceId + ':';
+        database.prepare("DELETE FROM store_records WHERE cid IS NULL AND kind = 'control' AND substr(record_id,1,?) = ?")
+            .run(outputPrefix.length, outputPrefix);
+        database.prepare("DELETE FROM server_state WHERE kind = 'control' AND substr(id,1,?) = ?")
+            .run(outputPrefix.length, outputPrefix);
     }
 }
 
-function retentionBlocker(database: SqlDatabase, members: string[]): string | undefined {
-    if (members.length > 200) return 'family_limit';
+function retentionBlocker(database: SqlDatabase, root: string): string | undefined {
+    let familyPolicy: string | undefined;
+    let familyOwner: string | undefined;
+    for (const members of retentionFamilyPages(database, root)) {
+        const placeholders = members.map(() => '?').join(',');
+        for (const policy of database.prepare(`SELECT DISTINCT mode,ttl_ms FROM conversations WHERE cid IN (${placeholders})`).all(...members)) {
+            const identity = JSON.stringify([policy.mode, policy.ttl_ms]);
+            if (familyPolicy !== undefined && familyPolicy !== identity) return 'family_policy_mismatch';
+            familyPolicy = identity;
+        }
+        for (const owner of database.prepare(`SELECT DISTINCT json_extract(value_json,'$.principalId') AS principal FROM store_records WHERE cid IN (${placeholders}) AND kind = 'conversation'`).all(...members)) {
+            const identity = String(owner.principal);
+            if (familyOwner !== undefined && familyOwner !== identity) return 'family_owner_mismatch';
+            familyOwner = identity;
+        }
+        const blocker = retentionPageBlocker(database, members);
+        if (blocker) return blocker;
+    }
+    return undefined;
+}
+
+function retentionPageBlocker(database: SqlDatabase, members: string[]): string | undefined {
     const placeholders = members.map(() => '?').join(',');
     const policies = database.prepare(`SELECT DISTINCT mode,ttl_ms FROM conversations WHERE cid IN (${placeholders})`).all(...members);
     if (policies.length > 1) return 'family_policy_mismatch';
@@ -198,14 +233,20 @@ export function purgeExpiredConversation(database: SqlDatabase, conversationId: 
     const root = database.prepare('SELECT mode,state,expires_at,policy_rev FROM conversations WHERE cid = ?').get(conversationId);
     if (!root) throw new AgentFault('CONVERSATION_NOT_FOUND', '限时清理会话不存在');
     if (retentionRoot(database, conversationId) !== conversationId) throw new AgentFault('RETENTION_TRANSITION_BUSY', '派生会话随父级保存归属统一清理');
-    const members = retentionFamily(database, conversationId);
-    const result: RetentionSweepConversation = { conversationId, policyRevision: Number(root.policy_rev), expiresAt: root.expires_at === null ? null : String(root.expires_at), state: 'deleted', conversationIds: members };
+    const result: RetentionSweepConversation = { conversationId, policyRevision: Number(root.policy_rev), expiresAt: root.expires_at === null ? null : String(root.expires_at), state: 'deleted', conversationIds: [] };
     if (root.state === 'deleted') return result;
     if (root.mode !== 'ttl' || !root.expires_at || String(root.expires_at) > now) throw new AgentFault('RETENTION_NOT_DUE', '会话尚未到达限时清理时点');
-    const blocker = retentionBlocker(database, members);
+    const blocker = retentionBlocker(database, conversationId);
     if (blocker) return { ...result, state: 'deferred', reason: blocker };
+    const checkpoint = database.prepare("SELECT value_json FROM server_state WHERE kind = 'retentionPurgeCursor' AND id = ?").get(conversationId);
+    const cursor = checkpoint ? String(JSON.parse(String(checkpoint.value_json)).cursor) : '';
+    const children = database.prepare(`${retentionFamilyCte} SELECT cid FROM family WHERE cid <> ? AND cid > ? ORDER BY cid LIMIT 200`)
+        .all(conversationId, conversationId, cursor).map(row => String(row.cid));
+    const complete = children.length < 200;
+    const members = complete ? [...children, conversationId] : children;
     database.exec('BEGIN IMMEDIATE');
     try {
+        database.prepare("UPDATE conversations SET state = 'purging' WHERE cid = ?").run(conversationId);
         for (const member of members) {
             queueConversationFiles(database, member);
             pinRecovery(database, member, now);
@@ -224,9 +265,12 @@ export function purgeExpiredConversation(database: SqlDatabase, conversationId: 
             database.prepare(`UPDATE runs SET active_round_id = NULL,active_step_id = NULL,snapshot_json = json_object('conversationId',cid,'runId',run_id,'rootRunId',root_run_id,'parentRunId',parent_run_id,'runEpoch',run_epoch,'kind',kind,'state',state,'effectState',effect_state,'cleanupState',cleanup_state,'retentionExpired',json('true')) WHERE cid = ?`).run(member);
             database.prepare("UPDATE conversations SET state = 'deleted',active_runs = 0,history_root = NULL,view_root = NULL,version = version + 1 WHERE cid = ?").run(member);
         }
+        if (complete) database.prepare("DELETE FROM server_state WHERE kind = 'retentionPurgeCursor' AND id = ?").run(conversationId);
+        else database.prepare("INSERT INTO server_state(kind,id,revision,value_json) VALUES('retentionPurgeCursor',?,1,?) ON CONFLICT(kind,id) DO UPDATE SET revision=revision+1,value_json=excluded.value_json")
+            .run(conversationId, JSON.stringify({ rootConversationId: conversationId, cursor: children[children.length - 1] }));
         database.exec('COMMIT');
     } catch (error) { database.exec('ROLLBACK'); throw error; }
-    return result;
+    return { ...result, conversationIds: members, ...(complete ? {} : { state: 'deferred' as const, reason: 'family_page_pending' }) };
 }
 
 const unreferencedObject = `NOT EXISTS (SELECT 1 FROM refs WHERE target_kind = 'object' AND target_id = objects.hash)
@@ -265,14 +309,16 @@ function releaseResolvedRecovery(database: SqlDatabase): void {
 }
 
 function releaseResolvedWebRecovery(database: SqlDatabase): void {
-    const rows = database.prepare(`SELECT DISTINCT conversations.cid FROM store_records
-        JOIN conversations ON conversations.cid = json_extract(store_records.value_json,'$.conversationId')
-        WHERE store_records.cid IS NULL AND store_records.kind = 'control' AND store_records.record_id GLOB 'web-resource:*'
-        AND json_extract(store_records.value_json,'$.adapterId') IN ('web-native-sessions-v1','web-table-artifacts-v1')
-        AND conversations.state = 'deleted' AND json_extract(store_records.value_json,'$.state') = 'released'
-        AND json_extract(store_records.value_json,'$.cleanupState') = 'released'
-        AND json_extract(store_records.value_json,'$.receipt.released') = 1
-        AND json_extract(store_records.value_json,'$.receipt.terminalConfirmed') = 1
+    const rows = database.prepare(`WITH owned(value_json) AS (
+        SELECT value_json FROM store_records WHERE cid IS NULL AND kind = 'control' AND record_id GLOB 'web-resource:*'
+        UNION SELECT value_json FROM server_state WHERE kind = 'control' AND id GLOB 'web-resource:*')
+        SELECT DISTINCT conversations.cid FROM owned
+        JOIN conversations ON conversations.cid = json_extract(owned.value_json,'$.conversationId')
+        WHERE json_extract(owned.value_json,'$.adapterId') IN ('web-native-sessions-v1','web-table-artifacts-v1','native.command')
+        AND conversations.state = 'deleted' AND json_extract(owned.value_json,'$.state') = 'released'
+        AND json_extract(owned.value_json,'$.cleanupState') = 'released'
+        AND json_extract(owned.value_json,'$.receipt.released') = 1
+        AND json_extract(owned.value_json,'$.receipt.terminalConfirmed') = 1
         ORDER BY conversations.cid LIMIT 50`).all();
     for (const row of rows) {
         database.exec('BEGIN IMMEDIATE');

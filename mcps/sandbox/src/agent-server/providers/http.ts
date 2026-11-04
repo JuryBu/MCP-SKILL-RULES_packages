@@ -1,10 +1,11 @@
 import { AgentFault } from '../protocol.js';
 import type { JsonObject } from '../protocol.js';
 import { objectValue, stringValue } from './assemble.js';
+import { normalizeProgrokUsage, normalizeUsage } from '../accounting/usage.js';
 import { ProviderFault } from './types.js';
 import { createProviderNetwork, ProviderNetworkError } from './network.js';
 import type { ProviderNetwork, ProviderNetworkOptions } from './network.js';
-import type { HttpRequest, HttpResponse, HttpTransport, ProviderAttempt, RawProviderResponse, TransportCause, TransportPhase } from './types.js';
+import type { HttpRequest, HttpResponse, HttpTransport, ProviderAttempt, ProviderProtocol, RawProviderResponse, TransportCause, TransportPhase } from './types.js';
 
 const MAX_RESPONSE_BYTES = 64 * 1024 * 1024;
 const safeErrorNames = new Set(['Error', 'TypeError', 'RangeError', 'AbortError', 'TimeoutError', 'FetchError', 'SystemError', 'AggregateError', 'DOMException', 'ProviderNetworkError']);
@@ -90,6 +91,8 @@ export class FetchTransport implements HttpTransport {
         const deadlineAt = Date.now() + request.timeoutMs;
         let status: number | undefined;
         let transportPhase: TransportPhase = 'preflight';
+        const chunks: Uint8Array[] = [];
+        const headers: Record<string, string> = {};
         try {
             if (signal?.aborted) throw new ProviderFault('E_CANCELLED', '请求发送前已取消', { acceptance: 'not_sent', transportPhase });
             const network = this.networkForRequest();
@@ -99,6 +102,9 @@ export class FetchTransport implements HttpTransport {
             const response = await network.fetch(request.url, { method: request.method, headers: request.headers,
                 body: request.body, signal: controller.signal, redirect: 'error' });
             status = response.status;
+            response.headers.forEach((value, name) => {
+                if (!/authorization|cookie|api.?key|token|secret/i.test(name)) headers[name] = value;
+            });
             transportPhase = 'response_headers';
             const declared = Number(response.headers.get('content-length'));
             if (Number.isFinite(declared) && declared > maximum) {
@@ -108,7 +114,6 @@ export class FetchTransport implements HttpTransport {
             }
             transportPhase = 'response_body';
             const reader = response.body?.getReader();
-            const chunks: Uint8Array[] = [];
             let total = 0;
             if (reader) {
                 try {
@@ -122,18 +127,25 @@ export class FetchTransport implements HttpTransport {
                                 { acceptance: status >= 200 && status < 300 ? 'accepted' : 'unknown', httpStatus: status, transportPhase });
                         }
                         chunks.push(item.value);
+                        await request.onChunk?.(item.value, { status, headers });
                     }
+                } catch (error) {
+                    await reader.cancel().catch(() => {});
+                    throw error;
                 } finally { reader.releaseLock(); }
             }
-            const headers: Record<string, string> = {};
-            response.headers.forEach((value, name) => {
-                if (!/authorization|cookie|api.?key|token|secret/i.test(name)) headers[name] = value;
-            });
             return { status, headers, body: Buffer.concat(chunks).toString('utf8') };
         } catch (error) {
-            if (error instanceof ProviderFault) throw error;
-            if (error instanceof ProviderNetworkError) throw transportFailure(error, { phase: 'preflight' });
-            throw transportFailure(error, { phase: transportPhase, httpStatus: status, aborted: signal?.aborted, timedOut });
+            controller.abort();
+            const fault = error instanceof ProviderFault ? error : error instanceof ProviderNetworkError
+                ? transportFailure(error, { phase: 'preflight' })
+                : transportFailure(error, { phase: transportPhase, httpStatus: status, aborted: signal?.aborted, timedOut });
+            if (!fault.rawResponse && chunks.length && status !== undefined) {
+                throw new ProviderFault(fault.code, fault.message, { acceptance: fault.acceptance, phase: fault.phase,
+                    httpStatus: status, transportPhase: fault.transportPhase ?? transportPhase, transportCause: fault.transportCause,
+                    rawResponse: { httpStatus: status, headers, body: Buffer.concat(chunks).toString('utf8'), json: {} } });
+            }
+            throw fault;
         } finally {
             clearTimeout(timer);
             signal?.removeEventListener('abort', abort);
@@ -180,7 +192,33 @@ function modelUnavailableReason(httpStatus: number, native: JsonObject | null): 
     return undefined;
 }
 
-export function decodeResponse(response: HttpResponse): RawProviderResponse {
+export function responseUsage(protocol: ProviderProtocol, json: JsonObject): import('../accounting/usage.js').NormalizedUsage {
+    return protocol === 'progrok' ? normalizeProgrokUsage(json.usage)
+        : normalizeUsage(protocol, protocol === 'gemini' ? json.usageMetadata : json.usage);
+}
+
+function knownTemporaryRejection(protocol: ProviderProtocol | undefined, endpoint: string | undefined, status: number,
+    nativeCode: string | undefined, native: JsonObject | null, retryAfterMs: number | undefined): boolean {
+    if (!endpoint || !protocol) return false;
+    let url: URL;
+    try { url = new URL(endpoint); } catch { return false; }
+    if (url.protocol !== 'https:' || url.port || url.username || url.password) return false;
+    const type = stringValue(native?.type);
+    if (protocol === 'openai_responses' && url.hostname === 'api.openai.com') {
+        return status === 429 && retryAfterMs !== undefined && (['rate_limit_exceeded', 'slow_down'].includes(nativeCode ?? '') || type === 'rate_limit_error')
+            || status === 503 && nativeCode === 'server_is_overloaded';
+    }
+    if (protocol === 'anthropic' && url.hostname === 'api.anthropic.com') {
+        return status === 429 && type === 'rate_limit_error' && retryAfterMs !== undefined || status === 529 && type === 'overloaded_error';
+    }
+    if (protocol === 'gemini' && url.hostname === 'generativelanguage.googleapis.com' && status === 429 && nativeCode === 'RESOURCE_EXHAUSTED') {
+        const details = Array.isArray(native?.details) ? native.details.map(objectValue).filter(value => value !== null) : [];
+        return retryAfterMs !== undefined && details.some(detail => detail.reason === 'RATE_LIMIT_EXCEEDED');
+    }
+    return false;
+}
+
+export function decodeResponse(response: HttpResponse, protocol?: ProviderProtocol, endpoint?: string): RawProviderResponse {
     let json: JsonObject | null = null;
     try { json = objectValue(JSON.parse(response.body)); } catch {}
     if (!json) {
@@ -189,26 +227,30 @@ export function decodeResponse(response: HttpResponse): RawProviderResponse {
                 rawResponse: { httpStatus: response.status, headers: response.headers, body: response.body, json: {}, parseError: 'invalid_json_or_non_object' } });
     }
     const raw = { httpStatus: response.status, headers: response.headers, body: response.body, json };
-    if (response.status >= 200 && response.status < 300 && !json.error) return raw;
+    if (response.status >= 200 && response.status < 300 && (!json.error || protocol === 'openai_responses'
+        && ['failed', 'incomplete', 'cancelled'].includes(String(json.status)) && Array.isArray(json.output))) return raw;
     const native = objectValue(json.error);
-    const nativeValue = stringValue(native?.code) ?? stringValue(native?.status);
+    const nativeValue = stringValue(native?.code) ?? stringValue(native?.status) ?? stringValue(native?.type);
     const nativeCode = nativeValue && /^[A-Za-z0-9_.-]{1,80}$/.test(nativeValue) ? nativeValue : undefined;
     const httpStatus = response.status;
-    const quota = httpStatus === 402 || /quota|insufficient|resource_exhausted/i.test(nativeCode ?? '');
+    const quota = httpStatus === 402 || /insufficient_quota|insufficient_balance|billing_hard_limit|quota_exceeded|credit_balance_exhausted|(?:organization|project)_(?:spend|usage)_limit_exceeded/i.test(nativeCode ?? '');
+    const retryAfterMs = parseRetryAfter(response.headers['retry-after']);
+    const temporary = !quota && knownTemporaryRejection(protocol, endpoint, httpStatus, nativeCode, native, retryAfterMs);
     const nativeReason = modelUnavailableReason(httpStatus, native);
-    const code = quota ? 'E_QUOTA' : nativeReason ? 'E_MODEL_UNAVAILABLE' : [401, 403].includes(httpStatus) ? 'E_AUTH' : httpStatus === 429 ? 'E_RATE_LIMIT'
+    const code = quota ? 'E_QUOTA' : nativeReason ? 'E_MODEL_UNAVAILABLE' : [401, 403].includes(httpStatus) ? 'E_AUTH' : httpStatus === 429 ? 'E_RATE_LIMIT' : temporary ? 'E_PROVIDER_TEMPORARY'
         : [400, 404, 405, 413, 422].includes(httpStatus) ? 'E_PARAMETER_INVALID' : 'E_RESULT_UNKNOWN';
     const executionEvidence = json.usage != null || json.usageMetadata != null
         || (Array.isArray(json.output) && json.output.length > 0) || (Array.isArray(json.candidates) && json.candidates.length > 0)
         || (Array.isArray(json.choices) && json.choices.length > 0);
-    const rejected = !executionEvidence && [400, 401, 402, 403, 404, 405, 410, 413, 422].includes(httpStatus) && native !== null;
+    const rejected = !executionEvidence && ([400, 401, 402, 403, 404, 405, 410, 413, 422].includes(httpStatus) || temporary) && native !== null;
     const summary = nativeReason === 'model_unavailable_for_new_users' ? '供应商当前未向新用户提供所选模型，请核对账户可用性与目录'
         : nativeReason === 'model_account_access_unavailable' ? '当前账户或项目无权使用所选模型，请核对账户可用性'
         : nativeReason ? '供应商未找到所选模型或不支持该模型操作，请核对最新目录与账户可用性' : '供应商请求未成功';
     throw new ProviderFault(code, `${summary}（HTTP ${httpStatus}），原始响应已保留`,
         { acceptance: executionEvidence ? 'accepted' : rejected ? 'rejected' : 'unknown', phase: executionEvidence ? 'accepted' : rejected ? 'rejected' : 'unknown',
             httpStatus, nativeCode, ...(nativeReason ? { nativeReason } : {}),
-            retryAfterMs: parseRetryAfter(response.headers['retry-after']), rawResponse: raw, retryable: false });
+            retryAfterMs, rawResponse: raw, retryable: temporary && rejected,
+            ...(protocol && (json.usage !== undefined || json.usageMetadata !== undefined) ? { usage: responseUsage(protocol, json) } : {}) });
 }
 
 export function bearerHeaders(credential?: string): Record<string, string> {

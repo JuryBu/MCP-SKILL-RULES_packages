@@ -4,6 +4,7 @@ import type { DispatchJournalPort, PreparedDispatch, RecordedFailure } from '../
 import type { NormalizedResponse, ProviderAttempt } from '../providers/types.js';
 import type { UpperBound } from '../accounting/budget-ledger.js';
 import { settlementForResponse } from '../accounting/settlement.js';
+import { failureHasExecutionEvidence, failureUsageResponse, financialInputTokens, nextProviderUsageRevision, preserveKnownProviderCharges, settlementForFailure } from '../providers/failure-accounting.js';
 import type { StorePort, StoreTransition } from './port.js';
 import type { SqliteStore } from './sqlite.js';
 import { SqliteAccountingPort, SqliteDispatchJournalPort } from './provider-journal.js';
@@ -46,6 +47,7 @@ interface MemoryAttempt {
     memoryBytes: number;
     commitUncertain?: boolean;
     failureBytes?: number;
+    responseUsageRevision?: number;
 }
 
 function ownValue<Value>(value: Value): Value {
@@ -186,8 +188,10 @@ export class AgentDispatchJournalPort implements DispatchJournalPort {
                 if (entry.responseHash !== responseHash) throw new AgentFault('E_RESPONSE_CONFLICT', '原临时尝试已经返回不同响应');
                 if (entry.state === 'committed') return { canExecuteTools: false };
             }
-            const currency = (await this.accounting.read(attempt.rootBudgetId)).budget.currency;
-            const calculated = settlementForResponse({ attempt, response, currency });
+            const finance = await this.accounting.read(attempt.rootBudgetId);
+            entry.responseUsageRevision ??= nextProviderUsageRevision(finance, attempt, response.providerResponseId);
+            const calculated = preserveKnownProviderCharges(settlementForResponse({ attempt, response, currency: finance.budget.currency,
+                usageRevision: entry.responseUsageRevision }), finance, attempt);
             const price = attempt.snapshot.pricingSnapshot ?? attempt.snapshot.price;
             const settlement: TemporaryFeeSettlement = { intent: entry.intent, usageRevision: calculated.usageRevision,
                 providerExecutionId: calculated.providerExecutionId, complete: calculated.complete,
@@ -198,7 +202,7 @@ export class AgentDispatchJournalPort implements DispatchJournalPort {
                     basis: charge.amountMicros === null ? 'incomplete' : charge.kind === 'calculated' ? 'frozen_price_reported_usage' : 'provider_reported_cost',
                     priceFingerprint: price ? this.hashCanonical(entry.intent.conversationId, price) : null,
                     sourceFingerprint: price ? sha256(price.sourceRef) : null,
-                    inputTokens: response.usage.inputTokens, outputTokens: response.usage.outputTokens,
+                    inputTokens: financialInputTokens(response.usage), outputTokens: response.usage.outputTokens,
                     cacheReadTokens: response.usage.cacheReadTokens, cacheWriteTokens: response.usage.cacheWriteTokens,
                     reasoningTokens: response.usage.reasoningTokens } })) };
             const memoryBytes = maySave ? this.measure(response) : 0;
@@ -253,8 +257,27 @@ export class AgentDispatchJournalPort implements DispatchJournalPort {
             }
             this.verifyEntry(entry, attempt);
             if (entry.state === 'committed') return;
+            const observed = failureUsageResponse(attempt, failure);
+            const finance = await this.accounting.read(attempt.rootBudgetId);
+            const reservation = finance.reservations.find(item => item.attemptId === attempt.attemptId);
+            const hasUsage = failureHasExecutionEvidence(failure) || Boolean(reservation?.chargeKeys.length);
+            if (observed && reservation?.state !== 'settled') {
+                const calculated = settlementForFailure(attempt, observed, finance);
+                const price = attempt.snapshot.pricingSnapshot ?? attempt.snapshot.price;
+                await this.accounting.execute({ type: 'settle', ...calculated, charges: calculated.charges.map(charge => ({ ...charge,
+                    usage: { basis: charge.kind === 'provider_reported' ? 'provider_reported_cost' : 'incomplete',
+                        priceFingerprint: price ? this.hashCanonical(entry.intent.conversationId, price) : null,
+                        sourceFingerprint: charge.kind === 'provider_reported' ? sha256(canonicalJson({ protocol: attempt.snapshot.profile.protocol,
+                            field: observed.usage.providerCostBasis?.field ?? 'provider_reported_cost' })) : price ? sha256(price.sourceRef) : null,
+                        inputTokens: financialInputTokens(observed.usage), outputTokens: observed.usage.outputTokens,
+                        cacheReadTokens: observed.usage.cacheReadTokens, cacheWriteTokens: observed.usage.cacheWriteTokens,
+                        reasoningTokens: observed.usage.reasoningTokens } })) });
+                entry.responseUsageRevision = undefined;
+            }
             const code = /^E_[A-Z0-9_]{1,80}$/.test(failure.error.code) ? failure.error.code : 'E_TEMPORARY_PROVIDER_FAILURE';
-            const result = await this.store.persistent.executeTemporaryFee({ type: 'failure', failure: { intent: entry.intent, acceptance: failure.acceptance, code } });
+            const result = reservation?.state === 'settled' ? { status: 'unknown' as const }
+                : await this.store.persistent.executeTemporaryFee({ type: 'failure', failure: { intent: entry.intent,
+                    acceptance: hasUsage ? 'unknown' : failure.acceptance, code } });
             entry.state = result.status === 'rejected' ? 'rejected' : result.status === 'committed' ? 'committed' : 'unknown';
             if (entry.attempt && !this.closing && !this.closedConversations.has(entry.intent.conversationId)) {
                 const bytes = this.measure(failure);

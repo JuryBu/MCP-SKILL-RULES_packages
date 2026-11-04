@@ -5,14 +5,20 @@ import type { StorePort } from '../storage/port.js';
 import type { CoreRestorePort } from './restore.js';
 import type { WorkspaceJournalPort } from './journal.js';
 import { createMemoryWorkspaceRestoreCore, validateRestoreHistory } from './temporary-history.js';
+import { collectRoundChildChanges } from './round-children.js';
 
-type DurableHistoryStore = WorkspaceRpcStore & Pick<StorePort, 'readHistory' | 'getRecord'>;
+type DurableHistoryStore = WorkspaceRpcStore & Pick<StorePort, 'readHistory' | 'getRecord' | 'listRecords'>;
 
 export function createAgentWorkspaceRestoreCore(options: { store: { persistent: DurableHistoryStore; temporary: StorePort };
     journal: WorkspaceJournalPort; plans: RestorePlanStorePort; quiesce: CoreRestorePort['quiesce'] }): CoreRestorePort {
     const durable = createSqliteWorkspaceRestoreCore(options.store.persistent, options.quiesce);
     const temporary = createMemoryWorkspaceRestoreCore({ ...options, store: options.store.temporary });
-    return { validatePreview: (input, context) => (context.retention.mode === 'temporary' ? temporary : durable).validatePreview!(input, context),
+    return { validatePreview: async (input, context) => {
+        const selection = await (context.retention.mode === 'temporary' ? temporary : durable).validatePreview!(input, context);
+        if (input.mode !== 'round_restart' || !selection.roundIds) return selection;
+        return { ...selection, ...await collectRoundChildChanges(context.retention.mode === 'temporary' ? options.store.temporary : options.store.persistent,
+            options.journal, context, selection.roundIds, input.expectedHistoryEpoch) };
+    },
         quiesce: (input, context) => (context.retention.mode === 'temporary' ? temporary : durable).quiesce(input, context), commitHistory: (input, context) =>
         (context.retention.mode === 'temporary' ? temporary : durable).commitHistory(input, context) };
 }

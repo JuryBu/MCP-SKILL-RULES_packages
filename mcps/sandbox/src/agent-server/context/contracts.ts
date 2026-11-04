@@ -3,6 +3,9 @@ import type { NativeSendView, ProviderProtocol } from '../providers/types.js';
 import type { HistoryItem, HistoryPage, HistoryQuery, ReceiptKey } from '../storage/port.js';
 
 export interface ContextPolicy {
+    taskPlanManaged: boolean;
+    communicationWindowSize: number;
+    communicationTextChars: number;
     localContextWindowTokens: number | null;
     bpcThreshold: number;
     hardThreshold: number;
@@ -193,6 +196,7 @@ export interface CompactionSnapshot {
     config: FrozenCompressionConfig;
     historyFeedback?: HistoryFeedbackSnapshot;
     requirementSourceMetadata?: RequirementSourceMetadata[];
+    communicationWindow?: import('./communication-window.js').CommunicationWindow;
     requestBudget?: CompactionRequestBudget;
 }
 
@@ -247,6 +251,8 @@ export interface DigestText {
     title: string;
     unresolved: RequirementAnchor[];
     resolutions?: RequirementResolution[];
+    continuesPrevious?: boolean;
+    reorganizedTail?: { body: string; skeleton: string; title: string };
 }
 
 export interface CompressionChunk {
@@ -321,6 +327,7 @@ export interface SummaryBatch extends DigestText {
     anchors: SourceBlock[];
     historyFeedback?: PublishedHistoryFeedback;
     feedbackSourceNodeIds?: string[];
+    exchangeId?: string;
 }
 
 export interface FoldNode extends Omit<SummaryBatch, 'kind'> {
@@ -338,6 +345,9 @@ export interface SummaryView {
     historyFeedbackRevision?: number;
     requirementGuidanceCursor?: number;
     summaryBudget?: number;
+    renderedLevels?: { nodeId: string; level: 'body' | 'skeleton' | 'title' }[];
+    communicationWindow?: import('./communication-window.js').CommunicationWindow;
+    communicationRendering?: import('./communication-window.js').CommunicationRendering;
     fitEvidence?: { inputTokens: number; target: number; inputBudget: number | null;
         targetReached: boolean; optimizationStoppedAtMinimum?: boolean };
 }
@@ -387,6 +397,8 @@ export interface CompactionCandidate {
     error: ContextFailure | null;
     publishedViewRevision: number | null;
     publicationReceiptKey: ReceiptKey | null;
+    publicationRevoked?: { reason: 'hard_takeover' | 'cancelled' | 'history_changed' | 'model_changed'; revokedAt: string; pendingAttemptId: string | null;
+        resolution?: { attemptId: string; status: 'found' | 'notAccepted' } };
 }
 
 export interface ContextFailure {
@@ -416,6 +428,7 @@ export interface SchedulerCheckpoint {
 }
 
 export interface CompactionPort extends ContextHistoryPort {
+    ensureCommunicationWindow?(input: { conversationId: string; policy: ContextPolicy; signal?: AbortSignal }): Promise<SummaryView>;
     readRequirementSourceMetadata?(input: { conversationId: string; historyEpoch: number; itemIds: string[] }): Promise<{
         historyEpoch: number; items: RequirementSourceMetadata[];
     }>;
@@ -434,6 +447,7 @@ export interface CompactionPort extends ContextHistoryPort {
     publishCandidate(input: { candidate: CompactionCandidate; receiptKey: ReceiptKey }): Promise<Publication>;
     getPublication(receiptKey: ReceiptKey): Promise<Publication | null>;
     discardCandidate(input: { conversationId: string; candidateId: string; generation: string; state: 'cancelled' | 'discarded' }): Promise<void>;
+    revokeCandidatePublication?(candidate: CompactionCandidate): Promise<void>;
     loadScheduler(conversationId: string): Promise<SchedulerCheckpoint | null>;
     saveScheduler(conversationId: string, checkpoint: SchedulerCheckpoint): Promise<void>;
 }

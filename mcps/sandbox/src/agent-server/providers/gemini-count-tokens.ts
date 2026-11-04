@@ -20,6 +20,7 @@ export interface GeminiTokenCountResult {
         requestBodyHash: string;
         observedAt: string;
         deadlineAt: string;
+        requestDeadlineAt?: string;
     };
 }
 
@@ -28,10 +29,13 @@ export interface GeminiTokenCounterOptions {
     transport: HttpTransport;
     credentialAccess?: CredentialAccess;
     now?: () => number;
+    requestTimeoutMs?: number;
 }
 
 export function createGeminiTokenCounter(options: GeminiTokenCounterOptions) {
     const now = options.now ?? Date.now;
+    const requestTimeoutMs = options.requestTimeoutMs ?? 15_000;
+    if (!Number.isFinite(requestTimeoutMs) || requestTimeoutMs <= 0) throw new AgentFault('E_COUNT_TOKENS_CONFIG', '原生计数单次期限必须为正数');
     const adapter = new GeminiAdapter();
     const active = new Map<AbortController, Promise<GeminiTokenCountResult>>();
     let closed = false;
@@ -39,12 +43,16 @@ export function createGeminiTokenCounter(options: GeminiTokenCounterOptions) {
     const countTokens = (profileId: string, modelId: string, view: NativeSendView, signal: AbortSignal | undefined,
         deadlineAt: string, parameters?: JsonObject): Promise<GeminiTokenCountResult> => {
         if (closed) return Promise.reject(new AgentFault('E_COUNT_TOKENS_CLOSED', '计数端口已经关闭'));
-        const deadline = Date.parse(deadlineAt);
-        if (!Number.isFinite(deadline) || deadline <= now()) return Promise.reject(new AgentFault('E_COUNT_TOKENS_DEADLINE', '原生计数期限已经到期或无效'));
+        const executionDeadline = Date.parse(deadlineAt);
+        if (!Number.isFinite(executionDeadline) || executionDeadline <= now()) return Promise.reject(new AgentFault('E_COUNT_TOKENS_DEADLINE', '原生计数期限已经到期或无效'));
+        const deadline = Math.min(executionDeadline, now() + Math.min(15_000, requestTimeoutMs));
+        const timeoutCode = deadline < executionDeadline ? 'E_COUNT_TOKENS_TIMEOUT' : 'E_COUNT_TOKENS_DEADLINE';
+        const timeoutMessage = deadline < executionDeadline ? '原生计数超过单次等待期限' : '原生计数超过本次执行期限';
         const controller = new AbortController();
-        const stop = (code: string, message: string) => controller.abort(new AgentFault(code, message));
+        const stop = (code: string, message: string) => controller.abort(new AgentFault(code, message,
+            { executionDeadlineAt: deadlineAt, requestDeadlineAt: new Date(deadline).toISOString() }));
         const check = () => {
-            if (now() >= deadline && !controller.signal.aborted) stop('E_COUNT_TOKENS_DEADLINE', '原生计数超过本次执行期限');
+            if (now() >= deadline && !controller.signal.aborted) stop(timeoutCode, timeoutMessage);
             if (controller.signal.aborted) throw controller.signal.reason;
         };
         const aborted = new Promise<never>((_resolve, reject) => {
@@ -53,7 +61,7 @@ export function createGeminiTokenCounter(options: GeminiTokenCounterOptions) {
         const cancel = () => stop('E_CANCELLED', '原生计数已取消');
         signal?.addEventListener('abort', cancel, { once: true });
         if (signal?.aborted) cancel();
-        const timer = setTimeout(() => stop('E_COUNT_TOKENS_DEADLINE', '原生计数超过本次执行期限'), Math.min(2_147_483_647, Math.max(1, deadline - now())));
+        const timer = setTimeout(() => stop(timeoutCode, timeoutMessage), Math.max(1, deadline - now()));
         const work = Promise.resolve().then(async (): Promise<GeminiTokenCountResult> => {
             check();
             const profile = await options.profiles.get(profileId);
@@ -92,7 +100,7 @@ export function createGeminiTokenCounter(options: GeminiTokenCounterOptions) {
             return freezeOwned({ inputTokens, raw, source: { kind: 'gemini_count_tokens' as const, endpoint: endpoint.href,
                 modelId: bareModel, profileId: profile.profileId, profileRevision: profile.revision,
                 credentialGeneration: profile.credentialGeneration, requestHash, requestBodyHash,
-                observedAt: new Date(now()).toISOString(), deadlineAt } });
+                observedAt: new Date(now()).toISOString(), deadlineAt, requestDeadlineAt: new Date(deadline).toISOString() } });
         });
         const result = Promise.race([work, aborted]).finally(() => {
             clearTimeout(timer);

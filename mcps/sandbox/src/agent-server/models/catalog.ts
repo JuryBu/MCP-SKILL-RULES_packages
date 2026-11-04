@@ -9,6 +9,9 @@ import { normalizeProgrokMetadata } from './progrok.js';
 import type { ProviderAdapter, ProviderProfile, ProviderProtocol, SendContext } from '../providers/types.js';
 import { requireEvidence, validateEvidence } from './evidence.js';
 import type { Evidence, EvidenceScope } from './evidence.js';
+import { catalogLayers, composeCatalogEntries, effectiveCatalog } from './catalog-layers.js';
+import type { CatalogSourceScope } from './catalog-layers.js';
+import { normalizeDocumentedMetadata } from './metadata.js';
 
 export interface ParameterSpec {
     type: 'number' | 'integer' | 'string' | 'boolean' | 'object' | 'array';
@@ -49,6 +52,9 @@ export interface CatalogSnapshot {
     observedAt: string;
     expiresAt: string;
     entries: ModelEntry[];
+    sourceScope?: CatalogSourceScope;
+    discoveryEntries?: ModelEntry[];
+    declarations?: ModelEntry[];
 }
 
 export interface CatalogPort {
@@ -88,8 +94,8 @@ export function entryFromMetadata(profile: ProviderProfile, metadata: JsonObject
         maxOutputTokens: count(profile.protocol === 'gemini' ? metadata.outputTokenLimit : undefined),
         inputModalities: unknown(), outputModalities: unknown(), tools: unknown(), streaming: unknown(), parameters: {},
         pricing: unknown(), rawMetadata: metadata, retired: false, contextLimitMode: profile.protocol === 'gemini' ? 'separate' : 'combined' };
-    if (profile.protocol === 'progrok') return normalizeProgrokMetadata(profile, entry);
-    return profile.protocol === 'compatible_chat' ? normalizeCompatibleChatMetadata(entry) : entry;
+    if (profile.protocol === 'progrok') return normalizeDocumentedMetadata(profile, normalizeProgrokMetadata(profile, entry));
+    return normalizeDocumentedMetadata(profile, profile.protocol === 'compatible_chat' ? normalizeCompatibleChatMetadata(entry) : entry);
 }
 
 export function validateModelEntry(entry: ModelEntry, profile: ProviderProfile): void {
@@ -136,7 +142,8 @@ export class ModelCatalog {
     constructor(readonly port: CatalogPort, private readonly now: () => number = Date.now) {}
 
     async get(profileId: string, modelId: string, routeId: string | null = null): Promise<{ catalog: CatalogSnapshot; entry: ModelEntry }> {
-        const catalog = await this.port.read(profileId);
+        const stored = await this.port.read(profileId);
+        const catalog = stored ? effectiveCatalog(stored, this.now()) : null;
         const entry = catalog?.entries.find(item => item.modelId === modelId && item.routeId === routeId);
         if (!catalog || !entry) throw new AgentFault('E_MODEL_NOT_FOUND', '本地模型目录没有该模型及路由');
         return { catalog, entry };
@@ -144,7 +151,8 @@ export class ModelCatalog {
 
     async list(profileId: string, cursor: string | null = null, limit = 50): Promise<{ catalogVersion: string | null; entries: ModelEntry[]; nextCursor: string | null }> {
         if (!Number.isSafeInteger(limit) || limit < 1 || limit > 200) throw new AgentFault('INVALID_PARAMS', '目录页大小须为1至200');
-        const catalog = await this.port.read(profileId);
+        const stored = await this.port.read(profileId);
+        const catalog = stored ? effectiveCatalog(stored, this.now()) : null;
         const index = cursor === null ? 0 : Number(cursor);
         if (!Number.isSafeInteger(index) || index < 0 || (cursor !== null && String(index) !== cursor)) throw new AgentFault('E_CURSOR_INVALID', '目录游标无效');
         const entries = catalog?.entries.slice(index, index + limit) ?? [];
@@ -174,13 +182,17 @@ export class ModelCatalog {
         }
         const previous = await this.port.read(profile.profileId);
         if ((previous?.catalogVersion ?? null) !== expectedCatalogVersion) throw new AgentFault('E_CATALOG_CONFLICT', '模型声明所依据的目录版本已变化');
-        const originalEntries = previous?.profileRevision === profile.revision ? previous.entries : (previous?.entries ?? []).map(value => ({ ...value, retired: true }));
-        const entries = [...originalEntries.filter(value => value.modelId !== entry.modelId || value.routeId !== entry.routeId), immutableJson(entry)];
-        if (entries.length > 10_000 || Buffer.byteLength(canonicalJson(entry)) > 1_048_576) throw new AgentFault('E_CATALOG_LIMIT', '人工模型声明超过有界目录上限');
+        const { discoveryEntries, declarations: originalDeclarations } = catalogLayers(previous);
+        const sourceScope = { endpoint: profile.baseUrl.replace(/\/+$/, ''), protocol: profile.protocol };
+        const declarations = [...originalDeclarations.filter(value => value.modelId !== entry.modelId || value.routeId !== entry.routeId
+            || value.protocol !== entry.protocol || value.contextWindow.scope.endpoint !== sourceScope.endpoint), immutableJson(entry)];
+        const entries = composeCatalogEntries(discoveryEntries, declarations, sourceScope, this.now());
+        if (entries.length > 10_000 || declarations.length > 10_000 || Buffer.byteLength(canonicalJson(entry)) > 1_048_576) throw new AgentFault('E_CATALOG_LIMIT', '人工模型声明超过有界目录上限');
         const expiresAt = new Date(Math.max(previous ? Date.parse(previous.expiresAt) : 0,
             Math.min(...evidence.map(item => Date.parse(item.expiresAt))))).toISOString();
         const snapshot = immutableJson({ schemaVersion: 1 as const, catalogVersion: randomUUID(), profileId: profile.profileId,
-            profileRevision: profile.revision, observedAt: new Date(this.now()).toISOString(), expiresAt, entries });
+            profileRevision: profile.revision, observedAt: new Date(this.now()).toISOString(), expiresAt, entries,
+            sourceScope, discoveryEntries, declarations });
         await this.port.publish(snapshot, expectedCatalogVersion);
         return snapshot;
     }
@@ -188,10 +200,11 @@ export class ModelCatalog {
     refresh(profile: ProviderProfile, adapter: ProviderAdapter, context: SendContext, options: {
         signal?: AbortSignal; enrich?: (entry: ModelEntry) => ModelEntry;
     } = {}): Promise<CatalogSnapshot> {
-        const ongoing = this.refreshes.get(profile.profileId);
+        const refreshKey = canonicalJson([profile.profileId, profile.revision, profile.protocol, profile.baseUrl]);
+        const ongoing = this.refreshes.get(refreshKey);
         if (ongoing) return ongoing;
-        const refresh = this.performRefresh(profile, adapter, context, options).finally(() => this.refreshes.delete(profile.profileId));
-        this.refreshes.set(profile.profileId, refresh);
+        const refresh = this.performRefresh(profile, adapter, context, options).finally(() => this.refreshes.delete(refreshKey));
+        this.refreshes.set(refreshKey, refresh);
         return refresh;
     }
 
@@ -200,6 +213,8 @@ export class ModelCatalog {
     }): Promise<CatalogSnapshot> {
         if (!profile.discovery.enabled || adapter.protocol !== profile.protocol) throw new AgentFault('E_DISCOVERY_DISABLED', '此配置未启用对应协议的目录发现');
         const previous = await this.port.read(profile.profileId);
+        const layers = catalogLayers(previous);
+        const sourceScope = { endpoint: profile.baseUrl.replace(/\/+$/, ''), protocol: profile.protocol };
         const observedAt = new Date(this.now()).toISOString();
         const expiresAt = new Date(this.now() + 24 * 60 * 60 * 1000).toISOString();
         const entries: ModelEntry[] = [];
@@ -220,11 +235,15 @@ export class ModelCatalog {
             }
             if (page.complete && page.nextCursor === null) {
                 if (options.signal?.aborted) throw new AgentFault('E_CANCELLED', '目录刷新已取消，旧目录保持有效');
-                for (const old of previous?.entries ?? []) {
+                for (const old of layers.discoveryEntries) {
+                    if (old.protocol !== profile.protocol || old.contextWindow.scope.endpoint !== sourceScope.endpoint) continue;
                     if (!entries.some(item => item.modelId === old.modelId && item.routeId === old.routeId)) entries.push({ ...old, retired: true });
                 }
+                const effective = composeCatalogEntries(entries, layers.declarations, sourceScope, this.now());
+                if (entries.length > 10_000 || effective.length > 10_000) throw new AgentFault('E_CATALOG_LIMIT', '模型目录与人工声明超过有界上限');
                 const snapshot = immutableJson({ schemaVersion: 1 as const, catalogVersion: randomUUID(), profileId: profile.profileId,
-                    profileRevision: profile.revision, observedAt, expiresAt, entries });
+                    profileRevision: profile.revision, observedAt, expiresAt, entries: effective,
+                    sourceScope, discoveryEntries: entries, declarations: layers.declarations });
                 await this.port.publish(snapshot, previous?.catalogVersion ?? null);
                 return snapshot;
             }

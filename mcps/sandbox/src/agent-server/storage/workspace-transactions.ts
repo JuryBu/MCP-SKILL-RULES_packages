@@ -305,13 +305,22 @@ export class WorkspaceTransactions {
                     || command.receipt.destinationAfterVersion?.versionToken !== previous.receipt?.destinationAfterVersion?.versionToken)) throw new AgentFault('COMMAND_ID_REUSED', '同一文件操作收到不同两端回执', undefined, true);
             return previous;
         }
+        const observation = command.receipt?.commandObservation;
+        if (observation) {
+            if (previous.toolId !== 'local.run_command' || !previous.commandActionId || command.receipt?.commitMode !== 'command_observed_file'
+                || !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(observation.afterBase64)
+                || observation.afterBase64.length > Math.ceil(MAX_FILE_BYTES / 3) * 4) throw new AgentFault('VERSION_CONFLICT', '命令观察回执与原准备记录不同', undefined, true);
+            previous.afterBase64 = observation.afterBase64;
+        }
         if (command.receipt) this.validateReceipt(previous, command.receipt);
         else if (!command.errorCode) throw new AgentFault('INVALID_PARAMS', '提交结果需要原生回执或明确错误状态');
         const conversation = this.conversation(command.conversationId);
         const next: WireChangeAction = { ...previous, state: command.receipt ? 'applied' : command.unknown ? 'unknown' : 'failed',
             ...(command.receipt ? { receipt: structuredClone(command.receipt), afterVersion: structuredClone(command.receipt.afterVersion),
+                settledAt: command.receipt.committedAt,
                 workspaceRevisionBefore: conversation.workspaceRevision, workspaceRevisionAfter: conversation.workspaceRevision + 1 }
                 : { errorCode: command.errorCode }) };
+        if (next.receipt) delete next.receipt.commandObservation;
         const saved = this.files.prepare(next, 'workspace_change');
         return this.atomic([saved], () => {
             const row = this.database.prepare('SELECT content_hash,version FROM workspace_changes WHERE action_id = ? AND cid = ?').get(command.actionId, command.conversationId);

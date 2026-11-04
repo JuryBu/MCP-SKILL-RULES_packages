@@ -4,6 +4,7 @@ import type { CompressionModelSelection, ContextPolicy, FrozenCompressionConfig 
 import { ContextFault } from './errors.js';
 
 export const DEFAULT_CONTEXT_POLICY: Readonly<ContextPolicy> = Object.freeze({
+    taskPlanManaged: false, communicationWindowSize: 10, communicationTextChars: 64 * 1024,
     localContextWindowTokens: null,
     bpcThreshold: 0.68, hardThreshold: 0.90, keepCompleteRounds: 2, deltaSteps: 2,
     chunkInputTokens: 16_000, referenceTokens: 1_000, readFrameBytes: 256 * 1024,
@@ -39,6 +40,7 @@ export function validateContextPolicy(overrides: Partial<ContextPolicy> = {}): C
         if (!(key in DEFAULT_CONTEXT_POLICY)) throw new ContextFault('CONFIG_INVALID', '未知上下文配置字段', { field: key });
     }
     const policy = { ...DEFAULT_CONTEXT_POLICY, ...overrides };
+    if (typeof policy.taskPlanManaged !== 'boolean') throw new ContextFault('CONFIG_INVALID', 'Task/Plan实体接管状态须为布尔值');
     if (policy.localContextWindowTokens !== null && (!Number.isSafeInteger(policy.localContextWindowTokens) || policy.localContextWindowTokens < 2048)) {
         throw new ContextFault('CONFIG_INVALID', '本地工作窗口须为空或至少2048 token的安全整数');
     }
@@ -47,10 +49,11 @@ export function validateContextPolicy(overrides: Partial<ContextPolicy> = {}): C
         throw new ContextFault('CONFIG_INVALID', '阈值须满足0 < BPC < hard < 1');
     }
     for (const [field, value] of Object.entries(policy)) {
-        if (field.endsWith('Threshold') || field === 'localContextWindowTokens') continue;
+        if (field.endsWith('Threshold') || field === 'localContextWindowTokens' || field === 'taskPlanManaged') continue;
         if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0) throw new ContextFault('CONFIG_INVALID', '上下文配置须为非负安全整数', { field });
     }
-    if (policy.chunkInputTokens < 64 || policy.referenceTokens >= policy.chunkInputTokens
+    if (policy.communicationWindowSize < 1 || policy.communicationWindowSize > 15 || policy.communicationTextChars < 1024
+        || policy.chunkInputTokens < 64 || policy.referenceTokens >= policy.chunkInputTokens
         || policy.readFrameBytes < 4 || policy.readFrameBytes > 256 * 1024
         || policy.maxActiveNodes < policy.stableHeadBatches + policy.stableTailBatches + 1
         || policy.foldAfterBatches < policy.maxActiveNodes || policy.immediateRetriggerLimit < 1) {
@@ -83,7 +86,8 @@ export function freezeCompressionConfig(input: {
         throw new ContextFault('CONFIG_INVALID', '压缩模型配置或有效窗口不完整');
     }
     const policy = validateContextPolicy(input.policy);
-    const rules = input.rules ?? 'Summarize only target sources. Preserve unresolved requirements verbatim with source anchors. References are context only. Return body, skeleton, title and unresolved anchors.';
+    const rules = input.rules ?? ('Reorganize the last semantic segment together with complete new target rounds. Earlier segments remain fixed. Preserve facts, corrections, actual results and retrieval anchors. When semanticTail is supplied, return continuesPrevious and either a combined digest or reorganizedTail plus the new digest. '
+        + 'Only the main model maintains task state in Task/Plan files. Existing requirement records are read-only handoff material until those files take over; their visibility does not grant the compression model ownership. Never create, edit or resolve task state. Return body, skeleton, title and an empty unresolved array.');
     const modelFingerprint = hashContext(model);
     const configFingerprint = hashContext({ policy, modelFingerprint, rules, revision: input.revision });
     return freezeValue({ policy, model, modelSource, modelFingerprint, configFingerprint, revision: input.revision, rules });

@@ -5,6 +5,7 @@ import type { ModelEntry, ParameterSpec } from '../models/catalog.js';
 import type { Evidence } from '../models/evidence.js';
 import { arrayObjects, assembleResponse, checkToolResults, freezeOwned, gateDeclaredTools, immutableJson, mediaBlock, objectValue, parseArguments, requireRoute, stringValue, validateTools, verifySnapshot } from './assemble.js';
 import { attemptTimeout, bearerHeaders, decodeResponse, endpointUrl } from './http.js';
+import { requestProviderResponse } from './streaming.js';
 import type { DiscoveryPage, NativeBlock, NativeSendView, NormalizedResponse, ProviderAdapter, ProviderAttempt, ProviderProfile, RawProviderResponse, RequestSnapshot, SendContext, StopKind, ToolCall, ToolResult } from './types.js';
 
 const reserved = new Set(['model', 'messages', 'contents', 'input', 'tools', 'stream', 'stream_options', 'provider', 'headers']);
@@ -149,7 +150,8 @@ export class CompatibleChatAdapter implements ProviderAdapter {
             }
         }
         if (pending.size) throw new AgentFault('E_TOOL_PAIRING', 'Chat发送前必须补齐工具结果');
-        const body: JsonObject = { ...parameters, model: modelId, messages: view.messages, stream: false };
+        const body: JsonObject = { ...parameters, model: modelId, messages: view.messages, stream: view.stream === true };
+        if (view.stream) body.stream_options = { include_usage: true };
         if (view.tools?.length) body.tools = view.tools.map(tool => ({ type: 'function', function: { name: tool.name,
             parameters: tool.parameters, ...(tool.description !== undefined ? { description: tool.description } : {}),
             ...(tool.strict !== undefined ? { strict: tool.strict } : {}) } }));
@@ -160,7 +162,7 @@ export class CompatibleChatAdapter implements ProviderAdapter {
         verifySnapshot(snapshot, this);
         requireRoute(snapshot);
         const body = JSON.parse(snapshot.body) as JsonObject;
-        if (body.model !== snapshot.modelId || body.stream !== false || !Array.isArray(body.messages) || !body.messages.length) {
+        if (body.model !== snapshot.modelId || body.stream !== (snapshot.streaming === true) || !Array.isArray(body.messages) || !body.messages.length) {
             throw new AgentFault('E_REQUEST_SCHEMA', '冻结的Chat请求不完整');
         }
         const policy = snapshot.profile.routePolicy;
@@ -181,11 +183,11 @@ export class CompatibleChatAdapter implements ProviderAdapter {
             const parsed = JSON.parse(body) as JsonObject;
             if (!objectValue(parsed.provider)) throw new AgentFault('E_ROUTE_UNVERIFIED', '聚合路由设置必须在冻结前写入实际请求');
         }
-        const response = await context.transport.request({ method: 'POST', url: attempt.snapshot.endpoint,
+        const raw = await requestProviderResponse(attempt, context, { method: 'POST', url: attempt.snapshot.endpoint,
             headers: { 'Content-Type': 'application/json', ...bearerHeaders(context.credential) },
-            body, timeoutMs: attemptTimeout(attempt) }, signal);
+            body, timeoutMs: attemptTimeout(attempt) }, normalizeChatResponse, signal);
         const names = arrayObjects((JSON.parse(body) as JsonObject).tools).map(tool => stringValue(objectValue(tool.function)?.name) ?? '');
-        return gateDeclaredTools(assembleResponse(attempt.attemptId, decodeResponse(response), normalizeChatResponse), names);
+        return gateDeclaredTools(assembleResponse(attempt.attemptId, raw, normalizeChatResponse), names);
     }
 
     async discover(profile: ProviderProfile, cursor: string | null, context: SendContext, signal?: AbortSignal): Promise<DiscoveryPage> {

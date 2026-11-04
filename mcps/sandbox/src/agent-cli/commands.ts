@@ -12,6 +12,7 @@ import { artifactMetadata, isJsonMime } from './presentation.js';
 import { parseCliInputReferences, parseCliReferenceSource, prepareCliInputReferences } from './references.js';
 import type { CliReferenceSource } from './references.js';
 import { installLifecycleCommandSpecs } from './lifecycle-commands.js';
+import { refreshSavedProfileCatalog } from './configuration-commands.js';
 
 const MUTATION_OPTIONS = ['command-id', 'lease-id', 'control-epoch', 'params'];
 const PAGE_OPTIONS = ['cursor', 'limit'];
@@ -160,6 +161,7 @@ export interface ExecuteContext {
     conversationId?: string;
     readInput: () => Promise<string | undefined>;
     signal?: AbortSignal;
+    interactive?: boolean;
 }
 
 export interface CommandExecution {
@@ -172,6 +174,14 @@ export function supportsServerSecretImport(): boolean {
     const spec = METHOD_SPECS['profiles.importSecret'];
     return Boolean(spec?.schema.safeParse({ profileId: 'schema-check', expectedRevision: 0,
         clientCommandId: 'schema-check', sourcePath: 'server-owned-file-reference', format: 'plain' }).success);
+}
+
+export function commandEffect(command: ParsedCommand): { method?: string; writes: boolean; label: string } {
+    const params = typeof command.parsed.options.params === 'string' ? parseJsonObject(command.parsed.options.params, '--params') : {};
+    let method = command.spec.name === 'rpc' ? command.positionals[0] : command.spec.method;
+    if (command.spec.name === 'session mode' && (command.parsed.options['preview-token'] !== undefined || params.previewToken !== undefined)) method = 'conversations.setRetention';
+    const writes = method ? METHOD_SPECS[method]?.writes ?? command.spec.mutates : command.spec.mutates;
+    return { method, writes, label: writes ? '修改状态' : '只读/本地' };
 }
 
 export function parseCommand(parsed: ParsedArguments): ParsedCommand {
@@ -321,6 +331,25 @@ export async function executeCommand(command: ParsedCommand, context: ExecuteCon
         'workspace-revision': 'expectedWorkspaceRevision',
     };
     for (const [option, field] of Object.entries(copyOptions)) if (options[option] !== undefined) params[field] = options[option];
+    if (spec.name === 'runs resume') {
+        if (!conversationId || typeof params.runId !== 'string') throw usage('runs resume需要原runId和当前会话');
+        const needRun = params.expectedRunEpoch === undefined;
+        const needHistory = params.expectedHistoryEpoch === undefined;
+        const [run, conversation] = await Promise.all([
+            needRun ? context.client.request<Record<string, unknown>>('runs.get', { conversationId, runId: params.runId }) : undefined,
+            needHistory ? context.client.request<Record<string, unknown>>('conversations.get', { conversationId }) : undefined,
+        ]);
+        if (run && !run.ok) return { method: 'runs.get', result: run };
+        if (conversation && !conversation.ok) return { method: 'conversations.get', result: conversation };
+        if (needRun) {
+            if (!Number.isSafeInteger(run?.data?.runEpoch) || Number(run?.data?.runEpoch) < 1) throw usage('原执行快照缺少有效runEpoch，本次未提交恢复');
+            params.expectedRunEpoch = run!.data!.runEpoch;
+        }
+        if (needHistory) {
+            if (!Number.isSafeInteger(conversation?.data?.historyEpoch) || Number(conversation?.data?.historyEpoch) < 0) throw usage('当前会话快照缺少有效historyEpoch，本次未提交恢复');
+            params.expectedHistoryEpoch = conversation!.data!.historyEpoch;
+        }
+    }
     if (spec.name === 'conversation create') {
         Object.assign(params, conversationCreateParams(parsed, context, params));
     }
@@ -478,7 +507,9 @@ export async function executeCommand(command: ParsedCommand, context: ExecuteCon
     }
     if (spec.name === 'compact') {
         params.mode = options.preview === true ? 'preview' : 'manual';
-        if (params.budget !== undefined || BUDGET_OPTIONS.some(option => options[option] !== undefined)) params.budget = parseBudget(parsed, params.budget);
+        const explicitBudget = params.budget !== undefined || BUDGET_OPTIONS.some(option => options[option] !== undefined);
+        if (context.interactive && options.preview !== true && !explicitBudget) params.budget = { costMode: 'metered', maxCostMicros: null, wallMs: 600_000, maxModelCalls: 128 };
+        else if (explicitBudget) params.budget = parseBudget(parsed, params.budget);
     }
     if (spec.name.startsWith('compact ') && positionals[0] !== undefined) params.candidateId = positionals[0];
     if (spec.name === 'compact recover' && !params.candidateId) throw usage('compact recover需要原candidateId，可先用compact status查看');
@@ -511,6 +542,7 @@ export async function executeCommand(command: ParsedCommand, context: ExecuteCon
     }
     if (methodSpec.writes && context.signal?.aborted) return { method, clientCommandId, result: clientFailure(new AgentFault('FRONTEND_CANCELLED', '前台已取消，本次执行尚未提交', { conversationId })) };
     let result = await context.client.request(method, params, { clientCommandId });
+    if (method === 'profiles.put' || method === 'profiles.importSecret') result = await refreshSavedProfileCatalog(context.client, result, context.signal);
     if (spec.name === 'doctor' && result.ok) result = { ...result, data: { product: result.data, cli: { version: SERVER_VERSION, node: process.version, platform: process.platform, architecture: process.arch },
         ...(options.terminal ? { terminal: { scope: '仅当前CLI终端', recovery: '光标或输入异常时，在同一终端重新运行本CLI；已退出的执行用原runId查询，不重新提交' } } : {}), modelRequestPerformed: false } };
     if (spec.name === 'runs get' && conversationId) result = await resolveRunResult(context.client, conversationId, result as RpcResult<Record<string, unknown>>);

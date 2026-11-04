@@ -1,3 +1,5 @@
+import { MODEL_FUNCTION_SCHEMAS } from '../tools/schemas.js';
+
 export type ChildToolRetentionMode = 'temporary' | 'ttl' | 'archive';
 export type ChildToolModelEffect = 'none' | 'invokes_model' | 'unknown';
 export type ChildToolAvailability = 'available' | 'unavailable' | 'disabled' | 'unknown';
@@ -50,7 +52,7 @@ export interface ChildToolSelectionResult {
 
 export type ChildToolSelectionPolicy = (input: Readonly<ChildToolSelectionInput>) => ChildToolSelectionResult;
 
-const baseTools = new Set(['read_file', 'write_file', 'list_files', 'run_command']);
+const baseTools = new Set(MODEL_FUNCTION_SCHEMAS.map(schema => schema.name));
 const defaultTools = ['read_file', 'write_file', 'list_files'];
 
 function argumentPolicyVerified(fact: Readonly<ChildToolCatalogFact>): boolean {

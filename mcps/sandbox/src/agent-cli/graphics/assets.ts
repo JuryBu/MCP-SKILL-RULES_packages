@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import { existsSync, readFileSync, statSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { decodeSixel, type RasterFrame } from './sixel-raster.js';
+import { decodeSixel, encodeSixel, fitRaster, type RasterFrame } from './sixel-raster.js';
 
 export type MascotState = 'idle' | 'thinking' | 'searching' | 'typing' | 'approval' | 'compact' | 'complete';
 export interface SpriteFrame { width: number; height: number; rows: string[] }
@@ -21,6 +21,7 @@ export class CharacterAssets {
     private readonly cache = new Map<string, Buffer>();
     private cacheBytes = 0;
     private readonly rasters = new Map<string, RasterFrame>();
+    private readonly scaled = new Map<string, string>();
     readonly dimensions = { regular: { width: 300, height: 340 }, compact: { width: 150, height: 180 } };
 
     constructor(readonly cacheEnabled = true) {
@@ -47,13 +48,8 @@ export class CharacterAssets {
         const entries = this.animations[state]?.[compact ? 'compact' : 'regular'];
         if (!entries?.length) return `${state === 'idle' ? 'cat' : 'human'}-${compact ? 'compact' : 'regular'}.sixel`;
         if (reduced) return entries[0].file;
-        let time = Math.max(0, elapsedMs);
         const duration = entries.reduce((sum, entry) => sum + entry.durationMs, 0);
-        if (state === 'idle') {
-            time %= 10_000 + duration;
-            if (time < 10_000) return entries[0].file;
-            time -= 10_000;
-        } else time %= duration;
+        let time = Math.max(0, elapsedMs) % duration;
         for (const entry of entries) {
             if (time < entry.durationMs) return entry.file;
             time -= entry.durationMs;
@@ -65,16 +61,33 @@ export class CharacterAssets {
         return this.load(`sixel/${key}`).toString('ascii');
     }
 
+    scaledSixel(key: string, width: number, height: number): string {
+        const frame = this.raster(key);
+        if (frame.width === width && frame.height === height) return this.sixel(key);
+        const cacheKey = `${key}:${width}:${height}`;
+        const previous = this.scaled.get(cacheKey);
+        if (previous && this.cacheEnabled) return previous;
+        const result = encodeSixel(fitRaster(frame, width, height));
+        if (this.cacheEnabled) { while (this.scaled.size >= 4) this.scaled.delete(this.scaled.keys().next().value!); this.scaled.set(cacheKey, result); }
+        return result;
+    }
+
+    kitty(key: string, width: number, height: number, columns: number, rows: number, imageId: number): string {
+        const frame = fitRaster(this.raster(key), width, height);
+        const bytes = Buffer.alloc(frame.pixels.length * 3);
+        frame.pixels.forEach((pixel, index) => { const color = pixel < 0 ? 0x191816 : pixel; bytes[index * 3] = color >> 16 & 255; bytes[index * 3 + 1] = color >> 8 & 255; bytes[index * 3 + 2] = color & 255; });
+        const data = bytes.toString('base64');
+        let output = '';
+        for (let offset = 0; offset < data.length; offset += 4096) output += `\x1b_G${offset ? '' : `a=T,f=24,i=${imageId},s=${width},v=${height},c=${columns},r=${rows},C=1,q=2,`}m=${offset + 4096 < data.length ? 1 : 0};${data.slice(offset, offset + 4096)}\x1b\\`;
+        return output;
+    }
+
     nextFrameDelay(state: MascotState, compact: boolean, elapsedMs: number, reduced: boolean): number {
         if (reduced) return 10_000;
         const entries = this.animations[state]?.[compact ? 'compact' : 'regular'];
         if (!entries?.length) return state === 'idle' ? 1000 : 250;
         const duration = entries.reduce((sum, entry) => sum + entry.durationMs, 0);
-        let time = Math.max(0, elapsedMs) % (state === 'idle' ? 10_000 + duration : duration);
-        if (state === 'idle') {
-            if (time < 10_000) return Math.max(16, Math.min(1000, 10_000 - time));
-            time -= 10_000;
-        }
+        let time = Math.max(0, elapsedMs) % duration;
         for (const entry of entries) {
             if (time < entry.durationMs) return Math.max(16, Math.min(1000, entry.durationMs - time));
             time -= entry.durationMs;
@@ -93,7 +106,7 @@ export class CharacterAssets {
         return frame;
     }
 
-    clear(): void { this.cache.clear(); this.rasters.clear(); this.cacheBytes = 0; }
+    clear(): void { this.cache.clear(); this.rasters.clear(); this.scaled.clear(); this.cacheBytes = 0; }
 
     private load(path: string): Buffer {
         if (!this.directory || !/^[a-zA-Z0-9_./-]+$/.test(path) || path.includes('..')) throw new Error('素材路径无效');

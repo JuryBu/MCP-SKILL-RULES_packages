@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import { AgentFault, canonicalJson } from '../protocol.js';
-import { pathIdentity } from '../security/policy.js';
+import { isWithin, pathIdentity } from '../security/policy.js';
 import type { BoundToolContext } from '../tools/types.js';
 import type { RetainPolicy } from '../protocol.js';
 import type { FileCommitReceipt, FileVersion, RestoreCreatedFileProof } from './versions.js';
@@ -27,6 +27,11 @@ export interface ChangeAction {
     receipt?: FileCommitReceipt;
     errorCode?: string;
     restoreCreatedFrom?: RestoreCreatedFileProof;
+    recordedAt?: string;
+    settledAt?: string;
+    commandActionId?: string;
+    sourceRoundId?: string;
+    workspaceOrigin?: { conversationId: string; runId: string; roundId: string; actionId: string };
 }
 
 export interface WorkspaceJournalPort {
@@ -120,12 +125,27 @@ export class MemoryWorkspaceJournal implements WorkspaceJournalPort {
         if (!action) throw new AgentFault('CHANGE_PREPARE_FAILED', '修改准备记录缺失', undefined, true);
         if (action.state === 'applied') return cloneAction(action);
         if (result.receipt) {
+            const observation = result.receipt.commandObservation;
+            if (observation) {
+                if (action.toolId !== 'local.run_command' || !action.commandActionId || result.receipt.commitMode !== 'command_observed_file') {
+                    throw new AgentFault('VERSION_CONFLICT', '命令后版本只能结清原命令的文件记录', undefined, true);
+                }
+                const after = Buffer.from(observation.afterBase64, 'base64');
+                if (after.length > 8 * 1024 * 1024 || result.receipt.afterVersion.sha256 !== bytesHash(after)
+                    || result.receipt.afterVersion.byteLength !== after.length) throw new AgentFault('VERSION_CONFLICT', '命令后字节与观察版本不同', undefined, true);
+                if (this.bytes - action.after.length + after.length > this.maxBytes) throw new AgentFault('CHANGE_PREPARE_FAILED', '命令后版本超过原记录预算', undefined, true);
+                this.bytes += after.length - action.after.length;
+                action.after = after;
+            }
             const revision = (this.revisions.get(conversationId) ?? 0) + 1;
             this.revisions.set(conversationId, revision);
             action.workspaceRevisionBefore = revision - 1;
             action.state = 'applied';
+            action.settledAt = result.receipt.committedAt;
             action.afterVersion = structuredClone(result.receipt.afterVersion);
-            action.receipt = structuredClone(result.receipt);
+            const receipt = { ...result.receipt };
+            delete receipt.commandObservation;
+            action.receipt = structuredClone(receipt);
             action.workspaceRevisionAfter = revision;
         } else {
             action.state = result.unknown ? 'unknown' : 'failed';
@@ -145,23 +165,40 @@ export class MemoryWorkspaceJournal implements WorkspaceJournalPort {
 }
 
 export class WorkspaceCoordinator {
-    private readonly tails = new Map<string, Promise<void>>();
+    private readonly active = new Set<readonly string[]>();
+    private readonly waiting: { paths: readonly string[]; start(): void }[] = [];
 
     async withPaths<Value>(paths: readonly string[], operation: () => Promise<Value>): Promise<Value> {
         const keys = [...new Set(paths.map(pathIdentity))].sort();
-        const acquire = async (index: number): Promise<Value> => {
-            if (index === keys.length) return operation();
-            const key = keys[index];
-            const previous = this.tails.get(key) ?? Promise.resolve();
-            let release!: () => void;
-            const pending = new Promise<void>(resolve => { release = resolve; });
-            const tail = previous.then(() => pending);
-            this.tails.set(key, tail);
-            await previous;
-            try { return await acquire(index + 1); }
-            finally { release(); if (this.tails.get(key) === tail) this.tails.delete(key); }
-        };
-        return acquire(0);
+        if (!keys.length) return operation();
+        return new Promise<Value>((resolve, reject) => {
+            this.waiting.push({ paths: keys, start: () => {
+                this.active.add(keys);
+                Promise.resolve().then(operation).then(resolve, reject).finally(() => {
+                    this.active.delete(keys);
+                    this.drain();
+                });
+            } });
+            this.drain();
+        });
+    }
+
+    private overlaps(first: readonly string[], second: readonly string[]): boolean {
+        return first.some(candidate => second.some(other => isWithin(candidate, other) || isWithin(other, candidate)));
+    }
+
+    private drain(): void {
+        const blocked: (readonly string[])[] = [];
+        for (let index = 0; index < this.waiting.length;) {
+            const request = this.waiting[index];
+            if ([...this.active, ...blocked].some(paths => this.overlaps(request.paths, paths))) {
+                blocked.push(request.paths);
+                index++;
+            } else {
+                this.waiting.splice(index, 1);
+                request.start();
+            }
+        }
     }
 }
 
@@ -171,7 +208,7 @@ export function changeIdentity(context: BoundToolContext, path: string, argsHash
     before: Buffer | null, after: Buffer, revision: number, toolId = 'local.write_file'): ChangeAction {
     return { actionId: context.actionId, conversationId: context.conversationId, runId: context.runId, roundId: context.roundId,
         attemptId: context.attemptId, policyRevision: context.policyRevision, runEpoch: context.runEpoch, retention: context.retention, toolId, argsHash,
-        path, state: 'prepared', beforeVersion, before, after, workspaceRevisionBefore: revision };
+        path, state: 'prepared', beforeVersion, before, after, workspaceRevisionBefore: revision, recordedAt: new Date().toISOString() };
 }
 
 export function bytesHash(value: Buffer): string { return createHash('sha256').update(value).digest('hex'); }

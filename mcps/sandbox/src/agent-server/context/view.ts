@@ -6,6 +6,7 @@ import { conservativeTextTokens } from './budget.js';
 import { freezeValue, hashBytes, hashContext } from './config.js';
 import { ContextFault } from './errors.js';
 import { activeRequirements, mergeRequirementRecords } from './requirements.js';
+import { fitCommunicationRendering, readCommunicationRendering } from './communication-window.js';
 
 export function hasNativeSignature(value: unknown): boolean {
     if (Array.isArray(value)) return value.some(hasNativeSignature);
@@ -58,7 +59,7 @@ export function createSummaryBatch(input: {
         roundIds: [...input.roundIds], sourceSpans: input.chunks.flatMap(chunk => chunk.sourceSpans),
         chunkIds: input.chunks.map(chunk => chunk.chunkId), parentBatchIds: [...input.parentBatchIds],
         modelFingerprint: input.modelFingerprint, body, skeleton, title,
-        unresolved: mergeRequirements([input.inheritedRequirements, ...input.chunks.map(chunk => chunk.digest.unresolved)]),
+        unresolved: structuredClone(input.inheritedRequirements),
         anchors: input.chunks.flatMap(chunk => chunk.anchors) });
 }
 
@@ -91,17 +92,18 @@ function renderRequirements(requirements: RequirementAnchor[]): string {
 }
 
 export function renderSummary(nodes: SummaryNode[], policy: ContextPolicy, budget = Number.MAX_SAFE_INTEGER,
-    countTokens: TokenCounter = conservativeTextTokens): RenderedSummary {
+    countTokens: TokenCounter = conservativeTextTokens, publishedLevels?: SummaryView['renderedLevels']): RenderedSummary {
     validateSummaryNodes(nodes);
     const middleEnd = nodes.length - policy.stableTailBatches;
-    const levels: SummaryLevel[] = nodes.map((_, index) => index < policy.stableHeadBatches || index >= middleEnd ? 'body'
-        : index < middleEnd - policy.middleSkeletonBatches ? 'title' : 'skeleton');
+    const fixed = new Map(publishedLevels?.map(entry => [entry.nodeId, entry.level]));
+    const levels: SummaryLevel[] = nodes.map((node, index) => fixed.get(node.nodeId) ?? (index < policy.stableHeadBatches || index >= middleEnd ? 'body'
+        : index < middleEnd - policy.middleSkeletonBatches ? 'title' : 'skeleton'));
     const rank = { title: 0, skeleton: 1, body: 2 };
     for (const [index, node] of nodes.entries()) {
         const retained = node.historyFeedback?.level;
-        if (retained && rank[retained] > rank[levels[index]]) levels[index] = retained;
+        if (!fixed.has(node.nodeId) && retained && rank[retained] > rank[levels[index]]) levels[index] = retained;
     }
-    const requirements = activeRequirements(mergeRequirements(nodes.map(node => node.unresolved)));
+    const requirements = policy.taskPlanManaged ? [] : activeRequirements(mergeRequirements(nodes.map(node => node.unresolved)));
     const nativeAnchors = new Map<string, { itemId: string; blockId: string; sha256: string; retrieval: SummaryNode['anchors'][number]['retrieval'] }>();
     for (const node of nodes) for (const anchor of node.anchors) {
         if (anchor.mediaType || typeof anchor.retrieval.nativeType === 'string') nativeAnchors.set(JSON.stringify([anchor.itemId, anchor.blockId, anchor.sha256]),
@@ -109,7 +111,7 @@ export function renderSummary(nodes: SummaryNode[], policy: ContextPolicy, budge
     }
     const render = () => {
         const parts = nodes.map((node, index) => `[summary ${node.nodeId}; seq=${node.firstSeq}..${node.lastSeq}; hash=${node.hash}; read=summary:${node.nodeId}]\n${node[levels[index]]}`);
-        if (requirements.length) parts.push(renderRequirements(requirements));
+        if (requirements.length) parts.push(`Read-only legacy task handoff: the main model should reconcile these originals into Task.md and Plan.md before taking over their state. Compression never adds, changes or resolves these records.\n${renderRequirements(requirements)}`);
         if (nativeAnchors.size) parts.push(`Native source anchors (original content retained):\n${[...nativeAnchors.values()].map(anchor => canonicalJson(anchor)).join('\n')}`);
         return parts.join('\n\n');
     };
@@ -124,7 +126,7 @@ export function renderSummary(nodes: SummaryNode[], policy: ContextPolicy, budge
             || (leftFeedback?.hitCount ?? 0) - (rightFeedback?.hitCount ?? 0)
             || (leftFeedback?.lastHitStep ?? 0) - (rightFeedback?.lastHitStep ?? 0);
     });
-    for (const useful of [false, true]) {
+    for (const useful of publishedLevels ? [] : [false, true]) {
         const group = degradationOrder.filter(index => Boolean(nodes[index].historyFeedback) === useful);
         for (const level of ['skeleton', 'title'] as const) {
             for (const index of group) {
@@ -142,6 +144,47 @@ export function renderSummary(nodes: SummaryNode[], policy: ContextPolicy, budge
     }
     return { text, tokens, levels: nodes.map((node, index) => ({ nodeId: node.nodeId, level: levels[index] })),
         degraded: levels.some((level, index) => level !== original[index]), hash: hashBytes(text) };
+}
+
+export function renderSummaryView(view: Pick<SummaryView, 'nodes' | 'renderedLevels' | 'communicationWindow' | 'communicationRendering'>,
+    policy: ContextPolicy, budget = Number.MAX_SAFE_INTEGER, countTokens: TokenCounter = conservativeTextTokens) {
+    let communicationRendering = view.communicationRendering;
+    let summary: RenderedSummary;
+    if (communicationRendering) {
+        const text = readCommunicationRendering(view.communicationWindow, communicationRendering);
+        summary = renderSummary(view.nodes, policy, Math.max(0, budget - (text ? countTokens(`\n\n${text}`) : 0)), countTokens, view.renderedLevels);
+    } else {
+        const full = renderSummary(view.nodes, policy, Number.MAX_SAFE_INTEGER, countTokens, view.renderedLevels);
+        const complete = fitCommunicationRendering(view.communicationWindow, Number.MAX_SAFE_INTEGER, countTokens);
+        if (countTokens([full.text, complete?.text].filter(Boolean).join('\n\n')) <= budget) {
+            summary = full;
+            communicationRendering = complete;
+        } else {
+            try { summary = renderSummary(view.nodes, policy, view.communicationWindow ? Math.floor(budget * 0.75) : budget, countTokens, view.renderedLevels); }
+            catch (error) {
+                if (!(error instanceof ContextFault) || error.code !== 'CONTEXT_SUMMARY_BUDGET') throw error;
+                summary = renderSummary(view.nodes, policy, budget, countTokens, view.renderedLevels);
+            }
+            communicationRendering = fitCommunicationRendering(view.communicationWindow,
+                Math.max(0, budget - summary.tokens - (summary.text ? countTokens('\n\n') : 0)), countTokens);
+        }
+    }
+    let text = [summary.text, communicationRendering?.text].filter(Boolean).join('\n\n');
+    if (countTokens(text) > budget && !view.communicationRendering) {
+        communicationRendering = fitCommunicationRendering(view.communicationWindow,
+            Math.max(0, budget - summary.tokens - countTokens('\n\n') - (countTokens(text) - budget)), countTokens);
+        text = [summary.text, communicationRendering?.text].filter(Boolean).join('\n\n');
+    }
+    const tokens = countTokens(text);
+    if (tokens > budget) throw new ContextFault('SUMMARY_BUDGET', '固定摘要与交流窗口渲染超过总预算', { summaryTokens: tokens, summaryBudget: budget });
+    return { ...summary, text, tokens, hash: hashBytes(text), communicationRendering };
+}
+
+export function sealPublishedSummaryView(view: SummaryView, policy: ContextPolicy, budget = view.summaryBudget ?? Number.MAX_SAFE_INTEGER,
+    countTokens: TokenCounter = conservativeTextTokens): SummaryView {
+    const rendered = renderSummaryView({ ...view, renderedLevels: undefined }, policy, budget, countTokens);
+    return freezeValue({ ...view, renderedLevels: rendered.levels,
+        ...(rendered.communicationRendering ? { communicationRendering: rendered.communicationRendering } : {}) });
 }
 
 export function planSummaryFold(nodes: SummaryNode[], policy: ContextPolicy, summaryBudget: number,
@@ -169,10 +212,11 @@ export function applySummaryFold(nodes: SummaryNode[], plan: { children: Summary
     return result;
 }
 
-export function validatePublication(candidate: { snapshot: { historyEpoch: number; parentViewRevision: number; runId: string; runEpoch: number;
+export function validatePublication(candidate: { publicationRevoked?: unknown; snapshot: { historyEpoch: number; parentViewRevision: number; runId: string; runEpoch: number;
     compressionGeneration: string; effectiveModelFingerprint: string; snapshotAppendSeq: number; sourcePrefixHash: string } }, current: ContextCapture,
     verifiedPrefixHash: string): void {
     const snapshot = candidate.snapshot;
+    if (candidate.publicationRevoked) throw new ContextFault('HISTORY_STALE', '候选发布资格已经撤销，原请求及费用状态继续保留');
     if (current.historyEpoch !== snapshot.historyEpoch) throw new ContextFault('HISTORY_STALE', '历史epoch已改变');
     if (current.viewRevision !== snapshot.parentViewRevision) throw new ContextFault('PARENT_STALE', '候选父视图已改变');
     if (current.effectiveModelFingerprint !== snapshot.effectiveModelFingerprint) throw new ContextFault('MODEL_STALE', '有效压缩模型身份已改变');

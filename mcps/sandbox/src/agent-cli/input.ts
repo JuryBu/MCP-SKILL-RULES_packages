@@ -17,9 +17,11 @@ export class DraftBuffer {
     private undoStack: { text: string; cursor: number }[] = [];
     private redoStack: { text: string; cursor: number }[] = [];
 
+    constructor(readonly sensitive = false) {}
+
     replace(text: string): void {
         if (Buffer.byteLength(text, 'utf8') > MAX_DRAFT_BYTES) throw usage('草稿超过1MiB，请改用附件；原草稿仍保留');
-        this.undoStack.push({ text: this.text, cursor: this.cursorGrapheme });
+        if (!this.sensitive) this.undoStack.push({ text: this.text, cursor: this.cursorGrapheme });
         this.redoStack = [];
         while (this.undoStack.length > 32 || this.undoStack.reduce((sum, item) => sum + Buffer.byteLength(item.text, 'utf8'), 0) > 2 * MAX_DRAFT_BYTES) this.undoStack.shift();
         this.text = text;
@@ -75,6 +77,7 @@ export class DraftBuffer {
     }
 
     undo(): void {
+        if (this.sensitive) return;
         const previous = this.undoStack.pop();
         if (!previous) return;
         this.redoStack.push({ text: this.text, cursor: this.cursorGrapheme });
@@ -82,6 +85,7 @@ export class DraftBuffer {
     }
 
     redo(): void {
+        if (this.sensitive) return;
         const next = this.redoStack.pop();
         if (!next) return;
         this.undoStack.push({ text: this.text, cursor: this.cursorGrapheme });

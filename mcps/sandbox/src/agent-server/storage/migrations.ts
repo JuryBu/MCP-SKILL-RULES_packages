@@ -3,7 +3,7 @@ import { readFileSync } from 'node:fs';
 import { AgentFault } from '../protocol.js';
 import type { SqlDatabase } from './internal.js';
 
-const migrationNames = ['001.sql', '002-runtime.sql', '003-accounting.sql', '004-config.sql', '005-tools-workspace.sql', '006-history.sql', '007-provider-journal.sql', '008-global-metadata.sql', '009-object-dependencies.sql', '010-temporary-finance.sql'];
+const migrationNames = ['001.sql', '002-runtime.sql', '003-accounting.sql', '004-config.sql', '005-tools-workspace.sql', '006-history.sql', '007-provider-journal.sql', '008-global-metadata.sql', '009-object-dependencies.sql', '010-temporary-finance.sql', '011-metered-budget.sql'];
 export const STORAGE_SCHEMA_VERSION = migrationNames.length;
 
 export interface StorageMigration {

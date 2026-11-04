@@ -555,7 +555,10 @@ export function createAgentRuntime(options: AgentRuntimeOptions = {}) {
         if (!accepting || conversation.value.state !== 'open') throw new AgentFault('INVALID_STATE', '会话当前无法启动执行');
         checkExpiry(conversation.value);
         if (conversation.value.activeRunId) throw new AgentFault('INVALID_STATE', '会话已有未结束的执行，请向原执行提交输入');
-        const budget = validateBudget(command.params.budget as Record<string, unknown>, now());
+        const interactive = command.method === 'runs.startInteractive';
+        const budget = validateBudget(interactive
+            ? { costMode: 'metered', maxCostMicros: null }
+            : command.params.budget as Record<string, unknown>, now(), interactive);
         if (executor && budget.costMode === 'hard' && !executor.capabilities?.hardBudget) throw new AgentFault('BUDGET_UNBOUNDED', '执行器尚未声明可靠的硬金额限制');
         const runId = randomUUID();
         const time = timestamp(now());
@@ -1539,7 +1542,7 @@ export function createAgentRuntime(options: AgentRuntimeOptions = {}) {
         return serial.run(async () => {
             const candidates = new Set(pendingRetentionSweeps);
             for (const conversation of result.conversations) {
-                if (conversation.state !== 'deleted' || !conversation.expiresAt
+                if (!(conversation.state === 'deleted' || conversation.state === 'deferred' && conversation.reason === 'family_page_pending') || !conversation.expiresAt
                     || !Number.isFinite(Date.parse(conversation.expiresAt)) || Date.parse(conversation.expiresAt) > now()) continue;
                 for (const conversationId of conversation.conversationIds) candidates.add(conversationId);
             }
@@ -1891,7 +1894,7 @@ export function createAgentRuntime(options: AgentRuntimeOptions = {}) {
             conversation.value.state = 'open';
             return commit(conversation, [], [{ type: 'conversation.reopened', payload: {} }], { ...conversation.value, revision: conversation.revision + 1 }, command);
         }
-        if (method === 'runs.start') return startRun(conversation, command);
+        if (method === 'runs.start' || method === 'runs.startInteractive') return startRun(conversation, command);
         if (method.startsWith('inputs.')) return modifyInput(method, conversation, command);
         if (method === 'interactions.respond') return respondInteraction(conversation, command);
         const record = await getRun(conversation.value.conversationId, String(command.params.runId));
@@ -2096,7 +2099,7 @@ export function createAgentRuntime(options: AgentRuntimeOptions = {}) {
                 return structuredClone(previous.value.execution) as ExecutionLease;
             }
             if (conversation.value.activeRunId) throw new AgentFault('INVALID_STATE', '原会话执行尚未结束，维护压缩不能另建根任务');
-            const budget: Record<string, unknown> = restoring ? { ...suppliedBudget, deadlineAt: timestamp(now() + 600000) } : validateBudget(suppliedBudget, now());
+            const budget: Record<string, unknown> = restoring ? { ...suppliedBudget, deadlineAt: timestamp(now() + 600000) } : validateBudget(suppliedBudget, now(), true);
             const deadlineAt = String(suppliedBudget.deadlineAt ?? budget.deadlineAt);
             if (!Number.isFinite(Date.parse(deadlineAt)) || Date.parse(deadlineAt) <= now()) throw new AgentFault('BUDGET_REQUIRED', '维护期限须有效且尚未到期');
             budget.deadlineAt = deadlineAt;
@@ -2194,10 +2197,12 @@ export function createAgentRuntime(options: AgentRuntimeOptions = {}) {
         });
     }
 
-    async function quiesceWorkspace(input: { restorePlanId: string; mode: 'files_only' | 'round_restart'; expectedHistoryEpoch: number; expectedWorkspaceRevision: number; targetRoundId?: string | null },
+    async function quiesceWorkspace(input: { restorePlanId: string; mode: 'files_only' | 'round_restart'; expectedHistoryEpoch: number; expectedWorkspaceRevision: number;
+        targetRoundId?: string | null; childConversationIds?: string[] },
         context: BoundToolContext, authorization: { client: ClientIdentity; params: Record<string, unknown> }, settle: () => Promise<boolean>): Promise<{ release(): Promise<void> }> {
         await authorizeConversationWrite(authorization.client, authorization.params);
         let token: string = randomUUID();
+        const childTargets = new Map<string, string[]>();
         await serial.run(async () => {
             const conversation = await getConversation(context.conversationId, authorization.client);
             const previous = conversation.value.workspaceQuiesce as { restorePlanId?: string; token?: string } | undefined;
@@ -2207,10 +2212,37 @@ export function createAgentRuntime(options: AgentRuntimeOptions = {}) {
             if (run.value.runEpoch !== context.runEpoch || run.value.effectState === 'unknown' || run.value.state === 'outcome_unknown') {
                 throw new AgentFault('OUTCOME_UNKNOWN', '恢复前须确认原执行代次和全部在途动作');
             }
+            for (const childId of new Set(input.childConversationIds ?? [])) {
+                const child = await getConversation(childId, undefined, true);
+                if (childId === context.conversationId || child.value.principalId !== conversation.value.principalId
+                    || child.value.options.parentConversationId !== context.conversationId) {
+                    throw new AgentFault('CONTROL_REQUIRED', '恢复停止点只接纳预览所属父会话的子任务');
+                }
+                const marker = child.value.workspaceQuiesce as { restorePlanId?: string; token?: string } | undefined;
+                if (marker && marker.restorePlanId !== input.restorePlanId) throw new AgentFault('WORKSPACE_BUSY', '子任务已有另一恢复停止点');
+                const runs = await listAll<RunData>('run', childId);
+                if (runs.some(record => record.value.effectState === 'unknown' || record.value.state === 'outcome_unknown')) {
+                    throw new AgentFault('OUTCOME_UNKNOWN', '所属子任务仍有未核清副作用，恢复预览保留');
+                }
+                childTargets.set(childId, runs.map(record => record.value.runId));
+            }
             if (previous?.token) token = previous.token;
             conversation.value.workspaceQuiesce = { restorePlanId: input.restorePlanId, token };
             workspaceStops.set(context.conversationId, token);
             await commit(conversation, [], [{ type: 'workspace.quiescing', payload: { restorePlanId: input.restorePlanId } }], null);
+            for (const [childId, runIds] of childTargets) {
+                const child = await getConversation(childId, undefined, true);
+                child.value.workspaceQuiesce = { restorePlanId: input.restorePlanId, token, parentConversationId: context.conversationId };
+                workspaceStops.set(childId, token);
+                await commit(child, [], [{ type: 'workspace.quiescing', payload: { restorePlanId: input.restorePlanId,
+                    parentConversationId: context.conversationId } }], null);
+                for (const childRunId of runIds) {
+                    const childRun = await getRun(childId, childRunId);
+                    if (!isTerminal(childRun.value) && childRun.value.state !== 'paused') {
+                        await stopRun(await getConversation(childId, undefined, true), childRun, 'paused', 'WORKSPACE_RESTORE');
+                    }
+                }
+            }
             if (!isTerminal(run.value) && run.value.state !== 'paused' && run.value.maintenancePurpose !== 'workspace_restore') {
                 await stopRun(await getConversation(context.conversationId), run, 'paused', 'WORKSPACE_RESTORE');
             }
@@ -2218,9 +2250,19 @@ export function createAgentRuntime(options: AgentRuntimeOptions = {}) {
         const deadline = performance.now() + cleanupGraceMs;
         while (true) {
             const run = await getRun(context.conversationId, context.runId);
+            let childrenReleased = true;
+            for (const [childId, runIds] of childTargets) for (const childRunId of runIds) {
+                const child = await getRun(childId, childRunId);
+                if (child.value.effectState === 'unknown' || child.value.state === 'outcome_unknown' || child.value.cleanupState === 'unconfirmed') {
+                    throw new AgentFault('CLEANUP_UNCONFIRMED', '所属子任务的执行或资源尚未核清，恢复停止点继续保留');
+                }
+                if (executions.has(childRunId) || scheduled.has(childRunId)
+                    || !(isTerminal(child.value) || child.value.state === 'paused')
+                    || !['released', 'not_needed'].includes(child.value.cleanupState)) childrenReleased = false;
+            }
             if (!executions.has(context.runId) && !scheduled.has(context.runId) && (isTerminal(run.value) || run.value.state === 'paused'
                 || run.value.kind === 'maintenance' && run.value.maintenancePurpose === 'workspace_restore' && run.value.state === 'running')
-                && ['released', 'not_needed'].includes(run.value.cleanupState)) {
+                && ['released', 'not_needed'].includes(run.value.cleanupState) && childrenReleased) {
                 context.runEpoch = run.value.runEpoch;
                 break;
             }
@@ -2232,13 +2274,15 @@ export function createAgentRuntime(options: AgentRuntimeOptions = {}) {
         if (!await settle()) throw new AgentFault('CLEANUP_UNCONFIRMED', '恢复前原工具或压缩动作尚未结清');
         return { release: async () => {
             await serial.run(async () => {
-                const conversation = await getConversation(context.conversationId, undefined, true);
-                const marker = conversation.value.workspaceQuiesce as { token?: string } | undefined;
-                if (!marker) { workspaceStops.delete(context.conversationId); return; }
-                if (marker?.token !== token) throw new AgentFault('WORKSPACE_BUSY', '恢复安全停止点已被替换');
-                delete conversation.value.workspaceQuiesce;
-                await commit(conversation, [], [{ type: 'workspace.quiesceReleased', payload: { restorePlanId: input.restorePlanId } }], null);
-                workspaceStops.delete(context.conversationId);
+                for (const conversationId of [context.conversationId, ...childTargets.keys()]) {
+                    const conversation = await getConversation(conversationId, undefined, true);
+                    const marker = conversation.value.workspaceQuiesce as { token?: string } | undefined;
+                    if (!marker) { workspaceStops.delete(conversationId); continue; }
+                    if (marker.token !== token) throw new AgentFault('WORKSPACE_BUSY', '恢复安全停止点已被替换');
+                    delete conversation.value.workspaceQuiesce;
+                    await commit(conversation, [], [{ type: 'workspace.quiesceReleased', payload: { restorePlanId: input.restorePlanId } }], null);
+                    workspaceStops.delete(conversationId);
+                }
             });
         } };
     }

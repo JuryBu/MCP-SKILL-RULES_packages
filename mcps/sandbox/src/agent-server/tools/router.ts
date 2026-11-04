@@ -26,6 +26,8 @@ import type { DelegationTools } from './delegation.js';
 import { ModelToolDiscovery } from './discovery.js';
 import { HistoryRecallTools, isHistoryRecallTool } from './history.js';
 import type { HistoryRecallPort } from './history.js';
+import { TaskPlanTools } from './task-plan.js';
+import type { TaskPlanSnapshot } from '../context/task-plan.js';
 
 export interface ToolRouterOptions {
     files?: ControlledFiles;
@@ -51,6 +53,7 @@ export class ToolRouter {
     readonly maxCaptureBytes: number;
     readonly approvals: ApprovalLedger;
     readonly fileOperations: WorkspaceFileOperations;
+    readonly taskPlan: TaskPlanTools;
     readonly resources: ResourceRegistry;
     readonly shared?: SharedMcpCatalog;
     readonly pendingTools: PendingToolCoordinator;
@@ -72,6 +75,10 @@ export class ToolRouter {
         this.approvals = options.approvals ?? new ApprovalLedger();
         this.fileOperations = new WorkspaceFileOperations({ journal: this.journal, files: this.files,
             coordinator: this.coordinator, approvals: this.approvals, maxCaptureBytes: this.maxCaptureBytes });
+        this.taskPlan = new TaskPlanTools({ journal: this.journal, files: this.files, coordinator: this.coordinator,
+            approvals: this.approvals, maxCaptureBytes: this.maxCaptureBytes });
+        this.commands.bindWorkspace?.({ journal: this.journal, files: this.files,
+            coordinator: this.coordinator, maxCaptureBytes: this.maxCaptureBytes });
         this.resources = options.resources ?? new ResourceRegistry();
         this.commands.attachResources?.(this.resources);
         this.shared = options.shared;
@@ -86,7 +93,14 @@ export class ToolRouter {
 
     private historyAvailable(name: string): boolean { return !!this.history && (name !== 'mark_history_hit' || this.history.canMarkHit); }
 
-    private localSchemas(): readonly ModelFunctionSchema[] { return MODEL_FUNCTION_SCHEMAS.filter(schema => !isHistoryRecallTool(schema.name) || this.historyAvailable(schema.name)); }
+    private localSchemas(): readonly ModelFunctionSchema[] { return [...MODEL_FUNCTION_SCHEMAS.filter(schema => !isHistoryRecallTool(schema.name) || this.historyAvailable(schema.name)),
+        ...this.taskPlan.modelFunctionSchemas]; }
+
+    async readTaskPlan(trustedContext: ToolExecutionContext): Promise<TaskPlanSnapshot | null> {
+        const context = this.bind(trustedContext);
+        await this.current(context);
+        return context.roots.length ? this.taskPlan.read(context) : null;
+    }
 
     get modelFunctionSchemas(): readonly ModelFunctionSchema[] { return [...structuredClone(this.localSchemas()),
         ...(this.delegation?.modelFunctionSchemas ?? []), ...(this.shared?.modelFunctionSchemas() ?? [])]; }
@@ -122,9 +136,9 @@ export class ToolRouter {
     }
 
     list(): ToolCatalogEntry[] {
-        const local: ToolCatalogEntry[] = MODEL_FUNCTION_SCHEMAS.map(schema => ({ toolId: `local.${schema.name}`, serviceId: 'local', name: schema.name,
+        const local: ToolCatalogEntry[] = this.localSchemas().map(schema => ({ toolId: `local.${schema.name}`, serviceId: 'local', name: schema.name,
             summary: schema.description, effectKinds: this.fileOperations.handles(schema.name) ? FILE_OPERATION_EFFECT_KINDS[schema.name]
-                : schema.name === 'write_file' || schema.name === 'mark_history_hit' ? ['write'] : schema.name === 'run_command' ? ['process', 'network'] : ['read'],
+                : schema.name === 'write_file' || schema.name === 'mark_history_hit' || schema.name === 'task_plan_write' ? ['write'] : schema.name === 'run_command' ? ['process', 'network'] : ['read'],
             modelEffect: 'none', resourceKind: schema.name === 'run_command' ? 'process' : null,
             schemaHash: createHash('sha256').update(canonicalJson(schema.parameters)).digest('hex'), adapterVersion: '1',
             availability: isHistoryRecallTool(schema.name) && !this.historyAvailable(schema.name) ? 'unavailable' : schema.name === 'run_command' && !(this.commandCapability?.available === true
@@ -141,7 +155,7 @@ export class ToolRouter {
     }
 
     describe(name: string): ModelFunctionSchema {
-        const schema = [...MODEL_FUNCTION_SCHEMAS, ...(this.delegation?.modelFunctionSchemas ?? [])]
+        const schema = [...this.localSchemas(), ...(this.delegation?.modelFunctionSchemas ?? [])]
             .find(entry => entry.name === name || `local.${entry.name}` === name);
         if (!schema) throw new AgentFault('TOOL_NOT_ALLOWED', '该工具未在模型工具目录中启用');
         return structuredClone(schema);
@@ -275,6 +289,13 @@ export class ToolRouter {
                 return { ...result, disposition: 'completed' };
             }
             assertModelArguments(args);
+            if (this.taskPlan.handles(localName)) {
+                const result = await this.taskPlan.execute(localName, args as JsonObject, context);
+                if (!result.ok && result.error) throw new AgentFault(result.error.code, result.error.message,
+                    result.error.details, result.error.mayHaveStarted);
+                await this.current(context);
+                return { ...result, disposition: 'completed' };
+            }
             const schema = localArgumentSchemas[localName as keyof typeof localArgumentSchemas];
             if (!schema) {
                 if (this.shared) return { ok: true, data: await this.shared.execute(name, args, context) };

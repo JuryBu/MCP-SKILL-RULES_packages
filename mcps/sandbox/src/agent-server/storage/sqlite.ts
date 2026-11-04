@@ -154,6 +154,8 @@ export class SqliteStore implements StorePort {
             if (method === 'readHistory' || method === 'readHistoryMetadata') throw new AgentFault('NOT_FOUND', '找不到历史所属会话');
             if (method === 'readArtifact') throw new AgentFault('NOT_FOUND', '找不到该会话内的正文引用');
             if (method === 'accounting.read') throw new AgentFault('BUDGET_REQUIRED', '必须先创建明确的根预算');
+            if (method === 'accounting.usage') return { inputTokens: 0, outputTokens: 0, cachedInputTokens: 0,
+                totalTokens: 0, costs: [], amountStatus: 'known', tokensStatus: 'known' } as Result;
             if (method === 'profile.get' || method === 'secret.get' || method === 'catalog.read') return null as Result;
             if (method === 'profile.list') return [] as Result;
             if (method === 'temporaryFee.read') return undefined as Result;
@@ -304,6 +306,10 @@ export class SqliteStore implements StorePort {
 
     readAccounting(rootBudgetId: string): Promise<BudgetView> {
         return this.request('accounting.read', { rootBudgetId });
+    }
+
+    readUsage(query: import('./usage.js').UsageQuery): Promise<import('./usage.js').UsageSummary> {
+        return this.request('accounting.usage', query);
     }
 
     prepareProviderAttempt(attempt: ProviderAttempt, upperBound: UpperBound): Promise<PreparedDispatch> {

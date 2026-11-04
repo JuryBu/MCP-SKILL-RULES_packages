@@ -28,18 +28,21 @@ export function requireRunEpoch(run: RunSnapshot, expected: unknown): void {
         { currentRunEpoch: run.runEpoch });
 }
 
-export function validateBudget(value: Record<string, unknown>, now: number): Record<string, unknown> {
+export function validateBudget(value: Record<string, unknown>, now: number, allowMetered = false): Record<string, unknown> {
     const wallMs = value.wallMs ?? 60 * 60 * 1000;
     const maxModelCalls = value.maxModelCalls ?? 128;
     const costMode = value.costMode ?? 'hard';
     if (!Number.isSafeInteger(wallMs) || Number(wallMs) < 1 || Number(wallMs) > 365 * 24 * 60 * 60 * 1000
         || !Number.isSafeInteger(maxModelCalls) || Number(maxModelCalls) < 1) throw new AgentFault('INVALID_PARAMS', '执行时间和模型次数须为有限正整数');
-    if (costMode !== 'hard' && costMode !== 'estimated') throw new AgentFault('INVALID_PARAMS', 'costMode须为hard或estimated');
+    if (costMode !== 'hard' && costMode !== 'estimated' && !(allowMetered && costMode === 'metered')) {
+        throw new AgentFault('INVALID_PARAMS', '当前入口不接受此费用模式');
+    }
     if (costMode === 'hard' && (!Number.isSafeInteger(value.maxCostMicros) || Number(value.maxCostMicros) < 0
         || typeof value.currency !== 'string' || !/^[A-Z]{3}$/.test(value.currency))) {
         throw new AgentFault('BUDGET_REQUIRED', 'hard预算需要明确金额上限和三字母币种');
     }
-    if (costMode === 'estimated' && (!Number.isSafeInteger(value.maxOutputTokens) || Number(value.maxOutputTokens) < 1)) {
+    if ((costMode === 'estimated' || costMode === 'metered' && value.maxOutputTokens !== undefined)
+        && (!Number.isSafeInteger(value.maxOutputTokens) || Number(value.maxOutputTokens) < 1)) {
         throw new AgentFault('BUDGET_UNBOUNDED', 'estimated预算需要有限的maxOutputTokens');
     }
     return { ...value, wallMs, maxModelCalls, costMode, maxCostMicros: value.maxCostMicros ?? null,

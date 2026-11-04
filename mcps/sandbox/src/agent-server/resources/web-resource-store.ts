@@ -136,6 +136,11 @@ export interface WebResourceRetentionRemoval {
     deferredResourceIds: string[];
 }
 
+export interface WebResourceMetadataPage {
+    resources: OwnedResource[];
+    nextCursor: string | null;
+}
+
 export class WebResourceStore implements ResourceStorePort {
     private readonly fallback: ResourceStorePort;
     private readonly adapterIds?: ReadonlySet<string>;
@@ -237,7 +242,8 @@ export class WebResourceStore implements ResourceStorePort {
             if (hash !== previous?.commandOutput?.hash) {
                 for (const [index, recordKey] of this.outputKeys(stored).entries()) {
                     expected.push({ key: recordKey, revision: null });
-                    records.push({ key: recordKey, revision: 1, value: { text: text.slice(index * 32768, (index + 1) * 32768) } });
+                    records.push({ key: recordKey, revision: 1, value: { conversationId: resource.conversationId,
+                        resourceId: resource.resourceId, adapterId: resource.adapterId, text: text.slice(index * 32768, (index + 1) * 32768) } });
                 }
             }
         }
@@ -319,6 +325,48 @@ export class WebResourceStore implements ResourceStorePort {
             remove: output.remove });
     }
 
+    async listMetadataPage(conversationId: string, rootRunId: string,
+        input: { cursor?: string; limit?: number } = {}): Promise<WebResourceMetadataPage> {
+        const limit = input.limit ?? 100;
+        if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100) throw new AgentFault('INVALID_PARAMS', '资源状态页大小须为1至100');
+        const summary = (resource: OwnedResource): OwnedResource => {
+            const receipt = resource.receipt && { ...resource.receipt, evidence: { ...resource.receipt.evidence } };
+            if (receipt) delete receipt.evidence.output;
+            return metadata({ ...resource, ...(receipt ? { receipt } : {}) });
+        };
+        let cursor = input.cursor;
+        if (cursor === undefined || cursor.startsWith('memory:')) {
+            const offset = cursor === undefined ? 0 : Number(cursor.slice(7));
+            if (!Number.isSafeInteger(offset) || offset < 0) throw new AgentFault('INVALID_PARAMS', '资源状态页游标无效');
+            const ids = [...this.temporaryCharges].filter(([, charge]) => charge.conversationId === conversationId).map(([id]) => id);
+            if (this.temporaryBudget && ids.length) {
+                const resources: OwnedResource[] = [];
+                let position = offset;
+                for (; position < ids.length && resources.length < limit; position++) {
+                    const resource = await this.fallback.get(ids[position]);
+                    if (resource?.rootRunId === rootRunId) resources.push(summary(resource));
+                }
+                if (resources.length) return { resources, nextCursor: position < ids.length ? 'memory:' + position : 'records:' };
+            } else {
+                const fallback = await this.fallback.list(conversationId, rootRunId);
+                const resources = fallback.slice(offset, offset + limit).map(summary);
+                if (resources.length) return { resources, nextCursor: offset + resources.length < fallback.length
+                    ? 'memory:' + (offset + resources.length) : 'records:' };
+            }
+            cursor = 'records:';
+        }
+        if (!cursor.startsWith('records:')) throw new AgentFault('INVALID_PARAMS', '资源状态页游标无效');
+        const page = await this.port.listRecords<StoredResource>({ kind: 'control', conversationId: null,
+            cursor: cursor.slice(8) || undefined, limit });
+        const resources = page.items.filter(record => record.key.id.startsWith(resourcePrefix)
+            && record.value.conversationId === conversationId && record.value.rootRunId === rootRunId && this.handles(record.value))
+            .map(record => summary(record.value));
+        if (page.hasMore && (!page.nextCursor || 'records:' + page.nextCursor === cursor)) {
+            throw new AgentFault('STORAGE_CURSOR_STALE', '资源状态分页未前进');
+        }
+        return { resources, nextCursor: page.hasMore ? 'records:' + page.nextCursor : null };
+    }
+
     async list(conversationId: string, rootRunId: string): Promise<OwnedResource[]> {
         const records = await this.fallback.list(conversationId, rootRunId);
         let cursor: string | undefined;
@@ -341,7 +389,7 @@ export class WebResourceStore implements ResourceStorePort {
         const conversations = new Set(deletedConversationIds);
         const resources = new Map<string, StoreRecord<OwnedResource>>();
         const deferred = new Set<string>();
-        const selected: StoreRecord[] = [];
+        const selected: TransitionExpected[] = [];
         let cursor: string | undefined;
         const seen = new Set<string>();
         do {
@@ -351,11 +399,11 @@ export class WebResourceStore implements ResourceStorePort {
                 if (record.value.state !== 'released' || record.value.cleanupState !== 'released'
                     || !record.value.receipt?.released || !record.value.receipt.terminalConfirmed) deferred.add(record.value.resourceId);
                 else {
-                    selected.push(record as unknown as StoreRecord);
+                    selected.push({ key: record.key, revision: record.revision });
                     for (const recordKey of this.outputKeys(record.value)) {
                         const chunk = await this.port.getRecord(recordKey);
                         if (!chunk) throw new AgentFault('RESOURCE_UNRESOLVED', '原命令输出分片待恢复');
-                        selected.push(chunk);
+                        selected.push({ key: chunk.key, revision: chunk.revision });
                     }
                 }
             }
@@ -370,7 +418,7 @@ export class WebResourceStore implements ResourceStorePort {
                 kind: 'control', ...(cursor ? { cursor } : {}) });
             for (const record of page.items) if (record.key.id.startsWith(operationPrefix)) {
                 const original = resources.get(record.value.resourceId);
-                if (original && !deferred.has(record.value.resourceId)) selected.push(record as unknown as StoreRecord);
+                if (original && !deferred.has(record.value.resourceId)) selected.push({ key: record.key, revision: record.revision });
                 else if (!original && record.value.conversationId && conversations.has(record.value.conversationId)) deferred.add(record.value.resourceId);
             }
             if (page.nextCursor === null) { cursor = undefined; break; }

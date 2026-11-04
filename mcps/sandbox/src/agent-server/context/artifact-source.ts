@@ -98,7 +98,7 @@ export async function readHistoryArtifact(store: Pick<StorePort, 'readArtifact'>
 }
 
 export function createArtifactHistorySourcePort(store: Pick<StorePort, 'readContent' | 'readArtifact'>, input: {
-    conversationId: string; maxBytes?: number; maxReadBytes?: number; maxCacheBytes?: number; cache?: ArtifactProjectionCache;
+    conversationId: string; maxBytes?: number; maxReadBytes?: number; maxCacheBytes?: number; cache?: ArtifactProjectionCache; preferProjection?: boolean;
 }): ContextSourcePort {
     const maxReadBytes = contextArtifactFrameBytes(input.maxReadBytes);
     const cache = input.cache ?? new ArtifactProjectionCache(input.maxCacheBytes);
@@ -139,5 +139,7 @@ export function createArtifactHistorySourcePort(store: Pick<StorePort, 'readCont
         },
     };
     const source = createHistorySourcePort(store, { conversationId: input.conversationId, maxReadBytes, largeContent: large });
-    return { ...source, releaseCached(blocks: readonly SourceBlock[]) { for (const block of blocks) cache.delete(input.conversationId, block.contentId); } };
+    return { ...(input.preferProjection ? { describe: async (item: HistoryItem, signal?: AbortSignal) => (await large.describe(item, signal)).map(block => ({
+        ...block, retrieval: { ...block.retrieval, rawObjectHash: item.objectRef.hash, rawObjectBytes: item.objectRef.rawBytes } })), read: large.read } : source),
+    releaseCached(blocks: readonly SourceBlock[]) { for (const block of blocks) cache.delete(input.conversationId, block.contentId); } };
 }

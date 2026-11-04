@@ -13,6 +13,9 @@ import type { StoredReceipt } from './port.js';
 import { receiptKey, storeKey } from './port.js';
 import { requireSqlContextDispatchFence } from './context-transactions.js';
 import { settlementForResponse } from '../accounting/settlement.js';
+import { failureHasExecutionEvidence, failureUsageResponse, nextProviderUsageRevision, preserveKnownProviderCharges, settlementForFailure } from '../providers/failure-accounting.js';
+import { readUsageSummary } from './usage.js';
+import type { UsageQuery, UsageSummary } from './usage.js';
 
 interface JournalEvent {
     event: AgentEvent;
@@ -36,6 +39,8 @@ export class ProviderTransactions {
     }
 
     readAccounting(rootBudgetId: string): BudgetView { return this.accounting.read(rootBudgetId); }
+
+    readUsage(query: UsageQuery): UsageSummary { return readUsageSummary(this.database, query); }
 
     readAttempt(attemptId: string): PersistedProviderAttempt | undefined {
         const row = this.row(attemptId);
@@ -110,8 +115,9 @@ export class ProviderTransactions {
             if (current.state === 'committed') return { canExecuteTools: false };
             const actualLive = this.requireLiveRun(attempt.snapshot, false);
             const authorized = canExecuteTools && Boolean(actualLive);
-            const currency = this.accounting.readBudget(attempt.rootBudgetId).currency;
-            const settlement = settlementForResponse({ attempt, response, currency });
+            const finance = this.accounting.read(attempt.rootBudgetId);
+            const settlement = preserveKnownProviderCharges(settlementForResponse({ attempt, response, currency: finance.budget.currency,
+                usageRevision: nextProviderUsageRevision(finance, attempt, response.providerResponseId) }), finance, attempt);
             const pricingSnapshot = attempt.snapshot.pricingSnapshot ?? attempt.snapshot.price;
             this.accounting.apply({ type: 'settle', ...settlement, charges: settlement.charges.map(charge => ({ ...charge,
                 usage: { settlement: charge.usage, priceSourceRef: pricingSnapshot?.sourceRef ?? null,
@@ -139,13 +145,25 @@ export class ProviderTransactions {
         const row = this.requireAttempt(attempt);
         if (row.state === 'committed') return;
         const saved = this.files.prepare(failure, 'provider_failure');
-        const rejected = failure.acceptance === 'not_sent' || failure.acceptance === 'rejected';
+        const observed = failureUsageResponse(attempt, failure);
+        const finance = this.accounting.read(attempt.rootBudgetId);
+        const reservation = finance.reservations.find(item => item.attemptId === attempt.attemptId);
+        const rejected = !failureHasExecutionEvidence(failure) && !reservation?.chargeKeys.length
+            && (failure.acceptance === 'not_sent' || failure.acceptance === 'rejected');
         const state = rejected ? 'rejected' : 'unknown';
         if (row.state === state && row.failure_object_hash === saved.hash) return;
+        const observedUsage = observed ? this.files.prepare(observed.usage, 'provider_usage') : undefined;
         const event = this.prepareEvent(attempt, `provider.attempt_${state}`, { attemptId: attempt.attemptId,
-            acceptance: failure.acceptance, errorCode: failure.error.code }, saved.hash);
-        this.atomic([saved, event.eventObject, event.receiptObject], () => {
-            this.accounting.apply(rejected ? { type: 'reject', attemptId: attempt.attemptId,
+            acceptance: observed ? 'accepted' : failure.acceptance, errorCode: failure.error.code }, saved.hash);
+        this.atomic([saved, ...(observedUsage ? [observedUsage] : []), event.eventObject, event.receiptObject], () => {
+            if (observed && reservation?.state !== 'settled') {
+                const settlement = settlementForFailure(attempt, observed, finance);
+                const price = attempt.snapshot.pricingSnapshot ?? attempt.snapshot.price;
+                this.accounting.apply({ type: 'settle', ...settlement, charges: settlement.charges.map(charge => ({ ...charge,
+                    usage: { settlement: charge.usage, priceSourceRef: price?.sourceRef ?? null, frozenAt: attempt.snapshot.frozenAt,
+                        snapshotHash: attempt.snapshot.snapshotHash, basis: charge.kind === 'provider_reported' ? 'provider_reported_cost' : 'incomplete' } })) });
+            }
+            if (reservation?.state !== 'settled') this.accounting.apply(rejected ? { type: 'reject', attemptId: attempt.attemptId,
                 acceptance: failure.acceptance as 'not_sent' | 'rejected', evidenceRef: `object:${saved.hash}` }
                 : { type: 'unknown', attemptId: attempt.attemptId });
             if (failure.error.code === 'E_QUOTA') this.accounting.apply({ type: 'halt', rootBudgetId: attempt.rootBudgetId,
@@ -154,6 +172,11 @@ export class ProviderTransactions {
             this.database.prepare('UPDATE provider_attempt_journal SET state = ?,failure_object_hash = ?,updated_at = ? WHERE attempt_id = ?')
                 .run(state, saved.hash, event.event.occurredAt, attempt.attemptId);
             this.reference(attempt, 'failure', saved.hash);
+            if (observedUsage) {
+                this.database.prepare('UPDATE attempts SET usage_hash = ?,response_id = COALESCE(?,response_id) WHERE attempt_id = ?')
+                    .run(observedUsage.hash, observed!.providerResponseId, attempt.attemptId);
+                this.reference(attempt, 'usage', observedUsage.hash);
+            }
             this.commitEvent(event);
         });
     }

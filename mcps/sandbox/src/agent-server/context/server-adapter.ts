@@ -16,6 +16,9 @@ import { StoreCompactionPort } from '../storage/context-port.js';
 import { assertContextDispatchFence, contextCandidateKey, contextContent, contextRootBudgetId, contextRunKey, contextStateKey, ContextTransactions, nextContextRecord } from '../storage/context-transactions.js';
 import type { ContextCandidateData, ContextStateData } from '../storage/context-transactions.js';
 import { ContextService, appendPlainUser, injectSummaryText } from './service.js';
+import { createToolDeliveryStore } from './tool-delivery.js';
+import { renderTaskPlanSnapshot, taskPlanReadyForTakeover } from './task-plan.js';
+import type { TaskPlanSnapshot } from './task-plan.js';
 import type { ContextExecutionViewInput, ContextExecutionViewResolver, ContextPrepareView } from './service.js';
 import type { CompressionModelPort, CompressionModelSelection, CompressionRequest, CompressionResult, ContextPolicy, ContextSourcePort,
     ContextCapture, ConversationContextLimits, ExecutionLease, FrozenCompressionConfig, MaintenanceCallbacks, UnknownContextCleanupInput } from './contracts.js';
@@ -28,7 +31,6 @@ import { createContextServerControls } from './server-controls.js';
 import type { ContextPreparedMeasurement, ContextServerCompactInput, ContextServerCompactResult, ContextServerControlInput, ContextServerControlResult, ContextServerStatus, ContextServerStatusInput } from './server-controls.js';
 import { createContextMaintenanceCallbacks } from './maintenance-budget.js';
 import { createHistoricalToolResultResolver } from './history-tool-outcomes.js';
-import { parseRequirementResolutions } from './requirements.js';
 import type { ContextMaintenanceBudgetOptions } from './maintenance-budget.js';
 
 export type ContextProviderServices = ReturnType<typeof createProviderServices>;
@@ -73,6 +75,7 @@ export interface ContextServerAdapterOptions {
     now?: () => number;
     maxCachedConversations?: number;
     maxSourceCacheBytes?: number;
+    readTaskPlan?: (context: ExecutorContext, plan: ExecutionPlan) => Promise<TaskPlanSnapshot | null>;
 }
 
 export interface ContextServerBinding {
@@ -100,6 +103,7 @@ export interface ContextServerAdapter {
     cacheSnapshot(): { sourcePorts: number; sourceBytes: number; indexConversations: number; indexItems: number };
     compactionPort: StoreCompactionPort;
     compressionModel: ProviderCompressionModelPort;
+    preserveToolResult: ReturnType<typeof createToolDeliveryStore>['preserve'];
 }
 
 function dispatchKey(request: CompressionRequest) {
@@ -120,17 +124,15 @@ export const COMPRESSION_INSTRUCTIONS = [
     'A sourceRoundOutcome closes a stopped local round, not its unfinished user goal. Preserve its actual failure/cancellation and outstanding requirements; never infer that requested work was performed merely because the round terminated.',
     'Summarize tools by their relevant inputs, actual outputs, side effects and remaining uncertainty. Preserve the source item/block identifiers needed to retrieve exact details. Media bytes, native signatures and raw tool records remain in their original stores; retain their retrieval anchors without inventing their contents.',
     'The skeleton is a compact factual index that retains essential current constraints, conclusions and source identifiers even when the full body is not sent. The title should identify the actual topic so the model can find it later.',
-    'For every still-active user requirement or unresolved question in targets, include an unresolved entry with its exact quote and source itemId/blockId. Include startByte when the quote is repeated. Quote only the exact target substring, not a paraphrase. Do not use an empty unresolved array while target requirements remain unfinished.',
-    'Each unresolved entry must use this JSON shape: {"quote":"an exact contiguous substring of ONE targets entry text","source":{"itemId":"that targets entry span.itemId","blockId":"that targets entry span.blockId"}}. Omit source.startByte for a unique quote: the host computes its exact UTF-8 byte offset from the frozen source. Prefer a longer unique quote over calculating an offset. A repeated quote requires its correct absolute UTF-8 byte offset, not a character index. Never add unresolved entries quoted only from references or priorGuidance; those sources remain outside this target delta.',
+    'The main model exclusively owns Task.md, Plan.md and all task completion states. Return unresolved:[] and omit resolutions. Never create, edit or resolve a compression-owned task list, including when no entity files exist or simple QA needs no plan.',
+    'Existing requirement records are read-only handoff material. The host preserves them until workspace files take over their display. taskPlanManaged controls that display only; it never changes task-state ownership. Preserve actual user constraints as facts with their retrieval anchors.',
     'Use references and priorGuidance only to understand the target delta and preserve continuity. Compress only targets; do not turn reference-only material into new facts. When folding summaries, preserve their still-active obligations, source anchors and relationships.',
     'Read useful-history feedback as a relevance signal, retaining the facts that made that source useful. Keep unresolved obligations accessible even when their source has no hits. Follow the supplied rules and output budget.',
     'When requestBudget is present, summaryBudget is the remaining TOTAL encoded summary allowance in the complete task request after retained originals, current input, rules and tool schemas. Share that allowance across all active summaries, including folds, titles, anchors and verbatim unresolved obligations. It is not a per-chunk output allowance. Preserve all still-active obligations while making body, skeleton and title concise enough for that complete request.',
     'Do not replace concrete facts with generic statements such as details are stored elsewhere. Put the facts needed for the next task step in body and skeleton, then retain anchors for the remaining detail.',
-    'You may also return resolutions: [{requirementId,status:"fulfilled"|"superseded",resolvedQuote,evidence:[{quote,source:{itemId,blockId}}],replacementRequirementId?}]. Use only exact IDs in priorGuidance.activeRequirements. Choose the smallest exact resolvedQuote: the contiguous part of the OLD requirement actually resolved by later evidence. The host preserves the original record and all text outside that part as active remainder obligations. Evidence must quote actual later targets/references or a known later requirement. Missing or uncertain evidence means keep the obligation. No resolutions field is required for an ordinary digest.',
-    'Use superseded only for an explicit correction, withdrawal or phase continuation from a trusted later user source. Cite the exact user words that change the old obligation, not an assistant or tool restatement, acknowledgment, promise or summary. A later requirement ID is optional and must itself have user provenance; repeating an obligation preserves it. For a numerical threshold change inside a mixed requirement, resolve only the obsolete threshold; the original format and unfinished deliverable remain active unless the user explicitly changes them too.',
-    'Use fulfilled only when exact later evidence demonstrates the requested work was actually done: a successful action/read-back, delivered content, or a trusted successfully closed assistant reply that itself completes conversational work. A successful assistant round may fulfill a simple request to confirm or briefly explain scope. For a substantive deliverable, acknowledgment is not delivery: an intent or promise to write, preserve or finish it later leaves it pending. Plans, fixtures, failed/cancelled actions and round termination do not fulfill unfinished work.',
-    'For a mixed instruction to briefly explain the scope and keep an unfinished final report, fulfill only the scope-explanation clause after the actual reply; the ongoing report remains active. Keeping a task pending does not complete it. Split independent obligations into exact contiguous unresolved quotes when possible; never retire a whole mixed requirement because just one clause was satisfied or corrected. Phase-scoped waits and confirmation-only turns can be superseded by an actual later user continuation. Preserve ongoing substantive constraints when retiring a phase. The activeRequirements list rotates within a bounded byte budget; requirements not shown on this page remain active.',
 ].join('\n');
+
+const SEMANTIC_TAIL_INSTRUCTIONS = 'When semanticTail is present, reorganize that last segment together with the new targets. Earlier segments are immutable. Return continuesPrevious:boolean. If true, body/skeleton/title describe the combined segment. If false, also return reorganizedTail:{body,skeleton,title} for the old segment and use body/skeleton/title for the new segment. A same-round subchunk must continue its previous segment. Keep source facts and retrieval identities exact.';
 
 function parseDigest(request: CompressionRequest, response: NormalizedResponse): { digest: CompressionResult['digest']; valid: boolean;
     validationError?: string; repairable?: boolean; omittedReferenceRequirements?: Array<CompressionRequest['chunk']['sourceSpans'][number]>;
@@ -146,62 +148,24 @@ function parseDigest(request: CompressionRequest, response: NormalizedResponse):
             || !value.body.trim() || !value.skeleton.trim() || !value.title.trim()) throw new Error('digest shape');
         if (request.reason === 'fold') return { digest: { body: value.body, skeleton: value.skeleton,
             title: value.title, unresolved: [] }, valid: true };
-        type DigestPart = { text: string; span: CompressionRequest['chunk']['sourceSpans'][number] };
-        const payload = JSON.parse(request.chunk.body) as { targets: DigestPart[]; references?: DigestPart[] };
-        const targets = payload.targets;
-        const omittedReferenceRequirements: Array<CompressionRequest['chunk']['sourceSpans'][number]> = [];
-        const normalizedRequirementSources: Array<{ itemId: string; blockId: string; providedStartByte: number; startByte: number; endByte: number }> = [];
-        const unresolved = (value.unresolved as unknown[]).flatMap(raw => {
-            if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw new Error('unresolved quote');
-            const item = raw as { quote?: unknown; itemId?: string; blockId?: string; startByte?: number;
-                source?: { itemId?: string; blockId?: string; startByte?: number } };
-            if (typeof item.quote !== 'string' || !item.quote) throw new Error('unresolved quote');
-            const quote = item.quote;
-            const source = item.source ?? { itemId: item.itemId, blockId: item.blockId, startByte: item.startByte };
-            if (typeof source.itemId !== 'string' || !source.itemId || typeof source.blockId !== 'string' || !source.blockId) {
-                throw new Error('unresolved source identity');
+        const payloadValue = JSON.parse(request.chunk.body) as { semanticTail?: { continuesPreviousRequired?: boolean } | null };
+        const semantic: Partial<CompressionResult['digest']> = {};
+        if (payloadValue.semanticTail) {
+            if (typeof value.continuesPrevious !== 'boolean'
+                || payloadValue.semanticTail.continuesPreviousRequired && !value.continuesPrevious) throw new Error('semantic tail continuation');
+            semantic.continuesPrevious = value.continuesPrevious;
+            if (!value.continuesPrevious) {
+                const tail = value.reorganizedTail as Record<string, unknown> | undefined;
+                if (!tail || typeof tail.body !== 'string' || !tail.body.trim() || typeof tail.skeleton !== 'string'
+                    || !tail.skeleton.trim() || typeof tail.title !== 'string' || !tail.title.trim()) throw new Error('semantic tail reorganization');
+                semantic.reorganizedTail = { body: tail.body, skeleton: tail.skeleton, title: tail.title };
             }
-            const findMatches = (parts: DigestPart[]) => parts.flatMap(target => {
-                if ((source.itemId && source.itemId !== target.span.itemId) || (source.blockId && source.blockId !== target.span.blockId)) return [];
-                const positions: number[] = [];
-                for (let position = target.text.indexOf(quote); position >= 0; position = target.text.indexOf(quote, position + 1)) positions.push(position);
-                return positions.map(position => {
-                    const startByte = target.span.startByte + Buffer.byteLength(target.text.slice(0, position));
-                    const span = { ...target.span, startByte, endByte: startByte + Buffer.byteLength(quote), sha256: hashBytes(quote) };
-                    return { span, quote };
-                });
-            });
-            const targetMatches = findMatches(targets);
-            let matches = targetMatches.filter(match => source.startByte === undefined || source.startByte === match.span.startByte);
-            if (!matches.length && typeof source.itemId === 'string' && source.itemId && typeof source.blockId === 'string' && source.blockId
-                && Number.isSafeInteger(source.startByte) && source.startByte! >= 0 && targetMatches.length === 1) {
-                matches = targetMatches;
-                normalizedRequirementSources.push({ itemId: source.itemId, blockId: source.blockId, providedStartByte: source.startByte!,
-                    startByte: matches[0].span.startByte, endByte: matches[0].span.endByte });
-            }
-            if (matches.length === 1) return [{ id: derivedContextId(['requirement', matches[0].span, quote]), quote, source: matches[0].span }];
-            const referenceMatches = findMatches(payload.references ?? []).filter(match => source.startByte === undefined || source.startByte === match.span.startByte);
-            const reference = referenceMatches.length === 1 ? referenceMatches[0] : null;
-            const referenceBlock = reference && request.snapshot.referenceBlocks?.find(block => block.itemId === reference.span.itemId
-                && block.blockId === reference.span.blockId && block.sha256 === reference.span.blockHash);
-            const targetEnd = request.snapshot.manifest?.rounds.at(-1)?.lastSeq;
-            if (matches.length === 0 && source.itemId && source.blockId && !targets.some(target => target.text.includes(quote))
-                && reference && reference.span.purpose === 'reference' && referenceBlock && targetEnd !== undefined
-                && referenceBlock.seq > targetEnd && reference.span.startByte >= 0 && reference.span.endByte <= referenceBlock.byteLength) {
-                omittedReferenceRequirements.push(reference.span);
-                return [];
-            }
-            throw new Error('unresolved source ambiguous');
-        });
-        if (omittedReferenceRequirements.length && !unresolved.length) throw new Error('reference-only requirements without a verified target requirement');
-        const resolutions = parseRequirementResolutions(value.resolutions, request, unresolved);
-        return { digest: { body: value.body, skeleton: value.skeleton, title: value.title, unresolved,
-            ...(resolutions.length ? { resolutions } : {}) }, valid: true,
-            ...(omittedReferenceRequirements.length ? { omittedReferenceRequirements } : {}),
-            ...(normalizedRequirementSources.length ? { normalizedRequirementSources } : {}) };
+        }
+        return { digest: { body: value.body, skeleton: value.skeleton,
+            title: value.title, unresolved: [], ...semantic }, valid: true };
     } catch (error) { return { digest: { body: text, skeleton: '', title: '', unresolved: [] }, valid: false,
-        repairable: (parsingResponse && error instanceof SyntaxError) || (error instanceof Error && ['digest shape', 'unresolved quote',
-            'unresolved source identity', 'unresolved source ambiguous', 'reference-only requirements without a verified target requirement'].includes(error.message)),
+        repairable: (parsingResponse && error instanceof SyntaxError) || (error instanceof Error && ['digest shape',
+            'semantic tail continuation', 'semantic tail reorganization'].includes(error.message)),
         validationError: error instanceof Error ? error.message : 'digest validation failed' }; }
 }
 
@@ -276,11 +240,12 @@ export class ProviderCompressionModelPort implements CompressionModelPort {
         if (hashBytes(request.chunk.body) !== request.inputBodyHash || request.inputBodyHash !== request.chunk.inputBodyHash) {
             throw new ContextFault('SOURCE_GAP', '压缩分块实际字节与冻结指纹不同');
         }
-        const instructions = request.reason === 'fold' ? `${COMPRESSION_INSTRUCTIONS}\nFor this fold, return only body, skeleton and title. The system inherits every child requirement and its resolution state, source proof and identity unchanged. Do not add, resolve or re-source requirements.` : COMPRESSION_INSTRUCTIONS;
+        const baseInstructions = `${COMPRESSION_INSTRUCTIONS}\n${SEMANTIC_TAIL_INSTRUCTIONS}`;
+        const instructions = request.reason === 'fold' ? `${baseInstructions}\nFor this fold, return only body, skeleton and title. Preserve the original facts and retrieval anchors. Task/Plan state remains owned by the main model; existing requirement records remain unchanged.` : baseInstructions;
         let view = appendPlainUser(injectSummaryText({ protocol: profile.protocol }, instructions), request.chunk.body);
         if (request.validationRepair) view = appendPlainUser(view, canonicalJson({ validationRepair: {
             previousAttemptId: request.validationRepair.previousAttemptId, validationError: request.validationRepair.validationError,
-            instructions: 'Return one corrected JSON digest for the same frozen targets. Preserve all active requirements. Use exact source identities and a longer unique verbatim quote, or an exact absolute UTF-8 byte offset for repeated quotes. Return body, skeleton, title and unresolved. The previous response below failed validation.',
+            instructions: 'Return one corrected JSON digest for the same frozen targets. Preserve source facts and retrieval identities. The main model owns all task states; existing requirement records remain read-only. Return body, skeleton, title, unresolved:[] and the required semantic-tail fields. The previous response below failed validation.',
             previousResponse: request.validationRepair.previousResponse,
         } }));
         const versions = { conversationId: request.execution.conversationId, runId: request.execution.runId, runEpoch: request.execution.runEpoch,
@@ -483,7 +448,7 @@ export function createContextServerAdapter(options: ContextServerAdapterOptions)
         async prepareRun(input) {
             const selected = await maintenanceOwner.prepareRun?.(input) ?? input.config;
             const root = await options.provider.ledger.read(input.execution.rootBudgetId);
-            if (!root.budget.quotaLimitId || !root.quotaLimit) throw new ContextFault('CONFIG_INVALID', '维护压缩根任务需要全局费用上限');
+            if (root.budget.mode !== 'metered' && (!root.budget.quotaLimitId || !root.quotaLimit)) throw new ContextFault('CONFIG_INVALID', '维护压缩根任务需要全局费用上限');
             const maxOutputTokens = Math.min(selected.model.maxOutputTokens, root.budget.maxOutputTokens);
             const model = { ...selected.model, maxOutputTokens, parameters: { ...selected.model.parameters, maxOutputTokens } };
             const config = freezeCompressionConfig({ currentModel: model,
@@ -494,7 +459,9 @@ export function createContextServerAdapter(options: ContextServerAdapterOptions)
         },
         finishRun: input => maintenanceOwner.finishRun(input),
     } : undefined;
-    const service = new ContextService({ compaction: { port: compactionPort, sources, model: compressionModel, maintenance, now,
+    const toolDeliveries = createToolDeliveryStore(options.store);
+    const service = new ContextService({ preserveToolResult: toolDeliveries.preserve, readToolDelivery: toolDeliveries.read,
+        compaction: { port: compactionPort, sources, model: compressionModel, maintenance, now,
         maxCachedConversations: maximumConversations }, policy: options.policy, readVersionState: async conversationId => {
             const record = await options.store.getRecord({ conversationId, kind: 'conversation', id: conversationId });
             const historyEpoch = record?.value.historyEpoch;
@@ -531,17 +498,19 @@ export function createContextServerAdapter(options: ContextServerAdapterOptions)
         if (plan.rootBudgetId !== rootBudgetId) throw new ContextFault('CONFIG_INVALID', 'ExecutionPlan根预算须采用Runtime持久rootRunId',
             { rootRunId: rootBudgetId, planRootBudgetId: plan.rootBudgetId });
         const root = await options.provider.ledger.read(rootBudgetId);
-        if (!root.budget.quotaLimitId || !root.quotaLimit) throw new ContextFault('CONFIG_INVALID', '压缩必须复用当前根任务的全局费用上限');
+        if (root.budget.mode !== 'metered' && (!root.budget.quotaLimitId || !root.quotaLimit)) throw new ContextFault('CONFIG_INVALID', '压缩必须复用当前根任务的全局费用上限');
         const resolved = await options.resolveSelection?.(context, plan);
         const local = resolved && Object.hasOwn(resolved, 'conversation') ? resolved.conversation
             : selectionFromOptions(context.conversationOptions.compressionModelSelection ?? context.conversationOptions.compressionModel);
         const globalSelection = resolved && Object.hasOwn(resolved, 'global') ? resolved.global
             : (plan.profile.compressionModelRef ? { modelId: plan.profile.compressionModelRef } : null);
         const maximum = root.budget.maxOutputTokens;
+        const taskPlan = await options.readTaskPlan?.(context, plan);
         const selectedModel = await makeSelection(plan, local ?? globalSelection ?? { profileId: plan.profile.profileId, modelId: plan.modelId }, maximum);
         const config = freezeCompressionConfig({ currentModel: selectedModel,
             ...(local ? { conversationModel: selectedModel } : globalSelection ? { globalModel: selectedModel } : {}),
-            policy: { ...options.policy, ...(context.conversationOptions.contextPolicy as Partial<ContextPolicy> | undefined), ...resolved?.policy },
+            policy: { ...options.policy, ...(context.conversationOptions.contextPolicy as Partial<ContextPolicy> | undefined), ...resolved?.policy,
+                taskPlanManaged: taskPlanReadyForTakeover(taskPlan) },
             revision: resolved?.revision ?? plan.profile.revision, rules: resolved?.rules ?? options.rules });
         const execution: ExecutionLease = { kind: context.snapshot.kind, conversationId: context.snapshot.conversationId,
             runId: context.snapshot.runId, runEpoch: context.snapshot.runEpoch, rootBudgetId,
@@ -554,10 +523,15 @@ export function createContextServerAdapter(options: ContextServerAdapterOptions)
         return { config, execution, limits, stepSeq: capture.stepSeq };
     };
 
+    const taskPlanDynamicContext = (overrides: Awaited<ReturnType<ContextExecutionViewResolver>>, context: ExecutorContext, plan: ExecutionPlan) => async () => {
+            const existing = typeof overrides.dynamicContext === 'function' ? await overrides.dynamicContext() : overrides.dynamicContext;
+            const taskPlan = await options.readTaskPlan?.(context, plan);
+            return [existing, taskPlan ? renderTaskPlanSnapshot(taskPlan) : ''].filter(Boolean).join('\n\n');
+    };
     const prepareView = service.createPrepareView(async (context, plan, input) => {
         const binding = await bind(context, plan);
         const overrides = await options.resolveView?.(context, plan, input) ?? {};
-        return { ...overrides, readTailReuse: 'consume', policy: binding.config.policy,
+        return { ...overrides, dynamicContext: taskPlanDynamicContext(overrides, context, plan), readTailReuse: 'consume', policy: binding.config.policy,
             resolveHistoricalToolResults: overrides.resolveHistoricalToolResults ?? createHistoricalToolResultResolver(options.store),
             readItem: overrides.readItem ?? ((item, bounds) => item.value !== undefined ? Promise.resolve(item.value) : readHistoryArtifact(options.store,
                 { conversationId: context.snapshot.conversationId, item, maxReadBytes: bounds.maxReadBytes, signal: bounds.signal })),
@@ -575,7 +549,7 @@ export function createContextServerAdapter(options: ContextServerAdapterOptions)
         const binding = await bind(context, plan);
         const overrides = await options.resolveView?.(context, plan, input) ?? {};
         try {
-            const viewInput = { ...overrides, readTailReuse: 'offer' as const, conversationId: context.snapshot.conversationId, context, adapter: plan.adapter,
+            const viewInput = { ...overrides, dynamicContext: taskPlanDynamicContext(overrides, context, plan), readTailReuse: 'offer' as const, conversationId: context.snapshot.conversationId, context, adapter: plan.adapter,
                 resolveHistoricalToolResults: overrides.resolveHistoricalToolResults ?? createHistoricalToolResultResolver(options.store),
                 readItem: overrides.readItem ?? ((item, bounds) => item.value !== undefined ? Promise.resolve(item.value) : readHistoryArtifact(options.store,
                     { conversationId: context.snapshot.conversationId, item, maxReadBytes: bounds.maxReadBytes, signal: bounds.signal })),
@@ -684,5 +658,6 @@ export function createContextServerAdapter(options: ContextServerAdapterOptions)
         return structuredClone(measurement);
     };
 
-    return { service, prepareView, postStep, bind, finishExecution, reconcileCleanup, confirmUnknownCleanup, releaseConversation, cacheSnapshot, readPreparedEstimate, compactionPort, compressionModel, ...controls };
+    return { service, prepareView, postStep, bind, finishExecution, reconcileCleanup, confirmUnknownCleanup, releaseConversation, cacheSnapshot, readPreparedEstimate, compactionPort, compressionModel,
+        preserveToolResult: toolDeliveries.preserve, ...controls };
 }

@@ -10,6 +10,7 @@ import type { StoredRestorePlan } from '../storage/workspace-port.js';
 import { changeIdentity, sharedWorkspaceCoordinator } from './journal.js';
 import type { ChangeAction, WorkspaceCoordinator, WorkspaceJournalPort } from './journal.js';
 import { WorkspaceRestorer } from './restore.js';
+import { assertChildWorkspaceRevisions, mergeRestoreActions, readJournalActions } from './round-children.js';
 import type { RestorePathResult, RestorePreviewInput } from './restore.js';
 import { fileHunks, reverseTextChange } from './text-restore.js';
 import { assertReadablePath, captureFile, ControlledFiles } from './versions.js';
@@ -371,6 +372,7 @@ interface OperationRestorePlan {
     policyRevision: number;
     rootsHash: string;
     actionIds: string[];
+    childRevisions?: Record<string, number>;
     baselines: FileVersion[];
     operations: OperationRestoreStep[];
     state: 'preview' | 'committing' | 'complete' | 'pending';
@@ -413,7 +415,7 @@ export class FileOperationsRestorer extends WorkspaceRestorer {
         return { restorePlanId: plan.restorePlanId, mode: plan.input.mode, state: plan.state, revision: plan.revision,
             policyRevision: plan.policyRevision, rootsHash: plan.rootsHash,
             expectedHistoryEpoch: plan.input.expectedHistoryEpoch, expectedWorkspaceRevision: plan.input.expectedWorkspaceRevision,
-            actionIds: [...plan.actionIds], operations: plan.operations.map(step => ({ path: step.path, destinationPath: step.destinationPath ?? null,
+            actionIds: [...plan.actionIds], childConversationIds: Object.keys(plan.childRevisions ?? {}), operations: plan.operations.map(step => ({ path: step.path, destinationPath: step.destinationPath ?? null,
                 operation: step.kind, conflict: step.code ?? null, targetSha256: step.targetBase64 === undefined ? null : hash(Buffer.from(step.targetBase64, 'base64')),
                 currentVersion: plan.baselines.find(version => samePath(version.canonicalPath, step.path)) ?? null })),
             results: structuredClone(plan.results), historyReceipt: plan.historyReceipt ?? null,
@@ -450,7 +452,9 @@ export class FileOperationsRestorer extends WorkspaceRestorer {
         }
         if (await this.journal.revision(context.conversationId) !== input.expectedWorkspaceRevision) throw new AgentFault('VERSION_CONFLICT', '工作区版本已变化，请重新预览');
         const selection = await this.core?.validatePreview?.(input, context);
-        const selected = this.chooseOperationActions(await this.journal.list(context.conversationId), input, selection?.roundIds);
+        const selected = this.chooseOperationActions(mergeRestoreActions(await readJournalActions(this.journal, context.conversationId,
+            input.mode === 'round_restart' && !selection?.roundIds ? undefined
+                : action => this.chooseOperationActions([action], input, selection?.roundIds).length > 0), selection), input, selection?.roundIds);
         if (!selected.some(action => action.fileOperation && action.fileOperation.kind !== 'patch')) return super.preview(input, context, restorePlanId);
         if (input.hunks?.some(item => !selected.some(action => action.actionId === item.actionId))) throw new AgentFault('INVALID_PARAMS', '所选片段不属于当前恢复动作');
         const paths = [...new Map(selected.flatMap(fileOperationPaths).map(candidate => [pathIdentity(candidate), candidate])).values()];
@@ -533,7 +537,8 @@ export class FileOperationsRestorer extends WorkspaceRestorer {
         }
         const plan: OperationRestorePlan = { fileOperationsVersion: 1, restorePlanId: restorePlanId ?? randomUUID(), input: structuredClone(input),
             principalId: context.principalId, conversationId: context.conversationId, policyRevision: context.policyRevision, rootsHash: this.rootsDigest(context),
-            actionIds: selected.map(action => action.actionId), baselines, operations, state: 'preview', results: [], revision: 0 };
+            actionIds: selected.map(action => action.actionId), childRevisions: selection?.childRevisions,
+            baselines, operations, state: 'preview', results: [], revision: 0 };
         try { await this.storeOperationPlan(plan, null); }
         catch (error) {
             if (error instanceof AgentFault && error.code === 'WORKSPACE_CAS_CONFLICT') {
@@ -629,10 +634,12 @@ export class FileOperationsRestorer extends WorkspaceRestorer {
         if (!this.core) throw new AgentFault('RESTORE_PENDING', '文件恢复需要核心安全停止点和历史提交端口');
         await current(context);
         const guard = await this.core.quiesce({ restorePlanId: planId, mode: plan.input.mode, expectedHistoryEpoch: plan.input.expectedHistoryEpoch,
-            expectedWorkspaceRevision: plan.input.expectedWorkspaceRevision, targetRoundId: plan.input.roundId ?? null }, context);
+            expectedWorkspaceRevision: plan.input.expectedWorkspaceRevision, targetRoundId: plan.input.roundId ?? null,
+            childConversationIds: Object.keys(plan.childRevisions ?? {}) }, context);
         try {
             return await this.coordinator.withPaths(plan.baselines.map(version => version.canonicalPath), async () => {
                 if (await this.journal.revision(context.conversationId) !== plan.input.expectedWorkspaceRevision) throw new AgentFault('VERSION_CONFLICT', '预览后工作区已有其它修改');
+                await assertChildWorkspaceRevisions(this.journal, plan.childRevisions);
                 const versions = new Map(plan.baselines.map(version => [pathIdentity(version.canonicalPath), version]));
                 const blocked = new Set<string>();
                 for (const version of plan.baselines) {
@@ -677,10 +684,12 @@ export class FileOperationsRestorer extends WorkspaceRestorer {
         await current(context);
         const revision = await this.journal.revision(context.conversationId);
         const guard = await this.core.quiesce({ restorePlanId: planId, mode: plan.input.mode, expectedHistoryEpoch: plan.input.expectedHistoryEpoch,
-            expectedWorkspaceRevision: revision, targetRoundId: plan.input.roundId ?? null }, context);
+            expectedWorkspaceRevision: revision, targetRoundId: plan.input.roundId ?? null,
+            childConversationIds: Object.keys(plan.childRevisions ?? {}) }, context);
         try {
             return await this.coordinator.withPaths(plan.baselines.map(version => version.canonicalPath), async () => {
                 if (await this.journal.revision(context.conversationId) !== revision) throw new AgentFault('VERSION_CONFLICT', '查回期间工作区版本已经变化');
+                await assertChildWorkspaceRevisions(this.journal, plan.childRevisions);
                 const own = new Set(plan.operations.map(step => step.actionId));
                 const later = (await this.journal.list(context.conversationId)).filter(action => (action.workspaceRevisionAfter ?? -1) > plan.input.expectedWorkspaceRevision
                     || action.state === 'prepared' || action.state === 'unknown');

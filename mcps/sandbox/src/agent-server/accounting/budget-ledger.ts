@@ -4,7 +4,7 @@ import type { JsonValue } from '../protocol.js';
 
 export interface BudgetDefinition {
     rootBudgetId: string;
-    mode?: 'hard' | 'estimated';
+    mode?: 'hard' | 'estimated' | 'metered';
     currency: string;
     maxCostMicros: number | null;
     maxModelCalls: number;
@@ -37,7 +37,7 @@ export interface QuotaLimitRecord extends QuotaLimitDefinition {
 }
 
 export interface BudgetRecord extends BudgetDefinition {
-    mode: 'hard' | 'estimated';
+    mode: 'hard' | 'estimated' | 'metered';
     unsettledCalls?: number;
     spentCalls: number;
     heldCalls: number;
@@ -82,7 +82,7 @@ export type ReservationInput = { rootBudgetId: string; attemptId: string; action
     upperBound: UpperBound; foregroundCallFloor?: 1 } & ReservationIdentity;
 
 export type ReservationRecord = ReservationIdentity & {
-    amountMode?: 'estimated';
+    amountMode?: 'estimated' | 'metered';
     attemptId: string;
     rootBudgetId: string;
     actionId: string;
@@ -220,7 +220,8 @@ function refreshTotals(state: AccountingState): void {
     }
     for (const charge of Object.values(state.charges)) {
         const budget = budgetFor(state, charge.rootBudgetId);
-        budget.spentMicros = safeAdd(budget.spentMicros, charge.amountMicros ?? 0);
+        if (charge.currency === budget.currency) budget.spentMicros = safeAdd(budget.spentMicros, charge.amountMicros ?? 0);
+        else if (budget.mode === 'metered') budget.amountUnknown = true;
     }
     for (const reservation of Object.values(state.reservations)) {
         const budget = budgetFor(state, reservation.rootBudgetId);
@@ -257,7 +258,8 @@ function releaseKnownCosts(state: AccountingState, reservation: ReservationRecor
     reservation.state = complete ? 'settled' : 'unsettled';
     reservation.callHeld = false;
     reservation.dispatched = true;
-    if (reservation.amountMode !== 'estimated' && (reservation.postResponseUpperBound || reservation.upperMicros !== null) && known > effectiveUpper) {
+    if (reservation.amountMode !== 'estimated' && reservation.amountMode !== 'metered'
+        && (reservation.postResponseUpperBound || reservation.upperMicros !== null) && known > effectiveUpper) {
         budgetFor(state, reservation.rootBudgetId).overdrawn = true;
     }
 }
@@ -344,7 +346,7 @@ export function applyAccountingCommand(previous: AccountingState, command: Accou
     } else if (command.type === 'create_budget') {
         const definition = { ...command.definition, mode: command.definition.mode ?? 'hard' };
         requiredIdentity(definition.rootBudgetId);
-        if (!['hard', 'estimated'].includes(definition.mode) || !/^[A-Z]{3}$/.test(definition.currency) || !definition.sourceRef
+        if (!['hard', 'estimated', 'metered'].includes(definition.mode) || !/^[A-Z]{3}$/.test(definition.currency) || !definition.sourceRef
             || !exactAmount(definition.maxModelCalls) || definition.maxModelCalls < 1
             || !exactAmount(definition.maxOutputTokens) || definition.maxOutputTokens < 1
             || !Number.isFinite(Date.parse(definition.deadlineAt)) || Date.parse(definition.deadlineAt) <= now
@@ -352,6 +354,9 @@ export function applyAccountingCommand(previous: AccountingState, command: Accou
             throw new AgentFault('BUDGET_REQUIRED', '根预算必须明确币种、次数、输出上限、期限和来源');
         }
         if (definition.mode === 'hard' && definition.maxCostMicros === null) throw new AgentFault('BUDGET_REQUIRED', '硬金额预算必须提供明确金额');
+        if (definition.mode === 'metered' && (definition.maxCostMicros !== null || definition.quotaLimitId)) {
+            throw new AgentFault('BUDGET_REQUIRED', '人工计量模式只记录费用，不可混用金额上限或供应商限额');
+        }
         if (definition.quotaLimitId) {
             const globalLimit = quotaLimitFor(state, definition.quotaLimitId);
             if (globalLimit.currency !== definition.currency) throw new AgentFault('E_CURRENCY_MISMATCH', '根预算与供应商总限额币种不同');
@@ -396,7 +401,7 @@ export function applyAccountingCommand(previous: AccountingState, command: Accou
         const upper = command.upperBound;
         const globalLimit = budget.quotaLimitId ? quotaLimitFor(state, budget.quotaLimitId) : null;
         const estimatedAmountMode = budget.mode === 'estimated' && globalLimit?.amountMode === 'estimated';
-        if (!globalLimit && upper.source !== 'fixture') throw new AgentFault('E_GLOBAL_BUDGET_REQUIRED', '真实模型请求必须关联跨全部根任务的供应商总限额');
+        if (!globalLimit && budget.mode !== 'metered' && upper.source !== 'fixture') throw new AgentFault('E_GLOBAL_BUDGET_REQUIRED', '真实模型请求必须关联跨全部根任务的供应商总限额');
         if (globalLimit && (!globalLimit.quotaScopeIds.includes(command.quotaScopeId) || globalLimit.blockedReason || globalLimit.overdrawn)) {
             throw new AgentFault('E_GLOBAL_BUDGET_HALTED', '供应商总限额不可用于该账户或已经停止新增请求');
         }
@@ -434,6 +439,7 @@ export function applyAccountingCommand(previous: AccountingState, command: Accou
         if (attempts.length >= 3) throw new AgentFault('E_ATTEMPT_LIMIT', '同一动作最多提交三次尝试');
         reservation = { attemptId: command.attemptId, rootBudgetId: command.rootBudgetId, actionId: command.actionId,
             ...(estimatedAmountMode ? { amountMode: 'estimated' as const } : {}),
+            ...(budget.mode === 'metered' ? { amountMode: 'metered' as const } : {}),
             quotaScopeId: command.quotaScopeId, ...reservationIdentity, upperMicros: upper.amountMicros, originalUpperBound: structuredClone(upper),
             heldMicros: upper.amountMicros ?? 0, amountUnknown: upper.amountMicros === null || !upper.reliable,
             state: 'reserved', dispatched: false, callHeld: true, intentHash: hash(command),
@@ -522,13 +528,17 @@ export function applyAccountingCommand(previous: AccountingState, command: Accou
             }
             for (const charge of command.charges) {
                 requiredIdentity(charge.component);
-                if (charge.currency !== budget.currency) throw new AgentFault('E_CURRENCY_MISMATCH', '结算费用与根预算币种不同');
+                if (charge.currency !== budget.currency && budget.mode !== 'metered') throw new AgentFault('E_CURRENCY_MISMATCH', '结算费用与根预算币种不同');
                 if (charge.amountMicros !== null && !exactAmount(charge.amountMicros)) throw new AgentFault('E_PRICE_UNKNOWN', '结算金额超出精确整数范围');
                 if (Buffer.byteLength(canonicalJson(charge.usage)) > 65_536) throw new AgentFault('E_USAGE_LIMIT', '费用usage元数据超过64KiB');
                 const identity = chargeKey(reservation.quotaScopeId, reservation.executionKey, charge.component);
                 const existing = state.charges[identity];
                 if (existing) {
                     if (command.usageRevision < existing.usageRevision) throw new AgentFault('E_USAGE_STALE', 'usage补报版本已经过期');
+                    if (existing.currency !== charge.currency && !(budget.mode === 'metered' && existing.currency === 'XXX'
+                        && existing.amountMicros === null && command.usageRevision > existing.usageRevision && /^[A-Z]{3}$/.test(charge.currency))) {
+                        throw new AgentFault('E_CURRENCY_MISMATCH', '同一费用组件的已知币种不能被改写');
+                    }
                     if (command.usageRevision === existing.usageRevision) {
                         if (hash({ amount: charge.amountMicros, usage: charge.usage }) !== hash({ amount: existing.amountMicros, usage: existing.usage })) {
                             throw new AgentFault('E_USAGE_CONFLICT', '同一usage版本的费用内容冲突');
@@ -536,7 +546,7 @@ export function applyAccountingCommand(previous: AccountingState, command: Accou
                         replayed = true;
                     } else {
                         if (existing.amountMicros !== null && charge.amountMicros === null) throw new AgentFault('E_USAGE_CONFLICT', '未知补报不能覆盖已有明确费用');
-                        Object.assign(existing, { usageRevision: command.usageRevision, amountMicros: charge.amountMicros,
+                        Object.assign(existing, { usageRevision: command.usageRevision, amountMicros: charge.amountMicros, currency: charge.currency,
                             usage: charge.usage, kind: charge.kind });
                     }
                 } else state.charges[identity] = { ...charge, quotaScopeId: reservation.quotaScopeId,

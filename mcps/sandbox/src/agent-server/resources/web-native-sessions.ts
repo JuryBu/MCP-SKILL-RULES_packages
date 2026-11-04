@@ -12,6 +12,8 @@ export interface NativeWebReference {
     backendOwnerId?: string;
 }
 
+type NativeSessionOwner = Pick<BoundToolContext, 'principalId' | 'conversationId' | 'rootRunId' | 'runId'>;
+
 export interface NativeWebSessionContract {
     normalSessionCalls: boolean;
     enabled: false;
@@ -71,7 +73,7 @@ export class NativeWebSessionPort {
         return this.client.invoke(name, args, signal);
     }
 
-    private async owned(resource: OwnedResource, context: BoundToolContext): Promise<OwnedResource> {
+    private async owned(resource: OwnedResource, context: NativeSessionOwner): Promise<OwnedResource> {
         const saved = await this.store.get(resource.resourceId);
         if (!saved || saved.adapterId !== this.adapterId || saved.issuerId !== resource.issuerId || saved.principalId !== context.principalId
             || saved.conversationId !== context.conversationId || saved.rootRunId !== context.rootRunId
@@ -85,7 +87,7 @@ export class NativeWebSessionPort {
                 resource.conversationId, resource.runId, resource.requestId])).digest('hex')}`;
     }
 
-    async findByRequest(resource: OwnedResource, context: BoundToolContext): Promise<OwnedResource | null> {
+    async findByRequest(resource: OwnedResource, context: NativeSessionOwner): Promise<OwnedResource | null> {
         resource = await this.owned(resource, context);
         if (resource.state === 'released') return resource;
         const ownerId = this.owner(resource);
@@ -169,7 +171,7 @@ export class NativeWebSessionPort {
         }
     }
 
-    async close(resource: OwnedResource, context: BoundToolContext): Promise<OwnedResource> {
+    async close(resource: OwnedResource, context: NativeSessionOwner): Promise<OwnedResource> {
         resource = await this.owned(resource, context);
         if (resource.state === 'released') return resource;
         if (resource.receipt?.evidence.referenceKind === 'borrowed') {

@@ -428,6 +428,7 @@ function dispatch(request: WorkerRequest): unknown {
         case 'readHistoryMetadata': return readHistoryMetadata(database!, request.params as HistoryMetadataQuery);
         case 'accounting.execute': return providerTransactions.executeAccounting(request.params as AccountingCommand);
         case 'accounting.read': return providerTransactions.readAccounting((request.params as { rootBudgetId: string }).rootBudgetId);
+        case 'accounting.usage': return providerTransactions.readUsage(request.params as import('./usage.js').UsageQuery);
         case 'provider.prepareAttempt': {
             const params = request.params as { attempt: ProviderAttempt; upperBound: UpperBound };
             return providerTransactions.prepareAttempt(params.attempt, params.upperBound);

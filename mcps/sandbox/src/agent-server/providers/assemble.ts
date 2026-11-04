@@ -37,6 +37,7 @@ export function freezeRequest(input: {
     price?: PriceEntry;
     requirePricingSnapshot?: boolean;
     frozenAt?: string;
+    stream?: boolean;
 }): RequestSnapshot {
     const { adapter, profile, versions, modelId, view } = input;
     if (!versions.runId || !versions.stepId || !versions.actionId || !versions.conversationId
@@ -52,7 +53,9 @@ export function freezeRequest(input: {
     if (!Number.isFinite(Date.parse(input.deadlineAt))) throw new AgentFault('E_REQUEST_DEADLINE', '请求必须有有限期限');
     const timeoutMs = input.timeoutMs ?? 900_000;
     if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1) throw new AgentFault('E_REQUEST_DEADLINE', '请求超时必须为正整数');
-    const encoded = adapter.encode(view, modelId, input.parameters);
+    const streaming = input.stream ?? view.stream ?? false;
+    const encoded = adapter.encode({ ...view, stream: streaming }, modelId, input.parameters);
+    if (adapter.protocol === 'openai_responses') encoded.store = profile.remoteRetention === 'allowed';
     if (adapter.protocol === 'compatible_chat' && profile.routePolicy.kind === 'pinned_aggregator') {
         encoded.provider = { only: [profile.routePolicy.provider ?? ''], allow_fallbacks: false, require_parameters: true };
     }
@@ -72,7 +75,8 @@ export function freezeRequest(input: {
         profile, profileRevision: profile.revision,
         credentialGeneration: profile.credentialGeneration, routePolicyVersion: profile.routePolicy.version, modelId,
         effectiveParameters: input.parameters, adapterVersion: adapter.version, serializerVersion: 'canonical-json-v1' as const,
-        endpoint: adapter.endpoint(profile, modelId), bodyHash: sha256(body), timeoutMs, deadlineAt: input.deadlineAt };
+        ...(streaming ? { streaming: true } : {}),
+        endpoint: adapter.endpoint(profile, modelId, streaming), bodyHash: sha256(body), timeoutMs, deadlineAt: input.deadlineAt };
     const owned = { ...immutableJson(fixed), body };
     const fields = { ...owned, snapshotHash: sha256(canonicalJson(owned)) };
     const snapshot = Object.freeze(Object.fromEntries(Object.keys(fields).sort()
@@ -96,7 +100,7 @@ export function verifySnapshot(snapshot: RequestSnapshot, adapter: ProviderAdapt
     const pricingSnapshot = snapshot.pricingSnapshot ?? snapshot.price;
     if (snapshot.adapterVersion !== adapter.version || snapshot.profile.protocol !== adapter.protocol
         || snapshot.bodyHash !== sha256(snapshot.body) || snapshotHash !== sha256(canonicalJson(fixed))
-        || snapshot.endpoint !== adapter.endpoint(snapshot.profile, snapshot.modelId)
+        || snapshot.endpoint !== adapter.endpoint(snapshot.profile, snapshot.modelId, snapshot.streaming === true)
         || snapshot.profileRevision !== snapshot.profile.revision
         || snapshot.credentialGeneration !== snapshot.profile.credentialGeneration
         || snapshot.routePolicyVersion !== snapshot.profile.routePolicy.version

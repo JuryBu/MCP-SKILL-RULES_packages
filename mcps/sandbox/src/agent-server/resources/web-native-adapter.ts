@@ -8,9 +8,11 @@ import type { SharedToolSpec } from '../tools/adapters/types.js';
 import { assertOwnedWebArguments, assertNativeWebTableArguments, verifiedPersistentWebToolSpecs } from '../tools/adapters/web.js';
 import { validateToolArguments } from '../tools/schema-cache.js';
 import type { OwnedResource, ResourceAdapter, ResourceReceipt, ResourceRegistry, ResourceStorePort } from './registry.js';
-import type { NativeWebReference } from './web-native-sessions.js';
+import { NativeWebSessionPort, inspectNativeWebSessionContract, type NativeWebReference } from './web-native-sessions.js';
 
 export interface NativeWebAdapterContract {
+    leaseMode?: 'native' | 'core';
+    upstreamMissing?: string[];
     ephemeralContent?: boolean;
     missingEphemeral?: string[];
     enabled: boolean;
@@ -97,7 +99,13 @@ export function inspectNativeWebAdapterContract(tools: readonly BrokerToolDefini
         if (properties?.ephemeralContent?.type !== 'boolean') missingEphemeral.push(`${name}:ephemeralContent`);
         if (!((properties?.saveMode?.enum ?? []) as string[]).includes('inline')) missingEphemeral.push(`${name}:saveMode=inline`);
     }
-    return { enabled: !missing.length, missing, ephemeralContent: !missing.length && !missingEphemeral.length, missingEphemeral,
+    const normal = inspectNativeWebSessionContract(tools);
+    const coreManaged = Boolean(coreIssuerId) && normal.normalSessionCalls
+        && toolNames.every(name => name === 'web_interact' || name === 'web_pipeline') && missing.length > 0
+        && missing.every(field => /:(?:requestId|leaseUntil|hardLeaseUntil|renew)$/.test(field));
+    return { enabled: !missing.length || coreManaged, missing: coreManaged ? [] : missing,
+        leaseMode: coreManaged ? 'core' : 'native', upstreamMissing: missing,
+        ephemeralContent: !missing.length && !missingEphemeral.length, missingEphemeral,
         contractHash: createHash('sha256').update(canonicalJson(tools)).digest('hex'),
         callerSource: 'core_bound_caller', remoteAuthentication: 'not_provided' };
 }
@@ -158,6 +166,8 @@ export class NativeWebResourceAdapter implements ResourceAdapter {
     readonly supports: ResourceAdapter['supports'];
     private readonly outputs = new Map<string, { output: unknown; resourceId: string; principalId: string; conversationId: string; bytes: number }>();
     private readonly schemas: ReadonlyMap<string, Record<string, unknown>>;
+    private normalSessions?: NativeWebSessionPort;
+    private readonly expiryTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
     private constructor(readonly options: NativeWebAdapterOptions, readonly contract: NativeWebAdapterContract, tools: readonly BrokerToolDefinition[]) {
         this.adapterId = options.adapterId ?? 'web-native-sessions-v1';
@@ -170,7 +180,9 @@ export class NativeWebResourceAdapter implements ResourceAdapter {
         const tools = options.definitions ?? await nativeWebToolDefinitions(options.client);
         const contract = inspectNativeWebAdapterContract(tools, options.coreIssuerId, options.toolNames);
         if (!contract.enabled) throw new AgentFault('TOOL_CAPABILITY_UNVERIFIED', '真实原生网页尚缺请求/租期schema，持续入口保持unavailable', { missing: contract.missing });
-        return new NativeWebResourceAdapter(options, contract, tools);
+        const adapter = new NativeWebResourceAdapter(options, contract, tools);
+        if (contract.leaseMode === 'core') adapter.normalSessions = await NativeWebSessionPort.connect(options.client, options.resourceStore, adapter.adapterId);
+        return adapter;
     }
 
     inputSchema(toolName: NativeWebToolName): Record<string, unknown> {
@@ -197,6 +209,41 @@ export class NativeWebResourceAdapter implements ResourceAdapter {
         if (!schema) throw new AgentFault('TOOL_CAPABILITY_UNVERIFIED', '原生网页缺少已核验schema', { name });
         validateToolArguments(args, schema);
         return this.options.client.invoke(name, args, signal);
+    }
+
+    private clearExpiry(resourceId: string): void {
+        clearTimeout(this.expiryTimers.get(resourceId));
+        this.expiryTimers.delete(resourceId);
+    }
+
+    private armExpiry(resource: OwnedResource, retry = false): void {
+        this.clearExpiry(resource.resourceId);
+        const timer = setTimeout(() => {
+            this.expiryTimers.delete(resource.resourceId);
+            void (async () => {
+                const current = await this.options.resourceStore.get(resource.resourceId);
+                if (!current || current.state === 'released') return;
+                await this.owned(current);
+                if (Date.parse(current.leaseUntil) > Date.now()) { this.armExpiry(current); return; }
+                const closed = await this.normalSessions!.close(current, current);
+                if (closed.receipt?.released && closed.receipt.terminalConfirmed) this.discardOutput(current.requestId);
+            })().catch(() => { this.armExpiry(resource, true); });
+        }, retry ? 30000 : Math.max(1, Math.min(2147483647, Date.parse(resource.leaseUntil) - Date.now())));
+        timer.unref();
+        this.expiryTimers.set(resource.resourceId, timer);
+    }
+
+    private async normalReceipt(resource: OwnedResource, leaseUntil = resource.leaseUntil): Promise<ResourceReceipt | null> {
+        const found = await this.normalSessions!.findByRequest(resource, resource);
+        if (!found?.receipt) return null;
+        const receipt: ResourceReceipt = { ...found.receipt, evidence: { ...found.receipt.evidence,
+            requestId: resource.requestId, leaseUntil,
+            hardLeaseUntil: resource.receipt?.evidence.hardLeaseUntil ?? resource.leaseUntil,
+            contractHash: this.contract.contractHash, leaseMode: 'core', remoteLeaseEnforced: 'false',
+            backendIdleExpiry: 'upstream-default', callerSource: 'core_bound_caller', remoteAuthentication: 'not_provided' } };
+        if (receipt.released) this.clearExpiry(resource.resourceId);
+        else this.armExpiry({ ...found, leaseUntil });
+        return receipt;
     }
 
     private parse(resource: OwnedResource, result: unknown, ownerId = this.owner(resource), hardLeaseUntil?: string): ResourceReceipt | null {
@@ -257,13 +304,15 @@ export class NativeWebResourceAdapter implements ResourceAdapter {
             requestId: resource.requestId, backendOwnerId: ownerId, hardLeaseUntil: call.hardLeaseUntil,
             referenceKind: call.reference.kind, callerSource: 'core_bound_caller', remoteAuthentication: 'not_provided', contractHash: this.contract.contractHash } };
         await this.options.resourceStore.put(resource);
-        const args = { ...call.args, ownerId, requestId: resource.requestId, leaseUntil: resource.leaseUntil, hardLeaseUntil: call.hardLeaseUntil,
+        if (this.normalSessions) this.armExpiry(resource);
+        const args = { ...call.args, ownerId,
+            ...(!this.normalSessions ? { requestId: resource.requestId, leaseUntil: resource.leaseUntil, hardLeaseUntil: call.hardLeaseUntil } : {}),
             ...(temporary ? { ephemeralContent: true, saveMode: 'inline', ...(call.toolName !== 'web_download' ? { humanAssistance: 'never' } : {}) }
                 : call.toolName !== 'web_download' ? { saveMode: call.toolName === 'web_extract_tables' ? 'file' : 'inline', humanAssistance: 'never' } : {}),
             ...(call.toolName === 'web_pipeline' ? { keepSession: true } : {}),
             ...(call.reference.kind === 'borrowed' ? { sessionId: call.reference.externalId } : {}) };
         const output = await this.invoke(call.toolName, args, signal);
-        const receipt = this.parse(resource, output, ownerId, call.hardLeaseUntil);
+        const receipt = this.normalSessions ? await this.normalReceipt(resource) : this.parse(resource, output, ownerId, call.hardLeaseUntil);
         if (!receipt) throw new AgentFault('RESOURCE_UNRESOLVED', '原网页创建尚无原request回执', { requestId: resource.requestId }, true);
         receipt.evidence.referenceKind = call.reference.kind;
         receipt.evidence.toolName = call.toolName;
@@ -278,6 +327,7 @@ export class NativeWebResourceAdapter implements ResourceAdapter {
 
     async findByRequest(resource: OwnedResource): Promise<ResourceReceipt | null> {
         await this.owned(resource);
+        if (this.normalSessions) return this.normalReceipt(resource);
         return this.parse(resource, await this.invoke('web_list_sessions', { ownerId: this.owner(resource), requestId: resource.requestId, includeAllOwners: false }));
     }
 
@@ -291,6 +341,11 @@ export class NativeWebResourceAdapter implements ResourceAdapter {
         await this.owned(resource);
         const hard = resource.receipt?.evidence.hardLeaseUntil;
         if (typeof hard !== 'string' || Date.parse(leaseUntil) > Date.parse(hard)) throw new AgentFault('RESOURCE_LEASE_BUDGET', '续租将超过原先批准的hard预算', { field: 'leaseUntil', hardLeaseUntil: hard });
+        if (this.normalSessions) {
+            const receipt = await this.normalReceipt(resource, leaseUntil);
+            if (!receipt) throw new AgentFault('RESOURCE_UNRESOLVED', '原会话尚未查回，保留原请求且停止续租', { requestId: resource.requestId }, true);
+            return receipt;
+        }
         const receipt = this.parse(resource, await this.invoke('web_interact', { ownerId: this.owner(resource), requestId: resource.requestId, action: 'renew', leaseUntil }));
         if (!receipt) throw new AgentFault('RESOURCE_UNRESOLVED', '续租缺少原request回执', { requestId: resource.requestId }, true);
         return receipt;
@@ -298,6 +353,15 @@ export class NativeWebResourceAdapter implements ResourceAdapter {
 
     async cancel(resource: OwnedResource): Promise<ResourceReceipt> {
         await this.owned(resource);
+        if (this.normalSessions) {
+            const closed = await this.normalSessions.close(resource, resource);
+            if (!closed.receipt) throw new AgentFault('RESOURCE_UNRESOLVED', '原会话关闭尚无回执', { requestId: resource.requestId }, true);
+            if (closed.receipt.released && closed.receipt.terminalConfirmed) {
+                this.clearExpiry(resource.resourceId);
+                if (!this.options.preserveOutputOnCancel) this.discardOutput(resource.requestId);
+            }
+            return closed.receipt;
+        }
         const receipt = this.parse(resource, await this.invoke('web_close_sessions', { ownerId: this.owner(resource), requestId: resource.requestId, closeAllForOwner: false }));
         if (!receipt) throw new AgentFault('RESOURCE_UNRESOLVED', '取消缺少原request终态', { requestId: resource.requestId }, true);
         if (!this.options.preserveOutputOnCancel && receipt.released && receipt.terminalConfirmed) this.discardOutput(resource.requestId);
@@ -365,6 +429,7 @@ export async function dispatchNativeWebResource(input: NativeWebDispatch): Promi
     return { ...(object(output) ?? { content: [{ type: 'text', text: '已沿原request查回网页资源，未重复创建页面' }] }),
         structuredContent: { ...object(object(output)?.structuredContent), ownedResource: { resourceId: resource.resourceId,
             requestId: resource.requestId, leaseUntil: resource.leaseUntil, state: resource.state, cleanupState: resource.cleanupState,
+            externalId: resource.externalId, ownerId: resource.receipt?.evidence.backendOwnerId,
             recovered: output === undefined, callerSource: 'core_bound_caller', remoteAuthentication: 'not_provided' } } };
 }
 

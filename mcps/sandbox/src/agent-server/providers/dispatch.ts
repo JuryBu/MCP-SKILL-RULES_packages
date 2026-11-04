@@ -1,17 +1,21 @@
 import { AgentFault } from '../protocol.js';
 import type { AgentError } from '../protocol.js';
 import type { UpperBound } from '../accounting/budget-ledger.js';
+import type { NormalizedUsage } from '../accounting/usage.js';
 import { freezeOwned, prepareAttempt } from './assemble.js';
 import { attemptTimeout, safeTransportCause } from './http.js';
 import { ProviderFault } from './types.js';
 import { sharedQuotaScheduler } from './quota.js';
+import { failureHasExecutionEvidence } from './failure-accounting.js';
 import type { QuotaScheduler } from './quota.js';
-import type { Acceptance, HttpTransport, LookupResult, NormalizedResponse, ProviderAdapter, ProviderAttempt, RawProviderResponse, RequestSnapshot } from './types.js';
+import type { Acceptance, HttpTransport, LookupResult, NormalizedResponse, ProviderAdapter, ProviderAttempt, ProviderPartial, RawProviderResponse, RequestSnapshot } from './types.js';
 
 export interface RecordedFailure {
     error: AgentError;
     acceptance: Acceptance;
     rawResponse?: RawProviderResponse;
+    partialResponse?: NormalizedResponse;
+    usage?: NormalizedUsage;
 }
 
 export type PreparedDispatch = { status: 'send' } | { status: 'committed'; response: NormalizedResponse }
@@ -21,6 +25,7 @@ export interface DispatchJournalPort {
     prepareAttempt(attempt: ProviderAttempt, upperBound: UpperBound): Promise<PreparedDispatch>;
     commitResponse(attempt: ProviderAttempt, response: NormalizedResponse): Promise<{ canExecuteTools: boolean }>;
     recordFailure(attempt: ProviderAttempt, failure: RecordedFailure): Promise<void>;
+    recordPartial?(attempt: ProviderAttempt, partial: ProviderPartial): Promise<void>;
 }
 
 export interface CredentialAccess {
@@ -36,6 +41,7 @@ export interface DispatchOptions {
     now?: () => number;
     sleep?: (milliseconds: number, signal?: AbortSignal) => Promise<void>;
     quotaScheduler?: QuotaScheduler;
+    onPartial?: (attempt: ProviderAttempt, partial: ProviderPartial) => void | Promise<void>;
 }
 
 export function abortableSleep(milliseconds: number, signal?: AbortSignal): Promise<void> {
@@ -79,7 +85,8 @@ export class ProviderDispatcher {
     }
 
     async execute(adapter: ProviderAdapter, snapshot: RequestSnapshot, rootBudgetId: string, upperBound: UpperBound,
-        options: { signal?: AbortSignal; attemptId?: string } = {}): Promise<NormalizedResponse> {
+        options: { signal?: AbortSignal; attemptId?: string;
+            onPartial?: (attempt: ProviderAttempt, partial: ProviderPartial) => void | Promise<void> } = {}): Promise<NormalizedResponse> {
         adapter.validate(snapshot);
         return (this.options.quotaScheduler ?? sharedQuotaScheduler).run(snapshot.profile.quotaScopeId,
             () => this.executeWithinQuota(adapter, snapshot, rootBudgetId, upperBound, options),
@@ -87,7 +94,8 @@ export class ProviderDispatcher {
     }
 
     private async executeWithinQuota(adapter: ProviderAdapter, snapshot: RequestSnapshot, rootBudgetId: string, upperBound: UpperBound,
-        options: { signal?: AbortSignal; attemptId?: string }): Promise<NormalizedResponse> {
+        options: { signal?: AbortSignal; attemptId?: string;
+            onPartial?: (attempt: ProviderAttempt, partial: ProviderPartial) => void | Promise<void> }): Promise<NormalizedResponse> {
         adapter.validate(snapshot);
         for (let index = 0; index < this.maxAttempts; index++) {
             const attempt = prepareAttempt(snapshot, rootBudgetId, index === 0 ? options.attemptId : undefined);
@@ -112,7 +120,11 @@ export class ProviderDispatcher {
                     const expiry = upperBound.expiresAt ?? snapshot.pricingSnapshot?.expiresAt ?? snapshot.price?.expiresAt;
                     if (expiry && Date.parse(expiry) <= this.now()) throw new ProviderFault('E_PRICE_UNKNOWN', '实际发送前费用上界已过期', { acceptance: 'not_sent' });
                     adapterEntered = true;
-                    return adapter.send(attempt, { transport: trackedTransport, credential }, options.signal);
+                    return adapter.send(attempt, { transport: trackedTransport, credential, onPartial: async partial => {
+                        await this.options.journal.recordPartial?.(attempt, partial);
+                        await options.onPartial?.(attempt, partial);
+                        await this.options.onPartial?.(attempt, partial);
+                    } }, options.signal);
                 };
                 const profile = snapshot.profile;
                 if (profile.credentialRef) {
@@ -125,9 +137,10 @@ export class ProviderDispatcher {
                         { acceptance: 'not_sent', phase: 'prepared', transportPhase: 'preflight', transportCause: safeTransportCause(error) })
                     : asProviderFault(error);
                 await this.options.journal.recordFailure(attempt, { error: { ...fault.toJSON(), actionId: snapshot.actionId, attemptId: attempt.attemptId },
-                    acceptance: fault.acceptance, ...(fault.rawResponse ? { rawResponse: fault.rawResponse } : {}) });
-                const retryable = ['not_sent', 'rejected'].includes(fault.acceptance) && fault.retryable
-                    && ['E_RATE_LIMIT', 'E_TRANSPORT_UNSENT'].includes(fault.code) && index + 1 < this.maxAttempts;
+                    acceptance: fault.acceptance, ...(fault.rawResponse ? { rawResponse: fault.rawResponse } : {}),
+                    ...(fault.partialResponse ? { partialResponse: fault.partialResponse } : {}), ...(fault.usage ? { usage: fault.usage } : {}) });
+                const retryable = ['not_sent', 'rejected'].includes(fault.acceptance) && fault.retryable && !failureHasExecutionEvidence(fault)
+                    && ['E_RATE_LIMIT', 'E_PROVIDER_TEMPORARY', 'E_TRANSPORT_UNSENT'].includes(fault.code) && index + 1 < this.maxAttempts;
                 if (!retryable) throw fault;
                 const random = this.options.random?.() ?? Math.random();
                 const jitter = Math.floor(Math.max(0, Math.min(1, random)) * Math.min(30_000, 1000 * 2 ** index));
@@ -152,14 +165,25 @@ export class ProviderDispatcher {
         throw new AgentFault('E_ATTEMPT_LIMIT', '本动作已达到提交上限');
     }
 
-    async lookup(adapter: ProviderAdapter, attempt: ProviderAttempt, signal?: AbortSignal): Promise<LookupResult> {
+    async lookup(adapter: ProviderAdapter, attempt: ProviderAttempt, signal?: AbortSignal,
+        options: { providerResponseId?: string } = {}): Promise<LookupResult> {
         const waits = [2000, 5000, 15_000];
+        const query = async (): Promise<LookupResult> => {
+            const lookup = async (credential?: string): Promise<LookupResult> => adapter.lookup({ attemptId: attempt.attemptId,
+                ...(options.providerResponseId ? { providerResponseId: options.providerResponseId } : {}), snapshot: attempt.snapshot },
+            { transport: this.options.transport, credential }, signal);
+            if (!attempt.snapshot.profile.credentialRef) return lookup();
+            if (!this.options.credentials) throw new ProviderFault('E_SECRET_BACKEND', '原结果查询缺少受保护凭据端口', { acceptance: 'not_sent' });
+            return this.options.credentials.withCredential(attempt.snapshot.profile.credentialRef, attempt.snapshot.credentialGeneration, lookup);
+        };
+        let result = await query();
         for (const wait of waits) {
+            if (result.status !== 'pending') return result.status === 'found'
+                ? { status: 'found', response: routeChecked(attempt.snapshot, result.response) } : result;
             if (this.now() + wait >= Date.parse(attempt.snapshot.deadlineAt)) break;
             await this.sleep(wait, signal);
-            const result = await adapter.lookup({ attemptId: attempt.attemptId }, { transport: this.options.transport }, signal);
-            if (result.status !== 'pending') return result;
+            result = await query();
         }
-        return { status: 'pending' };
+        return result.status === 'found' ? { status: 'found', response: routeChecked(attempt.snapshot, result.response) } : result;
     }
 }

@@ -16,6 +16,7 @@ import { DELEGATION_FUNCTION_SCHEMAS } from './tools/delegation.js';
 import { hasMcpToolImageReferences } from './media/tool-results.js';
 import { appendNativeHistoryView } from './context/native-view-build.js';
 import { scopedToolActionId } from './tool-action-identity.js';
+import { createExecutionProgress } from './execution-progress.js';
 
 export interface ExecutionPlan {
     profile: ProviderProfile;
@@ -502,11 +503,22 @@ export function createProviderExecutor(services: ExecutionServices): AgentExecut
                         attachmentManifestHash: prepared.attachmentManifestHash,
                         nativeReplayHash: sha256(canonicalJson(view)) } });
                 await context.checkpoint('awaiting_response', { stepId, actionId, modelId: plan.modelId, profileId: plan.profile.profileId });
-                const response = await services.dispatcher.execute(preparedRequest.adapter, preparedRequest.snapshot, plan.rootBudgetId,
-                    preparedRequest.upperBound, { signal: context.signal });
+                const progress = createExecutionProgress(context, { stepId, actionId });
+                let response: NormalizedResponse;
+                try {
+                    response = await services.dispatcher.execute(preparedRequest.adapter, preparedRequest.snapshot, plan.rootBudgetId,
+                        preparedRequest.upperBound, { signal: context.signal, onPartial: async (attempt, partial) => {
+                            try { await progress.onPartial(attempt, partial); }
+                            finally { confirmedAttemptId = progress.attemptId ?? confirmedAttemptId; }
+                        } });
+                    acceptance = 'accepted';
+                    confirmedAttemptId = response.attemptId;
+                    await progress.flush();
+                } catch (error) {
+                    await progress.flush().catch(() => undefined);
+                    throw error;
+                } finally { progress.close(); }
                 modelCallsUsed++;
-                acceptance = 'accepted';
-                confirmedAttemptId = response.attemptId;
                 const modelReceipt = await context.recordStep({ kind: 'model', operationId: `model:${response.attemptId}`, stepId, actionId,
                     protocol: plan.adapter.protocol, response });
                 published.push(...await services.publish(context, response));

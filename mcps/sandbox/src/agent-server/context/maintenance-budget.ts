@@ -50,14 +50,14 @@ export function createContextMaintenanceCallbacks(options: ContextMaintenanceBud
             }
             definition.maxOutputTokens = Math.min(definition.maxOutputTokens, input.config.model.maxOutputTokens);
             const budget: JsonObject = { ...value, costMode: definition.mode ?? 'hard', currency: definition.currency,
-                quotaLimitId: definition.quotaLimitId!, maxCostMicros: definition.maxCostMicros,
+                ...(definition.quotaLimitId ? { quotaLimitId: definition.quotaLimitId } : {}), maxCostMicros: definition.maxCostMicros,
                 maxModelCalls: definition.maxModelCalls, maxOutputTokens: definition.maxOutputTokens, deadlineAt: definition.deadlineAt };
             const execution = await options.lifecycle.createRun({ ...input, budget });
             try {
                 validateLease(execution, input.conversationId, definition, now());
                 await options.ledger.create({ ...definition, rootBudgetId: execution.rootBudgetId, deadlineAt: execution.deadlineAt });
                 const root = await options.ledger.read(execution.rootBudgetId);
-                if (!root.budget.quotaLimitId || !root.quotaLimit) throw new ContextFault('CONFIG_INVALID', '维护预算尚未关联全局费用上限');
+                if (root.budget.mode !== 'metered' && (!root.budget.quotaLimitId || !root.quotaLimit)) throw new ContextFault('CONFIG_INVALID', '维护预算尚未关联全局费用上限');
                 return execution;
             } catch (error) {
                 await options.lifecycle.finishRun({ execution, result: 'failed', failure: contextFailure(error) });
@@ -68,7 +68,7 @@ export function createContextMaintenanceCallbacks(options: ContextMaintenanceBud
             const config = await options.lifecycle.prepareRun?.(input) ?? input.config;
             const root = await options.ledger.read(input.execution.rootBudgetId);
             validateLease(input.execution, input.execution.conversationId, root.budget, now());
-            if (!root.budget.quotaLimitId || !root.quotaLimit) throw new ContextFault('CONFIG_INVALID', '恢复维护压缩需要原全局预算');
+            if (root.budget.mode !== 'metered' && (!root.budget.quotaLimitId || !root.quotaLimit)) throw new ContextFault('CONFIG_INVALID', '恢复维护压缩需要原全局预算');
             return config;
         },
         finishRun: input => options.lifecycle.finishRun(input),

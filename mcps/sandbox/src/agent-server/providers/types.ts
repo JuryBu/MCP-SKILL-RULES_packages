@@ -49,6 +49,7 @@ export interface FunctionTool {
 
 export interface NativeSendView {
     protocol: ProviderProtocol;
+    stream?: boolean;
     messages?: JsonObject[];
     contents?: JsonObject[];
     input?: JsonObject[];
@@ -82,6 +83,7 @@ export interface RequestVersions {
 
 export interface RequestSnapshot extends RequestVersions {
     schemaVersion: 1;
+    streaming?: boolean;
     rootBudgetId?: string;
     frozenAt: string;
     pricingSnapshot?: PriceEntry;
@@ -125,6 +127,7 @@ export interface NativeBlock {
     thoughtSignature?: string;
     thought?: boolean;
     materialization?: 'inline' | 'remote_pending';
+    nativeFragments?: Array<{ index: number; nativeRef: string; native: JsonValue; thoughtSignature?: string }>;
 }
 
 export interface ToolCall {
@@ -152,6 +155,19 @@ export interface RawProviderResponse {
     body: string;
     json: JsonObject;
     parseError?: 'invalid_json_or_non_object';
+    stream?: { protocol: ProviderProtocol; complete: boolean; eventCount: number };
+}
+
+export interface ProviderPartial {
+    attemptId: string;
+    seq: number;
+    receivedAt: string;
+    kind: 'transport' | 'event';
+    eventType: string;
+    native: JsonObject | null;
+    providerResponseId: string | null;
+    textDelta?: string;
+    receivedBytes?: number;
 }
 
 export interface NormalizedResponse {
@@ -178,6 +194,7 @@ export interface HttpRequest {
     body?: string;
     timeoutMs: number;
     maxResponseBytes?: number;
+    onChunk?: (chunk: Uint8Array, response: { status: number; headers: Record<string, string> }) => void | Promise<void>;
 }
 
 export interface HttpResponse {
@@ -194,6 +211,7 @@ export interface HttpTransport {
 export interface SendContext {
     transport: HttpTransport;
     credential?: string;
+    onPartial?: (partial: ProviderPartial) => void | Promise<void>;
 }
 
 export interface DiscoveryPage {
@@ -205,17 +223,19 @@ export interface DiscoveryPage {
 export type LookupResult = { status: 'unsupported' | 'pending' | 'not_found'; provesNotAccepted?: boolean }
     | { status: 'found'; response: NormalizedResponse };
 
+export interface ProviderLookupHandle { attemptId: string; providerResponseId?: string; snapshot?: RequestSnapshot }
+
 export interface ProviderAdapter {
     readonly protocol: ProviderProtocol;
     readonly version: string;
-    endpoint(profile: ProviderProfile, modelId: string): string;
+    endpoint(profile: ProviderProfile, modelId: string, stream?: boolean): string;
     encode(view: NativeSendView, modelId: string, parameters: JsonObject): JsonObject;
     encodeForMeasurement?(view: NativeSendView, modelId: string, parameters: JsonObject): JsonObject;
     validate(snapshot: RequestSnapshot): void;
     send(attempt: ProviderAttempt, context: SendContext, signal?: AbortSignal): Promise<NormalizedResponse>;
     discover(profile: ProviderProfile, cursor: string | null, context: SendContext, signal?: AbortSignal): Promise<DiscoveryPage>;
     continueView(view: NativeSendView, response: NormalizedResponse, results: ToolResult[]): NativeSendView;
-    lookup(handle: { attemptId: string; providerResponseId?: string }, context: SendContext, signal?: AbortSignal): Promise<LookupResult>;
+    lookup(handle: ProviderLookupHandle, context: SendContext, signal?: AbortSignal): Promise<LookupResult>;
 }
 
 export class ProviderFault extends AgentFault {
@@ -228,11 +248,14 @@ export class ProviderFault extends AgentFault {
     readonly transportPhase?: TransportPhase;
     readonly retryAfterMs?: number;
     readonly rawResponse?: RawProviderResponse;
+    readonly partialResponse?: NormalizedResponse;
+    readonly usage?: NormalizedUsage;
 
     constructor(code: string, message: string, options: {
         acceptance: Acceptance; phase?: DispatchPhase; httpStatus?: number; nativeCode?: string; nativeReason?: string;
         transportCause?: TransportCause; transportPhase?: TransportPhase;
         retryAfterMs?: number; retryable?: boolean; rawResponse?: RawProviderResponse;
+        partialResponse?: NormalizedResponse; usage?: NormalizedUsage;
     }) {
         const phase = options.phase ?? (options.acceptance === 'not_sent' ? 'prepared' : options.acceptance === 'unknown' ? 'unknown' : options.acceptance);
         super(code, message, { acceptance: options.acceptance, phase,
@@ -250,5 +273,7 @@ export class ProviderFault extends AgentFault {
         this.transportPhase = options.transportPhase;
         this.retryAfterMs = options.retryAfterMs;
         this.rawResponse = options.rawResponse;
+        this.partialResponse = options.partialResponse;
+        this.usage = options.usage;
     }
 }

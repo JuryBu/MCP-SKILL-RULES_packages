@@ -6,6 +6,14 @@ export type TerminalKey = { name: string; text?: string; paste?: boolean };
 type InputStream = Readable & { isTTY?: boolean; isRaw?: boolean; setRawMode?: (raw: boolean) => unknown };
 type OutputStream = Writable & { columns?: number; rows?: number; isTTY?: boolean };
 
+export function terminalGraphicsHost(environment: NodeJS.ProcessEnv = process.env): { kitty: boolean; queries: boolean } {
+    const program = environment.TERM_PROGRAM?.toLowerCase();
+    const term = environment.TERM?.toLowerCase() ?? '';
+    const kitty = !environment.TMUX && !environment.STY && (term === 'xterm-kitty' || program === 'wezterm' || Boolean(environment.KITTY_WINDOW_ID));
+    const queries = kitty || Boolean(environment.WT_SESSION) || ['vscode', 'iterm.app', 'apple_terminal'].includes(program ?? '') || /^(?:xterm|foot|rxvt)/.test(term);
+    return { kitty, queries };
+}
+
 export class TerminalSession extends EventEmitter {
     private readonly decoder = new StringDecoder('utf8');
     private buffer = '';
@@ -40,7 +48,7 @@ export class TerminalSession extends EventEmitter {
         this.input.once('end', this.endListener);
         this.input.resume();
         this.output.on('resize', this.resizeListener);
-        if (!this.linear) await this.write('\x1b[?25l\x1b[?2004h\x1b[H\x1b[0J');
+        if (!this.linear) await this.write('\x1b[?25l\x1b[?2004h' + '\r\n'.repeat(this.height));
     }
 
     write(text: string, geometry?: { width: number; height: number }): Promise<void> {
@@ -66,7 +74,7 @@ export class TerminalSession extends EventEmitter {
         this.input.setRawMode?.(this.originalRaw);
         if (this.originalFlow === false || this.originalFlow === null) this.input.pause();
         else this.input.resume();
-        if (!this.linear) await this.write('\x1b[0m\x1b[r\x1b[?2004l\x1b[?7h\x1b[?25h\r\n');
+        if (!this.linear) await this.write('\x1b[0m\x1b[?2004l\x1b[?7h\x1b[?25h\r\n');
         await this.chain;
     }
 
@@ -103,6 +111,7 @@ export class TerminalSession extends EventEmitter {
             if (this.buffer.startsWith('\x1b[200~')) { this.buffer = this.buffer.slice(6); this.pasting = true; this.pasteRejected = false; continue; }
             if (this.buffer.startsWith('\x1b')) {
                 if (this.buffer.startsWith('\x1b\r')) { this.buffer = this.buffer.slice(2); this.emit('key', { name: 'alt-enter' }); continue; }
+                if (/^\x1b[mwsnrMWSNR]/.test(this.buffer)) { const name = 'alt-' + this.buffer[1].toLowerCase(); this.buffer = this.buffer.slice(2); this.emit('key', { name }); continue; }
                 const csi = /^\x1b\[[0-?]*[ -/]*[@-~]/.exec(this.buffer)?.[0];
                 if (csi) {
                     this.buffer = this.buffer.slice(csi.length);

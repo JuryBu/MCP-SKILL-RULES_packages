@@ -3,6 +3,7 @@ import type { JsonObject, JsonValue } from '../protocol.js';
 import { normalizeUsage } from '../accounting/usage.js';
 import { arrayObjects, assembleResponse, checkToolResults, freezeOwned, gateDeclaredTools, immutableJson, mediaBlock, objectValue, parseArguments, requireRoute, stringValue, validateTools, verifySnapshot } from './assemble.js';
 import { attemptTimeout, decodeResponse, endpointUrl } from './http.js';
+import { requestProviderResponse } from './streaming.js';
 import type { DiscoveryPage, NativeBlock, NativeSendView, NormalizedResponse, ProviderAdapter, ProviderAttempt, ProviderProfile, RawProviderResponse, RequestSnapshot, SendContext, StopKind, ToolCall, ToolResult } from './types.js';
 
 const reserved = new Set(['model', 'contents', 'messages', 'input', 'tools', 'stream', 'systemInstruction', 'system_instruction', 'cachedContent', 'cached_content']);
@@ -63,8 +64,17 @@ function normalizeGeminiResponse(attemptId: string, raw: RawProviderResponse): N
             if (!part) { problems.push('E_NATIVE_BLOCK_UNSUPPORTED'); return; }
             const signature = stringValue(part.thoughtSignature ?? part.thought_signature);
             if (typeof part.text === 'string') {
-                blocks.push({ index, candidateIndex, type: 'text', text: part.text, nativeRef, native: part,
-                    ...(signature ? { thoughtSignature: signature } : {}), ...(part.thought === true ? { thought: true } : {}) });
+                const block: NativeBlock = { index, candidateIndex, type: 'text', text: part.text, nativeRef, native: part,
+                    ...(signature ? { thoughtSignature: signature } : {}), ...(part.thought === true ? { thought: true } : {}) };
+                const previous = blocks.at(-1);
+                const previousIndex = previous?.nativeFragments?.at(-1)?.index ?? previous?.index;
+                if (raw.stream?.protocol === 'gemini' && previous?.type === 'text' && !previous.thought && !block.thought
+                    && previous.candidateIndex === candidateIndex && previousIndex === index - 1) {
+                    previous.nativeFragments ??= [{ index: previous.index, nativeRef: previous.nativeRef, native: previous.native,
+                        ...(previous.thoughtSignature ? { thoughtSignature: previous.thoughtSignature } : {}) }];
+                    previous.nativeFragments.push({ index, nativeRef, native: part, ...(signature ? { thoughtSignature: signature } : {}) });
+                    previous.text = (previous.text ?? '') + part.text;
+                } else blocks.push(block);
             } else if (objectValue(part.functionCall ?? part.function_call)) {
                 const fn = objectValue(part.functionCall ?? part.function_call)!;
                 const name = stringValue(fn.name);
@@ -108,16 +118,17 @@ export class GeminiAdapter implements ProviderAdapter {
     readonly protocol = 'gemini' as const;
     readonly version = 'gemini-generate-content-v3-thinking-level';
 
-    endpoint(profile: ProviderProfile, modelId: string): string {
+    endpoint(profile: ProviderProfile, modelId: string, stream = false): string {
         const model = modelId.replace(/^models\//, '');
         if (!model || !/^[a-zA-Z0-9._-]+$/.test(model)) throw new AgentFault('E_MODEL_INVALID', 'Gemini模型ID格式无效');
-        const suffix = `/models/${encodeURIComponent(model)}:generateContent`;
+        const suffix = `/models/${encodeURIComponent(model)}:${stream ? 'streamGenerateContent' : 'generateContent'}`;
         const url = endpointUrl(profile.baseUrl, '');
-        if (/:generateContent$/.test(url)) {
-            if (!url.endsWith(suffix)) throw new AgentFault('E_MODEL_CONFLICT', '固定Gemini端点与选定模型不同');
-            return url;
+        if (/:(?:generateContent|streamGenerateContent)$/.test(url)) {
+            const base = url.replace(/:(?:generateContent|streamGenerateContent)$/, '');
+            if (!base.endsWith(`/models/${encodeURIComponent(model)}`)) throw new AgentFault('E_MODEL_CONFLICT', '固定Gemini端点与选定模型不同');
+            return `${base}:${stream ? 'streamGenerateContent?alt=sse' : 'generateContent'}`;
         }
-        return endpointUrl(profile.baseUrl, suffix);
+        return `${endpointUrl(profile.baseUrl, suffix)}${stream ? '?alt=sse' : ''}`;
     }
 
     encode(view: NativeSendView, modelId: string, parameters: JsonObject): JsonObject {
@@ -168,9 +179,9 @@ export class GeminiAdapter implements ProviderAdapter {
         if (context.credential !== undefined && (!context.credential || /[\r\n]/.test(context.credential))) {
             throw new AgentFault('E_AUTH', '凭据内容无效');
         }
-        const raw = decodeResponse(await context.transport.request({ method: 'POST', url: attempt.snapshot.endpoint,
+        const raw = await requestProviderResponse(attempt, context, { method: 'POST', url: attempt.snapshot.endpoint,
             headers: { 'Content-Type': 'application/json', ...(context.credential ? { 'x-goog-api-key': context.credential } : {}) },
-            body: attempt.snapshot.body, timeoutMs: attemptTimeout(attempt) }, signal));
+            body: attempt.snapshot.body, timeoutMs: attemptTimeout(attempt) }, normalizeGeminiResponse, signal);
         const definitions = arrayObjects((JSON.parse(attempt.snapshot.body) as JsonObject).tools)
             .flatMap(tool => arrayObjects(tool.functionDeclarations));
         const normalized = gateDeclaredTools(assembleResponse(attempt.attemptId, raw, normalizeGeminiResponse), definitions.map(tool => stringValue(tool.name) ?? ''));
@@ -181,7 +192,7 @@ export class GeminiAdapter implements ProviderAdapter {
     }
 
     async discover(profile: ProviderProfile, cursor: string | null, context: SendContext, signal?: AbortSignal): Promise<DiscoveryPage> {
-        const base = profile.baseUrl.replace(/\/models\/[^/]+:generateContent\/?$/, '');
+        const base = profile.baseUrl.replace(/\/models\/[^/]+:(?:generateContent|streamGenerateContent)\/?$/, '');
         const url = new URL(endpointUrl(base, '/models'));
         url.searchParams.set('pageSize', String(profile.discovery.pageSize));
         if (cursor) url.searchParams.set('pageToken', cursor);

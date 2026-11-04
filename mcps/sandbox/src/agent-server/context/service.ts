@@ -12,12 +12,13 @@ import type { CompactionHandle } from './bpc.js';
 import { conservativeTextTokens } from './budget.js';
 import { hashBytes, hashContext, validateContextPolicy } from './config.js';
 import { checkAbort, ContextFault } from './errors.js';
-import { hasNativeSignature, renderSummary } from './view.js';
+import { hasNativeSignature, renderSummaryView } from './view.js';
 import { estimateNativeTextView, validateContextEstimateForView } from './input-estimate.js';
 import { appendNativeHistoryView, freezeNativeHistoryView } from './native-view-build.js';
 import { historicalToolGroup } from './history-tool-outcomes.js';
 import type { HistoricalToolResultResolver } from './history-tool-outcomes.js';
 import type { NativeHistoryAdapter } from './native-view-build.js';
+import type { ToolDeliveryIdentity, ToolDeliveryPolicy, ToolDelivery } from './tool-delivery.js';
 
 export interface ContextServiceOptions {
     compactor?: ContextCompactor;
@@ -30,6 +31,8 @@ export interface ContextServiceOptions {
     maxViewBytes?: number;
     maxViewItems?: number;
     countTokens?: TokenCounter;
+    preserveToolResult?: (identity: ToolDeliveryIdentity, result: ToolResult, policy?: ToolDeliveryPolicy) => Promise<ToolDelivery>;
+    readToolDelivery?: (identity: ToolDeliveryIdentity) => Promise<ToolDelivery | null>;
 }
 
 export interface ContextStepInput {
@@ -62,6 +65,7 @@ export interface ContextBuildViewInput {
     estimateView?: ContextViewEstimator;
     compression?: Omit<ContextStepInput, 'conversationId' | 'estimate'>;
     readTailReuse?: 'offer' | 'consume';
+    dynamicContext?: string | (() => Promise<string>);
 }
 
 interface CachedReadTail {
@@ -146,6 +150,15 @@ export function injectSummaryText(view: NativeSendView, text: string): NativeSen
     return appendMessages(view, [{ role: 'system', content: text }]);
 }
 
+export function appendDynamicContext(view: NativeSendView, text: string): NativeSendView {
+    if (!text) return view;
+    const content = `[Runtime workspace context; current snapshot, not a user message]\n${text}`;
+    if (view.protocol === 'gemini') return appendMessages(view, [{ role: 'user', parts: [{ text: content }] }]);
+    if (view.protocol === 'openai_responses') return appendMessages(view, [{ role: 'developer', content: [{ type: 'input_text', text: content }] }]);
+    if (view.protocol === 'anthropic') return appendMessages(view, [{ role: 'user', content: [{ type: 'text', text: content }] }]);
+    return appendMessages(view, [{ role: 'system', content }]);
+}
+
 export class ContextService {
     readonly compactor: ContextCompactor | undefined;
     private readonly policy: ContextPolicy;
@@ -174,7 +187,15 @@ export class ContextService {
     }
 
     async buildView(input: ContextBuildViewInput): Promise<ContextBuildViewResult> {
-        let result = await this.buildRawView(input);
+        const build = async () => {
+            try { return await this.buildRawView(input); }
+            catch (error) {
+                if (input.summaryView || !(error instanceof ContextFault)
+                    || !['CONTEXT_HISTORY_STALE', 'CONTEXT_PARENT_STALE'].includes(error.code)) throw error;
+                return this.buildRawView({ ...input, readTailReuse: undefined });
+            }
+        };
+        let result = await build();
         if (input.compression) {
             if (!this.compactor) throw new ContextFault('CONFIG_INVALID', '尚未注入压缩存储及模型端口');
             await this.compactor.beforeRequest({ ...input.compression, conversationId: input.conversationId,
@@ -272,13 +293,15 @@ export class ContextService {
         pendingExecution?: ExecutionLease): Promise<ContextBuildViewResult> {
         checkAbort(input.context.signal);
         if (input.baseView.protocol !== input.adapter.protocol) throw new ContextFault('PROTOCOL_INCOMPATIBLE', '发送视图与Provider适配器协议不同');
-        const summary = input.summaryView ?? await this.options.readSummaryView?.(input.conversationId)
-            ?? (this.compactor ? await this.compactor.readView(input.conversationId) : undefined);
-        const coveredEndSeq = summary?.coveredEndSeq ?? 0;
         const policy = input.policy ? validateContextPolicy(input.policy) : input.compression?.config.policy ?? this.policy;
-        const rendered = renderedSummary ? { ...renderedSummary, hash: hashBytes(renderedSummary.text) }
-            : renderSummary(summary?.nodes ?? [], policy, Math.min(summary?.summaryBudget ?? Number.MAX_SAFE_INTEGER,
+        const summary = input.summaryView ?? await this.options.readSummaryView?.(input.conversationId)
+            ?? (this.compactor ? await this.compactor.readView(input.conversationId, { policy, signal: input.context.signal }) : undefined);
+        const coveredEndSeq = summary?.coveredEndSeq ?? 0;
+        const summaryText = renderedSummary ? { ...renderedSummary, hash: hashBytes(renderedSummary.text) }
+            : renderSummaryView(summary ?? { nodes: [] }, policy, Math.min(summary?.summaryBudget ?? Number.MAX_SAFE_INTEGER,
                 input.summaryBudget ?? summary?.summaryBudget ?? input.compression?.limits.summaryBudget ?? Number.MAX_SAFE_INTEGER), this.countTokens);
+        const text = summaryText.text;
+        const rendered = { ...summaryText, text, tokens: this.countTokens(text), hash: hashBytes(text) };
         const selected: HistoryItem[] = [];
         const values = new Map<string, JsonValue>();
         const cursorSet = new Set<string>();
@@ -378,7 +401,19 @@ export class ContextService {
                     && resolved.every(result => response.toolCalls.some(call => call.callId === result.callId && call.name === result.name))) {
                     throw new PendingNativeToolStep(historyVersion);
                 }
-                const nativeResults = input.renderToolResults ? await input.renderToolResults(view, resolved) : resolved;
+                const stableResults: ToolResult[] = [];
+                for (const result of resolved) {
+                    if (!this.options.preserveToolResult) { stableResults.push(result); continue; }
+                    if (!item.runId || !item.runEpoch || !item.stepId) throw new ContextFault('SOURCE_GAP', '工具稳定发送版本缺少原生历史执行身份');
+                    const identity = { conversationId: input.conversationId, runId: item.runId,
+                        runEpoch: item.runEpoch, stepId: item.stepId, callId: result.callId };
+                    const previous = await this.options.readToolDelivery?.(identity);
+                    if (previous && ![previous.receivedHash, previous.sentHash].includes(hashContext(result))) {
+                        throw new ContextFault('SOURCE_GAP', '历史工具结果与原raw或固定sent版本不同');
+                    }
+                    stableResults.push((previous ?? await this.options.preserveToolResult(identity, result)).sent);
+                }
+                const nativeResults = input.renderToolResults ? await input.renderToolResults(view, stableResults) : stableResults;
                 view = appendNativeHistoryView(input.adapter, view, response, nativeResults);
             }
             else {
@@ -418,6 +453,8 @@ export class ContextService {
             } else throw new ContextFault('PROTOCOL_INCOMPATIBLE', '历史项目缺少可重放的原生类型', { itemId: item.itemId, kind: item.kind });
         }
         await flush(true);
+        const dynamic = typeof input.dynamicContext === 'function' ? await input.dynamicContext() : input.dynamicContext;
+        if (dynamic) view = appendDynamicContext(view, dynamic);
         if (Buffer.byteLength(canonicalJson(view)) > maxViewBytes) throw new ContextFault('INPUT_BUDGET', '完整原生发送视图超过明确内存预算', { maxViewBytes });
         view = freezeNativeHistoryView(view);
         const estimate = input.estimateView ? await input.estimateView(view, { baseView: input.baseView, summaryTokens: rendered.tokens })

@@ -4,6 +4,45 @@ import type { NormalizedResponse } from "../agent-server/providers/types.js";
 import { ProviderFault } from "../agent-server/providers/types.js";
 import { councilArtifactPath, registerCouncilArtifact } from "./artifact-store.js";
 
+export interface CouncilImageArtifact {
+    path: string;
+    mime: string;
+    sha256: string;
+    byteLength: number;
+}
+
+export function readyCouncilImages(metadata?: Record<string, unknown>): CouncilImageArtifact[] {
+    if (!Array.isArray(metadata?.media)) return [];
+    return metadata.media.flatMap((value: unknown): CouncilImageArtifact[] => {
+        if (!value || typeof value !== "object") return [];
+        const media = value as Record<string, unknown>;
+        if (media.type !== "image" || media.state !== "ready") return [];
+        if (typeof media.path !== "string" || typeof media.mime !== "string" || typeof media.sha256 !== "string"
+            || !Number.isSafeInteger(media.byteLength) || Number(media.byteLength) < 1) {
+            throw new ProviderFault("E_COUNCIL_MEDIA_INTEGRITY", "共享图片缺少原件、长度或哈希凭据", { acceptance: "not_sent" });
+        }
+        const stat = fs.statSync(media.path);
+        if (!stat.isFile() || stat.size !== media.byteLength) {
+            throw new ProviderFault("E_COUNCIL_MEDIA_INTEGRITY", "共享图片原件长度已经变化", { acceptance: "not_sent" });
+        }
+        const bytes = fs.readFileSync(media.path);
+        if (createHash("sha256").update(bytes).digest("hex") !== media.sha256) {
+            throw new ProviderFault("E_COUNCIL_MEDIA_INTEGRITY", "共享图片原件哈希已经变化", { acceptance: "not_sent" });
+        }
+        return [{ path: media.path, mime: media.mime, sha256: media.sha256, byteLength: bytes.length }];
+    });
+}
+
+export function councilMediaDescription(metadata?: Record<string, unknown>): string {
+    if (!Array.isArray(metadata?.media)) return "";
+    const media = metadata.media.filter(value => value && typeof value === "object").map(value => {
+        const item = value as Record<string, unknown>;
+        return { type: item.type, mime: item.mime, path: item.path, uri: item.uri, sha256: item.sha256,
+            byteLength: item.byteLength, state: item.state };
+    });
+    return media.length ? `原生媒体来源: ${JSON.stringify(media)}` : "";
+}
+
 export function saveCouncilApiResponse(runId: string, response: NormalizedResponse): Record<string, unknown> {
     const key = createHash("sha256").update(response.attemptId).digest("hex");
     const responsePath = councilArtifactPath(runId, "api-results", `${key}.json`);

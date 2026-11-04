@@ -15,6 +15,8 @@ import { SecretVault, NativeDpapiBackend } from './profiles/secret-vault.js';
 import { createProfileModelService } from './profiles/service.js';
 import { PROVIDER_RPC_SIGNATURES } from './profiles/rpc-signatures.js';
 import { createProviderServices } from './providers/services.js';
+import { readProviderBalance } from './providers/balance.js';
+import type { ProviderBalance } from './providers/balance.js';
 import type { CatalogPort } from './models/catalog.js';
 import type { NormalizedResponse, ProviderProfile } from './providers/types.js';
 import type { QuotaLimitDefinition } from './accounting/budget-ledger.js';
@@ -28,6 +30,7 @@ import { ApprovalLedger } from './security/approvals.js';
 import { createContextServerAdapter } from './context/server-adapter.js';
 import { recordHistoryHit } from './context/feedback.js';
 import { injectSummaryText } from './context/service.js';
+import { createToolDeliveryStore } from './context/tool-delivery.js';
 import type { StorePort } from './storage/port.js';
 import type { RetentionSweepResult } from './storage/port.js';
 import { MediaService } from './media/service.js';
@@ -175,6 +178,8 @@ export async function createAgentServices(options: ServerServiceOptions) {
     await options.runtime.setApprovalLedger(tools.approvals, tools.pendingTools);
     const dispatcher = provider.createDispatcher(withInternalChildBudgets(journal, options.runtime.internalChildren));
     const tokenCounts = new Map<string, { createdAt: number; value: Promise<GeminiTokenCountResult> }>();
+    const tokenCountCooldowns = new Map<string, number>();
+    const balanceCache = new Map<string, { expiresAt: number; value: Promise<ProviderBalance> }>();
     const conversationWrites = new AsyncLocalStorage<{ client: ClientIdentity; params: Record<string, unknown> }>();
     const contextWriteCommands = new Map<string, { hash: string; promise: Promise<RpcResult> }>();
     const configuration = createConfigurationService({ store: options.store,
@@ -199,6 +204,7 @@ export async function createAgentServices(options: ServerServiceOptions) {
     let inputAttachments: InputAttachmentService;
     const inputSelections = new WeakMap<ExecutionPlan, AttachmentModelSelection>();
     const contextService = createContextServerAdapter({ store: contextStore, provider, dispatcher, journal,
+        readTaskPlan: async context => tools.readTaskPlan(await toolContext(context)),
         authorizeControlWrite: async conversationId => {
             const authorization = conversationWrites.getStore();
             if (!authorization || authorization.params.conversationId !== conversationId) throw new AgentFault('CONTROL_REQUIRED', '压缩控制写入需要原会话调用方');
@@ -245,7 +251,9 @@ export async function createAgentServices(options: ServerServiceOptions) {
             const nativeGemini = plan.profile.protocol === 'gemini' && plan.profile.routePolicy.kind === 'direct';
             const countText = nativeGemini && new URL(plan.profile.baseUrl).origin === 'https://generativelanguage.googleapis.com';
             const estimateView: ContextViewEstimator = async (view, details) => {
-                if (!countText && !nativeViewHasMedia(view)) return estimateNativeTextView(view, details);
+                const hasMedia = nativeViewHasMedia(view);
+                const counterKey = `${plan.profile.profileId}:${plan.profile.revision}:${plan.profile.credentialGeneration}:${plan.modelId}`;
+                if ((!countText || Date.now() < (tokenCountCooldowns.get(counterKey) ?? 0)) && !hasMedia) return estimateNativeTextView(view, details);
                 const viewHash = createHash('sha256').update(canonicalJson(view)).digest('hex');
                 const parametersHash = createHash('sha256').update(canonicalJson(plan.parameters)).digest('hex');
                 const key = `${context.snapshot.conversationId}:${context.snapshot.runId}:${context.snapshot.runEpoch}:${plan.profile.revision}:${plan.profile.credentialGeneration}:${plan.modelId}:${parametersHash}:${viewHash}`;
@@ -262,7 +270,26 @@ export async function createAgentServices(options: ServerServiceOptions) {
                     void value.catch(() => { if (tokenCounts.get(key)?.value === value) tokenCounts.delete(key); });
                     while (tokenCounts.size > 32) tokenCounts.delete(tokenCounts.keys().next().value!);
                 }
-                const counted = await entry.value;
+                let counted: GeminiTokenCountResult;
+                try {
+                    counted = await entry.value;
+                    tokenCountCooldowns.delete(counterKey);
+                } catch (error) {
+                    if (context.signal.aborted || hasMedia || !(error instanceof AgentFault) || error.code !== 'E_COUNT_TOKENS_TIMEOUT') throw error;
+                    tokenCountCooldowns.set(counterKey, Date.now() + 60_000);
+                    while (tokenCountCooldowns.size > 32) tokenCountCooldowns.delete(tokenCountCooldowns.keys().next().value!);
+                    await options.store.commitTransition({ expected: [], contents: [{ conversationId: context.snapshot.conversationId,
+                        contentId: `context-count-timeout:${randomUUID()}`, kind: 'context_token_count_timeout', indexHistory: false,
+                        value: { code: error.code, message: error.message, viewHash,
+                            runId: context.snapshot.runId, runEpoch: context.snapshot.runEpoch, rootBudgetId: plan.rootBudgetId,
+                            profileId: plan.profile.profileId, profileRevision: plan.profile.revision,
+                            credentialGeneration: plan.profile.credentialGeneration, modelId: plan.modelId,
+                            executionDeadlineAt: plan.deadlineAt,
+                            requestDeadlineAt: typeof error.details?.requestDeadlineAt === 'string' ? error.details.requestDeadlineAt : null,
+                            elapsedMs: Date.now() - entry.createdAt, observedAt: new Date().toISOString(),
+                            fallback: 'native_view_utf8_upper_bound' } }] });
+                    return estimateNativeTextView(view, details);
+                }
                 return { rules: 0, schema: 0, native: counted.inputTokens, summary: 0, retained: 0,
                     media: 0, protocol: 0, confidence: 'actual', totalInputTokens: counted.inputTokens,
                     tokenCountEvidence: { source: 'provider_native_count_tokens', scope: 'complete_native_input', protocol: plan.adapter.protocol,
@@ -276,9 +303,18 @@ export async function createAgentServices(options: ServerServiceOptions) {
             const conversation = await options.store.getRecord<{ principalId: string }>({ conversationId: context.snapshot.conversationId,
                 kind: 'conversation', id: context.snapshot.conversationId });
             if (!conversation) throw new AgentFault('NOT_FOUND', '请求准备所属会话已关闭');
+            const roots = context.conversationOptions.writeRoots ?? context.conversationOptions.workspaceRoots ?? [];
+            if (!Array.isArray(roots) || roots.some(root => typeof root !== 'string')) throw new AgentFault('WORKSPACE_REQUIRED', '写入根须由主调用方明确配置');
+            const workspaceInstructions = ['Trusted workspace configuration:',
+                `Approved writable roots: ${canonicalJson(roots)}.`,
+                roots.length ? `Default working directory: ${roots[0]}. Use absolute file paths and pass this directory explicitly to run_command unless the task requires another approved root.`
+                    : 'No writable workspace has been approved. Ask the caller to select one before writing or executing workspace commands.',
+                'Do not guess a workspace directory or request access to a whole drive to locate the selected workspace.'];
+            const suppliedInstructions = context.conversationOptions.instructions;
             const baseView = await configurationBridge.resolveBaseView({ ownerId: conversation.value.principalId,
                 conversationId: context.snapshot.conversationId, protocol: plan.adapter.protocol,
-                additionalInstructions: context.conversationOptions.instructions });
+                additionalInstructions: [...workspaceInstructions,
+                    ...(suppliedInstructions === undefined ? [] : [typeof suppliedInstructions === 'string' ? suppliedInstructions : canonicalJson(suppliedInstructions)])].join('\n') });
             return { baseView: fact ? injectSummaryText(baseView, `Workspace restore fact: ${canonicalJson(fact)}`) : baseView,
                 appendUser: context.conversationOptions.discussionOnly === true ? appendCouncilUser
                     : async (view: import('./providers/types.js').NativeSendView, content: JsonValue) => inputAttachments.appendUser(
@@ -525,24 +561,25 @@ export async function createAgentServices(options: ServerServiceOptions) {
         const budget = context.snapshot.budget;
         const parameters = context.conversationOptions.parameters && typeof context.conversationOptions.parameters === 'object'
             ? context.conversationOptions.parameters as JsonObject : {};
-        const maxOutputTokens = count(budget.maxOutputTokens ?? parameters.maxOutputTokens,
+        const maxOutputTokens = count(budget.maxOutputTokens ?? parameters.maxOutputTokens ?? profile.parameterDefaults.maxOutputTokens,
             Math.min(4096, entry.maxOutputTokens.value ?? 4096), '最大输出token');
         const maxModelCalls = count(budget.maxModelCalls, 128, '模型调用次数');
         const deadlineAt = typeof budget.deadlineAt === 'string' ? budget.deadlineAt : String(context.snapshot.deadlineAt ?? '');
         const rootBudgetId = String(context.snapshot.rootRunId ?? context.snapshot.runId);
-        const quotaLimitId = typeof budget.quotaLimitId === 'string' ? budget.quotaLimitId
+        const metered = budget.costMode === 'metered';
+        const quotaLimitId = metered ? undefined : typeof budget.quotaLimitId === 'string' ? budget.quotaLimitId
             : (profile as ProviderProfile & { quotaLimitId?: string | null }).quotaLimitId;
-        if (!quotaLimitId) throw new AgentFault('E_GLOBAL_BUDGET_REQUIRED', '先配置并选择跨全部任务的供应商费用总上限');
-        const currency = typeof budget.currency === 'string' ? budget.currency : entry.pricing.value?.currency;
+        if (!metered && !quotaLimitId) throw new AgentFault('E_GLOBAL_BUDGET_REQUIRED', '先配置并选择跨全部任务的供应商费用总上限');
+        const currency = typeof budget.currency === 'string' ? budget.currency : entry.pricing.value?.currency ?? (metered ? 'XXX' : undefined);
         if (!currency) throw new AgentFault('E_CURRENCY_UNKNOWN', '根预算需要明确币种');
         const inheritedBudget = await childRootBudget(context, accountingPort);
         if (inheritedBudget) {
             if (inheritedBudget.currency !== currency || inheritedBudget.quotaLimitId !== quotaLimitId) {
                 throw new AgentFault('CHILD_BUDGET_REQUIRED', '子任务须沿用原根预算的币种与供应商总额度');
             }
-        } else await accountingPort.execute({ type: 'create_budget', definition: { rootBudgetId, mode: budget.costMode === 'estimated' ? 'estimated' : 'hard',
+        } else await accountingPort.execute({ type: 'create_budget', definition: { rootBudgetId, mode: metered ? 'metered' : budget.costMode === 'estimated' ? 'estimated' : 'hard',
             currency, maxCostMicros: typeof budget.maxCostMicros === 'number' ? budget.maxCostMicros : null,
-            maxModelCalls, maxOutputTokens, deadlineAt, sourceRef: `run:${rootBudgetId}`, quotaLimitId } });
+            maxModelCalls, maxOutputTokens, deadlineAt, sourceRef: `run:${rootBudgetId}`, quotaLimitId: quotaLimitId ?? undefined } });
         const configuredTools = context.conversationOptions.tools;
         const toolNames = context.conversationOptions.toolsEnabled === false ? [] : Array.isArray(configuredTools)
             ? configuredTools.filter((tool): tool is string => typeof tool === 'string')
@@ -570,21 +607,27 @@ export async function createAgentServices(options: ServerServiceOptions) {
         return selected;
     };
 
+    const toolDeliveries = createToolDeliveryStore(options.store);
     const providerExecutor = createProviderExecutor({ plan, dispatcher, tools, toolContext,
         renderToolResults: (context, selected, view, results) => renderMcpToolResults({
             conversationId: context.snapshot.conversationId, view, results, attachments: inputAttachments,
             selection: inputSelections.get(selected), signal: context.signal }),
         transformToolResult: async (context, selected, result, identity) => {
-            if (!hasMcpToolImages(result)) return result;
-            const trusted = identity.toolContext;
-            if (typeof trusted.principalId !== 'string' || typeof trusted.runEpoch !== 'number') {
-                throw new AgentFault('E_TOOL_IMAGE_OWNER_REQUIRED', '工具图片需要所属主体和运行代次');
-            }
-            return convertMcpToolResult({ result, attachments: inputAttachments, selection: inputSelections.get(selected),
-                signal: context.signal, owner: { conversationId: context.snapshot.conversationId, runId: context.snapshot.runId,
-                    rootRunId: String(context.snapshot.rootRunId ?? context.snapshot.runId), runEpoch: trusted.runEpoch,
-                    actionId: identity.actionId, stepId: identity.stepId, attemptId: identity.attemptId,
-                    callId: result.callId, toolName: result.name, principalId: trusted.principalId } });
+            const delivery = await toolDeliveries.preserve({ conversationId: context.snapshot.conversationId,
+                runId: context.snapshot.runId, runEpoch: context.snapshot.runEpoch, stepId: identity.stepId,
+                callId: result.callId }, result, {}, async received => {
+                if (!hasMcpToolImages(received)) return received;
+                const trusted = identity.toolContext;
+                if (typeof trusted.principalId !== 'string' || typeof trusted.runEpoch !== 'number') {
+                    throw new AgentFault('E_TOOL_IMAGE_OWNER_REQUIRED', '工具图片需要所属主体和运行代次');
+                }
+                return convertMcpToolResult({ result: received, attachments: inputAttachments, selection: inputSelections.get(selected),
+                    signal: context.signal, owner: { conversationId: context.snapshot.conversationId, runId: context.snapshot.runId,
+                        rootRunId: String(context.snapshot.rootRunId ?? context.snapshot.runId), runEpoch: trusted.runEpoch,
+                        actionId: identity.actionId, stepId: identity.stepId, attemptId: identity.attemptId,
+                        callId: received.callId, toolName: received.name, principalId: trusted.principalId } });
+            });
+            return delivery.sent;
         },
         prepareView: (context, selected, input) => configurationBridge.prepareView(() => contextService.prepareView(context, selected, input)),
         postStep: contextService.postStep,
@@ -788,6 +831,43 @@ export async function createAgentServices(options: ServerServiceOptions) {
                 return await globalCommands.execute(method, params, client, async () => ({ ok: true,
                     data: await accountingPort.execute({ type: 'create_quota_limit', definition: params.definition as QuotaLimitDefinition }) }));
             }
+            if (method === 'usage.overview') {
+                const conversationId = typeof params.conversationId === 'string' ? params.conversationId : undefined;
+                let profileId = typeof params.profileId === 'string' ? params.profileId : undefined;
+                const rootBudgetIds = new Set<string>();
+                if (conversationId) {
+                    const authorized = await options.runtime.dispatch('conversations.get', { conversationId }, client);
+                    if (!authorized.ok) return authorized;
+                    const conversation = authorized.data as { options?: { profileId?: string } };
+                    profileId ??= conversation.options?.profileId;
+                    let cursor: string | undefined;
+                    do {
+                        const page = await options.store.listRecords<{ rootRunId: string; runId: string }>({
+                            kind: 'run', conversationId, cursor, limit: 100 });
+                        for (const record of page.items) rootBudgetIds.add(record.value.rootRunId ?? record.value.runId);
+                        cursor = page.hasMore ? page.nextCursor ?? undefined : undefined;
+                    } while (cursor);
+                }
+                const profile = profileId ? await provider.profiles.get(profileId) : null;
+                const balanceKey = profile ? `${profile.profileId}:${profile.revision}:${profile.credentialGeneration}` : '';
+                let balance = profile ? balanceCache.get(balanceKey) : undefined;
+                if (profile && (!balance || balance.expiresAt <= Date.now())) {
+                    balance = { expiresAt: Date.now() + 30_000, value: vault ? readProviderBalance(profile, vault)
+                        : Promise.resolve({ status: 'unavailable', source: profile.label, balances: [], message: '凭据服务暂不可用' }) };
+                    balanceCache.set(balanceKey, balance);
+                    while (balanceCache.size > 64) balanceCache.delete(balanceCache.keys().next().value!);
+                }
+                const [conversationUsage, providerUsage, account] = await Promise.all([
+                    options.store.persistent.readUsage({ rootBudgetIds: [...rootBudgetIds] }),
+                    options.store.persistent.readUsage(profile ? { quotaScopeId: profile.quotaScopeId } : {}),
+                    balance?.value ?? Promise.resolve({ status: 'unsupported', source: '未选择服务商', balances: [] }),
+                ]);
+                return { ok: true, data: { asOf: new Date().toISOString(), ...(profileId ? { profileId } : {}),
+                    account,
+                    conversation: conversationUsage,
+                    providerUsage: { scope: 'local_tool', costs: providerUsage.costs,
+                        amountStatus: providerUsage.amountStatus } } };
+            }
             if (method === 'budgets.get') return { ok: true, data: await accountingPort.read(String(params.rootBudgetId)) };
             if (method === 'budgets.reconcileResponses') {
                 await options.runtime.authorizeGlobalWrite(client, params);
@@ -854,7 +934,7 @@ export async function createAgentServices(options: ServerServiceOptions) {
                 return { ok: true, data: await media.list({ conversationId: String(params.conversationId), cursor: params.cursor as string | undefined,
                     limit: params.limit as number | undefined, maxBytes: params.maxBytes as number | undefined }) };
             }
-            if (method === 'runs.start' || method === 'runs.resume') {
+            if (method === 'runs.start' || method === 'runs.startInteractive' || method === 'runs.resume') {
                 const allowed = await options.runtime.dispatch('conversations.get', { conversationId: params.conversationId }, client);
                 if (!allowed.ok) return allowed;
                 const conversation = await options.store.getRecord<{ options: Record<string, unknown> }>({ conversationId: String(params.conversationId),
@@ -874,7 +954,8 @@ export async function createAgentServices(options: ServerServiceOptions) {
     return { executor, dispatch, provider, profiles, tools, journal, accountingPort, media, inputAttachments, contextService, workspaceService, resolveWorkspaceContext, quiesceWorkspace, lifecycle,
         hasMetadataWrites: () => contextWriteCommands.size > 0 || restoreRuns.size > 0 || lifecycle.hasActiveWork(),
         applyRetentionSweep: async (result: RetentionSweepResult): Promise<RetentionCacheSnapshot> => {
-            for (const group of result.conversations) if (group.state === 'deleted') {
+            for (const group of result.conversations) if (group.state === 'deleted'
+                || group.state === 'deferred' && group.reason === 'family_page_pending') {
                 for (const conversationId of group.conversationIds) expiredContextCaches.add(conversationId);
             }
             const runtime = await options.runtime.applyRetentionSweep(result);
@@ -945,7 +1026,7 @@ export async function createAgentServices(options: ServerServiceOptions) {
             await lifecycle.close();
             await globalCommands.drain();
             try { await shared?.close(); }
-            finally { await provider.close(); tokenCounts.clear(); expiredContextCaches.clear(); }
+            finally { await provider.close(); tokenCounts.clear(); balanceCache.clear(); expiredContextCaches.clear(); }
         },
         capabilities: { credentials: Boolean(vault), persistentAccounting: true, mediaPersistence: Boolean(mediaPersistence),
             providerProtocols: ['compatible_chat', 'gemini', 'openai_responses', 'anthropic'] } };

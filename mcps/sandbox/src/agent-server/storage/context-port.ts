@@ -3,11 +3,11 @@ import type { StateMutationPort, StorePort, StoreRecord, HistoryItem, HistoryQue
 import type { AgentEvent, JsonValue } from '../protocol.js';
 import { AgentFault, canonicalJson } from '../protocol.js';
 import type { CompactionCandidate, CompactionPort, ContextCapture, ExecutionLease, FrozenCompressionConfig, Publication,
-    RoundBoundary, SchedulerCheckpoint, SummaryNode, SummaryView, UnknownContextCleanupInput, RequirementSourceMetadata } from '../context/contracts.js';
+    RoundBoundary, SchedulerCheckpoint, SummaryNode, SummaryView, UnknownContextCleanupInput, RequirementSourceMetadata, ContextPolicy } from '../context/contracts.js';
 import { hashBytes, hashContext } from '../context/config.js';
 import { ContextFault } from '../context/errors.js';
 import { validateCoverage } from '../context/compaction.js';
-import { validatePublication, validateSummaryNodes } from '../context/view.js';
+import { sealPublishedSummaryView, validatePublication, validateSummaryNodes } from '../context/view.js';
 import { applyPublishedHistoryFeedback, readHistoryFeedbackSnapshot } from '../context/feedback.js';
 import { ContextTransactions, contextCandidateKey, contextContent, contextConversationKey, contextRunKey, contextStateKey,
     nextContextRecord, requireContextExecution, contextRootBudgetId, contextFeedbackStateKey, contextSummaryKey,
@@ -18,6 +18,9 @@ import { MAX_MODEL_STEP_PAIRINGS, modelStepPairing } from './model-step-pairing.
 import { measureCanonicalJsonBytes } from '../media/temporary-budget.js';
 import { MAX_WRITE_BATCH } from './internal.js';
 import { isStoppedUnknownWait } from '../cleanup-reconciliation.js';
+import { bootstrapCommunicationWindow, communicationNeedsBootstrap, renderCommunicationWindow } from '../context/communication-window.js';
+import type { CommunicationWindow } from '../context/communication-window.js';
+import { createArtifactHistorySourcePort } from '../context/artifact-source.js';
 
 interface HistoryIndex { historyEpoch: number; appendSeq: number; coveredEndSeq: number; stepSeq: number; items: HistoryItem[] }
 
@@ -26,6 +29,9 @@ export interface StoreCompactionPortOptions {
     maxIndexItems?: number;
     maxReadBytes?: number;
     maxCachedConversations?: number;
+    maxCommunicationScanItems?: number;
+    maxCommunicationScanBytes?: number;
+    maxCommunicationReadBytes?: number;
 }
 
 export class StoreCompactionPort implements CompactionPort {
@@ -36,6 +42,7 @@ export class StoreCompactionPort implements CompactionPort {
     private readonly maxIndexItems: number;
     private readonly maxReadBytes: number;
     private readonly maxCachedConversations: number;
+    private readonly communicationBounds: { maxScanItems: number; maxScanBytes: number; maxReadBytes: number };
 
     constructor(readonly store: StorePort, options: StoreCompactionPortOptions = {}) {
         this.transactions = new ContextTransactions(store);
@@ -47,6 +54,10 @@ export class StoreCompactionPort implements CompactionPort {
         this.maxReadBytes = Math.min(requestedReadBytes, 262144);
         this.maxCachedConversations = options.maxCachedConversations ?? 16;
         if (!Number.isSafeInteger(this.maxCachedConversations) || this.maxCachedConversations < 1) throw new ContextFault('CONFIG_INVALID', 'Context会话索引缓存上限须为正安全整数');
+        this.communicationBounds = { maxScanItems: options.maxCommunicationScanItems ?? 4096,
+            maxScanBytes: options.maxCommunicationScanBytes ?? 4 * 1024 * 1024,
+            maxReadBytes: options.maxCommunicationReadBytes ?? 16 * 1024 * 1024 };
+        if (!Object.values(this.communicationBounds).every(value => Number.isSafeInteger(value) && value > 0)) throw new ContextFault('CONFIG_INVALID', '交流首次窗口扫描/原文预算须为正安全整数');
     }
 
     async readHistory(query: HistoryQuery) {
@@ -106,6 +117,52 @@ export class StoreCompactionPort implements CompactionPort {
             maximumConversations: this.maxCachedConversations };
     }
     readContent(conversationId: string, contentId: string) { return this.store.readContent(conversationId, contentId); }
+
+    private async communicationView(conversationId: string, state: ContextStateData, view: SummaryView): Promise<SummaryView> {
+        const bootstrap = state.communicationBootstrap;
+        if (!bootstrap || bootstrap.historyEpoch !== view.historyEpoch || bootstrap.viewRevision !== view.revision
+            || bootstrap.coveredEndSeq !== view.coveredEndSeq) return view;
+        const window = await this.transactions.readObject<CommunicationWindow>(conversationId, bootstrap.contentId, bootstrap.contentHash);
+        if (window.historyEpoch !== view.historyEpoch || window.coveredEndSeq !== view.coveredEndSeq) throw new ContextFault('PARENT_STALE', '首次交流窗口与已发布范围不同');
+        renderCommunicationWindow(window);
+        return { ...view, communicationWindow: window };
+    }
+
+    async ensureCommunicationWindow(input: { conversationId: string; policy: ContextPolicy; signal?: AbortSignal }): Promise<SummaryView> {
+        if (input.signal?.aborted) throw new ContextFault('CANCELLED', '交流首次窗口已取消');
+        const conversation = await this.conversation(input.conversationId);
+        const state = await this.transactions.readState(input.conversationId);
+        const rawView = state.value.viewContentId ? await this.transactions.readObject<SummaryView>(input.conversationId, state.value.viewContentId)
+            : { revision: Number(conversation.value.viewRevision), historyEpoch: Number(conversation.value.historyEpoch), coveredEndSeq: 0, nodes: [] };
+        const view = await this.communicationView(input.conversationId, state.value, rawView);
+        if (view.revision !== Number(conversation.value.viewRevision) || view.historyEpoch !== Number(conversation.value.historyEpoch)) throw new ContextFault('PARENT_STALE', '首次交流窗口需要同一已发布视图');
+        if (!communicationNeedsBootstrap(view.communicationWindow, view.coveredEndSeq, input.policy)) return view;
+        const sources = createArtifactHistorySourcePort(this.store, { conversationId: input.conversationId,
+            maxBytes: this.communicationBounds.maxReadBytes, maxCacheBytes: this.communicationBounds.maxReadBytes, preferProjection: true });
+        const window = await bootstrapCommunicationWindow({ conversationId: input.conversationId, historyEpoch: view.historyEpoch,
+            viewRevision: view.revision, coveredEndSeq: view.coveredEndSeq, policy: input.policy,
+            history: this, sources, previous: view.communicationWindow, signal: input.signal, ...this.communicationBounds });
+        return this.retry(() => this.transactions.mutateState(input.conversationId, async port => {
+            if (input.signal?.aborted) throw new ContextFault('CANCELLED', '交流首次窗口发布前已取消');
+            const current = await this.conversation(input.conversationId, port);
+            const latest = await this.transactions.readState(input.conversationId, port);
+            if (current.value.historyEpoch !== view.historyEpoch || current.value.viewRevision !== view.revision
+                || latest.value.viewContentId !== state.value.viewContentId) throw new ContextFault('HISTORY_STALE', '首次交流窗口提交前发布视图已改变');
+            const known = latest.value.communicationBootstrap;
+            if (known?.historyEpoch === view.historyEpoch && known.viewRevision === view.revision && known.coveredEndSeq === view.coveredEndSeq) {
+                const adopted = await this.communicationView(input.conversationId, latest.value, rawView);
+                if (!communicationNeedsBootstrap(adopted.communicationWindow, view.coveredEndSeq, input.policy)) return adopted;
+            }
+            const contentId = randomUUID();
+            const next = nextContextRecord(contextStateKey(input.conversationId), latest.record, { ...latest.value,
+                communicationBootstrap: { historyEpoch: view.historyEpoch, viewRevision: view.revision, coveredEndSeq: view.coveredEndSeq,
+                    contentId, contentHash: hashContext(window) } });
+            await this.transactions.commit({ expected: [{ key: current.key, revision: current.revision },
+                { key: next.key, revision: latest.record?.revision ?? null }], records: [next],
+                contents: [contextContent(input.conversationId, contentId, 'context_communication_bootstrap', window)] }, port);
+            return { ...rawView, communicationWindow: window };
+        }));
+    }
 
     private async conversation(conversationId: string, port: Pick<StateMutationPort, 'getRecord'> = this.store): Promise<StoreRecord> {
         const record = await port.getRecord(contextConversationKey(conversationId));
@@ -323,8 +380,9 @@ export class StoreCompactionPort implements CompactionPort {
         const state = await this.transactions.readState(conversationId);
         const historyEpoch = Number(conversation.value.historyEpoch);
         const viewRevision = Number(conversation.value.viewRevision);
-        const view = state.value.viewContentId ? await this.transactions.readObject<SummaryView>(conversationId, state.value.viewContentId)
+        const storedView = state.value.viewContentId ? await this.transactions.readObject<SummaryView>(conversationId, state.value.viewContentId)
             : { revision: viewRevision, historyEpoch, coveredEndSeq: 0, nodes: [] };
+        const view = await this.communicationView(conversationId, state.value, storedView);
         if (view.revision !== viewRevision || view.historyEpoch !== historyEpoch) throw new ContextFault('PARENT_STALE', 'Context已提交视图与会话版本不同');
         let execution = state.value.execution;
         let activeRoundId: string | null = null;
@@ -410,6 +468,10 @@ export class StoreCompactionPort implements CompactionPort {
             const key = contextCandidateKey(candidate.conversationId, candidate.candidateId);
             const previous = await port.getRecord<ContextCandidateData>(key);
             if (previous?.value.state === 'published') return;
+            if (previous?.value.publicationRevoked) return;
+            if (previous?.value.state === 'unknown' && previous.value.pendingAttemptId
+                && candidate.pendingRequest?.attemptId === previous.value.pendingAttemptId
+                && ['snapshotting', 'generating', 'ready'].includes(candidate.state)) return;
             if (previous && ['discarded', 'cancelled'].includes(previous.value.state)) throw new ContextFault('HISTORY_STALE', '压缩候选已被丢弃');
             if (state.value.compressionGeneration !== candidate.snapshot.compressionGeneration
                 || Number(conversation.value.historyEpoch) !== candidate.snapshot.historyEpoch) throw new ContextFault('HISTORY_STALE', '候选历史或压缩代次已经变化');
@@ -431,6 +493,52 @@ export class StoreCompactionPort implements CompactionPort {
     async getCandidate(conversationId: string, candidateId: string): Promise<CompactionCandidate | null> {
         const index = await this.store.getRecord<ContextCandidateData>(contextCandidateKey(conversationId, candidateId));
         return index ? this.transactions.readObject<CompactionCandidate>(conversationId, index.value.contentId, index.value.contentHash) : null;
+    }
+
+    async revokeCandidatePublication(candidate: CompactionCandidate): Promise<void> {
+        const revocation = candidate.publicationRevoked;
+        if (!revocation) throw new ContextFault('CONFIG_INVALID', '撤销候选需要明确的发布失效原因');
+        await this.retry(() => this.transactions.mutateState(candidate.conversationId, async port => {
+            const key = contextCandidateKey(candidate.conversationId, candidate.candidateId);
+            const previous = await port.getRecord<ContextCandidateData>(key);
+            if (!previous) throw new ContextFault('SOURCE_GAP', '待撤销候选缺少持久原件');
+            if (previous.value.state === 'published') return;
+            const stored = await this.transactions.readObject<CompactionCandidate>(candidate.conversationId,
+                previous.value.contentId, previous.value.contentHash);
+            if (stored.snapshot.sourceManifestHash !== candidate.snapshot.sourceManifestHash
+                || stored.snapshot.runId !== candidate.snapshot.runId
+                || stored.snapshot.compressionGeneration !== candidate.snapshot.compressionGeneration) {
+                throw new ContextFault('SOURCE_GAP', '待撤销候选与原来源身份不同');
+            }
+            if (stored.publicationRevoked && stored.state === 'discarded') return;
+            if (stored.pendingRequest && candidate.pendingRequest
+                && stored.pendingRequest.attemptId !== candidate.pendingRequest.attemptId) {
+                throw new ContextFault('ATTEMPT_UNKNOWN', '撤销候选须继续核查原压缩请求', undefined, true);
+            }
+            const resolution = revocation.resolution;
+            const resolved = stored.pendingRequest && !candidate.pendingRequest && resolution?.attemptId === stored.pendingRequest.attemptId
+                && (resolution.status === 'notAccepted' || resolution.status === 'found' && candidate.failedResult
+                    && (candidate.failedResult.attemptId === resolution.attemptId || candidate.failedResult.requestAttemptId === resolution.attemptId)
+                    && candidate.failedResult.inputBodyHash === stored.pendingRequest.inputBodyHash
+                    && candidate.failedResult.modelFingerprint === stored.snapshot.effectiveModelFingerprint);
+            const pendingRequest = candidate.pendingRequest ?? (resolved ? null : stored.pendingRequest);
+            const revoked: CompactionCandidate = { ...candidate, pendingRequest,
+                failedResult: candidate.failedResult ?? stored.failedResult,
+                error: pendingRequest ? candidate.error ?? stored.error : candidate.error,
+                publicationRevoked: { ...(stored.publicationRevoked ?? revocation), ...(resolved ? { resolution } : {}) },
+                state: pendingRequest ? 'unknown' : 'discarded' };
+            const contentId = randomUUID();
+            const record = nextContextRecord(key, previous, { ...previous.value, state: revoked.state, contentId,
+                contentHash: hashContext(revoked), pendingAttemptId: revoked.pendingRequest?.attemptId ?? null,
+                publicationRevoked: revoked.publicationRevoked });
+            const state = await this.transactions.readState(candidate.conversationId, port);
+            const next = state.value.candidateId === candidate.candidateId
+                ? nextContextRecord(contextStateKey(candidate.conversationId), state.record, { ...state.value, candidateId: null }) : null;
+            await this.transactions.commit({ expected: [{ key, revision: previous.revision },
+                ...(next ? [{ key: next.key, revision: state.record?.revision ?? null }] : [])],
+                records: [record, ...(next ? [next] : [])],
+                contents: [contextContent(candidate.conversationId, contentId, 'context_candidate', revoked)] }, port);
+        }));
     }
 
     private summaryReadCurrent(input: ContextSummaryReadInput): Promise<StoreRecord> {
@@ -608,7 +716,8 @@ export class StoreCompactionPort implements CompactionPort {
             }
             const feedback = await this.readHistoryFeedback({ conversationId: candidate.conversationId,
                 historyEpoch: capture.historyEpoch, nodes: candidate.nextView.nodes });
-            const nextView = applyPublishedHistoryFeedback(candidate.nextView, feedback, capture.stepSeq);
+            const nextView = sealPublishedSummaryView(applyPublishedHistoryFeedback(candidate.nextView, feedback, capture.stepSeq),
+                candidate.snapshot.config.policy);
             const publishedNodes = new Map(nextView.nodes.map(node => [node.nodeId, node]));
             const published = { ...candidate, nextView, batch: publishedNodes.get(candidate.batch.nodeId) ?? candidate.batch,
                 folds: candidate.folds.map(node => publishedNodes.get(node.nodeId) ?? node),
@@ -620,7 +729,7 @@ export class StoreCompactionPort implements CompactionPort {
             const viewContentId = randomUUID();
             const candidateRecord = nextContextRecord(previous!.key, previous, { ...previous!.value, state: 'published', contentId: candidateContentId,
                 contentHash: hashContext(published), publishedViewRevision: candidate.nextView.revision });
-            const stateRecord = nextContextRecord(contextStateKey(candidate.conversationId), state.record, { ...state.value, viewContentId,
+            const stateRecord = nextContextRecord(contextStateKey(candidate.conversationId), state.record, { ...state.value, viewContentId, communicationBootstrap: null,
                 historyCheckpoint: { historyEpoch: history.historyEpoch, throughSeq: history.appendSeq, stepSeq: history.stepSeq } });
             const eventSeq = String(BigInt(String(conversation.value.eventSeq ?? '0')) + 1n);
             const conversationRecord = { ...conversation, revision: conversation.revision + 1, value: { ...conversation.value,

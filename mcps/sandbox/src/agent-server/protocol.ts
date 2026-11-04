@@ -220,6 +220,8 @@ export const METHOD_SPECS: Record<string, MethodSpec> = {
     'conversations.listArtifacts': spec({ ...conversationFields, ...pageFields,
         maxBytes: z.number().int().min(1).max(256 * 1024).optional() }, false, 'conversation', '分页查看所属会话的媒体原件和待获取状态'),
     'runs.start': spec({ ...conversationFields, ...commandFields, ...controlFields, input: content, budget: z.record(z.unknown()), options: z.record(z.unknown()).optional() }, true, 'conversation', '启动一个有独立预算的执行'),
+    'runs.startInteractive': spec({ ...conversationFields, ...commandFields, ...controlFields, input: content, options: z.record(z.unknown()).optional() }, true, 'conversation', '人工CLI开始对话，记录用量和费用，无强制金额上限'),
+    'usage.overview': spec({ conversationId: identifier.optional(), profileId: identifier.optional() }, false, 'none', '查询当前对话实际用量与供应商可取得的余额'),
     'runs.get': spec({ ...conversationFields, runId: identifier }, false, 'conversation', '查询原执行状态'),
     'runs.list': spec({ ...conversationFields, ...pageFields }, false, 'conversation', '分页查询执行记录'),
     'runs.cancel': spec({ ...runFields, ...commandFields, ...controlFields, reason: z.string().max(2048).optional(), acknowledgeUnknown: z.literal(true).optional() }, true, 'conversation', '取消原执行；显式acknowledgeUnknown只结束已清理的本地等待，原结果及费用未知继续保留'),

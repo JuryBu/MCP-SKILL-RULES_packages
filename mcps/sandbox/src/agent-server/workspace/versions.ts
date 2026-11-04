@@ -38,6 +38,7 @@ export interface FileCommitReceipt {
     destinationPath?: string;
     destinationBeforeVersion?: FileVersion;
     destinationAfterVersion?: FileVersion;
+    commandObservation?: { afterBase64: string };
 }
 
 export interface RestoreCreatedFileProof { creationActionId: string; lastActionId: string; expectedSha256: string }

@@ -52,6 +52,8 @@ export interface ResourceStorePort {
     get(resourceId: string): Promise<OwnedResource | undefined>;
     put(resource: OwnedResource): Promise<void>;
     list(conversationId: string, rootRunId: string): Promise<OwnedResource[]>;
+    listMetadataPage?(conversationId: string, rootRunId: string, input?: { cursor?: string; limit?: number }):
+        Promise<{ resources: OwnedResource[]; nextCursor: string | null }>;
     listTemporaryConversation?(conversationId: string): Promise<OwnedResource[]>;
     forgetTemporaryConversation?(conversationId: string, expected: readonly OwnedResource[]): Promise<void>;
 }
@@ -75,6 +77,24 @@ export class MemoryResourceStore implements ResourceStorePort {
     async put(resource: OwnedResource): Promise<void> { this.records.set(resource.resourceId, structuredClone(resource)); }
     async list(conversationId: string, rootRunId: string): Promise<OwnedResource[]> {
         return structuredClone([...this.records.values()].filter(resource => resource.conversationId === conversationId && resource.rootRunId === rootRunId));
+    }
+    async listMetadataPage(conversationId: string, rootRunId: string, input: { cursor?: string; limit?: number } = {}):
+        Promise<{ resources: OwnedResource[]; nextCursor: string | null }> {
+        const offset = Number(input.cursor ?? 0);
+        const limit = input.limit ?? 100;
+        if (!Number.isSafeInteger(offset) || offset < 0 || !Number.isSafeInteger(limit) || limit < 1 || limit > 100) {
+            throw new AgentFault('INVALID_PARAMS', '资源状态页游标或大小无效');
+        }
+        const resources: OwnedResource[] = [];
+        let matched = 0;
+        for (const resource of this.records.values()) if (resource.conversationId === conversationId && resource.rootRunId === rootRunId) {
+            if (matched++ < offset) continue;
+            if (resources.length === limit) return { resources, nextCursor: String(offset + limit) };
+            const receipt = resource.receipt && { ...resource.receipt, evidence: { ...resource.receipt.evidence } };
+            if (receipt) delete receipt.evidence.output;
+            resources.push(structuredClone({ ...resource, ...(receipt ? { receipt } : {}) }));
+        }
+        return { resources, nextCursor: null };
     }
     async listTemporaryConversation(conversationId: string): Promise<OwnedResource[]> {
         return structuredClone([...this.records.values()].filter(resource => resource.conversationId === conversationId && resource.retention.mode === 'temporary'));
@@ -300,18 +320,44 @@ export class ResourceRegistry {
         return structuredClone(resource);
     }
 
+    private async *runResources(context: BoundToolContext): AsyncGenerator<OwnedResource> {
+        if (!this.store.listMetadataPage) {
+            for (const resource of (await this.store.list(context.conversationId, context.rootRunId)).reverse()) yield resource;
+            return;
+        }
+        let cursor: string | undefined;
+        const seen = new Set<string>();
+        do {
+            const page = await this.store.listMetadataPage(context.conversationId, context.rootRunId, { cursor, limit: 100 });
+            for (const resource of [...page.resources].reverse()) yield resource;
+            if (page.nextCursor === null) return;
+            if (seen.has(page.nextCursor) || page.nextCursor === cursor) throw new AgentFault('STORAGE_CURSOR_STALE', '资源收尾分页未前进');
+            seen.add(page.nextCursor);
+            cursor = page.nextCursor;
+        } while (cursor !== undefined);
+    }
+
+    private statusOnly(resource: OwnedResource): OwnedResource {
+        if (!resource.receipt) return resource;
+        const evidence = { ...resource.receipt.evidence };
+        delete evidence.output;
+        return { ...resource, receipt: { ...resource.receipt, evidence } };
+    }
+
     async closeRun(context: BoundToolContext): Promise<OwnedResource[]> {
         this.closedRuns.add(this.key(context));
-        const records = await this.store.list(context.conversationId, context.rootRunId);
         const results: OwnedResource[] = [];
-        for (const resource of [...records].reverse()) if (context.runId === context.rootRunId || resource.runId === context.runId) results.push(await this.close(resource.resourceId, context));
+        for await (const resource of this.runResources(context)) if (context.runId === context.rootRunId || resource.runId === context.runId) {
+            results.push(this.statusOnly(await this.close(resource.resourceId, context)));
+        }
         return results;
     }
 
     async releaseIdle(context: BoundToolContext): Promise<OwnedResource[]> {
-        const records = await this.store.list(context.conversationId, context.rootRunId);
         const results: OwnedResource[] = [];
-        for (const resource of [...records].reverse()) if (context.runId === context.rootRunId || resource.runId === context.runId) results.push(await this.close(resource.resourceId, context));
+        for await (const resource of this.runResources(context)) if (context.runId === context.rootRunId || resource.runId === context.runId) {
+            results.push(this.statusOnly(await this.close(resource.resourceId, context)));
+        }
         return results;
     }
 

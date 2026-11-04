@@ -16,14 +16,16 @@ if (!existsSync(compiler)) throw new Error('Agent native compiler is unavailable
 const pendingRoot = join(outputRoot, `.agent-build-${randomUUID()}`);
 mkdirSync(pendingRoot);
 const hash = file => createHash('sha256').update(readFileSync(file)).digest('hex');
-const definitions = ['agent-secret-vault', 'windows-agent-runner', 'agent-file-commit'];
+const definitions = ['agent-secret-vault', 'windows-agent-runner', 'agent-file-commit', 'agent-graphics'];
 const artifacts = [];
 for (const name of definitions) {
     const source = join(packageRoot, 'native', `${name}.cs`);
     const pending = join(pendingRoot, `${name}.exe`);
     const sourceHash = hash(source);
-    const flags = ['/nologo', '/optimize+', '/langversion:5', '/platform:x64', '/target:exe',
-        '/reference:System.Security.dll', '/reference:System.Web.Extensions.dll', `/out:${pending}`, source];
+    const graphics = name === 'agent-graphics';
+    const flags = ['/nologo', '/optimize+', '/langversion:5', '/platform:x64', graphics ? '/target:winexe' : '/target:exe',
+        ...(graphics ? ['/reference:System.Drawing.dll', '/reference:System.Windows.Forms.dll'] : ['/reference:System.Security.dll']),
+        '/reference:System.Web.Extensions.dll', `/out:${pending}`, source];
     const result = spawnSync(compiler, flags, { encoding: 'utf8', windowsHide: true, timeout: 60_000, maxBuffer: 1024 * 1024 });
     if (result.stdout) process.stdout.write(result.stdout);
     if (result.stderr) process.stderr.write(result.stderr);

@@ -9,6 +9,8 @@ import { createCommandResourceAdapter } from '../resources/command-resource-adap
 import { assertNotProtected, isWithin, pathIdentity, requirePolicy } from '../security/policy.js';
 import { AgentNativeClient, helperEnvironment } from './native.js';
 import type { BoundToolContext } from './types.js';
+import { withDeclaredCommandWrites } from '../workspace/command-writes.js';
+import type { DeclaredCommandWorkspace } from '../workspace/command-writes.js';
 import { createWindowsJobLaunch, hasWindowsJobRunner, readWindowsJobMetadata, WindowsJobLaunchError } from '../../windows-job-runner.js';
 
 export const COMMAND_AUTHORIZATION_BOUNDARY = Object.freeze({ enabled: true,
@@ -105,7 +107,13 @@ export class RestrictedCommandRunner {
     private readonly attempts = new Map<string, CommandAttempt>();
     private readonly attachedResources = new WeakSet<ResourceRegistry>();
     private readonly runningCommands = new Map<string, { cancel: () => void; completion: Promise<RestrictedCommandReceipt> }>();
+    private workspace?: DeclaredCommandWorkspace;
     constructor(readonly native = new AgentNativeClient(), private readonly options: JobRunnerOptions = {}) {}
+
+    bindWorkspace(workspace: DeclaredCommandWorkspace): void {
+        if ([...this.attempts.values()].some(attempt => !attempt.settled)) throw new AgentFault('INVALID_STATE', '命令在途时不能替换工作区记录端口');
+        this.workspace = workspace;
+    }
 
     attachResources(resources: ResourceRegistry): void {
         if (this.attachedResources.has(resources)) return;
@@ -148,7 +156,10 @@ export class RestrictedCommandRunner {
         if (Number.isNaN(deadline) || deadline <= Date.now()) throw new AgentFault('TOOL_DEADLINE_EXCEEDED', '动作截止时间已到', { commandStarted: false });
         const attempt: CommandAttempt = { conversationId: context.conversationId, runId: context.runId, hash,
             settled: false, promise: Promise.resolve(undefined as unknown as CommandResult) };
-        attempt.promise = this.start(args, context, resources, hash, deadline).finally(() => { attempt.settled = true; });
+        const execute = () => this.start(args, context, resources, hash, deadline);
+        attempt.promise = (this.workspace && args.writeSet?.length
+            ? withDeclaredCommandWrites(this.workspace, args.writeSet, context, hash, execute) : execute())
+            .finally(() => { attempt.settled = true; });
         this.attempts.set(key, attempt);
         return attempt.promise;
     }

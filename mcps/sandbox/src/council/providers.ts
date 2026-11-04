@@ -177,9 +177,9 @@ function councilApiResult(provider: string, model: string, response: NormalizedR
     const artifacts = runId ? saveCouncilApiResponse(runId, response) : {};
     if (!response.complete || ['unknown', 'failed', 'truncated'].includes(response.stop.kind)) {
         throw new ProviderFault('E_RESPONSE_INCOMPLETE', 'API响应未完整完成，保留原结果并停止自动重发',
-            { acceptance: 'accepted', rawResponse: response.raw });
+            { acceptance: 'accepted', rawResponse: response.raw, partialResponse: response, usage: response.usage });
     }
-    if (response.stop.kind === 'refused') throw new ProviderFault('E_POLICY_REFUSAL', 'API响应已拒绝该动作', { acceptance: 'accepted', rawResponse: response.raw });
+    if (response.stop.kind === 'refused') throw new ProviderFault('E_POLICY_REFUSAL', 'API响应已拒绝该动作', { acceptance: 'accepted', rawResponse: response.raw, usage: response.usage });
     if (response.toolCalls.length) throw new ProviderFault('E_COUNCIL_TOOL_PENDING', 'Council工具调用需由同一核心会话处理后再交回结果',
         { acceptance: 'accepted', rawResponse: response.raw });
     return { provider, model, text: response.blocks.filter(block => block.type === 'text' && !block.thought)
@@ -1003,7 +1003,8 @@ async function callCouncilModelOnce(
     }
 
     if (config.provider === "grok") {
-        const text = await callProgrokAPI(prompt, timeoutMs, {
+        let text: string;
+        try { text = await callProgrokAPI(prompt, timeoutMs, {
             model,
             signal,
             baseUrl: getStringParam(config.params, "baseUrl") || getStringParam(config.params, "endpoint"),
@@ -1013,7 +1014,11 @@ async function callCouncilModelOnce(
                 url: image.dataUrl,
                 mimeType: image.mimeType,
             })),
-        });
+        }); } catch (error) {
+            if (error instanceof ProviderFault) throw error;
+            throw new ProviderFault('E_RESULT_UNKNOWN', '既有Grok请求没有取得可确认结果，保留原请求并停止自动重发或模型替换',
+                { acceptance: 'unknown', phase: 'dispatching' });
+        }
         return { provider: config.provider, model, text };
     }
 

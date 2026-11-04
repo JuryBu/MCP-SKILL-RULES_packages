@@ -4,6 +4,7 @@ import { normalizeProgrokUsage } from '../accounting/usage.js';
 import { arrayObjects, assembleResponse, freezeOwned, gateDeclaredTools, objectValue, requireRoute, stringValue, verifySnapshot } from './assemble.js';
 import { CompatibleChatAdapter, normalizeChatResponse } from './compatible-chat.js';
 import { attemptTimeout, decodeResponse, endpointUrl } from './http.js';
+import { requestProviderResponse } from './streaming.js';
 import type { DiscoveryPage, NativeSendView, NormalizedResponse, ProviderAdapter, ProviderAttempt, ProviderProfile, RawProviderResponse, RequestSnapshot, SendContext, ToolResult } from './types.js';
 
 function localApiBase(profile: ProviderProfile): string {
@@ -25,8 +26,8 @@ function localHeaders(context: SendContext): Record<string, string> {
 
 export async function callProgrokConversation(attempt: ProviderAttempt, context: SendContext, signal?: AbortSignal): Promise<RawProviderResponse> {
     new ProgrokAdapter().validate(attempt.snapshot);
-    return decodeResponse(await context.transport.request({ method: 'POST', url: attempt.snapshot.endpoint,
-        headers: localHeaders(context), body: attempt.snapshot.body, timeoutMs: attemptTimeout(attempt) }, signal));
+    return requestProviderResponse(attempt, context, { method: 'POST', url: attempt.snapshot.endpoint,
+        headers: localHeaders(context), body: attempt.snapshot.body, timeoutMs: attemptTimeout(attempt) }, normalizeChatResponse, signal);
 }
 
 export class ProgrokAdapter implements ProviderAdapter {
@@ -52,7 +53,7 @@ export class ProgrokAdapter implements ProviderAdapter {
         requireRoute(snapshot);
         localApiBase(snapshot.profile);
         const body = JSON.parse(snapshot.body) as JsonObject;
-        if (body.model !== snapshot.modelId || body.stream !== false || !Array.isArray(body.messages) || !body.messages.length) {
+        if (body.model !== snapshot.modelId || body.stream !== (snapshot.streaming === true) || !Array.isArray(body.messages) || !body.messages.length) {
             throw new AgentFault('E_REQUEST_SCHEMA', '冻结的Progrok Chat请求不完整');
         }
     }

@@ -4,6 +4,8 @@ import { normalizeUsage } from '../accounting/usage.js';
 import { arrayObjects, assembleResponse, checkToolResults, freezeOwned, gateDeclaredTools, immutableJson, objectValue, parseArguments, requireRoute, stringValue, validateTools, verifySnapshot } from './assemble.js';
 import { attemptTimeout, bearerHeaders, decodeResponse, endpointUrl } from './http.js';
 import { CompatibleChatAdapter } from './compatible-chat.js';
+import { requestProviderResponse } from './streaming.js';
+import type { LookupResult, ProviderLookupHandle } from './types.js';
 import type { DiscoveryPage, NativeBlock, NativeSendView, NormalizedResponse, ProviderAdapter, ProviderAttempt, ProviderProfile, RawProviderResponse, RequestSnapshot, SendContext, StopKind, ToolCall, ToolResult } from './types.js';
 
 const reserved = new Set(['model', 'input', 'messages', 'contents', 'tools', 'stream', 'store', 'previous_response_id', 'conversation', 'background', 'instructions', 'provider', 'headers']);
@@ -79,7 +81,7 @@ export class OpenAIResponsesAdapter implements ProviderAdapter {
             } else if (pending.size && item.role === 'user') throw new AgentFault('E_TOOL_PAIRING', 'Responses发送视图中仍有未配对的工具调用');
         }
         if (pending.size) throw new AgentFault('E_TOOL_PAIRING', 'Responses发送前必须补齐工具结果');
-        const body: JsonObject = { ...parameters, model: modelId, input: view.input, stream: false, store: false };
+        const body: JsonObject = { ...parameters, model: modelId, input: view.input, stream: view.stream === true, store: false };
         if (view.system !== undefined) body.instructions = view.system;
         if (view.tools?.length) body.tools = view.tools.map(tool => ({ type: 'function', name: tool.name, parameters: tool.parameters,
             ...(tool.description !== undefined ? { description: tool.description } : {}), ...(tool.strict !== undefined ? { strict: tool.strict } : {}) }));
@@ -91,15 +93,17 @@ export class OpenAIResponsesAdapter implements ProviderAdapter {
         requireRoute(snapshot);
         if (snapshot.profile.routePolicy.kind !== 'direct') throw new AgentFault('E_ROUTE_UNVERIFIED', 'Responses首版只接明确原生端点');
         const body = JSON.parse(snapshot.body) as JsonObject;
-        if (body.model !== snapshot.modelId || body.stream !== false || body.store !== false || !Array.isArray(body.input) || !body.input.length) {
+        if (body.model !== snapshot.modelId || body.stream !== (snapshot.streaming === true)
+            || body.store !== (snapshot.profile.remoteRetention === 'allowed') || !Array.isArray(body.input) || !body.input.length) {
             throw new AgentFault('E_REQUEST_SCHEMA', '冻结的Responses请求不完整');
         }
     }
 
     async send(attempt: ProviderAttempt, context: SendContext, signal?: AbortSignal): Promise<NormalizedResponse> {
         this.validate(attempt.snapshot);
-        const raw = decodeResponse(await context.transport.request({ method: 'POST', url: attempt.snapshot.endpoint,
-            headers: { 'Content-Type': 'application/json', ...bearerHeaders(context.credential) }, body: attempt.snapshot.body, timeoutMs: attemptTimeout(attempt) }, signal));
+        const raw = await requestProviderResponse(attempt, context, { method: 'POST', url: attempt.snapshot.endpoint,
+            headers: { 'Content-Type': 'application/json', ...bearerHeaders(context.credential) }, body: attempt.snapshot.body,
+            timeoutMs: attemptTimeout(attempt) }, normalizeResponsesResponse, signal);
         const names = arrayObjects((JSON.parse(attempt.snapshot.body) as JsonObject).tools).map(tool => stringValue(tool.name) ?? '');
         return gateDeclaredTools(assembleResponse(attempt.attemptId, raw, normalizeResponsesResponse), names);
     }
@@ -118,5 +122,18 @@ export class OpenAIResponsesAdapter implements ProviderAdapter {
         return immutableJson({ ...view, input: [...(view.input ?? []), ...response.replayMessages, ...output] });
     }
 
-    async lookup(): Promise<{ status: 'unsupported' }> { return { status: 'unsupported' }; }
+    async lookup(handle: ProviderLookupHandle, context: SendContext, signal?: AbortSignal): Promise<LookupResult> {
+        const snapshot = handle.snapshot;
+        if (!snapshot || snapshot.profile.remoteRetention !== 'allowed' || !handle.providerResponseId
+            || JSON.parse(snapshot.body).store !== true) return { status: 'unsupported' };
+        const endpoint = `${this.endpoint(snapshot.profile, snapshot.modelId)}/${encodeURIComponent(handle.providerResponseId)}`;
+        const response = await context.transport.request({ method: 'GET', url: endpoint,
+            headers: bearerHeaders(context.credential), timeoutMs: 10_000 }, signal);
+        if (response.status === 404) return { status: 'not_found', provesNotAccepted: false };
+        const raw = decodeResponse(response, this.protocol);
+        if (raw.json.id !== handle.providerResponseId) throw new AgentFault('E_RESPONSE_IDENTITY', '查回结果与原供应商响应身份不同');
+        if (['queued', 'in_progress'].includes(String(raw.json.status))) return { status: 'pending' };
+        const names = arrayObjects((JSON.parse(snapshot.body) as JsonObject).tools).map(tool => stringValue(tool.name) ?? '');
+        return { status: 'found', response: gateDeclaredTools(assembleResponse(handle.attemptId, raw, normalizeResponsesResponse), names) };
+    }
 }

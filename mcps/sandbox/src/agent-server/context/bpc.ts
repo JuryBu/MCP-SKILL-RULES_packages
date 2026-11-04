@@ -7,10 +7,11 @@ import type { CompactionCandidate, CompactionPort, CompactionReason, CompactionV
 import { checkContextGate, totalContextTokens } from './budget.js';
 import { freezeValue, hashContext } from './config.js';
 import { contextFailure, ContextFault } from './errors.js';
-import { generateCompaction, prepareCompaction, previewCompaction, fitCompactionSummary, validateCompressionResult, verifyManifestSources, verifyRequirements } from './compaction.js';
+import { factsOnlyCompressionResult, generateCompaction, prepareCompaction, previewCompaction, fitCompactionSummary, validateCompressionResult, verifyManifestSources } from './compaction.js';
 import type { CompactionPreview } from './compaction.js';
 import { createSourceManifest, readSelectedHistory } from './rounds.js';
-import { validatePublication } from './view.js';
+import { sealPublishedSummaryView, validatePublication } from './view.js';
+import { applyPublishedHistoryFeedback } from './feedback.js';
 
 interface ActiveCompaction {
     candidate: CompactionCandidate;
@@ -116,7 +117,8 @@ export class ContextCompactor {
         return previewCompaction(await this.options.port.inspect(conversationId), config);
     }
 
-    async readView(conversationId: string): Promise<SummaryView> {
+    async readView(conversationId: string, input?: { policy: import('./contracts.js').ContextPolicy; signal?: AbortSignal }): Promise<SummaryView> {
+        if (input && this.options.port.ensureCommunicationWindow) return this.options.port.ensureCommunicationWindow({ conversationId, ...input });
         return (await this.options.port.inspect(conversationId)).view;
     }
 
@@ -131,6 +133,7 @@ export class ContextCompactor {
             const checkpoint = await this.checkpoint(input.conversationId);
             if (checkpoint.state === 'hardPaused') throw new ContextFault('ATTEMPT_UNKNOWN', '压缩状态需要可信恢复后才能新增请求', { failure: checkpoint.lastFailure });
             if (input.reason === 'background' && checkpoint.state !== 'idle') throw new ContextFault('COMPACTION_PAUSED', '后台压缩处于冷却或熔断状态');
+            await this.options.port.ensureCommunicationWindow?.({ conversationId: input.conversationId, policy: input.config.policy, signal: abort.signal });
             const current = await this.options.port.inspect(input.conversationId);
             if (current.candidateId) {
                 const candidate = await this.options.port.getCandidate(input.conversationId, current.candidateId);
@@ -147,12 +150,8 @@ export class ContextCompactor {
                 const fixed = await input.estimateCompaction(candidate.snapshot, { coveredEndSeq: candidate.snapshot.coveredEndSeq, text: '', tokens: 0 }, abort.signal);
                 const fixedInputTokens = totalContextTokens(fixed.estimate);
                 const target = Math.min(input.limits.target, input.limits.inputBudget);
-                const targetRemaining = target - fixedInputTokens - 1;
-                const summaryBudget = Math.min(input.limits.summaryBudget, targetRemaining > 0 || input.reason === 'background'
-                    ? targetRemaining : input.limits.inputBudget - fixedInputTokens - 1);
-                if (summaryBudget <= 0) throw new ContextFault('SUMMARY_BUDGET', input.reason === 'background'
-                    ? '保留原文、当前输入及工具schema已占满后台压缩目标，摘要模型尚未调用'
-                    : '保留原文、当前输入及工具schema已占满安全输入预算，摘要模型尚未调用',
+                const summaryBudget = Math.min(input.limits.summaryBudget, input.limits.inputBudget - fixedInputTokens - 1);
+                if (summaryBudget <= 0) throw new ContextFault('SUMMARY_BUDGET', '保留原文、当前输入及工具schema已占满安全输入预算，摘要模型尚未调用',
                     { fixedInputTokens, target, inputBudget: input.limits.inputBudget, summaryBudget, conversationId: input.conversationId, historyEpoch: candidate.snapshot.historyEpoch,
                         appendSeq: candidate.snapshot.snapshotAppendSeq, nativeViewHash: fixed.nativeViewHash });
                 candidate = { ...candidate, snapshot: freezeValue({ ...candidate.snapshot, requestBudget: { target, inputBudget: input.limits.inputBudget, summaryBudget, fixedInputTokens,
@@ -173,6 +172,7 @@ export class ContextCompactor {
         let settled = false;
         const completion = generateCompaction({ candidate, priorView: capture.view, port: this.options.port, sources: this.options.sources,
             model: this.options.model, signal: abort.signal, countTokens: this.options.countTokens, now: this.now, estimateCompaction }).then(async result => {
+            if (abort.signal.aborted || candidate.publicationRevoked || this.active.get(candidate.conversationId)?.candidate !== candidate) return candidate;
             if (result.snapshot.execution.kind === 'maintenance') {
                 await this.publish(candidate.conversationId, capture.stepSeq);
                 await this.finishMaintenance(candidate, 'published');
@@ -182,7 +182,7 @@ export class ContextCompactor {
             let failure = error;
             if (!abort.signal.aborted && candidate.reason === 'background' && !candidate.pendingRequest
                 && candidate.snapshot.execution.kind !== 'maintenance' && error instanceof ContextFault
-                && !error.mayHaveStarted && (error.code === 'CONTEXT_SUMMARY_BUDGET'
+                && !error.mayHaveStarted && (error.code === 'CONTEXT_CONFIG_INVALID' || error.code === 'CONTEXT_SUMMARY_BUDGET'
                     || error.code === 'CONTEXT_SOURCE_GAP' && error.details?.knownInvalidDigest === true
                         && candidate.state === 'failed' && candidate.error?.details?.knownInvalidDigest === true)) {
                 const checkpoint = await this.checkpoint(candidate.conversationId);
@@ -279,6 +279,7 @@ export class ContextCompactor {
         const candidate = active?.candidate ?? (capture.candidateId ? await this.options.port.getCandidate(conversationId, capture.candidateId) : null);
         if (!candidate) return null;
         if (candidate.state === 'published') return this.options.port.getPublication(this.receipt(candidate));
+        if (candidate.publicationRevoked) return null;
         if (candidate.state !== 'ready') return null;
         if (receiptKey && receiptKey.conversationId !== conversationId) throw new ContextFault('CONFIG_INVALID', '发布回执必须属于当前会话');
         await verifyManifestSources(candidate.snapshot.manifest, this.options.sources, candidate.snapshot.config.policy.readFrameBytes, active?.abort.signal);
@@ -292,9 +293,16 @@ export class ContextCompactor {
             if (!estimator) throw new ContextFault('CONFIG_INVALID', '带原生请求预算的候选发布需要当前只读完整请求估计');
             const fitted = await fitCompactionSummary({ snapshot: candidate.snapshot, nodes: candidate.nextView.nodes,
                 coveredEndSeq: candidate.nextView.coveredEndSeq, countTokens: this.options.countTokens,
-                summaryBudget: candidate.nextView.summaryBudget, estimateCompaction: estimator, signal: active?.abort.signal });
-            candidate.nextView = freezeValue({ ...candidate.nextView, summaryBudget: fitted.budget });
+                summaryBudget: candidate.nextView.summaryBudget, estimateCompaction: estimator, signal: active?.abort.signal,
+                communicationWindow: candidate.nextView.communicationWindow });
+            candidate.nextView = freezeValue({ ...candidate.nextView, summaryBudget: fitted.budget, renderedLevels: fitted.rendered.levels,
+                ...(fitted.rendered.communicationRendering ? { communicationRendering: fitted.rendered.communicationRendering } : {}),
+                ...(fitted.fitEvidence ? { fitEvidence: fitted.fitEvidence } : {}) });
         }
+        const feedback = await this.options.port.readHistoryFeedback?.({ conversationId, historyEpoch: candidate.snapshot.historyEpoch,
+            nodes: candidate.nextView.nodes });
+        candidate.nextView = sealPublishedSummaryView(feedback ? applyPublishedHistoryFeedback(candidate.nextView, feedback, stepSeq) : candidate.nextView,
+            candidate.snapshot.config.policy, candidate.nextView.summaryBudget, this.options.countTokens);
         candidate.publicationReceiptKey = receiptKey ?? this.receipt(candidate);
         await this.options.port.saveCandidate(structuredClone(candidate));
         const ready = structuredClone(candidate);
@@ -364,6 +372,8 @@ export class ContextCompactor {
             return { state: 'cancelled', cooldownUntil: checkpoint.cooldownUntil };
         }
         this.starting.get(conversationId)?.abort.abort();
+        candidate.publicationRevoked ??= { reason: 'cancelled', revokedAt: new Date(this.now()).toISOString(),
+            pendingAttemptId: candidate.pendingRequest?.attemptId ?? null };
         active?.abort.abort();
         this.options.sources.releaseCached?.([...candidate.snapshot.manifest.blocks, ...candidate.snapshot.referenceBlocks]);
         if (options.human ?? true) checkpoint.cooldownUntil = this.now() + candidate.snapshot.config.policy.cooldownMs;
@@ -413,10 +423,48 @@ export class ContextCompactor {
         await this.persist(conversationId, emptyCheckpoint());
     }
 
+    async invalidate(conversationId: string, reason: NonNullable<CompactionCandidate['publicationRevoked']>['reason']): Promise<CompactionCandidate | null> {
+        this.starting.get(conversationId)?.abort.abort();
+        const capture = await this.options.port.inspect(conversationId);
+        const active = this.active.get(conversationId);
+        const candidate = active?.candidate ?? (capture.candidateId ? await this.options.port.getCandidate(conversationId, capture.candidateId) : null);
+        if (!candidate || ['published', 'cancelled', 'discarded'].includes(candidate.state)) return candidate;
+        if (candidate.state === 'publishing') throw new ContextFault('COMMIT_UNKNOWN', '先核原发布回执，再撤销候选发布资格', undefined, true);
+        candidate.publicationRevoked ??= { reason, revokedAt: new Date(this.now()).toISOString(), pendingAttemptId: candidate.pendingRequest?.attemptId ?? null };
+        active?.abort.abort();
+        if (candidate.pendingRequest) {
+            await this.options.model.cancel(candidate.pendingRequest).catch(() => 'unknown');
+            candidate.state = 'unknown';
+            candidate.error = { code: 'CONTEXT_ATTEMPT_UNKNOWN', message: '候选发布资格已撤销；原attempt费用与结果沿原身份继续核对',
+                mayHaveStarted: true, attemptId: candidate.pendingRequest.attemptId };
+            if (!this.options.port.revokeCandidatePublication) {
+                await this.options.port.saveCandidate(structuredClone(candidate));
+                throw new ContextFault('ATTEMPT_UNKNOWN', '存储尚未接入保留原费用未知的发布资格撤销事务', { candidateId: candidate.candidateId }, true);
+            }
+        } else candidate.state = 'discarded';
+        if (this.options.port.revokeCandidatePublication) await this.options.port.revokeCandidatePublication(structuredClone(candidate));
+        else await this.options.port.discardCandidate({ conversationId, candidateId: candidate.candidateId,
+            generation: candidate.snapshot.compressionGeneration, state: 'discarded' });
+        if (this.active.get(conversationId) === active) this.active.delete(conversationId);
+        this.options.sources.releaseCached?.([...candidate.snapshot.manifest.blocks, ...candidate.snapshot.referenceBlocks]);
+        return structuredClone(candidate);
+    }
+
     async beforeRequest(input: { conversationId: string; execution: ExecutionLease; config: FrozenCompressionConfig;
         stepSeq: number; limits: ContextLimits; estimateCompaction?: CompactionViewEstimator;
         estimate(): Promise<ContextEstimate> }): Promise<{ estimate: ContextEstimate; inputTokens: number; backgroundCandidateId: string | null }> {
         let checkpoint = await this.checkpoint(input.conversationId);
+        if (checkpoint.state === 'hardPaused' && checkpoint.lastFailure?.code === 'CONTEXT_CONFIG_INVALID'
+            && !checkpoint.lastFailure.mayHaveStarted) {
+            const capture = await this.options.port.inspect(input.conversationId);
+            const candidate = capture.candidateId ? await this.options.port.getCandidate(input.conversationId, capture.candidateId) : null;
+            if (candidate?.state === 'failed' && !candidate.pendingRequest
+                && candidate.error?.code === 'CONTEXT_CONFIG_INVALID' && !candidate.error.mayHaveStarted) {
+                checkpoint.state = 'circuitBroken';
+                await this.persist(input.conversationId, checkpoint);
+                if (this.active.get(input.conversationId)?.candidate.candidateId === candidate.candidateId) this.active.delete(input.conversationId);
+            }
+        }
         if (checkpoint.state === 'hardPaused') {
             const failure = checkpoint.lastFailure;
             if (failure?.code === 'CONTEXT_SUMMARY_BUDGET' && !failure.mayHaveStarted) {
@@ -428,22 +476,22 @@ export class ContextCompactor {
             }
             throw new ContextFault('ATTEMPT_UNKNOWN', '压缩结果或占用需要显式恢复', { failure });
         }
+        const previous = this.active.get(input.conversationId)?.candidate;
+        if (previous && previous.snapshot.effectiveModelFingerprint !== input.config.modelFingerprint) {
+            await this.invalidate(input.conversationId, 'model_changed');
+        }
         await this.publish(input.conversationId, input.stepSeq, undefined, input.estimateCompaction);
         let estimate = await input.estimate();
         let gate = checkContextGate(estimate, input.limits);
         let active = this.active.get(input.conversationId);
-        if (active && active.candidate.state === 'generating'
-            && (!gate.allowed || input.stepSeq >= active.candidate.snapshot.targetReplaceStep)) {
-            await active.completion;
-            await this.publish(input.conversationId, input.stepSeq, undefined, input.estimateCompaction);
-            estimate = await input.estimate();
-            gate = checkContextGate(estimate, input.limits);
-            active = this.active.get(input.conversationId);
-        }
         if (!gate.allowed) {
             if (active) {
-                const cancellation = await this.cancel(input.conversationId, { human: false });
-                if (cancellation.state === 'unknown') throw new ContextFault('ATTEMPT_UNKNOWN', '原后台attempt尚未结清，硬压缩保持阻塞', undefined, true);
+                if (this.options.port.revokeCandidatePublication && active.candidate.state !== 'publishing') {
+                    await this.invalidate(input.conversationId, 'hard_takeover');
+                } else {
+                    const cancellation = await this.cancel(input.conversationId, { human: false });
+                    if (cancellation.state === 'unknown') throw new ContextFault('ATTEMPT_UNKNOWN', '原后台attempt尚未结清，硬压缩保持阻塞', undefined, true);
+                }
             }
             const capture = await this.options.port.inspect(input.conversationId);
             const preview = previewCompaction(capture, input.config);
@@ -607,6 +655,62 @@ export class ContextCompactor {
         };
         const candidate = await this.options.port.getCandidate(conversationId, candidateId);
         if (!candidate) throw new ContextFault('SOURCE_GAP', '待恢复候选不存在');
+        if (candidate.publicationRevoked) {
+            if (!candidate.pendingRequest && candidate.publicationReceiptKey && ['publishing', 'unknown'].includes(candidate.state)) {
+                const publication = await this.options.port.getPublication(candidate.publicationReceiptKey);
+                if (!publication) throw new ContextFault('COMMIT_UNKNOWN', '已撤销候选的原发布回执仍未查明', undefined, true);
+                candidate.state = 'published';
+                candidate.publishedViewRevision = publication.viewRevision;
+                candidate.error = null;
+                releaseSettled();
+                const checkpoint = await this.checkpoint(conversationId);
+                checkpoint.state = (checkpoint.cooldownUntil ?? 0) > this.now() ? 'cooldown' : 'idle';
+                checkpoint.lastFailure = null;
+                checkpoint.lastPublishRevision = publication.viewRevision;
+                await this.persist(conversationId, checkpoint);
+                await this.finishMaintenance(candidate, 'published');
+                return candidate;
+            }
+            if (candidate.pendingRequest) {
+                const lookup = await this.options.model.lookup(candidate.pendingRequest);
+                if (lookup.status === 'found') {
+                    if ((lookup.result.attemptId !== candidate.pendingRequest.attemptId && lookup.result.requestAttemptId !== candidate.pendingRequest.attemptId)
+                        || lookup.result.inputBodyHash !== candidate.pendingRequest.inputBodyHash
+                        || lookup.result.modelFingerprint !== candidate.snapshot.effectiveModelFingerprint) throw new ContextFault('USAGE_MISMATCH', '已撤销候选的查回结果与原请求身份不同', undefined, true);
+                    candidate.publicationRevoked = { ...candidate.publicationRevoked,
+                        resolution: { attemptId: candidate.pendingRequest.attemptId, status: 'found' } };
+                    candidate.failedResult = structuredClone(lookup.result);
+                    candidate.pendingRequest = null;
+                    candidate.state = 'discarded';
+                    candidate.error = null;
+                } else if (lookup.status === 'notAccepted') {
+                    candidate.publicationRevoked = { ...candidate.publicationRevoked,
+                        resolution: { attemptId: candidate.pendingRequest.attemptId, status: 'notAccepted' } };
+                    candidate.pendingRequest = null;
+                    candidate.state = 'discarded';
+                    candidate.error = null;
+                }
+            }
+            if (this.options.port.revokeCandidatePublication) await this.options.port.revokeCandidatePublication(structuredClone(candidate));
+            else {
+                await this.options.port.saveCandidate(structuredClone(candidate));
+                if (candidate.state === 'discarded') await this.options.port.discardCandidate({ conversationId, candidateId,
+                    generation: candidate.snapshot.compressionGeneration, state: 'discarded' });
+            }
+            releaseSettled();
+            if (!candidate.pendingRequest && candidate.state === 'discarded') {
+                const current = await this.options.port.inspect(conversationId);
+                const checkpoint = await this.checkpoint(conversationId);
+                if ((!current.candidateId || current.candidateId === candidateId)
+                    && checkpoint.lastFailure?.attemptId === candidate.publicationRevoked.pendingAttemptId) {
+                    checkpoint.lastFailure = null;
+                    checkpoint.state = (checkpoint.cooldownUntil ?? 0) > this.now() ? 'cooldown' : 'idle';
+                    await this.persist(conversationId, checkpoint);
+                }
+                await this.finishMaintenance(candidate, 'cancelled');
+            }
+            return candidate;
+        }
         if (candidate.error?.details?.budgetDeferralCleanup === true) {
             throw new ContextFault('COMMIT_UNKNOWN', '先核实原预算延期候选的持久收尾，不新增压缩请求',
                 { candidateId, failure: candidate.error }, true);
@@ -671,10 +775,9 @@ export class ContextCompactor {
                 throw failure;
             }
             validateCompressionResult(candidate.pendingRequest, lookup.result);
-            if (candidate.pendingRequest.reason !== 'fold') await verifyRequirements(lookup.result.digest.unresolved, candidate.snapshot, this.options.sources, abort.signal);
             recoveredAttemptId = candidate.pendingRequest.attemptId;
             const chunk = candidate.pendingRequest.chunk;
-            if (!candidate.chunks.some(entry => entry.chunkId === chunk.chunkId)) candidate.chunks.push(freezeValue({ ...lookup.result,
+            if (!candidate.chunks.some(entry => entry.chunkId === chunk.chunkId)) candidate.chunks.push(freezeValue({ ...factsOnlyCompressionResult(lookup.result),
                 chunkId: chunk.chunkId, roundId: chunk.roundId, sourceSpans: chunk.sourceSpans, anchors: chunk.anchors }));
             candidate.pendingRequest = null;
         }

@@ -39,8 +39,7 @@ export function selectCompactionRounds(capture: ContextCapture, policy: ContextP
     }
     const targetIds = new Set(targets.map(round => round.roundId));
     const first = targets.length ? rounds.findIndex(round => round.roundId === targets[0].roundId) : -1;
-    const last = targets.length ? rounds.findIndex(round => round.roundId === targets[targets.length - 1].roundId) : -1;
-    const references = [rounds[first - 1], rounds[last + 1]].filter((round): round is RoundBoundary => Boolean(round) && !targetIds.has(round.roundId));
+    const references = [rounds[first - 1]].filter((round): round is RoundBoundary => Boolean(round) && !targetIds.has(round.roundId));
     return { targets, retained: rounds.filter(round => !targetIds.has(round.roundId) && round.lastSeq > capture.view.coveredEndSeq), references };
 }
 

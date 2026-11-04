@@ -8,9 +8,11 @@ import { derivedContextId, freezeValue, hashBytes, hashContext } from './config.
 import { checkAbort, contextFailure, ContextFault } from './errors.js';
 import { createSourceManifest, readSelectedHistory, selectCompactionRounds } from './rounds.js';
 import { readSourceFrame, utf8Boundary } from './sources.js';
-import { applySummaryFold, createSummaryBatch, mergeRequirements, planSummaryFold, renderSummary, sealSummaryNode, validatePublication } from './view.js';
+import { applySummaryFold, mergeRequirements, planSummaryFold, renderSummary, renderSummaryView, sealSummaryNode, validatePublication } from './view.js';
 import { feedbackSourceNodeIds } from './feedback.js';
-import { activeRequirements, applyRequirementResolutions, boundedRequirementGuidance } from './requirements.js';
+import { activeRequirements, boundedRequirementGuidance } from './requirements.js';
+import { applySemanticChunk, semanticTailInput } from './semantic-tail.js';
+import { updateCommunicationWindow } from './communication-window.js';
 
 export interface CompactionPreview {
     conversationId: string;
@@ -96,6 +98,7 @@ export async function prepareCompaction(input: {
         configFingerprint: config.configFingerprint, sourceHistoryRoot: capture.historyRoot, workspaceRevision: capture.workspaceRevision,
         createdAt: new Date(input.now ?? Date.now()).toISOString(), manifest, referenceBlocks: references.blocks,
         execution: structuredClone(execution), config, requirementSourceMetadata: [...requirementItems.values()],
+        ...(capture.view.communicationWindow ? { communicationWindow: capture.view.communicationWindow } : {}),
         ...(historyFeedback?.revision ? { historyFeedback } : {}) });
     return { candidateId, conversationId: capture.conversationId, state: 'snapshotting', reason: input.reason,
         snapshot, chunks: [], pendingRequest: null, failedResult: null, batch: null, folds: [], nextView: null, coverage: null, error: null,
@@ -134,7 +137,7 @@ async function readReferences(snapshot: CompactionSnapshot, sources: ContextSour
     if (referenceBudget <= 0) return parts;
     for (const block of snapshot.referenceBlocks) {
         checkAbort(signal);
-        if (block.kind !== 'text' || !block.byteLength) continue;
+        if (block.seq >= snapshot.coveredStartSeq || block.kind !== 'text' || !block.byteLength) continue;
         const frame = await readSourceFrame(sources, { block, startByte: 0,
             endByte: Math.min(block.byteLength, snapshot.config.policy.readFrameBytes), maxBytes: snapshot.config.policy.readFrameBytes, signal });
         let endByte = utf8Boundary(frame, frame.length);
@@ -151,6 +154,7 @@ async function readReferences(snapshot: CompactionSnapshot, sources: ContextSour
 export async function* createCompressionChunks(input: {
     snapshot: CompactionSnapshot; sources: ContextSourcePort; blocks?: SourceBlock[]; priorGuidance?: string | (() => string);
     requirementAnchors?: () => RequirementAnchor[];
+    semanticTail?: (roundId: string) => ReturnType<typeof semanticTailInput>;
     countTokens?: TokenCounter; signal: AbortSignal;
 }): AsyncGenerator<CompressionChunk> {
     const { snapshot, sources, signal } = input;
@@ -164,7 +168,10 @@ export async function* createCompressionChunks(input: {
     const blocks = input.blocks ?? snapshot.manifest.blocks;
     const roundIds = [...new Set(blocks.map(block => block.roundId))];
     const roundOutcomes = new Map(snapshot.manifest.rounds.filter(round => round.terminalOutcome).map(round => [round.roundId, round.terminalOutcome]));
+    let currentRoundId = '';
     const body = (parts: TextPart[], anchors: SourceBlock[]) => canonicalJson({ rules: snapshot.config.rules,
+        ...(input.semanticTail ? { semanticTail: input.semanticTail(currentRoundId) } : {}),
+        taskStateOwner: 'main_model', legacyRequirementsReadOnly: true, taskPlanManaged: policy.taskPlanManaged,
         ...(snapshot.requestBudget ? { requestBudget: snapshot.requestBudget } : {}),
         priorGuidance: guidance(), references, targets: parts.map(part => roundOutcomes.has(part.sourceRoundId)
             ? { ...part, sourceRoundOutcome: roundOutcomes.get(part.sourceRoundId) } : part),
@@ -173,13 +180,17 @@ export async function* createCompressionChunks(input: {
     const finish = (roundId: string, parts: TextPart[], anchors: SourceBlock[]): CompressionChunk => {
         const text = body(parts, anchors);
         const inputTokens = countTokens(text);
-        if (!Number.isSafeInteger(inputTokens) || inputTokens < 0 || inputTokens > inputLimit) throw new ContextFault('CONFIG_INVALID', '压缩规则、参考和来源头超出单块输入预算');
+        if (!Number.isSafeInteger(inputTokens) || inputTokens < 0 || inputTokens > inputLimit) throw new ContextFault('CONFIG_INVALID', '压缩规则、参考和来源头超出单块输入预算',
+            { inputTokens, inputLimit, roundId, textParts: parts.length, emptyTextParts: parts.filter(part => !part.text.length).length,
+                nativeAnchors: anchors.length, staticTokens: countTokens(body([], [])), rulesTokens: countTokens(snapshot.config.rules),
+                priorGuidanceTokens: countTokens(guidance()), referenceTokens: countTokens(canonicalJson(references)) });
         const sourceSpans = [...parts.map(part => part.span), ...anchors.map(fullSpan)];
         return freezeValue({ chunkId: derivedContextId([snapshot.candidateId, roundId, sourceSpans]), roundId, sourceSpans,
             referenceSpans: references.map(part => part.span), anchors, body: text, inputBodyHash: hashBytes(text), inputTokens,
             ...(input.requirementAnchors ? { requirementAnchors: input.requirementAnchors() } : {}) });
     };
     for (const roundId of roundIds) {
+        currentRoundId = roundId;
         checkAbort(signal);
         const roundBlocks = blocks.filter(block => block.roundId === roundId);
         let anchors: SourceBlock[] = [];
@@ -189,12 +200,24 @@ export async function* createCompressionChunks(input: {
                 yield finish(roundId, [], anchors);
                 anchors = [];
             }
+            if (countTokens(body([], [anchor])) > inputLimit) throw new ContextFault('CONFIG_INVALID', '单个原生检索锚点及当前末段超过压缩输入预算',
+                { inputLimit, staticTokens: countTokens(body([], [])), itemId: anchor.itemId, blockId: anchor.blockId });
             anchors.push(anchor);
         }
         let parts: TextPart[] = [];
         for (const block of roundBlocks.filter(entry => entry.kind === 'text')) {
             let offset = 0;
-            if (!block.byteLength) parts.push({ text: '', span: spanFor(block, 0, Buffer.alloc(0), 'target'), sourceRoundId: block.roundId });
+            if (!block.byteLength) {
+                const empty = { text: '', span: spanFor(block, 0, Buffer.alloc(0), 'target'), sourceRoundId: block.roundId };
+                if (countTokens(body([...parts, empty], anchors)) > inputLimit && (parts.length || anchors.length)) {
+                    yield finish(roundId, parts, anchors);
+                    parts = [];
+                    anchors = [];
+                }
+                if (countTokens(body([empty], [])) > inputLimit) throw new ContextFault('CONFIG_INVALID', '单个空文本的来源头已超过压缩输入预算',
+                    { inputLimit, staticTokens: countTokens(body([], [])), itemId: block.itemId, blockId: block.blockId });
+                parts.push(empty);
+            }
             while (offset < block.byteLength) {
                 checkAbort(signal);
                 const frame = await readSourceFrame(sources, { block, startByte: offset,
@@ -235,6 +258,11 @@ export async function* createCompressionChunks(input: {
         }
         if (parts.length || anchors.length) yield finish(roundId, parts, anchors);
     }
+}
+
+export function factsOnlyCompressionResult<Result extends CompressionResult>(result: Result): Result {
+    const { resolutions: _resolutions, ...digest } = result.digest;
+    return { ...result, digest: { ...digest, unresolved: [] } };
 }
 
 export function validateCompressionResult(request: CompressionRequest, result: CompressionResult): void {
@@ -339,15 +367,20 @@ function validateRequestBudgetIdentity(snapshot: CompactionSnapshot, measured: {
 }
 
 export async function fitCompactionSummary(input: { snapshot: CompactionSnapshot; nodes: SummaryNode[]; coveredEndSeq: number;
-    countTokens?: TokenCounter; summaryBudget?: number; estimateCompaction?: CompactionViewEstimator; signal?: AbortSignal }) {
+    countTokens?: TokenCounter; summaryBudget?: number; estimateCompaction?: CompactionViewEstimator; signal?: AbortSignal;
+    communicationWindow?: SummaryView['communicationWindow'] }) {
     const countTokens = input.countTokens ?? conservativeTextTokens;
     const limits = computeContextLimits(input.snapshot.config.model.contextWindow, input.snapshot.config.model.maxOutputTokens, input.snapshot.config.policy);
-    let budget = Math.min(limits.summaryBudget, input.estimateCompaction ? limits.summaryBudget
-        : input.snapshot.requestBudget?.summaryBudget ?? limits.summaryBudget, input.summaryBudget ?? limits.summaryBudget);
-    let safeFit: { rendered: ReturnType<typeof renderSummary>; budget: number; fitEvidence: NonNullable<SummaryView['fitEvidence']> } | undefined;
+    let budget = Math.min(limits.summaryBudget, input.snapshot.requestBudget?.summaryBudget ?? limits.summaryBudget,
+        input.summaryBudget ?? limits.summaryBudget);
+    const minimumRecord = renderSummary(input.nodes, input.snapshot.config.policy, Number.MAX_SAFE_INTEGER, countTokens,
+        input.nodes.map(node => ({ nodeId: node.nodeId, level: 'title' as const }))).tokens;
+    let safeFit: { rendered: ReturnType<typeof renderSummaryView>; budget: number; fitEvidence: NonNullable<SummaryView['fitEvidence']> } | undefined;
     while (true) {
-        let rendered: ReturnType<typeof renderSummary>;
-        try { rendered = renderSummary(input.nodes, input.snapshot.config.policy, budget, countTokens); }
+        let rendered: ReturnType<typeof renderSummaryView>;
+        try {
+            rendered = renderSummaryView({ nodes: input.nodes, communicationWindow: input.communicationWindow }, input.snapshot.config.policy, budget, countTokens);
+        }
         catch (error) {
             if (safeFit && error instanceof ContextFault && error.code === 'CONTEXT_SUMMARY_BUDGET') {
                 const current = await input.estimateCompaction!(input.snapshot, { coveredEndSeq: input.coveredEndSeq,
@@ -371,10 +404,17 @@ export async function fitCompactionSummary(input: { snapshot: CompactionSnapshot
         const validInputBudget = typeof inputBudget === 'number' && Number.isSafeInteger(inputBudget) && inputBudget > target;
         const fitEvidence = { inputTokens, target, inputBudget: validInputBudget ? inputBudget : null, targetReached: inputTokens < target };
         if (fitEvidence.targetReached) return { rendered, budget, fitEvidence };
+        if (validInputBudget && inputTokens < inputBudget && input.snapshot.requestBudget.fixedInputTokens >= target) {
+            return { rendered, budget, fitEvidence: { ...fitEvidence, optimizationStoppedAtMinimum: false } };
+        }
         if (validInputBudget && inputTokens < inputBudget) safeFit = { rendered, budget, fitEvidence };
-        const nextBudget = rendered.tokens - 1;
-        if (nextBudget < 0) throw new ContextFault('SUMMARY_BUDGET', '完整编码请求的保留部分已占满目标',
-            { inputTokens, target: input.snapshot.requestBudget.target, summaryBudget: budget });
+        const nextBudget = Math.max(minimumRecord, rendered.tokens - Math.max(1, inputTokens - target + 1));
+        if (nextBudget >= budget) {
+            if (safeFit && inputTokens < Number(inputBudget)) return { ...safeFit,
+                fitEvidence: { ...safeFit.fitEvidence, optimizationStoppedAtMinimum: true } };
+            throw new ContextFault('SUMMARY_BUDGET', '摘要最小表示的完整输入已达到安全输入预算',
+                { inputTokens, inputBudget, target, summaryBudget: budget });
+        }
         budget = nextBudget;
     }
 }
@@ -388,7 +428,8 @@ export async function generateCompaction(input: {
     const countTokens = input.countTokens ?? conservativeTextTokens;
     const now = input.now ?? Date.now;
     const inherited = mergeRequirements(priorView.nodes.map(node => node.unresolved));
-    let workingRequirements = inherited;
+    let semanticNodes = priorView.nodes;
+    candidate.chunks = candidate.chunks.map(chunk => freezeValue(factsOnlyCompressionResult(chunk)));
     let guidanceCursor = priorView.requirementGuidanceCursor ?? 0;
     const usefulHistory: NonNullable<CompactionSnapshot['historyFeedback']>['entries'] = [];
     for (const entry of [...(snapshot.historyFeedback?.entries ?? [])].sort((left, right) => right.lastHitStep - left.lastHitStep || right.hitCount - left.hitCount)) {
@@ -402,9 +443,9 @@ export async function generateCompaction(input: {
         else break;
     }
     const priorGuidance = () => {
-        const selected = boundedRequirementGuidance(workingRequirements, Math.floor(snapshot.config.policy.referenceTokens * 0.75), countTokens, guidanceCursor);
-        const base = { summaries: [] as typeof guidanceNodes, unresolvedCount: activeRequirements(workingRequirements).length,
-            activeRequirements: selected.map(({ id, quote }) => ({ id, quote })) };
+        const selected = boundedRequirementGuidance(inherited, Math.floor(snapshot.config.policy.referenceTokens * 0.75), countTokens, guidanceCursor);
+        const base = { summaries: [] as typeof guidanceNodes, unresolvedCount: activeRequirements(inherited).length,
+            legacyRequirementsReadOnly: true, handoffRequirements: selected.map(({ id, quote }) => ({ id, quote })) };
         const useful: typeof usefulHistory = [];
         for (const entry of usefulHistory) {
             if (countTokens(canonicalJson({ ...base, usefulHistory: [...useful, entry] })) <= snapshot.config.policy.referenceTokens) useful.push(entry);
@@ -414,10 +455,6 @@ export async function generateCompaction(input: {
         }
         return canonicalJson({ ...base, ...(useful.length ? { usefulHistory: useful } : {}) });
     };
-    const consumeRequirements = async (result: CompressionResult) => {
-        workingRequirements = await applyRequirementResolutions({ records: mergeRequirements([workingRequirements, result.digest.unresolved]),
-            resolutions: result.digest.resolutions ?? [], snapshot, sources, signal });
-    };
     const runChunk = async (chunk: CompressionChunk, reason: CompactionReason): Promise<ChunkDigest> => {
         checkAbort(signal);
         if (now() >= Date.parse(snapshot.execution.deadlineAt)) throw new ContextFault('CONFIG_INVALID', '根任务期限已到，停止新增压缩请求');
@@ -425,7 +462,6 @@ export async function generateCompaction(input: {
         if (existing) {
             if (existing.inputBodyHash !== chunk.inputBodyHash) throw new ContextFault('SOURCE_GAP', '恢复块与原冻结输入不一致');
             if (reason !== 'fold') {
-                await consumeRequirements(existing);
                 guidanceCursor += Math.max(1, chunk.requirementAnchors?.length ?? 0);
             }
             return existing;
@@ -449,10 +485,6 @@ export async function generateCompaction(input: {
             checkAbort(signal);
             try {
                 validateCompressionResult(request, result);
-                if (reason !== 'fold') {
-                    await verifyRequirements(result.digest.unresolved, snapshot, sources, signal);
-                    await consumeRequirements(result);
-                }
                 break;
             } catch (error) {
                 candidate.failedResult = structuredClone(result);
@@ -474,7 +506,7 @@ export async function generateCompaction(input: {
                 request = repair;
             }
         }
-        const digest: ChunkDigest = freezeValue({ ...structuredClone(result), chunkId: chunk.chunkId, roundId: chunk.roundId,
+        const digest: ChunkDigest = freezeValue({ ...structuredClone(factsOnlyCompressionResult(result)), chunkId: chunk.chunkId, roundId: chunk.roundId,
             sourceSpans: chunk.sourceSpans, anchors: chunk.anchors });
         candidate.chunks.push(digest);
         if (reason !== 'fold') guidanceCursor += Math.max(1, chunk.requirementAnchors?.length ?? 0);
@@ -487,21 +519,23 @@ export async function generateCompaction(input: {
         await port.saveCandidate(structuredClone(candidate));
         await verifyManifestSources(snapshot.manifest, sources, snapshot.config.policy.readFrameBytes, signal);
         for await (const chunk of createCompressionChunks({ snapshot, sources, priorGuidance, countTokens, signal,
-            requirementAnchors: () => boundedRequirementGuidance(workingRequirements, Math.floor(snapshot.config.policy.referenceTokens * 0.75), countTokens, guidanceCursor) })) {
+            semanticTail: (roundId: string) => semanticTailInput(semanticNodes, roundId),
+            requirementAnchors: () => boundedRequirementGuidance(inherited, Math.floor(snapshot.config.policy.referenceTokens * 0.75), countTokens, guidanceCursor) })) {
             const digest = await runChunk(chunk, candidate.reason);
             if (!chunkComplete(chunk, digest)) break;
+            semanticNodes = applySemanticChunk(semanticNodes, digest, snapshot);
         }
         const coverage = validateCoverage(snapshot.manifest, candidate.chunks, priorView.coveredEndSeq);
         candidate.coverage = coverage;
         if (!coverage.completeRoundIds.length) throw new ContextFault('SOURCE_GAP', '目标来源未完整覆盖一个连续整轮，保持原发送视图', { coverage });
         const accepted = new Set(coverage.completeRoundIds);
         const chunks = candidate.chunks.filter(chunk => accepted.has(chunk.roundId));
-        workingRequirements = inherited;
-        for (const chunk of chunks) await consumeRequirements(chunk);
-        candidate.batch = createSummaryBatch({ nodeId: derivedContextId([candidate.candidateId, 'batch']), chunks,
-            roundIds: coverage.completeRoundIds, firstSeq: snapshot.manifest.rounds[0].firstSeq, lastSeq: coverage.coveredEndSeq,
-            parentBatchIds: snapshot.parentBatchIds, modelFingerprint: snapshot.effectiveModelFingerprint, inheritedRequirements: workingRequirements });
-        let nodes = [...priorView.nodes, candidate.batch];
+        let nodes = chunks.reduce((previous, chunk) => applySemanticChunk(previous, chunk, snapshot), priorView.nodes);
+        const last = nodes.at(-1)!;
+        if (last.kind !== 'batch') throw new ContextFault('SOURCE_GAP', '语义增量末节点须为可独立发布的新批');
+        candidate.batch = last;
+        const communicationWindow = await updateCommunicationWindow({ previous: priorView.communicationWindow,
+            snapshot, nodes, coveredEndSeq: coverage.coveredEndSeq, sources, signal });
         const limits = computeContextLimits(snapshot.config.model.contextWindow, snapshot.config.model.maxOutputTokens, snapshot.config.policy);
         let foldBudget = Math.min(limits.summaryBudget, input.estimateCompaction ? limits.summaryBudget
             : snapshot.requestBudget?.summaryBudget ?? limits.summaryBudget);
@@ -517,10 +551,7 @@ export async function generateCompaction(input: {
             const foldBlocks: SourceBlock[] = plan.children.map(node => {
                 const bytes = Buffer.from(canonicalJson({ body: node.body, skeleton: node.skeleton, title: node.title,
                     sourceNodeId: node.nodeId, sourceRoundIds: node.roundIds, feedbackSourceNodeIds: feedbackSourceNodeIds(node),
-                    unresolved: node.unresolved.flatMap(requirement => {
-                        const current = workingRequirements.find(record => record.id === requirement.id) ?? requirement;
-                        return current.resolvedBy?.length ? [] : [current];
-                    }), anchors: node.anchors, sourceSpans: node.sourceSpans }), 'utf8');
+                    legacyRequirementHandoff: node.unresolved, anchors: node.anchors, sourceSpans: node.sourceSpans }), 'utf8');
                 foldBytes.set(node.nodeId, bytes);
                 return { itemId: node.nodeId, blockId: 'summary', contentId: node.nodeId, seq: node.firstSeq, roundId: `fold:${node.nodeId}`,
                     kind: 'text', byteLength: bytes.length, sha256: hashBytes(bytes), retrieval: { summaryId: node.nodeId, hash: node.hash } };
@@ -549,10 +580,13 @@ export async function generateCompaction(input: {
             if (nodes.length > snapshot.config.policy.maxActiveNodes) throw new ContextFault('SUMMARY_BUDGET', '折叠后活动节点仍超过上限');
         }
         const fitted = await fitCompactionSummary({ snapshot, nodes, coveredEndSeq: coverage.coveredEndSeq,
-            countTokens, estimateCompaction: input.estimateCompaction, signal });
+            countTokens, estimateCompaction: input.estimateCompaction, signal, communicationWindow });
         candidate.nextView = freezeValue({ revision: priorView.revision + 1, historyEpoch: snapshot.historyEpoch,
-            coveredEndSeq: coverage.coveredEndSeq, nodes, requirementGuidanceCursor: guidanceCursor % Math.max(1, activeRequirements(workingRequirements).length),
-            ...(snapshot.requestBudget ? { summaryBudget: fitted.budget } : {}),
+            coveredEndSeq: coverage.coveredEndSeq, nodes, requirementGuidanceCursor: guidanceCursor % Math.max(1, activeRequirements(inherited).length),
+            renderedLevels: fitted.rendered.levels,
+            ...(fitted.rendered.communicationRendering ? { communicationRendering: fitted.rendered.communicationRendering } : {}),
+            ...(communicationWindow ? { communicationWindow } : {}),
+            summaryBudget: fitted.budget,
             ...(fitted.fitEvidence ? { fitEvidence: fitted.fitEvidence } : {}) });
         checkAbort(signal);
         candidate.state = 'ready';

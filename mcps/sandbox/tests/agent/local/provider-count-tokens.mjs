@@ -16,6 +16,36 @@ const profile = () => ({ ...newProfile({ profileId: 'counter-fixture', label: 'o
 const credentials = { async withCredential(ref, generation, use) { assert.equal(ref, 'fixture-ref'); assert.equal(generation, 1); return use('fictional-count-credential'); } };
 const counter = transport => createGeminiTokenCounter({ profiles: { async get() { return profile(); } }, transport, credentialAccess: credentials });
 
+test('successful short counting preserves the original long task deadline identity (owned transport)', async () => {
+    let transportTimeout;
+    const service = counter({ async request(request) { transportTimeout = request.timeoutMs; return { status: 200, headers: {}, body: '{"totalTokens":3}' }; } });
+    const executionDeadlineAt = deadline(3_600_000);
+    try {
+        const result = await service.countTokens('counter-fixture', modelId, ordinaryView, undefined, executionDeadlineAt);
+        assert.equal(result.source.deadlineAt, executionDeadlineAt);
+        assert.ok(Date.parse(result.source.requestDeadlineAt) < Date.parse(executionDeadlineAt));
+        assert.ok(transportTimeout > 0 && transportTimeout <= 15_000);
+    } finally { await service.close(); }
+});
+
+test('a count preflight has a short independent deadline even when the task can run for an hour (owned transport)', async () => {
+    let observedTimeout;
+    let requests = 0;
+    const service = createGeminiTokenCounter({ profiles: { async get() { return profile(); } }, credentialAccess: credentials,
+        requestTimeoutMs: 20, transport: { async request(request, signal) {
+            requests++;
+            observedTimeout = request.timeoutMs;
+            return new Promise((_resolve, reject) => signal.addEventListener('abort', () => reject(signal.reason), { once: true }));
+        } } });
+    const started = Date.now();
+    try {
+        await assert.rejects(service.countTokens('counter-fixture', modelId, ordinaryView, undefined, deadline(3_600_000)), error => error.code === 'E_COUNT_TOKENS_TIMEOUT');
+        assert.equal(requests, 1);
+        assert.ok(observedTimeout > 0 && observedTimeout <= 20);
+        assert.ok(Date.now() - started < 500);
+    } finally { await service.close(); }
+});
+
 async function ownedHttp(handler, use) {
     const server = createServer(handler);
     server.listen(0, '127.0.0.1');

@@ -1,5 +1,40 @@
 export interface RasterFrame { width: number; height: number; pixels: Int32Array }
 
+export function fitRaster(frame: RasterFrame, width: number, height: number): RasterFrame {
+    width = Math.max(1, Math.floor(width)); height = Math.max(1, Math.floor(height));
+    if (width * height > 1024 * 1024) throw new Error('角色显示尺寸超出范围');
+    const scale = Math.min(width / frame.width, height / frame.height);
+    const scaledWidth = Math.max(1, Math.floor(frame.width * scale));
+    const scaledHeight = Math.max(1, Math.floor(frame.height * scale));
+    const left = Math.floor((width - scaledWidth) / 2);
+    const top = Math.floor((height - scaledHeight) / 2);
+    const pixels = new Int32Array(width * height).fill(-1);
+    for (let row = 0; row < scaledHeight; row += 1) for (let column = 0; column < scaledWidth; column += 1) {
+        pixels[(top + row) * width + left + column] = frame.pixels[Math.min(frame.height - 1, Math.floor(row / scale)) * frame.width + Math.min(frame.width - 1, Math.floor(column / scale))];
+    }
+    return { width, height, pixels };
+}
+
+export function encodeSixel(frame: RasterFrame): string {
+    const palette = [...new Set(frame.pixels)].filter(color => color >= 0);
+    let output = `\x1bP0;1;0q"1;1;${frame.width};${frame.height}`;
+    palette.forEach((color, index) => { output += `#${index};2;${[color >> 16 & 255, color >> 8 & 255, color & 255].map(channel => Math.round(channel * 100 / 255)).join(';')}`; });
+    for (let row = 0; row < frame.height; row += 6) {
+        palette.forEach((color, index) => {
+            let band = '';
+            for (let column = 0; column < frame.width; column += 1) {
+                let bits = 0;
+                for (let bit = 0; bit < 6 && row + bit < frame.height; bit += 1) if (frame.pixels[(row + bit) * frame.width + column] === color) bits |= 1 << bit;
+                band += String.fromCharCode(63 + bits);
+            }
+            band = band.replace(/\?+$/, '');
+            if (band) output += `#${index}` + band.replace(/([?-~])\1{3,}/g, run => `!${run.length}${run[0]}`) + '$';
+        });
+        if (row + 6 < frame.height) output += '-';
+    }
+    return output + '\x1b\\';
+}
+
 export function decodeSixel(source: string): RasterFrame {
     const header = /^\x1bP[\d;]*q"1;1;(\d+);(\d+)/.exec(source);
     if (!header) throw new Error('角色图片缺少方形像素尺寸');

@@ -1,7 +1,7 @@
 import { canonicalJson } from '../protocol.js';
 import { randomUUID } from 'node:crypto';
 import type { JsonValue } from '../protocol.js';
-import type { ContextCapture, ExecutionLease, SchedulerCheckpoint } from '../context/contracts.js';
+import type { CompactionCandidate, ContextCapture, ExecutionLease, SchedulerCheckpoint } from '../context/contracts.js';
 import { hashContext } from '../context/config.js';
 import { ContextFault } from '../context/errors.js';
 import type { ContentWrite, StateMutationPort, StoreCommitResult, StoreKey, StorePort, StoreRecord, StoreTransition } from './port.js';
@@ -22,6 +22,7 @@ export interface ContextStateData extends Record<string, unknown> {
     checkpoint: SchedulerCheckpoint | null;
     checkpointContentId: string | null;
     historyCheckpoint?: { historyEpoch: number; throughSeq: number; stepSeq: number } | null;
+    communicationBootstrap?: { historyEpoch: number; viewRevision: number; coveredEndSeq: number; contentId: string; contentHash: string } | null;
 }
 
 export interface ContextCandidateData extends Record<string, unknown> {
@@ -37,6 +38,7 @@ export interface ContextCandidateData extends Record<string, unknown> {
     parentViewRevision: number;
     publishedViewRevision: number | null;
     pendingAttemptId?: string | null;
+    publicationRevoked?: CompactionCandidate['publicationRevoked'];
 }
 
 export interface ContextSummaryReadInput {
