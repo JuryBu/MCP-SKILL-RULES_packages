@@ -28,12 +28,17 @@ export async function discoverDevinChildCandidates(parents: UnifiedConversationC
     const deadlineAt = Math.min(options.deadlineAt ?? Infinity, Date.now() + (options.deadlineMs ?? 12_000));
     const isCancelled = () => Boolean(options.signal?.aborted || options.isCancelled?.());
     const budgetStopped = () => isCancelled() || Date.now() >= deadlineAt || perParentBytes < 1;
+    const explicit = Boolean(options.parentConversationId || options.conversationIds?.length);
     for (const parent of limited) {
         if (budgetStopped()) { warnings.push("devin_child_read_budget"); break; }
         try {
-            const raw = await (options.readRaw || readDevinRawConversation)(parent.id, {
+            const physicalKind = parent.sourceKind === "devin-desktop" && !parent.sessionId ? "devin-desktop" : "devin-cli";
+            const physicalId = physicalKind === "devin-cli" ? parent.sessionId || parent.id : parent.uuid || parent.id;
+            const verifyAliases = explicit || Boolean(parent.uuid || parent.aliases?.some(alias => /^[\da-f]{8}-[\da-f]{4}-[\da-f]{4}-[\da-f]{4}-[\da-f]{12}$/iu.test(alias)));
+            const raw = await (options.readRaw || readDevinRawConversation)(verifyAliases ? parent.id : physicalId, {
                 maxBytes: perParentBytes, deadlineMs: deadlineAt, signal: options.signal,
-                isCancelled: () => isCancelled() || Date.now() >= deadlineAt,
+                isCancelled, childDiscoveryOnly: true,
+                ...(!verifyAliases ? { identityMode: "physical", physicalSourceKind: physicalKind } as const : {}),
             });
             if (budgetStopped()) { warnings.push("devin_child_read_budget"); break; }
             if (!raw) { warnings.push(`devin_child_parent_unavailable:${parent.id}`); continue; }

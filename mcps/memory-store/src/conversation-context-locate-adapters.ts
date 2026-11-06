@@ -1,6 +1,6 @@
 import fs from "node:fs";
-import { deepLocateCodexConversations, matchCodexContextProbeInRollout, getCodexThread, type CodexThreadInfo } from "./codex-client.js";
-import { deepLocateClaudeCodeConversations, matchClaudeCodeContextProbeInJsonl, getClaudeCodeThread, type ClaudeCodeThreadInfo } from "./claude-code-client.js";
+import { deepLocateCodexConversationsBounded, scanCodexContextProbeInRollout, getCodexThread, type CodexThreadInfo } from "./codex-client.js";
+import { deepLocateClaudeCodeConversations, matchClaudeCodeContextProbeInJsonlAsync, getClaudeCodeThread, type ClaudeCodeThreadInfo } from "./claude-code-client.js";
 import { conversationSourceIsPartial, loadConversationData } from "./conversation-bridge.js";
 import { iterateCachedConversationSourceCacheRounds, readCachedConversationSourceCache } from "./conversation-source-cache.js";
 import type { ConversationRound } from "./trajectory.js";
@@ -14,6 +14,12 @@ type DevinContextReader = typeof import("./devin-conversation.js").readDevinConv
 const DEVIN_PROBE_WINDOW_ROUNDS = 12;
 const DEVIN_PROBE_SOURCE_BYTES = 128 * 1024 * 1024;
 
+function codexLocateWarnings(candidate: UnifiedConversationCandidate, warnings: string[]): string[] {
+    if (candidate.dataChain !== "codex" || !warnings.some(warning => warning === "compressed_source_requires_verified_view" || warning === "history_base_not_scanned")) return warnings;
+    const prepare = JSON.stringify({ action: "fetch", conversationId: candidate.id, dataChain: "codex", source: "local", progressive: false, background: true });
+    return [...warnings, `Codex ${candidate.id} 的压缩原文尚未完整准备。可调用 conversation_read_original(${prepare})，沿原 taskId 等待成功后使用 source="cache" 的 list/search/read；当前部分结果保留未查范围。`];
+}
+
 function isDevinSource(candidate: UnifiedConversationCandidate, budget: ContextLocateReadBudget): boolean {
     return candidate.dataChain === "windsurf" && Boolean(candidate.sourceKind?.startsWith("devin-")) && budget.source !== "ls" && budget.source !== "cache";
 }
@@ -24,7 +30,9 @@ async function scanDevinProbe(candidate: UnifiedConversationCandidate, query: st
     const warnings: string[] = [];
     const child = Boolean(candidate.isChildThread || splitDevinSubagentId(candidate.id));
     const physicalDesktop = !child && candidate.sourceKind === "devin-desktop" && !candidate.sessionId;
-    let remainingSourceBytes = DEVIN_PROBE_SOURCE_BYTES;
+    const physicalKind = physicalDesktop ? "devin-desktop" : "devin-cli";
+    const readId = !child && !physicalDesktop ? candidate.sessionId || candidate.id : candidate.id;
+    let remainingSourceBytes = Math.min(DEVIN_PROBE_SOURCE_BYTES, budget.maxBytes);
     let remainingRounds = budget.maxRounds;
     let scannedBytes = 0;
     let nextEndRound: number | undefined;
@@ -43,10 +51,10 @@ async function scanDevinProbe(candidate: UnifiedConversationCandidate, query: st
                     : { startRound: Math.max(1, nextEndRound - windowRounds + 1), endRound: nextEndRound };
             let loaded: Awaited<ReturnType<DevinContextReader>>;
             try {
-                loaded = await read(candidate.id, { maxBytes: remainingSourceBytes, deadlineMs: fallbackDeadline,
-                    isCancelled: () => budget.isCancelled() || Date.now() >= fallbackDeadline,
+                loaded = await read(readId, { maxBytes: remainingSourceBytes, deadlineMs: fallbackDeadline,
+                    isCancelled: budget.isCancelled,
                     link: "summary", materializeAttachments: false, roundRange, identityCache,
-                    ...(physicalDesktop ? { identityMode: "physical", physicalSourceKind: "devin-desktop" } : {}),
+                    ...(!child ? { identityMode: "physical", physicalSourceKind: physicalKind } as const : {}),
                 });
             } catch (error) {
                 const code = (error as { code?: string }).code;
@@ -60,6 +68,7 @@ async function scanDevinProbe(candidate: UnifiedConversationCandidate, query: st
             sourcePartial ||= loaded.raw.partial;
             warnings.push(...loaded.raw.warnings);
             const coverage = loaded.raw.coverage;
+            if (!coverage && loaded.raw.summary.identityStatus === "pending") warnings.push(`devin_context_probe_relative_rounds:${candidate.id}:physical source only; aliases are unverified`);
             const selectedRounds = coverage ? coverage.endRound - coverage.startRound + 1 : Math.min(remainingRounds, loaded.rounds.length);
             const result = await locateConversationContext([{ ...candidate, sourcePartial: undefined }], query, {
                 probe: true, source: budget.source, mode: budget.mode, maxFiles: 1,
@@ -71,6 +80,24 @@ async function scanDevinProbe(candidate: UnifiedConversationCandidate, query: st
                     verifiedIdentity: { aliases: loaded!.raw.summary.aliases, uuid: loaded!.raw.summary.uuid, sessionId: loaded!.raw.summary.sessionId },
                 }) },
             });
+            if (result.hits.length && loaded.raw.summary.identityStatus === "pending" && remainingSourceBytes > 0
+                && !budget.isCancelled() && fallbackDeadline - Date.now() > 100) {
+                try {
+                    const verified = await read(readId, { maxBytes: remainingSourceBytes, deadlineMs: Math.min(fallbackDeadline - 50, Date.now() + 500),
+                        isCancelled: budget.isCancelled, link: "summary", materializeAttachments: false, roundRange, identityCache });
+                    if (verified) {
+                        remainingSourceBytes = Math.max(0, remainingSourceBytes - (verified.raw.readMetrics?.bytesRead ?? remainingSourceBytes));
+                        if (verified.raw.summary.identityStatus !== "pending" && verified.raw.summary.aliases.includes(loaded.raw.summary.canonicalId)) {
+                            for (const hit of result.hits) Object.assign(hit, { aliases: verified.raw.summary.aliases,
+                                uuid: verified.raw.summary.uuid, sessionId: verified.raw.summary.sessionId });
+                        }
+                    }
+                } catch (error) {
+                    const code = (error as { code?: string }).code;
+                    if (!code || !/^DEVIN_(?:BYTE_BUDGET|NODE_BUDGET|DEADLINE|ABORTED|RANGE_UNAVAILABLE)$/u.test(code)) throw error;
+                    warnings.push(`devin_context_alias_verification_pending:${candidate.id}:${code}`);
+                }
+            }
             hits.push(...result.hits);
             scannedBytes += result.scannedBytes;
             scanPartial ||= result.truncated;
@@ -112,29 +139,34 @@ async function scanStream(candidate: UnifiedConversationCandidate, query: string
     if (!thread) throw new Error("source thread not found");
     const filePath = "rolloutPath" in thread ? thread.rolloutPath : thread.jsonlPath;
     if (!filePath || !fs.existsSync(filePath)) throw new Error("source JSONL is missing");
-    const size = fs.statSync(filePath).size;
     if (budget.probe) {
-        const rawHits = candidate.dataChain === "codex"
-            ? matchCodexContextProbeInRollout(filePath, query, { maxBytes: budget.maxBytes })
-            : matchClaudeCodeContextProbeInJsonl(filePath, query, { maxBytes: budget.maxBytes });
+        const scan = candidate.dataChain === "codex"
+            ? await scanCodexContextProbeInRollout(filePath, query, { maxBytes: budget.maxBytes, deadlineAt: budget.deadlineAt, isCancelled: budget.isCancelled })
+            : await matchClaudeCodeContextProbeInJsonlAsync(filePath, query, { maxBytes: budget.maxBytes, maxHits: budget.maxHits, deadlineAt: budget.deadlineAt, isCancelled: budget.isCancelled });
+        const rawHits = scan.hits;
+        const relativeRounds = "roundNumbering" in scan && scan.roundNumbering === "relative";
         return {
             hits: rawHits.filter(hit => hit.role === "user" || hit.role === "assistant").slice(0, budget.maxHits).map(hit => ({
                 ...candidateHitIdentity(candidate), ...hit, snippet: redactLocateText(hit.snippet),
+                ...(relativeRounds ? { roundIndexIsRelative: true } : {}),
                 source: "message_body_hit", mode: "exact", filePath,
                 sourcePosition: { kind: "round", roundIndex: hit.roundIndex }, freshness: "unknown",
             })),
-            scannedBytes: Math.min(size, budget.maxBytes), totalBytes: size,
-            partial: size > budget.maxBytes || rawHits.length >= Math.min(5, budget.maxHits) || query.trim().length < 12,
-            warnings: size > budget.maxBytes ? ["contextProbe searched the bounded JSONL tail, not the entire conversation"] : undefined,
+            scannedBytes: scan.scannedBytes, totalBytes: scan.totalBytes,
+            partial: scan.partial || rawHits.length > budget.maxHits,
+            cancelled: budget.isCancelled() || ("cancelled" in scan && scan.cancelled),
+            warnings: codexLocateWarnings(candidate, [...scan.warnings, ...(relativeRounds || rawHits.some(hit => "roundIndexIsRelative" in hit && hit.roundIndexIsRelative)
+                ? ["contextProbe round numbers are relative to the verified physical source window"] : [])]),
         };
     }
     const options = {
         mode: budget.mode, maxFiles: 1, maxBytes: budget.maxBytes, maxHits: budget.maxHits,
-        deadlineMs: budget.deadlineAt - Date.now(), isCancelled: budget.isCancelled,
+        deadlineMs: budget.deadlineAt - Date.now(), deadlineAt: budget.deadlineAt, isCancelled: budget.isCancelled,
     };
-    const result = candidate.dataChain === "codex"
-        ? deepLocateCodexConversations(query, [thread as CodexThreadInfo], options)
-        : deepLocateClaudeCodeConversations(query, [thread as ClaudeCodeThreadInfo], options);
+    const codexResult = candidate.dataChain === "codex"
+        ? await deepLocateCodexConversationsBounded(query, [thread as CodexThreadInfo], options)
+        : undefined;
+    const result = codexResult ?? deepLocateClaudeCodeConversations(query, [thread as ClaudeCodeThreadInfo], options);
     return {
         hits: result.hits.map(hit => ({
             ...candidateHitIdentity(candidate), ...hit, snippet: redactLocateText(hit.snippet),
@@ -142,6 +174,7 @@ async function scanStream(candidate: UnifiedConversationCandidate, query: string
         })),
         scannedBytes: result.scannedBytes, totalBytes: result.totalBytes,
         partial: result.truncated, cancelled: result.status === "cancelled",
+        warnings: codexLocateWarnings(candidate, (codexResult?.sourceWindows || []).flatMap(window => window.warnings)),
     };
 }
 
@@ -166,18 +199,19 @@ export function createContextLocateAdapters(readDevin?: DevinContextReader): Con
         if (candidate.sourceBytes !== undefined && candidate.sourceBytes > budget.maxBytes && !(devinSource && budget.probe)) {
             return { rounds: [], partial: true, warnings: ["source size exceeds remaining locate budget; increase maxBytes or use a narrower source"] };
         }
-        const cancelled = () => budget.isCancelled() || Date.now() >= budget.deadlineAt;
+        const stopped = () => budget.isCancelled() || Date.now() >= budget.deadlineAt;
         if (devinSource) {
             const physicalDesktop = budget.probe && !candidate.isChildThread && !splitDevinSubagentId(candidate.id)
                 && candidate.sourceKind === "devin-desktop" && !candidate.sessionId;
-            const loaded = await read(candidate.id, {
-                maxBytes: budget.probe ? DEVIN_PROBE_SOURCE_BYTES : budget.maxBytes, deadlineMs: budget.deadlineAt, isCancelled: cancelled,
+            const physical = budget.probe && !candidate.isChildThread && !splitDevinSubagentId(candidate.id);
+            const loaded = await read(physical && !physicalDesktop ? candidate.sessionId || candidate.id : candidate.id, {
+                maxBytes: budget.probe ? Math.min(DEVIN_PROBE_SOURCE_BYTES, budget.maxBytes) : budget.maxBytes, deadlineMs: budget.deadlineAt, isCancelled: budget.isCancelled,
                 link: "summary", materializeAttachments: false,
                 roundRange: budget.probe && !physicalDesktop && !candidate.isChildThread && !splitDevinSubagentId(candidate.id)
                     ? { tailRounds: Math.min(DEVIN_PROBE_WINDOW_ROUNDS, budget.maxRounds) } : undefined,
-                ...(physicalDesktop ? { identityMode: "physical", physicalSourceKind: "devin-desktop" } : {}),
+                ...(physical ? { identityMode: "physical", physicalSourceKind: physicalDesktop ? "devin-desktop" : "devin-cli" } as const : {}),
             });
-            if (cancelled()) return { rounds: [], partial: true, warnings: ["Devin context scan was cancelled or exceeded its deadline"] };
+            if (stopped()) return { rounds: [], partial: true, warnings: ["Devin context scan was cancelled or exceeded its deadline"] };
             if (!loaded) throw new Error("Devin conversation source is unavailable");
             const coverage = loaded.raw.coverage;
             const firstRound = coverage?.startRound ?? (budget.probe ? Math.max(1, loaded.rounds.length - budget.maxRounds + 1) : 1);
@@ -189,10 +223,11 @@ export function createContextLocateAdapters(readDevin?: DevinContextReader): Con
                 warnings: [...loaded.raw.warnings, ...(bounded ? ["contextProbe searched a bounded recent-round window"] : [])] };
         }
         const loaded = await loadConversationData(candidate.dataChain, candidate.id, {
-            source: budget.source, includeRounds: false, link: "summary", isCancelled: cancelled,
-            sourceReadBudget: { maxBytes: budget.maxBytes, deadlineMs: budget.deadlineAt, isCancelled: cancelled },
+            source: budget.source, includeRounds: false, link: "summary", isCancelled: budget.isCancelled,
+            ...(candidate.dataChain === "antigravity" && budget.probe ? { locateWindow: { tailSteps: Math.min(4096, budget.maxRounds * 16) } } : {}),
+            sourceReadBudget: { maxBytes: budget.maxBytes, deadlineMs: budget.deadlineAt, isCancelled: budget.isCancelled },
         });
-        if (cancelled()) return { rounds: [], partial: true, warnings: ["source load exceeded locate deadline or was cancelled"] };
+        if (stopped()) return { rounds: [], partial: true, warnings: ["source load exceeded locate deadline or was cancelled"] };
         if (!loaded) throw new Error("conversation source is unavailable");
         const firstRound = budget.probe ? Math.max(1, (loaded.roundCount || loaded.rounds.length) - budget.maxRounds + 1) : 1;
         const cached = loaded.cacheKey && loaded.cacheGeneration
@@ -205,9 +240,10 @@ export function createContextLocateAdapters(readDevin?: DevinContextReader): Con
         return {
             rounds: cached?.rounds || loaded.rounds.filter(round => round.roundIndex >= firstRound),
             partial,
+            roundIndexIsRelative: loaded.sourceCoverage?.roundNumbering === "relative",
             filePath: loaded.cacheFingerprint?.path || candidate.sourcePath,
             freshness: partial ? "unknown" : "fresh",
-            warnings: partial ? [firstRound > 1 ? "contextProbe searched a bounded recent-round window" : "source cache is stale or source reported incomplete content"] : undefined,
+            warnings: [...(loaded.sourceDiagnostics || []), ...(partial ? [firstRound > 1 ? "contextProbe searched a bounded recent-round window" : "source cache is stale or source reported incomplete content"] : [])],
         };
     },
     };

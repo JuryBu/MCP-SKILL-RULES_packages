@@ -1,12 +1,12 @@
 import path from "node:path";
 import fs from "node:fs/promises";
 import { performance } from "node:perf_hooks";
-import { getClaudeCodeCorpusThread, listRecentClaudeCodeThreads, readClaudeCodeRoundTail, readClaudeCodeWindowText, type ClaudeCodeRoundTailCheckpoint, type ClaudeCodeThreadInfo } from "./claude-code-client.js";
-import { listDshSessionSources, readDshSessionIncremental, readDshSessionColdWindow, type DshReaderOptions, type DshSessionCheckpoint, type DshSessionEvent, type DshSessionSource } from "./dsh-session-reader.js";
+import { discoverClaudeCodeThreads, readClaudeCodeRoundTail, readClaudeCodeWindowText, type ClaudeCodeRoundTailCheckpoint, type ClaudeCodeThreadInfo } from "./claude-code-client.js";
+import { discoverDshSessionSources, readDshSessionIncremental, readDshSessionColdWindow, type DshReaderOptions, type DshSessionCheckpoint, type DshSessionEvent, type DshSessionSource } from "./dsh-session-reader.js";
 import { normalizeDshSessionEvents, DSH_NORMALIZATION_VERSION } from "./dsh-client.js";
 import { mergeConsecutiveHumanRounds, type ConversationRound } from "./trajectory.js";
 import { DATA_ROOT } from "./store.js";
-import { assertHostReadActive, hostCorpusDigest, type HostCorpusSnapshot } from "./conversation-host-projection.js";
+import { assertHostReadActive, hostConversationMatches, hostCorpusDigest, type HostCorpusSnapshot } from "./conversation-host-projection.js";
 import { assertHostFileUnchanged, captureHostFile, readHostCache, readHostTextWindow, writeHostCache, type HostFileRevision } from "./conversation-host-files.js";
 import type { HostCorpusBackend, HostCorpusReaderOptions } from "./conversation-corpus-reader-hosts.js";
 import type { CorpusConversation, CorpusFastReadRequest, CorpusReadControl, CorpusSourceStatus } from "./conversation-corpus-types.js";
@@ -72,6 +72,7 @@ export function createLogHostBackend(source: "claude-code" | "dsh", options: Hos
         const direction = request.lastRounds !== undefined || request.startRound === undefined && request.endRound === undefined ? "tail" : "head";
         const revision = await captureHostFile(filePath, { verifyUtf8: !dshSource || dshSource.provenance.format === "jsonl", isCancelled: control.isCancelled,
             onProgress: (bytes, totalBytes) => control.onProgress?.({ phase: `${source}-window-source-verification`, bytes, totalBytes }) });
+        if (dshSource && (revision.size !== dshSource.provenance.sourceSizeBytes || revision.mtimeMs !== dshSource.provenance.sourceMtimeMs)) throw new Error("DSH source changed after metadata discovery");
         if (revision.size > maxSourceBytes) throw new Error(`${source} source exceeds maxSourceBytes; use a larger explicit reader budget`);
         const verifiedAt = performance.now();
         const windowFile = path.join(root, `${hostCorpusDigest([source, id, request, "cold-window/v1"])}.window.json`);
@@ -137,6 +138,17 @@ export function createLogHostBackend(source: "claude-code" | "dsh", options: Hos
         return snapshot;
     };
     const read = async (conversation: CorpusConversation, control: CorpusReadControl, cachedOnly = false, request?: CorpusFastReadRequest): Promise<HostCorpusSnapshot | null> => {
+        const originalControl = control;
+        control = { ...control, isCancelled: () => {
+            if (originalControl.isCancelled?.()) return true;
+            if (originalControl.deadlineAt !== undefined && Date.now() >= originalControl.deadlineAt) {
+                const error = new Error("Log conversation source read deadline exceeded");
+                error.name = "TimeoutError";
+                Object.assign(error, { code: "LOG_SOURCE_DEADLINE" });
+                throw error;
+            }
+            return false;
+        } };
         assertHostReadActive(control);
         const started = performance.now();
         const id = conversation.canonicalId || conversation.id;
@@ -150,7 +162,13 @@ export function createLogHostBackend(source: "claude-code" | "dsh", options: Hos
         let verifiedAt = performance.now();
         let normalizedMs = 0;
         if (source === "claude-code") {
-            const thread = claudeThreads.get(id) || (options.claudeThreads ? (await options.claudeThreads()).find(item => item.id === id) : getClaudeCodeCorpusThread(id));
+            let thread = claudeThreads.get(id);
+            if (!thread && options.claudeThreads) thread = (await options.claudeThreads()).find(item => item.id === id);
+            if (!thread && !options.claudeThreads) {
+                const discovery = await discoverClaudeCodeThreads({ conversationIds: [id], deadlineAt: control.deadlineAt, isCancelled: control.isCancelled });
+                thread = discovery.threads.find(item => item.id === id);
+                if (thread) claudeThreads.set(id, thread);
+            }
             if (!thread) throw new Error(`Claude Code source not found: ${id}`);
             if ((await fs.stat(thread.jsonlPath)).size > maxSourceBytes) throw new Error("Claude Code source exceeds maxSourceBytes; use a larger explicit reader budget");
             if (request && !previous && (await fs.stat(thread.jsonlPath)).size > windowBytes) return readWindow(conversation, request, control, thread.jsonlPath);
@@ -190,8 +208,21 @@ export function createLogHostBackend(source: "claude-code" | "dsh", options: Hos
         } else {
             const configured = { ...options.dshOptions, maxDecompressedBytes: options.dshOptions?.maxDecompressedBytes ?? maxSourceBytes,
                 isCancelled: control.isCancelled, onProgress: (progress: { bytes: number; totalBytes: number; phase: string }) => control.onProgress?.({ ...progress, phase: `dsh-${progress.phase}` }) };
-            dshSources = await listDshSessionSources(configured);
-            const selected = dshSources.find(item => item.id === id);
+            let selected = dshSources.find(item => item.id === id);
+            if (selected) {
+                try {
+                    const metadata = await fs.stat(selected.provenance.sourcePath);
+                    if (metadata.size !== selected.provenance.sourceSizeBytes || metadata.mtimeMs !== selected.provenance.sourceMtimeMs) selected = undefined;
+                } catch (error) {
+                    if (!["ENOENT", "ENOTDIR"].includes((error as NodeJS.ErrnoException).code || "")) throw error;
+                    selected = undefined;
+                }
+            }
+            if (!selected) {
+                const discovery = await discoverDshSessionSources({ ...configured, conversationIds: [id], deadlineAt: control.deadlineAt });
+                dshSources = discovery.sources;
+                selected = dshSources.find(item => item.id === id);
+            }
             if (!selected) throw new Error(`DSH source not found: ${id}`);
             if (selected.provenance.sourceSizeBytes > maxSourceBytes) throw new Error("DSH source exceeds maxSourceBytes; use a larger explicit reader budget");
             if (request && !previous && (selected.provenance.sourceSizeBytes > windowBytes || selected.provenance.format === "jsonl.zstd")) {
@@ -199,6 +230,7 @@ export function createLogHostBackend(source: "claude-code" | "dsh", options: Hos
                 if (window) return window;
             }
             const result = await readDshSessionIncremental(selected, { ...configured, checkpoint: previous?.dshCheckpoint });
+            if (result.header.id !== id) throw new Error("DSH source identity changed during read");
             verifiedAt = performance.now();
             cacheHit = result.status === "unchanged" && Boolean(previous);
             if (cacheHit) entry = { ...previous!, revision: result.checkpoint.source };
@@ -238,22 +270,36 @@ export function createLogHostBackend(source: "claude-code" | "dsh", options: Hos
             assertHostReadActive(control);
             try {
                 let candidates: CorpusConversation[];
+                let discoveryPartial = false;
+                let discoveryWarnings: string[] = [];
                 if (source === "claude-code") {
-                    const threads = options.claudeThreads ? await options.claudeThreads() : listRecentClaudeCodeThreads(options.listLimit || 10_000);
-                    if (request.conversationIds && !options.claudeThreads) for (const id of request.conversationIds) {
-                        const exact = getClaudeCodeCorpusThread(id);
-                        if (exact && !threads.some(thread => thread.id === exact.id)) threads.push(exact);
+                    let threads: ClaudeCodeThreadInfo[];
+                    if (options.claudeThreads) threads = await options.claudeThreads();
+                    else {
+                        const discovery = await discoverClaudeCodeThreads({ conversationIds: request.conversationIds, workspaces: request.workspaces,
+                            workspaceMode: request.workspaceMode, limit: options.listLimit || 10_000, deadlineAt: control.deadlineAt,
+                            isCancelled: control.isCancelled, onProgress: progress => control.onProgress?.({ ...progress, phase: "claude-" + progress.phase }) });
+                        threads = discovery.threads;
+                        discoveryPartial = discovery.partial;
+                        discoveryWarnings = discovery.warnings;
                     }
                     for (const thread of threads) claudeThreads.set(thread.id, thread);
                     candidates = threads.map(claudeConversation);
                 } else {
-                    dshSources = await listDshSessionSources({ ...options.dshOptions, isCancelled: control.isCancelled });
+                    const discovery = await discoverDshSessionSources({ ...options.dshOptions, conversationIds: request.conversationIds,
+                        workspaces: request.workspaces, workspaceMode: request.workspaceMode, limit: options.listLimit || 10_000,
+                        deadlineAt: control.deadlineAt, isCancelled: control.isCancelled,
+                        onProgress: progress => control.onProgress?.({ ...progress, phase: "dsh-" + progress.phase }) });
+                    dshSources = discovery.sources;
+                    discoveryPartial = discovery.partial;
+                    discoveryWarnings = discovery.warnings;
                     candidates = dshSources.map(dshConversation);
                 }
                 const limited = candidates.length >= (options.listLimit || 10_000);
                 const unknownWorkspace = Boolean(request.workspaces?.length && candidates.some(candidate => !candidate.workspace));
-                statuses = [{ source, status: limited || unknownWorkspace ? "partial" : "ok", candidateCount: candidates.length,
-                    warnings: [...(limited ? ["host_source_enumeration_limit"] : []), ...(unknownWorkspace ? ["host_workspace_metadata_unavailable"] : [])] }];
+                candidates = candidates.filter(candidate => hostConversationMatches(candidate, request));
+                statuses = [{ source, status: discoveryPartial || limited || unknownWorkspace ? "partial" : "ok", candidateCount: candidates.length,
+                    warnings: [...discoveryWarnings, ...(limited ? ["host_source_enumeration_limit"] : []), ...(unknownWorkspace ? ["host_workspace_metadata_unavailable"] : [])] }];
                 assertHostReadActive(control);
                 return candidates;
             } catch (error) {

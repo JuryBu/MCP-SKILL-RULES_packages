@@ -465,7 +465,7 @@ try {
             database.close();
         }
     });
-    await test("target reads charge lightweight identity plus selected bodies, not unrelated payloads", async () => {
+    await test("physical target reads stay bounded while full alias verification charges all scanned identity input", async () => {
         const paths = configure("target-budget");
         const database = cliDatabase(paths.cli);
         try {
@@ -477,12 +477,35 @@ try {
             desktopDatabase(paths.desktop, uuid(90), [desktopUser("target-message")]);
             desktopDatabase(paths.desktop, uuid(91), [desktopUser("unrelated-message"), { kind: "agent_message", content: [{ content: { type: "text", text: "Y".repeat(2 * 1024 * 1024) } }] }], { unusedLargeMetadata: "X".repeat(1024 * 1024) });
             const options = { maxBytes: 16 * 1024 };
-            assert.equal((await resolveDevinConversation(uuid(90), options))?.canonicalId, "target");
-            const result = await readDevinRawConversation(uuid(90), options);
+            const physical = await readDevinRawConversation("target", { ...options, identityMode: "physical", physicalSourceKind: "devin-cli" });
+            assert.equal(physical?.summary.canonicalId, "target");
+            assert.equal(physical?.nodes.length, 1);
+            assert.deepEqual(physical?.nodes[0].message, user("target-message"));
+            assert.equal(physical?.summary.identityStatus, "pending");
+            assert.equal(physical?.partial, true);
+            assert.ok(physical?.warnings.includes("DEVIN_ALIAS_VERIFICATION_PENDING"));
+            assert.ok(!physical?.summary.aliases.includes(uuid(90)));
+            assert.ok(physical?.readMetrics && physical.readMetrics.bytesRead <= options.maxBytes);
+            await assert.rejects(resolveDevinConversation(uuid(90), options), error => error instanceof DevinReadError && error.code === "DEVIN_BYTE_BUDGET");
+            await assert.rejects(readDevinRawConversation(uuid(90), options), error => error instanceof DevinReadError && error.code === "DEVIN_BYTE_BUDGET");
+            const identityInputBytes = Number(database.prepare(`SELECT sum(length(CAST(chat_message AS BLOB)) + coalesce(length(CAST(metadata AS BLOB)),0)) AS bytes FROM message_nodes`).get()!.bytes);
+            const completeOptions = { maxBytes: 2 * identityInputBytes + 64 * 1024 };
+            const resolved = await resolveDevinConversation(uuid(90), completeOptions);
+            assert.equal(resolved?.canonicalId, "target");
+            assert.equal(resolved?.identityEvidence, "client-message-id");
+            assert.ok(resolved?.aliases.includes(uuid(90)));
+            const result = await readDevinRawConversation(uuid(90), completeOptions);
             assert.equal(result?.summary.canonicalId, "target");
+            assert.equal(result?.summary.uuid, uuid(90));
+            assert.ok(result?.summary.aliases.includes(uuid(90)));
             assert.equal(result?.nodes.length, 1);
+            assert.deepEqual(result?.nodes[0].message, physical?.nodes[0].message);
             assert.equal(result?.partial, false);
+            assert.ok(result?.readMetrics && result.readMetrics.bytesRead >= identityInputBytes
+                && result.readMetrics.bytesRead <= completeOptions.maxBytes);
             await assert.rejects(readDevinRawConversation("unrelated", options), error => error instanceof DevinReadError && error.code === "DEVIN_BYTE_BUDGET");
+            console.log(`TARGET_BUDGET ${JSON.stringify({ physicalBytes: physical?.readMetrics?.bytesRead, lowLimit: options.maxBytes,
+                identityInputBytes, completeBytes: result?.readMetrics?.bytesRead, completeLimit: completeOptions.maxBytes })}`);
         } finally { database.close(); }
     });
     console.log(`Devin SQLite tests: ${passed} groups passed; synthetic databases only.`);

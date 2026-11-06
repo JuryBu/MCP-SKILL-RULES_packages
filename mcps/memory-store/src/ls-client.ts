@@ -1,5 +1,6 @@
-import { execSync, execFileSync } from "child_process";
+import { execSync, execFileSync, execFile } from "child_process";
 import { createHash } from "node:crypto";
+import http from "node:http";
 import path from "path";
 import os from "os";
 import fs from "fs";
@@ -8,7 +9,9 @@ import { listLocalPbConversationCandidates, type ConversationDiscoveryDiagnostic
 import {
     registerLsEntry,
     cleanDeadEntries,
+    readRegistry,
 } from "./ls-registry.js";
+import type { LocalPbStepRangeRequest, LocalPbStepCoverage } from "./local-pb-reader.js";
 import { DEFAULT_ANTIGRAVITY_LS_MODEL_FALLBACKS } from "./ls-model-defaults.js";
 import {
     type LsProcessInfo,
@@ -226,6 +229,29 @@ export async function initParentLs(): Promise<void> {
 /** 测试注入的 LS 进程发现替身（null=用真实 PowerShell 扫描）。生产代码不调用。 */
 let lsDiscoveryOverride: (() => LsProcessInfo[]) | null = null;
 
+const LS_DISCOVERY_SCRIPT = [
+    "$ProgressPreference = 'SilentlyContinue'",
+    'Get-Process -Name language_server_windows_x64 -ErrorAction SilentlyContinue | ForEach-Object {',
+    '  $id = $_.Id',
+    '  $cmd = (Get-CimInstance Win32_Process -Filter "ProcessId=$id" -ErrorAction SilentlyContinue).CommandLine',
+    '  $ports = (Get-NetTCPConnection -OwningProcess $id -State Listen -ErrorAction SilentlyContinue | Select-Object -ExpandProperty LocalPort) -join ","',
+    '  "$id|$cmd|$ports"',
+    '}',
+].join("\n");
+
+function parseLsDiscoveryOutput(stdout: string): LsProcessInfo[] {
+    const results: LsProcessInfo[] = [];
+    for (const line of stdout.split("\n")) {
+        const [pidText, commandLine, portsText] = line.trim().split("|");
+        const pid = Number.parseInt(pidText || "", 10);
+        const csrf = commandLine?.match(/--csrf_token\s+(\S+)/u);
+        if (!Number.isFinite(pid) || !csrf || !portsText) continue;
+        const ports = portsText.split(",").map(value => Number.parseInt(value.trim(), 10)).filter(Number.isFinite).sort((left, right) => left - right);
+        if (ports.length) results.push({ pid, csrfToken: csrf[1], workspaceId: commandLine.match(/--workspace_id\s+(\S+)/u)?.[1] || "", ports });
+    }
+    return results;
+}
+
 /**
  * 测试专用：注入 discoverLsProcesses 替身，让 conversation-router 的 PowerShell 兜底分支
  * 可离线触发（不真跑 PowerShell）。传 null 还原真实扫描。生产代码不调用。
@@ -237,44 +263,14 @@ export function __setLsDiscoveryForTest(fn: (() => LsProcessInfo[]) | null): voi
 export function discoverLsProcesses(): LsProcessInfo[] {
     if (lsDiscoveryOverride) return lsDiscoveryOverride();
     try {
-        const psScript = [
-            "$ProgressPreference = 'SilentlyContinue'",
-            'Get-Process -Name language_server_windows_x64 -ErrorAction SilentlyContinue | ForEach-Object {',
-            '  $id = $_.Id',
-            '  $cmd = (Get-CimInstance Win32_Process -Filter "ProcessId=$id" -ErrorAction SilentlyContinue).CommandLine',
-            '  $ports = (Get-NetTCPConnection -OwningProcess $id -State Listen -ErrorAction SilentlyContinue | Select-Object -ExpandProperty LocalPort) -join ","',
-            '  "$id|$cmd|$ports"',
-            '}',
-        ].join('\n');
-        const encodedCmd = Buffer.from(psScript, 'utf16le').toString('base64');
+        const encodedCmd = Buffer.from(LS_DISCOVERY_SCRIPT, 'utf16le').toString('base64');
         const stdout = execSync(`powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand ${encodedCmd}`, {
             encoding: "utf-8",
             timeout: 20000,
             windowsHide: true,
         }).trim();
 
-        if (!stdout) return [];
-
-        const results: LsProcessInfo[] = [];
-        for (const line of stdout.split("\n")) {
-            const trimmed = line.trim();
-            if (!trimmed) continue;
-            const parts = trimmed.split("|");
-            if (parts.length < 3) continue;
-            const pid = parseInt(parts[0], 10);
-            const cmd = parts[1];
-            const portsStr = parts[2];
-            if (isNaN(pid) || !cmd) continue;
-            const csrfMatch = cmd.match(/--csrf_token\s+(\S+)/);
-            if (!csrfMatch) continue;
-            const wsMatch = cmd.match(/--workspace_id\s+(\S+)/);
-            const workspaceId = wsMatch ? wsMatch[1] : "";
-            const ports = portsStr.split(",").map(p => parseInt(p.trim(), 10))
-                .filter(p => !isNaN(p)).sort((a, b) => a - b);
-            if (ports.length === 0) continue;
-            results.push({ pid, csrfToken: csrfMatch[1], workspaceId, ports });
-        }
-        return results;
+        return parseLsDiscoveryOutput(stdout);
     } catch {
         return [];
     }
@@ -468,10 +464,202 @@ async function verifyTail(
  *   映射命中再确认（快路径）/ 枚举活跃 LS 并发广播 holds 取真持有者（慢路径，永不连错）。
  *   拿到 endpoint + 权威 stepCount → fetchFromLs（endpoint 指纹 + 权威 stepCount 缓存复核，方案 C）。
  */
+export interface TrajectoryReadOptions {
+    deadlineMs?: number;
+    signal?: AbortSignal;
+    isCancelled?: () => boolean;
+    maxBytes?: number;
+    stepRange?: LocalPbStepRangeRequest;
+}
+
+export interface TrajectoryReadResult {
+    trajectory: any;
+    fromCache: boolean;
+    coverage?: Omit<LocalPbStepCoverage, "encryptedEnvelopeVerified">;
+    sourceRevision?: string;
+    sourceBytes?: number;
+}
+
+function trajectoryReadError(code: string, message: string): Error & { code: string } {
+    return Object.assign(new Error(message), { name: code === "CANCELLED" ? "AbortError" : "TrajectoryReadError", code });
+}
+
+function createTrajectoryReadControl(options: TrajectoryReadOptions) {
+    if (options.deadlineMs !== undefined && !Number.isFinite(options.deadlineMs)) throw new Error("LS deadlineMs must be finite");
+    if (options.maxBytes !== undefined && (!Number.isSafeInteger(options.maxBytes) || options.maxBytes < 0)) throw new Error("LS maxBytes must be a nonnegative safe integer");
+    const controller = new AbortController();
+    let bytes = 0;
+    const cancel = () => controller.abort(trajectoryReadError("CANCELLED", "LS trajectory read cancelled"));
+    const check = () => {
+        if (options.signal?.aborted || options.isCancelled?.()) cancel();
+        if (!controller.signal.aborted && options.deadlineMs !== undefined && Date.now() >= options.deadlineMs) {
+            controller.abort(trajectoryReadError("DEADLINE_EXCEEDED", "LS trajectory read deadline exceeded"));
+        }
+        if (controller.signal.aborted) throw controller.signal.reason;
+    };
+    const poll = () => { try { check(); } catch { } };
+    options.signal?.addEventListener("abort", cancel, { once: true });
+    const timer = options.deadlineMs === undefined ? undefined : setTimeout(poll, Math.min(2_147_483_647, Math.max(1, Math.ceil(options.deadlineMs - Date.now()))));
+    const cancellationPoll = options.isCancelled ? setInterval(poll, 10) : undefined;
+    timer?.unref();
+    cancellationPoll?.unref();
+    return {
+        signal: controller.signal,
+        check,
+        remaining: (maximum: number) => { check(); return Math.max(1, Math.min(maximum, (options.deadlineMs ?? Date.now() + maximum) - Date.now())); },
+        consume: (count: number) => {
+            bytes += count;
+            if (options.maxBytes !== undefined && bytes > options.maxBytes) controller.abort(trajectoryReadError("PAYLOAD_TOO_LARGE", "LS response bytes exceed maxBytes"));
+            check();
+        },
+        get bytes() { return bytes; },
+        close: () => { if (timer) clearTimeout(timer); if (cancellationPoll) clearInterval(cancellationPoll); options.signal?.removeEventListener("abort", cancel); },
+    };
+}
+
+type TrajectoryReadControl = ReturnType<typeof createTrajectoryReadControl>;
+
+async function trajectoryRpc(connection: ParentLsConnection, method: string, payload: Record<string, unknown>, control: TrajectoryReadControl): Promise<any> {
+    control.check();
+    const body = JSON.stringify(payload);
+    try {
+        return await new Promise((resolve, reject) => {
+            const request = http.request({ hostname: "127.0.0.1", port: connection.port,
+                path: `/exa.language_server_pb.LanguageServerService/${method}`, method: "POST", signal: control.signal,
+                headers: { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(body),
+                    "x-codeium-csrf-token": connection.info.csrfToken, "Connect-Protocol-Version": "1" },
+                timeout: control.remaining(HEAVY_TIMEOUT) }, response => {
+                const chunks: Buffer[] = [];
+                response.on("error", reject);
+                response.on("data", (chunk: Buffer) => {
+                    try { control.consume(chunk.length); chunks.push(chunk); }
+                    catch (error) { request.destroy(error as Error); response.destroy(); reject(error); }
+                });
+                response.on("end", () => {
+                    try {
+                        control.check();
+                        if (!response.statusCode || response.statusCode < 200 || response.statusCode >= 300) throw new Error(`Antigravity RPC ${method} HTTP ${response.statusCode}`);
+                        resolve(JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}"));
+                    } catch (error) { reject(error); }
+                });
+            });
+            request.on("error", reject);
+            request.on("timeout", () => request.destroy(trajectoryReadError("LS_REQUEST_TIMEOUT", "LS trajectory request timeout")));
+            request.end(body);
+        });
+    } catch (error) { control.check(); throw error; }
+}
+
+async function discoverTrajectoryConnections(control: TrajectoryReadControl): Promise<ParentLsConnection[]> {
+    control.check();
+    if (lsDisabledForTest) return [];
+    const registered = Object.values(readRegistry().processes).map(entry => ({
+        info: { pid: entry.pid, csrfToken: entry.csrfToken, workspaceId: entry.workspaceId, ports: [entry.port] }, port: entry.port,
+    }));
+    let discovered: LsProcessInfo[];
+    if (lsDiscoveryOverride) discovered = lsDiscoveryOverride();
+    else {
+        const output = await new Promise<string>((resolve, reject) => {
+            execFile("powershell", ["-NoProfile", "-NonInteractive", "-Command", LS_DISCOVERY_SCRIPT], {
+                encoding: "utf8", windowsHide: true, timeout: control.remaining(20_000), signal: control.signal,
+            }, (error, stdout) => error ? reject(error) : resolve(stdout));
+        }).catch(error => { control.check(); if ((error as NodeJS.ErrnoException).code === "ENOENT") return ""; throw error; });
+        discovered = parseLsDiscoveryOutput(output);
+    }
+    control.check();
+    const all = [...registered, ...discovered.flatMap(info => info.ports.map(port => ({ info, port })))];
+    return all.filter((connection, index) => all.findIndex(other => other.info.pid === connection.info.pid && other.port === connection.port) === index);
+}
+
+function trajectoryStepBounds(range: LocalPbStepRangeRequest | undefined, totalSteps: number): { start: number; end: number } {
+    if (!range) return { start: 0, end: totalSteps };
+    const valid = (value: number) => Number.isSafeInteger(value) && value >= 0;
+    if ("tailSteps" in range) {
+        if (!valid(range.tailSteps) || range.tailSteps === 0 || "startStep" in range || "endStepExclusive" in range) throw new Error("Invalid LS tail step range");
+        return { start: Math.max(0, totalSteps - range.tailSteps), end: totalSteps };
+    }
+    if (!valid(range.startStep) || (range.endStepExclusive !== undefined && (!valid(range.endStepExclusive) || range.endStepExclusive < range.startStep))) throw new Error("Invalid LS absolute step range");
+    return { start: Math.min(totalSteps, range.startStep), end: Math.min(totalSteps, range.endStepExclusive ?? totalSteps) };
+}
+
+async function fetchBudgetedTrajectory(cascadeId: string, options: TrajectoryReadOptions): Promise<TrajectoryReadResult | null> {
+    trajectoryStepBounds(options.stepRange, 0);
+    const control = createTrajectoryReadControl(options);
+    const checkFailure = (error: unknown) => {
+        control.check();
+        if (["LS_SOURCE_CHANGED", "LS_INCOMPLETE", "LS_MALFORMED_RESPONSE"].includes((error as { code?: string })?.code || "")) throw error;
+    };
+    const summary = async (connection: ParentLsConnection) => {
+        const data = await trajectoryRpc(connection, "GetAllCascadeTrajectories", {}, control);
+        const value = data.trajectorySummaries?.[cascadeId];
+        if (!value) return null;
+        if (!Number.isSafeInteger(value.stepCount) || value.stepCount < 0) throw trajectoryReadError("LS_MALFORMED_RESPONSE", "LS returned an invalid trajectory step count");
+        return { stepCount: value.stepCount as number, lastModifiedTime: value.lastModifiedTime ?? null };
+    };
+    const read = async (connection: ParentLsConnection, before: NonNullable<Awaited<ReturnType<typeof summary>>> | null): Promise<TrajectoryReadResult> => {
+        if (!before && options.stepRange) throw new Error("LS_WINDOW_UNAVAILABLE: a verified step count is required for a locate window");
+        const bounds = trajectoryStepBounds(options.stepRange, before?.stepCount ?? Number.MAX_SAFE_INTEGER);
+        const steps: any[] = [];
+        let offset = bounds.start;
+        while (offset < bounds.end) {
+            control.check();
+            const page = await trajectoryRpc(connection, "GetCascadeTrajectorySteps", { cascadeId, stepOffset: offset }, control);
+            if (!Array.isArray(page.steps)) throw trajectoryReadError("LS_MALFORMED_RESPONSE", "LS returned malformed trajectory steps");
+            if (!page.steps.length) {
+                if (before) throw trajectoryReadError("LS_INCOMPLETE", "LS_INCOMPLETE: trajectory ended before its verified step count");
+                break;
+            }
+            const selected = page.steps.slice(0, bounds.end - offset);
+            steps.push(...selected);
+            offset += selected.length;
+        }
+        const after = await summary(connection);
+        if (!after || (before && JSON.stringify(before) !== JSON.stringify(after)) || (!before && after.stepCount !== steps.length)) {
+            throw trajectoryReadError("LS_SOURCE_CHANGED", "LS_SOURCE_CHANGED: trajectory version changed or could not be verified during read");
+        }
+        control.check();
+        const endStepExclusive = bounds.start + steps.length;
+        const coverage = { unit: "step" as const, startStep: bounds.start, endStepExclusive, totalSteps: after.stepCount,
+            complete: bounds.start === 0 && endStepExclusive === after.stepCount };
+        const sourceRevision = `antigravity-ls/window-v1:${createHash("sha256").update(JSON.stringify([cascadeId, connection.info.pid, connection.port, after, coverage, steps])).digest("hex")}`;
+        return { trajectory: { id: cascadeId, steps, numTotalSteps: after.stepCount }, fromCache: false, coverage, sourceRevision, sourceBytes: control.bytes };
+    };
+    try {
+        control.check();
+        const errors: string[] = [];
+        if (parentLs) {
+            try { const held = await summary(parentLs); if (held) return await read(parentLs, held); }
+            catch (error) { checkFailure(error); errors.push((error as Error).message); }
+        }
+        const connections = await discoverTrajectoryConnections(control);
+        const holders: Array<{ connection: ParentLsConnection; version: NonNullable<Awaited<ReturnType<typeof summary>>> }> = [];
+        for (const connection of connections) {
+            try { const held = await summary(connection); if (held) holders.push({ connection, version: held }); }
+            catch (error) { checkFailure(error); errors.push((error as Error).message); }
+        }
+        holders.sort((left, right) => right.version.stepCount - left.version.stepCount);
+        for (const holder of holders) {
+            try { return await read(holder.connection, holder.version); }
+            catch (error) { checkFailure(error); errors.push((error as Error).message); }
+        }
+        if (!holders.length && !options.stepRange) {
+            for (const connection of connections) {
+                try { return await read(connection, null); }
+                catch (error) { checkFailure(error); errors.push((error as Error).message); }
+            }
+        }
+        throw new Error(`No verified Antigravity LS trajectory source: ${errors.join("; ")}`);
+    } finally { control.close(); }
+}
+
 export async function fetchTrajectory(
     cascadeId: string,
-    forceRefresh = false
-): Promise<{ trajectory: any; fromCache: boolean } | null> {
+    forceRefresh = false,
+    options: TrajectoryReadOptions = {},
+): Promise<TrajectoryReadResult | null> {
+    if (options.deadlineMs !== undefined || options.signal || options.isCancelled || options.maxBytes !== undefined || options.stepRange) {
+        return fetchBudgetedTrajectory(cascadeId, options);
+    }
     const cachePath = getConvCachePath(cascadeId);
     const errors: string[] = [];
 

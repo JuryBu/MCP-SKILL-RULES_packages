@@ -113,7 +113,7 @@ function desktopToolCallIds(messages: DevinDesktopMessage[]): Set<string> {
     return result;
 }
 
-async function readDesktop(filename: string, budget: ReadBudget, identityOnly = false): Promise<DesktopConversation> {
+async function readDesktop(filename: string, budget: ReadBudget, identityOnly = false, childDiscoveryOnly = false): Promise<DesktopConversation> {
     return inSnapshot(filename, budget, async (database, identity, schema) => {
         if (!["position", "kind", "payload"].every(column => columns(database, "messages").has(column)) ||
             !["key", "value"].every(column => columns(database, "meta").has(column))) {
@@ -131,7 +131,7 @@ async function readDesktop(filename: string, budget: ReadBudget, identityOnly = 
             ? `CASE WHEN json_valid(payload) THEN CASE WHEN json_type(payload)='object' THEN json_object('id',json_extract(payload,'$.id'),'toolCallId',coalesce(json_extract(payload,'$.content.toolCallId'),json_extract(payload,'$.toolCallId')),'content', json((SELECT json_group_array(json_object('_meta', json_object('cognition.ai/clientMessageId', json_extract(block.value, '$._meta."cognition.ai/clientMessageId"'), 'cognition.ai/timestamp', json_extract(block.value, '$._meta."cognition.ai/timestamp"'))))
                 FROM json_each(messages.payload, '$.content') AS block WHERE block.type='object'))) ELSE payload END ELSE payload END`
             : "payload";
-        const statement = database.prepare(`WITH selected AS (SELECT position, kind, ${payloadExpression} AS payload FROM messages)
+        const statement = database.prepare(`WITH selected AS (SELECT position, kind, ${payloadExpression} AS payload FROM messages ${childDiscoveryOnly ? "WHERE kind='subagent'" : ""})
             SELECT position, kind, length(CAST(payload AS BLOB)) AS bytes,
             CASE WHEN length(CAST(payload AS BLOB)) <= ? THEN payload END AS payload FROM selected ORDER BY position`);
         for (const row of statement.iterate(budget.remainingBytes)) {
@@ -142,9 +142,10 @@ async function readDesktop(filename: string, budget: ReadBudget, identityOnly = 
         const timestamps = messages.flatMap(message => Array.isArray(message.payload.content)
             ? message.payload.content.map(block => asTimestamp(block?._meta?.["cognition.ai/timestamp"])).filter((item): item is string => !!item) : []);
         const warnings = ["DEVIN_DESKTOP_ONLY_PARTIAL"];
+        if (childDiscoveryOnly) warnings.push("DEVIN_CHILD_DISCOVERY_INDEX_ONLY");
         if (!messages.length) warnings.push("DEVIN_EMPTY_CONVERSATION");
         if (metadata.truncated === "1" || info.truncated === true) warnings.push("DEVIN_DESKTOP_TRUNCATED");
-        if (metadata.message_count !== undefined && Number(metadata.message_count) !== messages.length) warnings.push("DEVIN_DESKTOP_COUNT_MISMATCH");
+        if (!childDiscoveryOnly && metadata.message_count !== undefined && Number(metadata.message_count) !== messages.length) warnings.push("DEVIN_DESKTOP_COUNT_MISMATCH");
         const directories = [info.cwd, info.workingDirectory, ...(Array.isArray(info.workspaceUris) ? info.workspaceUris : [])].filter((value): value is string => typeof value === "string" && !!value);
         return {
             summary: {
@@ -258,10 +259,18 @@ async function desktopSharesIdentity(filename: string, budget: ReadBudget, cli: 
     });
 }
 
-async function readTargetIdentityCatalog(id: string, budget: ReadBudget, filenames?: string[]): Promise<CatalogEntry[]> {
+async function readTargetIdentityCatalog(id: string, budget: ReadBudget, filenames?: string[], rangeRequested = false): Promise<CatalogEntry[]> {
     const paths = devinPaths();
     const desktops = filenames ?? desktopFiles(paths.desktop, budget.maxDesktopFiles, () => budget.check());
-    const cli = isFile(paths.cli) ? (await readCliConversations(paths.cli, budget, { identityOnly: true, sessionId: id }))[0] : undefined;
+    const hint = [...verifiedAliasSummaries.entries()].find(([key, summary]) => key === aliasCacheKey(summary)
+        && (summary.aliases.includes(id) || summary.uuid?.toLowerCase() === id.toLowerCase()))?.[1];
+    let cli = isFile(paths.cli) ? (await readCliConversations(paths.cli, budget, { identityOnly: true, sessionId: id }))[0] : undefined;
+    if (!cli && hint?.sessionId && hint.sessionId !== id && isFile(paths.cli)) {
+        cli = (await readCliConversations(paths.cli, budget, { identityOnly: true, sessionId: hint.sessionId }))[0];
+    }
+    if (rangeRequested && cli?.summary.warnings.some(warning => /^DEVIN_(?:CHAIN_|SUMMARY_REFERENCE_|INVALID_JSON)/u.test(warning))) {
+        throw new DevinReadError("DEVIN_RANGE_UNAVAILABLE", `Cannot establish round boundaries in the selected CLI source: ${cli.summary.warnings.join(", ")}; use a full read to inspect source diagnostics.`);
+    }
     const selected: DesktopConversation[] = [];
     const exactDesktop = desktops.find(filename => path.parse(filename).name.toLowerCase() === id.toLowerCase());
     if (cli) {
@@ -275,7 +284,7 @@ async function readTargetIdentityCatalog(id: string, budget: ReadBudget, filenam
     if (!isFile(paths.cli)) return selected.map(desktop => ({ summary: desktop.summary, desktops: [desktop], excludedFromList: desktop.hidden || desktop.empty }));
     const messageIds = [...new Set(selected.flatMap(desktop => [...desktop.messageIds]))];
     const toolIds = [...new Set(selected.filter(desktop => desktop.messageIds.size === 0).flatMap(desktop => [...desktop.toolCallIds]))];
-    const matches = await findCliIdentityCandidates(paths.cli, budget, messageIds, toolIds);
+    const matches = await findCliIdentityCandidates(paths.cli, budget, messageIds, toolIds, cli && !cli.summary.partial ? [cli.summary.canonicalId] : []);
     const candidateIds = [...new Set([...(cli ? [cli.summary.canonicalId] : []), ...matches.sessionIds])];
     if (!candidateIds.length) return selected.map(desktop => ({ summary: desktop.summary, desktops: [desktop], excludedFromList: desktop.hidden || desktop.empty }));
     const entries = await readCatalog(budget, true, selected.map(desktop => desktop.summary.sourcePath), candidateIds, selected,
@@ -291,7 +300,7 @@ async function readTargetIdentityCatalog(id: string, budget: ReadBudget, filenam
     }
     if (!cli && !matches.uncertain) {
         const resolved = findEntry(entries, id);
-        if (resolved?.cli && resolved.summary.canonicalId !== id) return readTargetIdentityCatalog(resolved.summary.canonicalId, budget, desktops);
+        if (resolved?.cli && resolved.summary.canonicalId !== id) return readTargetIdentityCatalog(resolved.summary.canonicalId, budget, desktops, rangeRequested);
     }
     return entries;
 }
@@ -313,9 +322,11 @@ async function reuseVerifiedAliases(result: DevinDiscoveryResult, budget: ReadBu
             desktops.push(await readDesktop(filename, budget, true));
         }
         if (!verifiedAliasSummaries.has(key) || !desktops.length) continue;
+        const cli = (await readCliConversations(paths.cli, budget, { identityOnly: true, sessionId: cached.canonicalId }))[0];
         const matches = await findCliIdentityCandidates(paths.cli, budget,
             [...new Set(desktops.flatMap(desktop => [...desktop.messageIds]))],
-            [...new Set(desktops.flatMap(desktop => [...desktop.toolCallIds]))]);
+            [...new Set(desktops.flatMap(desktop => [...desktop.toolCallIds]))], cli && !cli.summary.partial ? [cli.summary.canonicalId] : []);
+        if (cli) matches.sessionIds.unshift(cli.summary.canonicalId);
         if (matches.uncertain || !matches.sessionIds.length) { verifiedAliasSummaries.delete(key); continue; }
         const entries = await readCatalog(budget, true, cached.desktopPaths, matches.sessionIds, desktops);
         const verified = entries.find(entry => entry.summary.canonicalId === cached.canonicalId && entry.summary.uuid === cached.uuid && !entry.excludedFromList);
@@ -354,9 +365,11 @@ async function readPhysicalIdentityCatalog(id: string, budget: ReadBudget, optio
     const paths = devinPaths();
     const sources = catalogSources(budget, id, options);
     const cli = options.physicalSourceKind !== "devin-desktop" && isFile(paths.cli)
-        ? (await readCliConversations(paths.cli, budget, { identityOnly: true, sessionId: id }))[0] : undefined;
+        ? (await readCliConversations(paths.cli, budget, { identityOnly: true, metadataOnly: options.childDiscoveryOnly, sessionId: id }))[0] : undefined;
     if (cli && sources.desktops.length) throw new DevinReadError("DEVIN_PHYSICAL_ID_AMBIGUOUS", "The ID exists in both physical stores; specify physicalSourceKind as devin-cli or devin-desktop.");
-    const desktop = sources.desktops[0] ? await readDesktop(sources.desktops[0], budget, true) : undefined;
+    const metadata = options.childDiscoveryOnly && sources.desktops[0] ? await readDesktopMetadata(sources.desktops[0], budget) : undefined;
+    const desktop = metadata ? { ...metadata, messages: [], messageIds: new Set<string>(), toolCallIds: new Set<string>(), revision: digest(metadata.summary) }
+        : sources.desktops[0] ? await readDesktop(sources.desktops[0], budget, true) : undefined;
     if (!cli && !desktop) return [];
     const original = cli?.summary ?? desktop!.summary;
     const summary: DevinConversationSummary = { ...original, identityStatus: "pending", partial: true,
@@ -365,13 +378,13 @@ async function readPhysicalIdentityCatalog(id: string, budget: ReadBudget, optio
 }
 
 async function readIdentityCatalog(id: string, budget: ReadBudget, options: DevinReadOptions): Promise<{ entries: CatalogEntry[]; version?: string; cacheHit?: boolean }> {
-    if (!options.identityCache) return { entries: options.identityMode === "physical" ? await readPhysicalIdentityCatalog(id, budget, options) : await readTargetIdentityCatalog(id, budget) };
+    if (!options.identityCache) return { entries: options.identityMode === "physical" ? await readPhysicalIdentityCatalog(id, budget, options) : await readTargetIdentityCatalog(id, budget, undefined, Boolean(options.roundRange)) };
     const sources = catalogSources(budget, id, options);
     const key = digest([id, options.identityMode, options.physicalSourceKind, sources.filenames]);
     const version = await options.identityCache.version(sources.filenames, budget);
     const cached = options.identityCache.get<CatalogEntry[]>(key, version);
     if (cached) return { entries: cached, version, cacheHit: true };
-    const entries = options.identityMode === "physical" ? await readPhysicalIdentityCatalog(id, budget, options) : await readTargetIdentityCatalog(id, budget, sources.desktops);
+    const entries = options.identityMode === "physical" ? await readPhysicalIdentityCatalog(id, budget, options) : await readTargetIdentityCatalog(id, budget, sources.desktops, Boolean(options.roundRange));
     const currentSources = catalogSources(budget, id, options);
     const after = await options.identityCache.version(currentSources.filenames, budget);
     if (after !== version) throw new DevinReadError("DEVIN_IDENTITY_CHANGED", "Devin sources changed during identity validation; retry with a fresh snapshot.");
@@ -471,6 +484,7 @@ export async function discoverDevinConversations(options: DevinDiscoveryOptions 
         return runIsolatedSource("devin-discover", { options: serializable }, { deadlineAt: options.deadlineMs, signal, isCancelled });
     }
     const budget = new ReadBudget(options);
+    if (options.limit !== undefined && (!Number.isSafeInteger(options.limit) || options.limit < 0)) throw new DevinReadError("DEVIN_INVALID_BUDGET", "Devin discovery limit must be a non-negative safe integer.");
     const paths = devinPaths();
     const result: DevinDiscoveryResult = { conversations: [], partial: false, diagnostics: [], scannedSessions: 0, scannedDesktopFiles: 0 };
     const diagnose = (error: unknown, sourceKind: DevinDiscoveryDiagnostic["sourceKind"], sourcePath: string, conversationId?: string) => {
@@ -483,6 +497,9 @@ export async function discoverDevinConversations(options: DevinDiscoveryOptions 
         if (isFile(paths.cli)) {
             await readCliConversations(paths.cli, budget, { metadataOnly: true,
                 conversationIds: idsAreCliOnly ? options.conversationIds : undefined,
+                excludeHidden: true,
+                discovery: options.verifyAliases === false || options.verifyAliases !== true && !verifiedAliasSummaries.size ? options : undefined,
+                maxConversations: options.limit !== undefined && options.verifyAliases !== true && !options.conversationIds?.length ? Math.min(options.limit, 20_000) + 1 : undefined,
                 acceptSummary: summary => discoveryMatches(summary, options, true), onSession: () => { result.scannedSessions++; },
                 onConversation: item => { if (!item.hidden && !item.empty) result.conversations.push(item.summary); },
                 onSessionError: (id, error) => diagnose(error, "devin-cli", paths.cli!, id) });
@@ -536,7 +553,6 @@ export async function discoverDevinConversations(options: DevinDiscoveryOptions 
         }
     }
     result.conversations.sort((left, right) => (Date.parse(right.updatedAt || "") || 0) - (Date.parse(left.updatedAt || "") || 0) || left.id.localeCompare(right.id));
-    if (options.limit !== undefined && (!Number.isSafeInteger(options.limit) || options.limit < 0)) throw new DevinReadError("DEVIN_INVALID_BUDGET", "Devin discovery limit must be a non-negative safe integer.");
     const limit = Math.min(options.limit ?? 20_000, 20_000);
     if (result.conversations.length > limit) {
         result.partial = true;
@@ -588,7 +604,7 @@ export async function readDevinRawConversation(id: string, options: DevinReadOpt
     if (!id.trim()) throw new DevinReadError("DEVIN_INVALID_ID", "A non-empty Devin conversation ID is required.");
     if (options.roundRange) validateDevinRoundRange(options.roundRange);
     const budget = new ReadBudget(options);
-    const ownedCache = options.roundRange && !options.identityCache ? new DevinIdentityCache() : undefined;
+    const ownedCache = (options.roundRange || options.childDiscoveryOnly) && !options.identityCache ? new DevinIdentityCache() : undefined;
     const effectiveOptions = ownedCache ? { ...options, identityCache: ownedCache } : options;
     try {
     const catalog = await readIdentityCatalog(id, budget, effectiveOptions);
@@ -598,10 +614,10 @@ export async function readDevinRawConversation(id: string, options: DevinReadOpt
         if (options.roundRange && !entry.cli) throw new DevinReadError("DEVIN_RANGE_UNAVAILABLE", "Desktop-only Devin sources do not yet have verified absolute round boundaries; omit roundRange for a full read.");
         const sameIds = (left: Set<string>, right: Set<string>) => left.size === right.size && [...left].every(value => right.has(value));
         if (entry.cli) {
-            const loaded = (await readCliConversations(entry.cli.summary.sourcePath, budget, { sessionId: entry.cli.summary.canonicalId, roundRange: options.roundRange,
+            const loaded = (await readCliConversations(entry.cli.summary.sourcePath, budget, { sessionId: entry.cli.summary.canonicalId, roundRange: options.roundRange, childDiscoveryOnly: options.childDiscoveryOnly,
                 ...(options.roundRange && catalog.version ? { validatedChain: { nodes: entry.cli.nodes, compactions: entry.cli.compactions,
                     warnings: entry.cli.summary.warnings, mainChainId: entry.cli.summary.mainChainId } } : {}) }))[0];
-            if (!loaded || (!options.roundRange && (!sameIds(entry.cli.messageIds, loaded.messageIds) || !sameIds(entry.cli.toolCallIds, loaded.toolCallIds)))) {
+            if (!loaded || (!options.childDiscoveryOnly && !options.roundRange && (!sameIds(entry.cli.messageIds, loaded.messageIds) || !sameIds(entry.cli.toolCallIds, loaded.toolCallIds)))) {
                 throw new DevinReadError("DEVIN_IDENTITY_CHANGED", "Devin identity changed during source reading; retry with a fresh snapshot.");
             }
             entry.cli = loaded;
@@ -616,8 +632,8 @@ export async function readDevinRawConversation(id: string, options: DevinReadOpt
             entry.desktops = [];
         }
         for (const [index, desktop] of entry.desktops.entries()) {
-            const loaded = await readDesktop(desktop.summary.sourcePath, budget);
-            if (!sameIds(desktop.messageIds, loaded.messageIds) || !sameIds(desktop.toolCallIds, loaded.toolCallIds)) {
+            const loaded = await readDesktop(desktop.summary.sourcePath, budget, false, options.childDiscoveryOnly);
+            if (!options.childDiscoveryOnly && (!sameIds(desktop.messageIds, loaded.messageIds) || !sameIds(desktop.toolCallIds, loaded.toolCallIds))) {
                 throw new DevinReadError("DEVIN_IDENTITY_CHANGED", "Devin Desktop identity changed during source reading; retry with a fresh snapshot.");
             }
             entry.desktops[index] = loaded;

@@ -11,6 +11,7 @@ export interface DevinReadOptions {
     identityCache?: import("./devin-identity-cache.js").DevinIdentityCache;
     identityMode?: "verified" | "physical";
     physicalSourceKind?: "devin-cli" | "devin-desktop";
+    childDiscoveryOnly?: boolean;
 }
 
 export type DevinRoundRange = { tailRounds: number } | { startRound: number; endRound?: number };

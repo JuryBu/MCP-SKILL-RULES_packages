@@ -94,6 +94,7 @@ import { readDevinConversation, splitDevinSubagentId, devinSubagentId, DEVIN_NOR
 import { getDevinIdentityReadTargets, rememberDevinIdentity, resolveCachedDevinIdentity } from "./devin-identity.js";
 import { windsurfSummaryFromDevin } from "./windsurf-client.js";
 import type { DevinReadOptions } from "./devin-types.js";
+import { LocalPbReaderError, type LocalPbStepRangeRequest } from "./local-pb-reader.js";
 
 export type ResolvedConversationChain = Exclude<DataChain, "auto">;
 
@@ -128,6 +129,17 @@ export interface ConversationLoadResult {
     sourceMode?: ConversationRawSource;
     sourceDiagnostics?: string[];
     sourcePartial?: boolean;
+    sourceCoverage?: {
+        unit: "step";
+        startStep: number;
+        endStepExclusive: number;
+        totalSteps: number;
+        complete: boolean;
+        encryptedEnvelopeVerified?: true;
+        source: "local" | "ls";
+        roundNumbering: "absolute" | "relative";
+        comparison: "deferred" | "not_requested" | "complete";
+    };
     localPbActivities?: LocalPbActivityData;
     sourceRevision?: SourceRevision;
     compactionMetadata?: ConversationCompactionMetadata;
@@ -214,7 +226,7 @@ interface ConversationCacheFreshness {
 
 let unversionedLsFingerprintSequence = 0;
 
-interface ConversationLoadOptions {
+export interface ConversationLoadOptions {
     refresh?: boolean;
     link?: ConversationLinkMode;
     cwd?: string;
@@ -237,10 +249,14 @@ interface ConversationLoadOptions {
     codexExpansionBudgetBytes?: number;
     requireCompactionMetadata?: boolean;
     sourceReadBudget?: DevinReadOptions;
+    locateWindow?: LocalPbStepRangeRequest;
 }
 
-function throwIfConversationLoadCancelled(options: Pick<ConversationLoadOptions, "isCancelled">): void {
-    if (!options.isCancelled?.()) return;
+function throwIfConversationLoadCancelled(options: Pick<ConversationLoadOptions, "isCancelled" | "sourceReadBudget">): void {
+    if (options.sourceReadBudget?.deadlineMs !== undefined && Date.now() >= options.sourceReadBudget.deadlineMs) {
+        throw new LocalPbReaderError("DEADLINE_EXCEEDED", "Conversation source read deadline exceeded");
+    }
+    if (!options.isCancelled?.() && !options.sourceReadBudget?.isCancelled?.() && !options.sourceReadBudget?.signal?.aborted) return;
     const error = new Error("conversation load cancelled");
     error.name = "AbortError";
     throw error;
@@ -307,6 +323,7 @@ export async function loadConversationData(
     conversationId?: string,
     options: ConversationLoadOptions = {},
 ): Promise<ConversationLoadResult | null> {
+    throwIfConversationLoadCancelled(options);
     chain = normalizeDataChain(chain);
     const source = options.source || "auto";
     if (chain === "auto") {
@@ -382,6 +399,7 @@ export async function loadConversationData(
     }
 
     const resolved = source === "cache" || source === "local" || options.publishedCacheOnly
+        || (chain === "antigravity" && conversationId && (options.locateWindow || options.sourceReadBudget))
         ? chain as ResolvedConversationChain
         : await resolveConversationChain(chain);
     if (!resolved) return null;
@@ -405,6 +423,9 @@ async function loadFromResolvedChain(
     }
 
     const source = options.source || "auto";
+    if (options.locateWindow && (resolved !== "antigravity" || source === "cache" || options.publishedCacheOnly || options.cacheGeneration)) {
+        throw new Error("locateWindow requires an Antigravity auto/local/ls source read without a cache generation");
+    }
     if (source === "ls" && (resolved === "codex" || resolved === "claude-code" || resolved === "dsh")) {
         throw new Error(`source=ls 不支持 ${resolved}；该宿主的权威原始源是本地 JSONL`);
     }
@@ -436,6 +457,14 @@ async function loadFromResolvedChain(
     const key = conversationSourceCacheKey(resolved, effectiveId, options);
     if (source === "cache" || options.publishedCacheOnly) return loadConversationCacheOnly(key, "cache", options);
     if (options.cacheGeneration) throw new Error("cacheGeneration 只能与 source=cache 或固定缓存读取一起使用");
+    if (resolved === "antigravity" && (options.locateWindow || options.sourceReadBudget)) {
+        const loaded = await withConversationSourcePressure(options.requestClass || "foreground", () => {
+            throwIfConversationLoadCancelled(options);
+            return loadRawConversationData(resolved, effectiveId, options);
+        });
+        throwIfConversationLoadCancelled(options);
+        return loaded;
+    }
     if (resolved === "codex" && !options.expectedCodexSource) {
         const currentThread = await getCodexThreadAsync(effectiveId);
         if (currentThread?.rolloutPath) {
@@ -1293,8 +1322,15 @@ export function describeConversationCacheReadFailure(
 function localPbToConversationResult(
     resolved: "antigravity" | "windsurf",
     conversationId: string,
+    options: ConversationLoadOptions = {},
+    onBytesReserved?: (bytes: number) => void,
 ): CachedConversationLoadResult | null {
-    const local = loadLocalPbConversation(resolved, conversationId);
+    const local = loadLocalPbConversation(resolved, conversationId, {
+        ...options.sourceReadBudget,
+        stepRange: options.locateWindow,
+        isCancelled: () => Boolean(options.isCancelled?.() || options.sourceReadBudget?.isCancelled?.()),
+        onBytesReserved,
+    });
     if (!local) return null;
     const diagnostics = [
         `本地 PB: ${local.candidateKinds.join("+")}，${local.rounds.length} 个主人轮次/${local.totalSteps} 步，${local.localPbActivities.activityCount}项活动${local.partial ? "（部分候选解码失败或源内容不完整）" : ""}`,
@@ -1313,6 +1349,11 @@ function localPbToConversationResult(
             totalSteps: local.totalSteps,
             cacheAuthority: "local",
             sourcePartial: local.partial,
+            cacheFingerprint: local.fingerprint,
+            sourceRevision: { revision: local.fingerprint.revision || "", contentCursor: String(local.coverage?.endStepExclusive ?? local.totalSteps), eventWatermark: null },
+            ...(local.coverage ? { sourceCoverage: { ...local.coverage, source: "local" as const,
+                roundNumbering: local.coverage.startStep > 0 ? "relative" as const : "absolute" as const,
+                comparison: options.source === "local" ? "not_requested" as const : "deferred" as const } } : {}),
             ...{ localPbActivities: local.localPbActivities },
             trajectory: {
                 id: local.selected.trajectory.id || conversationId,
@@ -1350,7 +1391,12 @@ async function lsConversationResult(
     options: ConversationLoadOptions,
 ): Promise<CachedConversationLoadResult | null> {
     if (resolved === "antigravity") {
-        const result = await fetchTrajectory(conversationId, options.refresh);
+        const result = await fetchTrajectory(conversationId, options.refresh, {
+            ...options.sourceReadBudget,
+            stepRange: options.locateWindow,
+            isCancelled: options.isCancelled || options.sourceReadBudget?.isCancelled
+                ? () => Boolean(options.isCancelled?.() || options.sourceReadBudget?.isCancelled?.()) : undefined,
+        });
         if (!result) return null;
         const trajectory = result.trajectory || {};
         const steps = trajectory.steps || [];
@@ -1362,6 +1408,10 @@ async function lsConversationResult(
             cacheAuthority: "ls",
             fromCache: result.fromCache,
             trajectory,
+            ...(result.coverage ? { sourceCoverage: { ...result.coverage, source: "ls" as const,
+                roundNumbering: result.coverage.startStep > 0 ? "relative" as const : "absolute" as const,
+                comparison: options.source === "ls" ? "not_requested" as const : "deferred" as const }, sourcePartial: !result.coverage.complete } : {}),
+            ...(result.sourceRevision ? { sourceRevision: { revision: result.sourceRevision, contentCursor: String(result.coverage?.endStepExclusive ?? steps.length), eventWatermark: null } } : {}),
             sourceDiagnostics: [`Antigravity LS: ${trajectory.numTotalSteps || steps.length} 步`],
         };
     }
@@ -1415,20 +1465,36 @@ async function loadRawConversationData(
     }
 
     if (resolved === "antigravity" || resolved === "windsurf") {
-        if (source === "local") return localPbToConversationResult(resolved, effectiveId);
+        if (source === "local") return localPbToConversationResult(resolved, effectiveId, options);
         if (source === "ls") return lsConversationResult(resolved, effectiveId, options);
         let local: ConversationLoadResult | null = null;
         let localError: unknown;
+        let localReservedBytes = 0;
         try {
-            local = localPbToConversationResult(resolved, effectiveId);
+            local = localPbToConversationResult(resolved, effectiveId, options, bytes => { localReservedBytes = bytes; });
         } catch (error) {
+            throwIfConversationLoadCancelled(options);
+            if (error instanceof LocalPbReaderError && (error.code === "CANCELLED" || error.code === "DEADLINE_EXCEEDED")) throw error;
             localError = error;
+        }
+        if (local && options.locateWindow) {
+            local.sourcePartial = true;
+            local.sourceDiagnostics = [...(local.sourceDiagnostics || []), "定位窗口已通过本地 PB 认证；完整 PB/LS 来源比较另行执行完整 fetch，本次未启动 LS 比较"];
+            return local;
         }
         let live: ConversationLoadResult | null = null;
         let liveError: unknown;
         try {
-            live = await lsConversationResult(resolved, effectiveId, options);
+            const liveOptions = options.sourceReadBudget?.maxBytes === undefined ? options : {
+                ...options, sourceReadBudget: { ...options.sourceReadBudget, maxBytes: Math.max(0, options.sourceReadBudget.maxBytes - localReservedBytes) },
+            };
+            live = await lsConversationResult(resolved, effectiveId, liveOptions);
         } catch (error) {
+            throwIfConversationLoadCancelled(options);
+            if (["LS_SOURCE_CHANGED", "LS_INCOMPLETE", "LS_MALFORMED_RESPONSE", "PAYLOAD_TOO_LARGE", "CANCELLED", "DEADLINE_EXCEEDED"].includes((error as { code?: string })?.code || "")) {
+                if (localError && error instanceof Error && !error.cause) error.cause = localError;
+                throw error;
+            }
             liveError = error;
         }
         if (local && live) {
@@ -1437,6 +1503,7 @@ async function loadRawConversationData(
                 throw new Error(`${resolved} 本地 PB 与 LS 内容冲突，拒绝盲目拼接`);
             }
             const selected = relation === "local_contains_live" ? local : live;
+            if (selected.sourceCoverage) selected.sourceCoverage = { ...selected.sourceCoverage, comparison: "complete" };
             selected.sourceDiagnostics = [
                 ...(local.sourceDiagnostics || []),
                 ...(live.sourceDiagnostics || []),

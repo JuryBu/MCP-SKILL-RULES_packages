@@ -329,10 +329,9 @@ test("cancellation during a main probe reaches readers and skips child fallback"
         assert.equal(budget.isCancelled(), true);
         return { rounds: [round(marker)] };
     } };
-    const result = await listConversationCandidates({ ...fixture.options, contextProbe: marker, signal: controller.signal });
+    await assert.rejects(listConversationCandidates({ ...fixture.options, contextProbe: marker, signal: controller.signal }),
+        error => error instanceof Error && error.name === "AbortError" && (error as Error & { code?: string }).code === "SOURCE_WORKER_CANCELLED");
     assert.deepEqual(fixture.events, ["list"]);
-    assert.equal(result.contextLocate?.status, "cancelled");
-    assert.equal(result.partial, true);
 });
 
 test("fallback preserves earlier read failures and partial identity", async () => {
@@ -398,8 +397,9 @@ test("default entry isolates serializable options once and waits for close on su
         assert.ok(warmMetadata.candidates[0]?.aliases?.includes(uuid), "a fresh worker retains the previously verified alias after rechecking unchanged sources");
         assert.equal(observedFork.mock.callCount(), 3);
         assert.equal(closes, 3);
-        await assert.rejects(listConversationCandidates({ dataChains: ["windsurf"], source: "local", deadlineAt: Date.now() - 1 }),
-            error => (error as NodeJS.ErrnoException).code === "SOURCE_WORKER_DEADLINE");
+        const expiredBeforeStart = await listConversationCandidates({ dataChains: ["windsurf"], source: "local", deadlineAt: Date.now() - 1 });
+        assert.equal(expiredBeforeStart.partial, true);
+        assert.deepEqual(expiredBeforeStart.candidates, []);
         assert.equal(observedFork.mock.callCount(), 3);
         const controller = new AbortController();
         const pending = listConversationCandidates({ dataChains: ["windsurf"], source: "local", signal: controller.signal, deadlineMs: 5000 });
@@ -409,8 +409,8 @@ test("default entry isolates serializable options once and waits for close on su
         } finally { clearTimeout(abortTimer); }
         assert.equal(observedFork.mock.callCount(), 4);
         assert.equal(closes, 4);
-        await assert.rejects(listConversationCandidates({ dataChains: ["windsurf"], source: "local", deadlineAt: Date.now() + 30, deadlineMs: 5000 }),
-            error => (error as NodeJS.ErrnoException).code === "SOURCE_WORKER_DEADLINE");
+        const expiredDuringRead = await listConversationCandidates({ dataChains: ["windsurf"], source: "local", deadlineAt: Date.now() + 30, deadlineMs: 5000 });
+        assert.equal(expiredDuringRead.partial, true);
         assert.equal(observedFork.mock.callCount(), 5);
         assert.equal(closes, 5);
         assert.deepEqual(fs.readFileSync(filename), sourceBefore);

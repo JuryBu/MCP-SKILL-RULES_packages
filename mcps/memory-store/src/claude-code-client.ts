@@ -3,6 +3,7 @@ import fs from "fs";
 import os from "os";
 import path from "path";
 import { StringDecoder } from "string_decoder";
+import { matchContextProbeText } from "./context-probe-text.js";
 import type { CompactionSummaryInfo, ConversationRound } from "./trajectory.js";
 import type { ConversationAttachment } from "./conversation-attachments.js";
 import type { ConversationLogicalChainMode } from "./chain.js";
@@ -129,6 +130,50 @@ export interface ClaudeCodeDeepLocateOptions {
     }) => void;
     isCancelled?: () => boolean;
 }
+
+export interface ClaudeCodeMetadataDiscoveryOptions {
+    conversationIds?: string[];
+    workspaces?: string[];
+    workspaceMode?: "contains" | "exact" | "under" | "any" | "all";
+    limit?: number;
+    maxEntries?: number;
+    maxFiles?: number;
+    maxBytes?: number;
+    maxCandidateMs?: number;
+    deadlineAt?: number;
+    deadlineMs?: number;
+    isCancelled?: () => boolean;
+    onProgress?: (progress: { bytes: number; totalBytes: number; phase: string }) => void;
+}
+
+export interface ClaudeCodeMetadataDiscoveryResult {
+    threads: ClaudeCodeThreadInfo[];
+    partial: boolean;
+    warnings: string[];
+    scannedEntries: number;
+    scannedFiles: number;
+    scannedBytes: number;
+}
+
+export interface ClaudeCodeAsyncContextProbeOptions {
+    maxBytes?: number;
+    maxHits?: number;
+    deadlineAt?: number;
+    deadlineMs?: number;
+    isCancelled?: () => boolean;
+    onProgress?: (bytes: number, totalBytes: number) => void;
+}
+
+export interface ClaudeCodeAsyncContextProbeResult {
+    hits: ClaudeCodeContextProbeHit[];
+    scannedBytes: number;
+    totalBytes: number;
+    partial: boolean;
+    warnings: string[];
+    roundNumbering: "absolute" | "relative";
+}
+
+class ClaudeCodeMetadataBudgetError extends Error {}
 
 const CLAUDE_JSONL_READ_CHUNK_BYTES = Number(process.env.MEMORY_STORE_CC_JSONL_READ_CHUNK_BYTES || 1024 * 1024);
 const CLAUDE_JSONL_MAX_LINE_CHARS = Number(process.env.MEMORY_STORE_CC_JSONL_MAX_LINE_CHARS || 16 * 1024 * 1024);
@@ -408,6 +453,7 @@ interface JsonlLineReadOptions {
     startLineNo?: number;
     isCancelled?: () => boolean;
     onProgress?: (bytes: number, totalBytes: number) => void;
+    onRead?: (bytes: number) => void;
 }
 
 type JsonlLineCallback = (line: string, lineNo: number, byteOffset: number) => boolean | void;
@@ -462,6 +508,8 @@ function readJsonlLines(
             pending += chunk;
             position += bytesRead;
             scannedBytes += bytesRead;
+
+            options.onRead?.(scannedBytes);
 
             let newlineIndex = pending.indexOf("\n");
             while (newlineIndex >= 0) {
@@ -534,6 +582,7 @@ async function readJsonlLinesAsync(
             const toRead = Math.min(buffer.length, endOffset - position);
             const { bytesRead } = await handle.read(buffer, 0, toRead, position);
             if (bytesRead <= 0) break;
+            options.onRead?.(scannedBytes + bytesRead);
             const chunk = decoder.write(buffer.subarray(0, bytesRead));
             pending += chunk;
             position += bytesRead;
@@ -937,7 +986,7 @@ function compactSummaryPlaceholder(info: CompactionSummaryInfo): string {
 function readThreadMetadata(
     jsonlPath: string,
     desktopIndex?: Map<string, ClaudeCodeDesktopIndexEntry>,
-    options: { bounded?: boolean } = {},
+    options: { bounded?: boolean; lines?: string[] } = {},
 ): ClaudeCodeThreadInfo | null {
     const id = path.basename(jsonlPath, ".jsonl");
     const stat = safeStat(jsonlPath);
@@ -987,7 +1036,9 @@ function readThreadMetadata(
             }
         }
     };
-    if (options.bounded) {
+    if (options.lines) {
+        for (const line of options.lines) inspectMetadataLine(line);
+    } else if (options.bounded) {
         const headBytes = Math.min(stat.size, CLAUDE_THREAD_LIST_HEAD_MAX_BYTES);
         readJsonlLines(jsonlPath, inspectMetadataLine, {
             maxBytes: headBytes,
@@ -1033,6 +1084,171 @@ function readThreadMetadata(
 
 export function isClaudeCodeStoreAvailable(): boolean {
     return fs.existsSync(claudeProjectsDir());
+}
+
+export async function discoverClaudeCodeThreads(options: ClaudeCodeMetadataDiscoveryOptions = {}): Promise<ClaudeCodeMetadataDiscoveryResult> {
+    const result: ClaudeCodeMetadataDiscoveryResult = { threads: [], partial: false, warnings: [], scannedEntries: 0, scannedFiles: 0, scannedBytes: 0 };
+    const limit = Math.max(0, options.limit ?? 10_000);
+    const maxFiles = Math.max(0, options.maxFiles ?? 10_000);
+    const maxEntries = Math.max(0, options.maxEntries ?? 100_000);
+    const maxBytes = Math.max(0, options.maxBytes ?? 16 * 1024 * 1024);
+    const deadlineAt = Math.min(options.deadlineAt ?? Infinity, Date.now() + Math.max(0, options.deadlineMs ?? 12_000));
+    const requested = options.conversationIds?.length ? new Map(options.conversationIds.map(id => [id.toLowerCase(), id])) : undefined;
+    const selected = new Map<string, { thread: ClaudeCodeThreadInfo; lines: string[] }>();
+    const seen = new Set<string>();
+    const desktop = new Map<string, ClaudeCodeDesktopIndexEntry>();
+    let matched = 0;
+    const warn = (message: string): void => { result.partial = true; if (result.warnings.length < 64) result.warnings.push(message); };
+    const check = (): void => {
+        assertClaudeCodeReadActive(options.isCancelled);
+        if (Date.now() >= deadlineAt) throw new ClaudeCodeMetadataBudgetError("claude_metadata_deadline_exceeded");
+    };
+    const files = async function* (directory: string): AsyncGenerator<string> {
+        check();
+        let handle: Awaited<ReturnType<typeof fs.promises.opendir>>;
+        try { handle = await fs.promises.opendir(directory); }
+        catch (error) {
+            if ((error as NodeJS.ErrnoException).code !== "ENOENT") warn(`claude_metadata_directory_error:${directory}:${String(error)}`);
+            return;
+        }
+        for await (const entry of handle) {
+            check();
+            if (result.scannedEntries >= maxEntries) throw new ClaudeCodeMetadataBudgetError("claude_metadata_entry_budget_exhausted");
+            result.scannedEntries += 1;
+            const filename = path.join(directory, entry.name);
+            if (entry.isDirectory()) yield* files(filename);
+            else if (entry.isFile()) yield filename;
+        }
+    };
+    const normalize = (value: string): string => path.resolve(value).replace(/\\/gu, "/").replace(/\/$/u, "").toLowerCase();
+    const matchesWorkspace = (thread: ClaudeCodeThreadInfo): boolean => {
+        if (!options.workspaces?.length) return true;
+        if (!thread.cwd) return false;
+        const workspace = normalize(thread.cwd);
+        const matches = options.workspaces.map(value => {
+            const scope = normalize(value);
+            return options.workspaceMode === "exact" ? workspace === scope
+                : options.workspaceMode === "under" ? workspace === scope || workspace.startsWith(`${scope}/`) : workspace.includes(scope);
+        });
+        return options.workspaceMode === "all" ? matches.every(Boolean) : matches.some(Boolean);
+    };
+    try {
+        check();
+        if (!limit) throw new ClaudeCodeMetadataBudgetError("claude_metadata_candidate_limit");
+        for await (const filename of files(claudeProjectsDir())) {
+            if (!filename.toLowerCase().endsWith(".jsonl")) continue;
+            const id = path.basename(filename, ".jsonl");
+            const key = id.toLowerCase();
+            if (requested && !requested.has(key)) continue;
+            if (seen.has(key)) {
+                const previous = selected.get(key);
+                if (previous && matchesWorkspace(previous.thread)) matched -= 1;
+                selected.delete(key);
+                warn(`claude_metadata_duplicate_id:${id}`);
+                continue;
+            }
+            seen.add(key);
+            if (result.scannedFiles >= maxFiles) throw new ClaudeCodeMetadataBudgetError("claude_metadata_file_budget_exhausted");
+            result.scannedFiles += 1;
+            const candidateDeadline = Math.min(deadlineAt, Date.now() + Math.max(0, options.maxCandidateMs ?? 1000));
+            const checkCandidate = (): void => {
+                check();
+                if (Date.now() >= candidateDeadline) throw new ClaudeCodeMetadataBudgetError("claude_metadata_candidate_deadline_exceeded");
+            };
+            try {
+                checkCandidate();
+                const before = await safeStatAsync(filename);
+                if (!before?.isFile()) { warn(`claude_metadata_source_missing:${id}`); continue; }
+                const lines: string[] = [];
+                const headBytes = Math.min(before.size, CLAUDE_THREAD_LIST_HEAD_MAX_BYTES, maxBytes - result.scannedBytes);
+                if (headBytes <= 0) throw new ClaudeCodeMetadataBudgetError("claude_metadata_byte_budget_exhausted");
+                const readWindow = async (startByte: number, bytes: number): Promise<void> => {
+                    let accounted = 0;
+                    await readJsonlLinesAsync(filename, (line, lineNo) => {
+                        checkCandidate();
+                        if (startByte === 0 || lineNo > 1) lines.push(line);
+                    }, { startByte, endByte: startByte + bytes, maxBytes: bytes, maxLineChars: CLAUDE_JSONL_MAX_LINE_CHARS,
+                        isCancelled: () => { checkCandidate(); return false; }, onRead: scanned => {
+                            result.scannedBytes += scanned - accounted;
+                            accounted = scanned;
+                            options.onProgress?.({ bytes: result.scannedBytes, totalBytes: maxBytes, phase: "metadata" });
+                            checkCandidate();
+                        } });
+                };
+                await readWindow(0, headBytes);
+                const wantedTail = Math.min(Math.max(0, before.size - headBytes), CLAUDE_THREAD_LIST_TAIL_MAX_BYTES);
+                const tailBytes = Math.min(wantedTail, maxBytes - result.scannedBytes);
+                if (tailBytes > 0) await readWindow(before.size - tailBytes, tailBytes);
+                if (tailBytes < wantedTail) warn("claude_metadata_byte_budget_exhausted");
+                const after = await safeStatAsync(filename);
+                checkCandidate();
+                if (!after || before.dev !== after.dev || before.ino !== after.ino || before.size !== after.size || before.mtimeMs !== after.mtimeMs || before.ctimeMs !== after.ctimeMs) {
+                    warn(`claude_metadata_source_changed:${id}`); continue;
+                }
+                if (!lines.some(line => parseJsonLine(line))) { warn(`claude_metadata_unreadable:${id}`); continue; }
+                const thread = readThreadMetadata(filename, undefined, { lines });
+                if (!thread) continue;
+                if (requested) thread.id = requested.get(key)!;
+                selected.set(key, { thread, lines });
+                if (matchesWorkspace(thread)) matched += 1;
+                if (!requested && matched >= limit) throw new ClaudeCodeMetadataBudgetError("claude_metadata_candidate_limit");
+            } catch (error) {
+                assertClaudeCodeReadActive(options.isCancelled);
+                if (error instanceof ClaudeCodeMetadataBudgetError && error.message !== "claude_metadata_candidate_deadline_exceeded") throw error;
+                warn(`claude_metadata_candidate_error:${id}:${String(error)}`);
+            }
+        }
+        if (selected.size) {
+            check();
+            for (const root of claudeDesktopIndexRoots()) {
+                for await (const filename of files(root)) {
+                    if (!/^local_.*\.json$/iu.test(path.basename(filename))) continue;
+                    check();
+                    const metadata = await safeStatAsync(filename);
+                    if (!metadata?.isFile()) continue;
+                    if (metadata.size > 256 * 1024) { warn("claude_metadata_desktop_entry_too_large"); continue; }
+                    if (metadata.size > maxBytes - result.scannedBytes) throw new ClaudeCodeMetadataBudgetError("claude_metadata_byte_budget_exhausted");
+                    const handle = await fs.promises.open(filename, "r");
+                    try {
+                        const bytes = Buffer.alloc(metadata.size);
+                        let filled = 0;
+                        while (filled < bytes.length) {
+                            check();
+                            const read = await handle.read(bytes, filled, bytes.length - filled, filled);
+                            if (!read.bytesRead) break;
+                            filled += read.bytesRead;
+                            result.scannedBytes += read.bytesRead;
+                        }
+                        check();
+                        const entry = parseClaudeCodeDesktopIndexData(root, filename, JSON.parse(bytes.subarray(0, filled).toString("utf8")));
+                        if (entry && selected.has(entry.conversationId.toLowerCase())) {
+                            const key = entry.conversationId.toLowerCase();
+                            const previous = desktop.get(key);
+                            if (!previous || (entry.updatedAtMs || 0) > (previous.updatedAtMs || 0)) desktop.set(key, entry);
+                        }
+                    } catch (error) {
+                        assertClaudeCodeReadActive(options.isCancelled);
+                        if (error instanceof ClaudeCodeMetadataBudgetError) throw error;
+                        warn(`claude_metadata_desktop_error:${String(error)}`);
+                    } finally { await handle.close(); }
+                }
+            }
+        }
+    } catch (error) {
+        assertClaudeCodeReadActive(options.isCancelled);
+        if (!(error instanceof ClaudeCodeMetadataBudgetError)) throw error;
+        warn(error.message);
+    }
+    assertClaudeCodeReadActive(options.isCancelled);
+    for (const [key, item] of selected) {
+        if (desktop.has(key)) item.thread = readThreadMetadata(item.thread.jsonlPath, desktop, { lines: item.lines }) || item.thread;
+        if (requested) item.thread.id = requested.get(key)!;
+        if (matchesWorkspace(item.thread)) result.threads.push(item.thread);
+        else if (!item.thread.cwd && options.workspaces?.length) warn("claude_metadata_workspace_unknown");
+    }
+    result.threads.sort((left, right) => (right.updatedAtMs || 0) - (left.updatedAtMs || 0) || left.id.localeCompare(right.id));
+    if (result.threads.length > limit) { result.threads = result.threads.slice(0, limit); warn("claude_metadata_candidate_limit"); }
+    return result;
 }
 
 export function listRecentClaudeCodeThreads(limit = 50): ClaudeCodeThreadInfo[] {
@@ -2247,16 +2463,84 @@ export function matchClaudeCodeContextProbeInJsonl(
             if (extracted.toolResults.length === 0 || extracted.text) roundIndex += 1;
         }
         for (const item of searchableTextsFromEvent(event)) {
-            if (!normalizeProbeText(item.text).includes(normalizedProbe)) continue;
+            const snippet = matchContextProbeText(item.text, probe);
+            if (snippet === null) continue;
             hits.push({
                 roundIndex: Math.max(roundIndex, 1),
                 role: item.role,
-                snippet: makeSnippet(item.text, probe),
+                snippet,
             });
             if (hits.length >= 5) return false;
         }
     }, { maxBytes: options.maxBytes || CLAUDE_CONTEXT_PROBE_MAX_BYTES, tailOnly: true });
     return hits;
+}
+
+export async function matchClaudeCodeContextProbeInJsonlAsync(
+    jsonlPath: string,
+    probe: string,
+    options: ClaudeCodeAsyncContextProbeOptions = {},
+): Promise<ClaudeCodeAsyncContextProbeResult> {
+    const result: ClaudeCodeAsyncContextProbeResult = { hits: [], scannedBytes: 0, totalBytes: 0, partial: false, warnings: [], roundNumbering: "absolute" };
+    const deadlineAt = Math.min(options.deadlineAt ?? Infinity, Date.now() + Math.max(0, options.deadlineMs ?? CLAUDE_CONTEXT_PROBE_DEADLINE_MS));
+    const check = (): void => {
+        assertClaudeCodeReadActive(options.isCancelled);
+        if (Date.now() >= deadlineAt) throw new ClaudeCodeMetadataBudgetError("claude_probe_deadline_exceeded");
+    };
+    const normalizedProbe = normalizeProbeText(probe);
+    if (normalizedProbe.length < 12) return { ...result, partial: true, warnings: ["claude_probe_too_short"] };
+    let before: fs.Stats | null = null;
+    try {
+        check();
+        before = await safeStatAsync(jsonlPath);
+        check();
+        if (!before?.isFile()) return { ...result, partial: true, warnings: ["claude_probe_source_missing"] };
+        result.totalBytes = before.size;
+        const maxBytes = Math.max(0, options.maxBytes ?? CLAUDE_CONTEXT_PROBE_MAX_BYTES);
+        const maxHits = Math.max(0, options.maxHits ?? 5);
+        const bytes = Math.min(before.size, maxBytes);
+        const start = before.size - bytes;
+        result.roundNumbering = start > 0 ? "relative" : "absolute";
+        result.partial = start > 0;
+        if (!bytes || !maxHits) return { ...result, partial: before.size > 0, warnings: ["claude_probe_budget_exhausted"] };
+        let roundIndex = 0;
+        await readJsonlLinesAsync(jsonlPath, (line, lineNo) => {
+            check();
+            if (start > 0 && lineNo === 1) return;
+            const event = parseJsonLine(line);
+            if (!event) return;
+            if (event.type === "user") {
+                const extracted = extractMessageContent(event.message?.content, event.cwd);
+                if (extracted.toolResults.length === 0 || extracted.text) roundIndex += 1;
+            }
+            for (const item of searchableTextsFromEvent(event)) {
+                check();
+                const snippet = matchContextProbeText(item.text, probe);
+                if (snippet === null) continue;
+                result.hits.push({ roundIndex: Math.max(roundIndex, 1), role: item.role, snippet });
+                if (result.hits.length >= maxHits) { result.partial = true; result.warnings.push("claude_probe_hit_limit"); return false; }
+            }
+        }, { maxBytes: bytes, startByte: start, endByte: before.size,
+            isCancelled: () => { check(); return false; },
+            onRead: scanned => { result.scannedBytes = scanned; options.onProgress?.(scanned, bytes); check(); } });
+        check();
+    } catch (error) {
+        assertClaudeCodeReadActive(options.isCancelled);
+        if (!(error instanceof ClaudeCodeMetadataBudgetError)) throw error;
+        result.partial = true;
+        result.warnings.push(error.message);
+    }
+    if (before) {
+        const after = await safeStatAsync(jsonlPath);
+        assertClaudeCodeReadActive(options.isCancelled);
+        if (!after || before.dev !== after.dev || before.ino !== after.ino || before.size !== after.size || before.mtimeMs !== after.mtimeMs || before.ctimeMs !== after.ctimeMs) {
+            result.hits = [];
+            result.partial = true;
+            result.warnings.push("claude_probe_source_changed");
+        }
+    }
+    if (result.roundNumbering === "relative") result.warnings.push("claude_probe_recent_window_only");
+    return result;
 }
 
 export function findClaudeCodeContextProbeMatches(

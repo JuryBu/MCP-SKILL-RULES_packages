@@ -18,6 +18,8 @@ export const GUIDE_TEXT = `# MCP Memory Store v${VERSION} 使用指南
 
 ## 五端搜索与构建好即用（v1.27）
 
+未知目标可用list配合明确dataChain、workspaces与contextProbe定位，conversationId只标识当前调用者。contextProbe允许原句的标点、空白与段落变化，返回实际原文片段；文字增删或改写请提供真实原话或显式模糊深搜。各来源独立核验正文，到期返回已确认候选和partial、未查范围及源错误。取消仍停止原读取，sourceFailureMode="fail"保留严格失败策略。list是同步入口，只支持缩小范围或调整deadlineMs；后台深搜使用deep_locate及原taskId的deep_locate_status/cancel。prepare、search_all分别使用各自status/cancel/resume，不混用任务操作。
+
 Codex、Claude Code、Windsurf/Devin、Antigravity、DeepSeek Harness 共用正文组合搜索和范围准备入口。新请求必须显式选择具体 dataChain：codex、claude-code、windsurf、antigravity 或 dsh；多端正文搜索使用 dataChains。查询当前端时也由调用者填写当前端的具体值，不省略来源或使用 auto 猜测。
 
 这些新入口的conversationId是当前调用者的稳定ID，conversationIds是目标对话ID数组；旧fetch/read/search/export的conversationId按其schema指定目标。单次新范围读取或命中展开只选择一个端、一个目标。不同端的相同ID分别保留，桌面ID与词对ID只在来源核验后关联。WSF和DSH只提供对话数据，不能作为modelChain。

@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { open, lstat, readdir, realpath, stat } from "node:fs/promises";
+import { open, opendir, lstat, readdir, realpath, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import path from "node:path";
 import { Decompress as ZstdDecompress } from "fzstd";
@@ -101,6 +101,28 @@ export interface DshSessionSource {
     provenance: DshSessionProvenance;
 }
 
+export interface DshMetadataDiscoveryOptions extends DshReaderOptions {
+    conversationIds?: string[];
+    workspaces?: string[];
+    workspaceMode?: "contains" | "exact" | "under" | "any" | "all";
+    limit?: number;
+    maxEntries?: number;
+    maxBytes?: number;
+    maxCandidateBytes?: number;
+    maxCandidateMs?: number;
+    deadlineAt?: number;
+    deadlineMs?: number;
+}
+
+export interface DshMetadataDiscoveryResult {
+    sources: DshSessionSource[];
+    partial: boolean;
+    warnings: string[];
+    scannedCandidates: number;
+    scannedEntries: number;
+    scannedBytes: number;
+}
+
 export interface DshSessionCheckpoint {
     version: 1;
     source: HostFileRevision;
@@ -163,6 +185,12 @@ export class DshSessionReaderError extends Error {
     }
 }
 
+class DshMetadataBudgetError extends DshSessionReaderError {
+    constructor(readonly reason: string, readonly global: boolean) {
+        super(`DSH metadata discovery ${reason}`);
+    }
+}
+
 class IncompleteZstdFrameError extends DshSessionReaderError {
     constructor() {
         super("incomplete trailing zstd frame");
@@ -192,9 +220,9 @@ export async function listDshSessionSnapshots(input: ReaderInput = {}): Promise<
 
 export async function readDshSession(input: ReadInput, options: DshReaderOptions = {}): Promise<DshSessionReadResult> {
     const normalized = normalizeReadInput(input, options);
-    const sources = await listDshSessionSources(normalized.options);
-    const source = sources.find(item => item.id === normalized.id);
-    if (!source) throw new DshSessionReaderError(`DSH session not found: ${normalized.id}`);
+    const discovery = await discoverDshSessionSources({ ...normalized.options, conversationIds: [normalized.id] });
+    const source = discovery.sources.find(item => item.id === normalized.id);
+    if (!source) throw new DshSessionReaderError(`DSH session not found: ${normalized.id}${discovery.partial ? `; metadata coverage partial: ${discovery.warnings.join("; ")}` : ""}`);
     return readDshSessionIncremental(source, normalized.options);
 }
 
@@ -307,22 +335,29 @@ function isWithin(root: string, candidate: string): boolean {
     return relative === "" || (!relative.startsWith(`..${path.sep}`) && relative !== ".." && !path.isAbsolute(relative));
 }
 
-async function readDshBytes(handle: Awaited<ReturnType<typeof open>>, position: number, length: number, size: number): Promise<Buffer> {
+interface DshByteReadControl {
+    beforeRead: (bytes: number) => void;
+    onRead: (bytes: number) => void;
+}
+
+async function readDshBytes(handle: Awaited<ReturnType<typeof open>>, position: number, length: number, size: number, control?: DshByteReadControl): Promise<Buffer> {
     if (position + length > size) throw new IncompleteZstdFrameError();
     const bytes = Buffer.allocUnsafe(length);
     let filled = 0;
     while (filled < length) {
+        control?.beforeRead(length - filled);
         const result = await handle.read(bytes, filled, length - filled, position + filled);
         if (!result.bytesRead) throw new IncompleteZstdFrameError();
         filled += result.bytesRead;
+        control?.onRead(result.bytesRead);
     }
     return bytes;
 }
 
-async function readDshFrame(handle: Awaited<ReturnType<typeof open>>, start: number, size: number, limit: number, isCancelled?: () => boolean): Promise<{ bytes: Buffer; end: number; checksum?: number }> {
-    const magic = await readDshBytes(handle, start, 4, size);
+async function readDshFrame(handle: Awaited<ReturnType<typeof open>>, start: number, size: number, limit: number, isCancelled?: () => boolean, control?: DshByteReadControl): Promise<{ bytes: Buffer; end: number; checksum?: number }> {
+    const magic = await readDshBytes(handle, start, 4, size, control);
     if (!ZSTD_MAGIC.every((value, index) => magic[index] === value)) throw new DshSessionReaderError("invalid zstd frame magic");
-    const descriptor = (await readDshBytes(handle, start + 4, 1, size))[0];
+    const descriptor = (await readDshBytes(handle, start + 4, 1, size, control))[0];
     if ((descriptor & 0x08) !== 0) throw new DshSessionReaderError("reserved zstd frame descriptor bit is set");
     const single = (descriptor & 0x20) !== 0;
     const flag = descriptor >>> 6;
@@ -330,7 +365,7 @@ async function readDshFrame(handle: Awaited<ReturnType<typeof open>>, start: num
     for (;;) {
         assertHostFileActive(isCancelled);
         if (offset - start > limit) throw new DshSessionReaderError("DSH compressed frame exceeds maxCompressedFrameBytes");
-        const bytes = await readDshBytes(handle, offset, 3, size);
+        const bytes = await readDshBytes(handle, offset, 3, size, control);
         const header = bytes[0] | bytes[1] << 8 | bytes[2] << 16;
         const type = header >>> 1 & 3;
         if (type === 3) throw new DshSessionReaderError("reserved zstd block type");
@@ -340,11 +375,175 @@ async function readDshFrame(handle: Awaited<ReturnType<typeof open>>, start: num
     }
     let checksum: number | undefined;
     if (descriptor & 4) {
-        checksum = (await readDshBytes(handle, offset, 4, size)).readUInt32LE();
+        checksum = (await readDshBytes(handle, offset, 4, size, control)).readUInt32LE();
         offset += 4;
     }
     if (offset - start > limit) throw new DshSessionReaderError("DSH compressed frame exceeds maxCompressedFrameBytes");
-    return { bytes: await readDshBytes(handle, start, offset - start, size), end: offset, checksum };
+    return { bytes: await readDshBytes(handle, start, offset - start, size, control), end: offset, checksum };
+}
+
+export async function discoverDshSessionSources(options: DshMetadataDiscoveryOptions = {}): Promise<DshMetadataDiscoveryResult> {
+    const result: DshMetadataDiscoveryResult = { sources: [], partial: false, warnings: [], scannedCandidates: 0, scannedEntries: 0, scannedBytes: 0 };
+    const limit = Math.max(0, options.limit ?? 10_000);
+    const maxEntries = Math.max(0, options.maxEntries ?? 100_000);
+    const maxBytes = Math.max(0, options.maxBytes ?? 16 * 1024 * 1024);
+    const candidateBytes = Math.max(0, options.maxCandidateBytes ?? 1024 * 1024);
+    const headerBytes = Math.max(1, options.maxLineBytes ?? 64 * 1024);
+    const deadlineAt = Math.min(options.deadlineAt ?? Infinity, Date.now() + Math.max(0, options.deadlineMs ?? 12_000));
+    const requested = options.conversationIds?.length ? new Set(options.conversationIds) : undefined;
+    const duplicated = new Set<string>();
+    const seenIds = new Set<string>();
+    const sources = new Map<string, DshSessionSource>();
+    const warn = (message: string): void => { result.partial = true; if (result.warnings.length < 64) result.warnings.push(message); };
+    const check = (): void => {
+        assertHostFileActive(options.isCancelled);
+        if (Date.now() >= deadlineAt) throw new DshMetadataBudgetError("deadline_exceeded", true);
+    };
+    const normalize = (value: string): string => path.resolve(value).replace(/\\/gu, "/").replace(/\/$/u, "").toLowerCase();
+    const matchesWorkspace = (source: DshSessionSource): boolean => {
+        if (!options.workspaces?.length) return true;
+        const workspace = normalize(typeof source.header.cwd === "string" ? source.header.cwd
+            : typeof source.header.workspace === "string" ? source.header.workspace : source.provenance.projectDirectory);
+        const matches = options.workspaces.map(value => {
+            const selected = normalize(value);
+            return options.workspaceMode === "exact" ? workspace === selected
+                : options.workspaceMode === "under" ? workspace === selected || workspace.startsWith(`${selected}/`)
+                    : workspace.includes(selected);
+        });
+        return options.workspaceMode === "all" ? matches.every(Boolean) : matches.some(Boolean);
+    };
+    const entries = async function* (directory: string) {
+        check();
+        let handle: Awaited<ReturnType<typeof opendir>>;
+        try { handle = await opendir(directory); }
+        catch (error) { if (isMissing(error)) return; throw error; }
+        for await (const entry of handle) {
+            check();
+            if (result.scannedEntries >= maxEntries) throw new DshMetadataBudgetError("entry_budget_exhausted", true);
+            result.scannedEntries += 1;
+            yield entry;
+        }
+    };
+    try {
+        check();
+        if (!limit) throw new DshMetadataBudgetError("candidate_limit", true);
+        const configuredRoot = resolveDshSessionsRoot(options);
+        const sessionsRoot = await realDirectory(configuredRoot, configuredRoot);
+        if (!sessionsRoot) return result;
+        for await (const project of entries(sessionsRoot)) {
+            if (!project.isDirectory() && !project.isSymbolicLink()) continue;
+            let projectDirectory: string | null;
+            try { projectDirectory = await realDirectory(path.join(sessionsRoot, project.name), sessionsRoot); }
+            catch (error) { warn(`dsh_metadata_project_error:${project.name}:${errorMessage(error)}`); continue; }
+            if (!projectDirectory) continue;
+            try {
+                for await (const session of entries(projectDirectory)) {
+                    if (!session.isDirectory() && !session.isSymbolicLink()) continue;
+                    check();
+                    result.scannedCandidates += 1;
+                    const candidateDeadline = Math.min(deadlineAt, Date.now() + Math.max(0, options.maxCandidateMs ?? 1000));
+                    let consumed = 0;
+                    const checkCandidate = (): void => {
+                        check();
+                        if (Date.now() >= candidateDeadline) throw new DshMetadataBudgetError("candidate_deadline_exceeded", false);
+                    };
+                    const byteControl: DshByteReadControl = {
+                        beforeRead: bytes => {
+                            checkCandidate();
+                            if (result.scannedBytes + bytes > maxBytes) throw new DshMetadataBudgetError("byte_budget_exhausted", true);
+                            if (consumed + bytes > candidateBytes) throw new DshMetadataBudgetError("candidate_byte_budget_exhausted", false);
+                        },
+                        onRead: bytes => {
+                            consumed += bytes;
+                            result.scannedBytes += bytes;
+                            options.onProgress?.({ bytes: result.scannedBytes, totalBytes: maxBytes, phase: "metadata" });
+                            checkCandidate();
+                        },
+                    };
+                    try {
+                        const sessionDirectory = await realDirectory(path.join(projectDirectory, session.name), sessionsRoot);
+                        if (!sessionDirectory) continue;
+                        const compressed = await realFile(path.join(sessionDirectory, "session.jsonl.zstd"), sessionsRoot);
+                        const raw = await realFile(path.join(sessionDirectory, "session.jsonl"), sessionsRoot);
+                        if (compressed && raw) throw new DshSessionReaderError("ambiguous DSH session source");
+                        if (!compressed && !raw) continue;
+                        const sourcePath = compressed || raw!;
+                        const handle = await open(sourcePath, "r");
+                        let source: DshSessionSource;
+                        try {
+                            checkCandidate();
+                            const before = await handle.stat();
+                            const decoder = new TextDecoder("utf-8", { fatal: true });
+                            let text = "";
+                            let position = 0;
+                            let decodedBytes = 0;
+                            while (!text.includes("\n") && position < before.size) {
+                                checkCandidate();
+                                if (compressed) {
+                                    const frame = await readDshFrame(handle, position, before.size, Math.min(options.maxCompressedFrameBytes ?? 32 * 1024 * 1024, candidateBytes),
+                                        () => { checkCandidate(); return false; }, byteControl);
+                                    const parts: string[] = [];
+                                    decodedBytes += await decompressZstdFrame(frame.bytes, decoder, parts,
+                                        (options.maxDecompressedBytes ?? DSH_DEFAULT_MAX_DECOMPRESSED_BYTES) - decodedBytes,
+                                        options.maxDecompressedFrameBytes ?? DSH_DEFAULT_MAX_DECOMPRESSED_FRAME_BYTES, frame.checksum, undefined, checkCandidate);
+                                    text += parts.join("");
+                                    position = frame.end;
+                                } else {
+                                    const length = Math.min(16 * 1024, before.size - position, headerBytes - position, maxBytes - result.scannedBytes, candidateBytes - consumed);
+                                    if (length <= 0) {
+                                        if (result.scannedBytes >= maxBytes) throw new DshMetadataBudgetError("byte_budget_exhausted", true);
+                                        throw new DshMetadataBudgetError("candidate_header_budget_exhausted", false);
+                                    }
+                                    const bytes = await readDshBytes(handle, position, length, before.size, byteControl);
+                                    text += decoder.decode(bytes, { stream: true });
+                                    position += bytes.length;
+                                }
+                                const newline = text.indexOf("\n");
+                                if (Buffer.byteLength(newline < 0 ? text : text.slice(0, newline)) > headerBytes) throw new DshMetadataBudgetError("candidate_header_budget_exhausted", false);
+                            }
+                            const newline = text.indexOf("\n");
+                            if (newline < 0) throw new DshSessionReaderError("DSH session has no complete header record");
+                            const header = validateHeader(parseJsonRecord(text.slice(0, newline).replace(/\r$/u, ""), 1));
+                            const after = await handle.stat();
+                            if (!sameRevision(before, after) || before.ctimeMs !== after.ctimeMs) throw new DshSessionReaderError("DSH source changed during metadata discovery");
+                            checkCandidate();
+                            source = { id: header.id, header, provenance: { source: "dsh", sessionsRoot, projectDirectory, sessionDirectory,
+                                sourcePath, format: compressed ? "jsonl.zstd" : "jsonl", sourceSizeBytes: before.size, sourceMtimeMs: before.mtimeMs,
+                                ignoredTrailingTextRecord: false, ignoredTrailingZstdFrame: false } };
+                        } finally { await handle.close(); }
+                        if (requested && !requested.has(source.id)) continue;
+                        if (duplicated.has(source.id)) continue;
+                        if (seenIds.has(source.id)) {
+                            sources.delete(source.id);
+                            duplicated.add(source.id);
+                            warn(`dsh_metadata_duplicate_id:${source.id}`);
+                            continue;
+                        }
+                        seenIds.add(source.id);
+                        if (options.workspaces?.length && typeof source.header.cwd !== "string" && typeof source.header.workspace !== "string") warn("dsh_metadata_workspace_unknown");
+                        if (!matchesWorkspace(source)) continue;
+                        sources.set(source.id, source);
+                        if (sources.size >= limit) throw new DshMetadataBudgetError("candidate_limit", true);
+                    } catch (error) {
+                        assertHostFileActive(options.isCancelled);
+                        if (error instanceof DshMetadataBudgetError && error.global) throw error;
+                        warn(`dsh_metadata_candidate_error:${session.name}:${errorMessage(error)}`);
+                    }
+                }
+            } catch (error) {
+                assertHostFileActive(options.isCancelled);
+                if (error instanceof DshMetadataBudgetError) throw error;
+                warn(`dsh_metadata_project_error:${project.name}:${errorMessage(error)}`);
+            }
+        }
+    } catch (error) {
+        assertHostFileActive(options.isCancelled);
+        if (!(error instanceof DshMetadataBudgetError)) throw error;
+        warn(`dsh_metadata_${error.reason}`);
+    }
+    assertHostFileActive(options.isCancelled);
+    result.sources = [...sources.values()].sort((left, right) => right.provenance.sourceMtimeMs - left.provenance.sourceMtimeMs || left.id.localeCompare(right.id));
+    return result;
 }
 
 export async function listDshSessionSources(input: ReaderInput = {}): Promise<DshSessionSource[]> {
@@ -575,7 +774,10 @@ export async function readDshSessionIncremental(source: DshSessionSource, option
                 }
                 const text: string[] = [];
                 let lastByte: number | undefined;
-                const count = await decompressZstdFrame(frame.bytes, decoder, text, limit - totalDecodedBytes, options.maxDecompressedFrameBytes || DSH_DEFAULT_MAX_DECOMPRESSED_FRAME_BYTES, frame.checksum, bytes => { if (bytes.length) lastByte = bytes.at(-1); });
+                const onOutput = (bytes: Uint8Array): void => { if (bytes.length) lastByte = bytes.at(-1); };
+                const count = await decompressZstdFrame(frame.bytes, decoder, text, limit - totalDecodedBytes,
+                    options.maxDecompressedFrameBytes || DSH_DEFAULT_MAX_DECOMPRESSED_FRAME_BYTES, frame.checksum, onOutput,
+                    options.isCancelled ? () => assertHostFileActive(options.isCancelled) : undefined);
                 totalDecodedBytes += count;
                 decodedBytes += count;
                 consume(text.join(""));
@@ -792,6 +994,7 @@ async function decompressZstdFrame(
     maxFrameBytes: number,
     expectedChecksum?: number,
     onOutput?: (bytes: Uint8Array) => void,
+    check?: () => void,
 ): Promise<number> {
     if (remainingBytes <= 0) {
         throw new DshSessionReaderError("DSH zstd decompressed output exceeds maxDecompressedBytes");
@@ -801,6 +1004,7 @@ async function decompressZstdFrame(
     const checksum = expectedChecksum === undefined ? undefined : (await xxhashApi).create64();
     const decompressor = new ZstdDecompress(chunk => {
         onOutput?.(chunk);
+        check?.();
         frameBytes += chunk.length;
         if (frameBytes > outputLimit) {
             const limitName = remainingBytes <= maxFrameBytes ? "maxDecompressedBytes" : "maxDecompressedFrameBytes";
@@ -810,7 +1014,14 @@ async function decompressZstdFrame(
         const text = decoder.decode(chunk, { stream: true });
         if (text) textParts.push(text);
     });
-    decompressor.push(frame, true);
+    if (check) {
+        for (let offset = 0; offset < frame.length; offset += 64 * 1024) {
+            check();
+            decompressor.push(frame.subarray(offset, Math.min(frame.length, offset + 64 * 1024)), offset + 64 * 1024 >= frame.length);
+            await new Promise<void>(resolve => setImmediate(resolve));
+        }
+        check();
+    } else decompressor.push(frame, true);
     if (checksum) {
         const actualChecksum = Number(checksum.digest() & 0xffff_ffffn) >>> 0;
         if (actualChecksum !== expectedChecksum) {

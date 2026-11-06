@@ -6,8 +6,8 @@ const send = (message: unknown): Promise<void> => new Promise((resolve, reject) 
     process.send(message, error => error ? reject(error) : resolve());
 });
 
-async function publish(value: any, location: (string | number)[] = []): Promise<void> {
-    const patch = (type: SourcePatch["type"], value: unknown, path = location) => send({ type: "patch", patch: { type, path, value } });
+async function publish(value: any, location: (string | number)[] = [], channel: "patch" | "checkpoint-patch" = "patch"): Promise<void> {
+    const patch = (type: SourcePatch["type"], value: unknown, path = location) => send({ type: channel, patch: { type, path, value } });
     if (typeof value === "string" && value.length > 65536) {
         await patch("set", "");
         for (let offset = 0; offset < value.length; offset += 65536) await patch("text", value.slice(offset, offset + 65536));
@@ -21,25 +21,35 @@ async function publish(value: any, location: (string | number)[] = []): Promise<
                 await patch("append", batch); batch = []; bytes = 0;
             }
             if (size > 512 * 1024) {
-                await publish(item, [...location, index]);
+                await publish(item, [...location, index], channel);
             } else { batch.push(item); bytes += size; }
         }
         if (batch.length) await patch("append", batch);
     } else if (value && typeof value === "object") {
         await patch("set", {});
-        for (const [key, item] of Object.entries(value)) await publish(item, [...location, key]);
+        for (const [key, item] of Object.entries(value)) await publish(item, [...location, key], channel);
     } else await patch("set", value);
 }
 
 async function execute(operation: IsolatedSourceOperation, payload: any, deadlineAt: number): Promise<unknown> {
-    const isCancelled = () => Date.now() >= deadlineAt || !process.connected;
+    const isCancelled = () => !process.connected;
     if (operation === "guard-record") {
         const { getConversationExecutionRecord } = await import("./guard-engine.js");
         return getConversationExecutionRecord(payload.conversationId, payload.startRound, payload.charBudget, payload.dataChain, { deadlineAt, isCancelled, allowUnavailable: payload.allowUnavailable });
     }
     if (operation === "candidates") {
         const { listConversationCandidates } = await import("./conversation-filter.js");
-        return listConversationCandidates({ ...payload, deadlineAt, isCancelled });
+        let pending = Promise.resolve();
+        return listConversationCandidates({ ...payload, deadlineAt, isCancelled,
+            onCheckpoint: (value: unknown) => {
+                const snapshot = structuredClone(value);
+                pending = pending.then(async () => {
+                    await publish(snapshot, [], "checkpoint-patch");
+                    await send({ type: "checkpoint-complete" });
+                });
+                return pending;
+            },
+        });
     }
     if (operation.startsWith("devin-")) {
         const options = { ...payload.options, deadlineMs: deadlineAt, isCancelled };

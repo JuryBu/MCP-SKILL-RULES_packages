@@ -36,24 +36,33 @@ async function assertCandidateEquivalence(filename: string, messageIds: string[]
     expectedRows: Array<{ session_id: string; uncertain: number }>, checkLimits = false): Promise<void> {
     const schemaDatabase = new DatabaseSync(filename, { readOnly: true });
     let schemaBytes: number;
+    let sourceNodes: number;
+    let sourceBytes: number;
     try {
         const schemaRows = schemaDatabase.prepare("SELECT name, sql FROM sqlite_master WHERE type='table' ORDER BY name").all();
         schemaBytes = Buffer.byteLength(JSON.stringify(schemaRows));
+        const sourceRows = schemaDatabase.prepare("SELECT chat_message, metadata FROM message_nodes").all();
+        sourceNodes = sourceRows.length;
+        sourceBytes = sourceRows.reduce((total, row) => total + Buffer.byteLength(String(row.chat_message ?? ""))
+            + Buffer.byteLength(String(row.metadata ?? "")), 0);
     } finally {
         schemaDatabase.close();
     }
-    const expectedNodes = expectedRows.length + 1;
-    const expectedBytes = schemaBytes + expectedRows.reduce((total, row) => total + Buffer.byteLength(JSON.stringify(row)), 0);
+    const legacyNodes = expectedRows.length + 1;
+    const legacyBytes = schemaBytes + expectedRows.reduce((total, row) => total + Buffer.byteLength(JSON.stringify(row)), 0);
     const expected = {
         sessionIds: [...new Set(expectedRows.map(row => row.session_id))].sort(),
         uncertain: expectedRows.some(row => row.uncertain === 1),
     };
-    for (const findCandidates of [findLegacyIdentityCandidates, findCliIdentityCandidates]) {
+    for (const { findCandidates, expectedNodes, expectedBytes, accounting } of [
+        { findCandidates: findLegacyIdentityCandidates, expectedNodes: legacyNodes, expectedBytes: legacyBytes, accounting: "legacy returned distinct rows" },
+        { findCandidates: findCliIdentityCandidates, expectedNodes: sourceNodes + 1, expectedBytes: schemaBytes + sourceBytes, accounting: "all scanned source rows including misses and duplicates" },
+    ]) {
         const budget = new ReadBudget({ maxNodes: expectedNodes, maxBytes: expectedBytes });
         const actual = await findCandidates(filename, budget, messageIds, toolCallIds);
         assert.deepEqual({ ...actual, sessionIds: actual.sessionIds.sort() }, expected, findCandidates.name);
-        assert.equal(budget.nodes, expectedNodes, `${findCandidates.name}: schema plus distinct session/uncertain node budget`);
-        assert.equal(budget.bytes, expectedBytes, `${findCandidates.name}: UTF-8 distinct row byte budget`);
+        assert.equal(budget.nodes, expectedNodes, `${findCandidates.name}: schema plus ${accounting} node budget`);
+        assert.equal(budget.bytes, expectedBytes, `${findCandidates.name}: schema plus UTF-8 ${accounting} byte budget`);
         if (!checkLimits) continue;
         for (const limit of [
             { options: { maxNodes: expectedNodes - 1 }, code: "DEVIN_NODE_BUDGET" },
@@ -63,6 +72,16 @@ async function assertCandidateEquivalence(filename: string, messageIds: string[]
                 error => error instanceof DevinReadError && error.code === limit.code,
                 `${findCandidates.name}: ${limit.code}`);
         }
+    }
+    if (checkLimits && sourceNodes + 1 > legacyNodes) {
+        await assert.rejects(findCliIdentityCandidates(filename, new ReadBudget({ maxNodes: legacyNodes }), messageIds, toolCallIds),
+            error => error instanceof DevinReadError && error.code === "DEVIN_NODE_BUDGET",
+            "distinct matches cannot substitute for the current source scan node budget");
+    }
+    if (checkLimits && schemaBytes + sourceBytes > legacyBytes) {
+        await assert.rejects(findCliIdentityCandidates(filename, new ReadBudget({ maxBytes: legacyBytes }), messageIds, toolCallIds),
+            error => error instanceof DevinReadError && error.code === "DEVIN_BYTE_BUDGET",
+            "unmatched and duplicate source payloads must exhaust the old returned-row byte budget");
     }
 }
 
@@ -135,7 +154,7 @@ async function testIdentityCandidateEquivalence(directory: string): Promise<void
     } finally {
         quotedDatabase.close();
     }
-    console.log("Devin identity equivalence: legacy/current SQLite candidates, cross-page match/uncertain states, quoted Unicode IDs, mixed tool arrays, and exact distinct budgets");
+    console.log("Devin identity equivalence: identical legacy/current candidates with separate exact returned-row/source-input budgets, cross-page uncertainty, quoted Unicode IDs, and mixed tool arrays");
 }
 
 const directory = fs.mkdtempSync(path.join(os.tmpdir(), "devin-identity-scan-"));

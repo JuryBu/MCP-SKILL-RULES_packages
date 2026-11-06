@@ -1,5 +1,6 @@
 import { execFile, execFileSync } from "child_process";
 import { sliceUnicodeSafe } from "./unicode-text.js";
+import { matchContextProbeText } from "./context-probe-text.js";
 import { createHash } from "crypto";
 import fs from "fs";
 import os from "os";
@@ -11,6 +12,7 @@ import {
     assertCodexHistorySourceAsync,
     assertCodexHistoryManifest,
     codexHistorySegmentReadPath,
+    createCodexLocateWindow,
     CodexHistorySourceMismatchError,
     parseCodexRolloutFilename,
     normalizeCodexHistoryPath,
@@ -20,6 +22,7 @@ import {
     resolveCodexHistorySourceAsync,
     type CodexHistorySource,
     type CodexHistorySegment,
+    type CodexLocateWindowSummary,
 } from "./codex-history-source.js";
 import { CodexOrdinalValidator, CodexPrefixIdentityVerifier, hashCodexPrefix, type CodexOrdinalMode, type CodexPrefixIdentity } from "./codex-history-integrity.js";
 import { CodexHistoryArchiveLogicalLimitError, getCodexHistoryArchiveLogicalLimit } from "./codex-history-archive.js";
@@ -111,6 +114,24 @@ export interface CodexContextProbeHit {
     roundIndex: number;
     role: "user" | "assistant" | "tool_args" | "tool_result" | "item" | "reasoning";
     snippet: string;
+    roundIndexIsRelative?: boolean;
+}
+
+export interface CodexContextProbeScanOptions {
+    maxBytes?: number;
+    deadlineAt?: number;
+    isCancelled?: () => boolean;
+    verifiedSource?: CodexHistorySource;
+}
+
+export interface CodexContextProbeScanResult {
+    hits: CodexContextProbeHit[];
+    scannedBytes: number;
+    totalBytes: number;
+    partial: boolean;
+    cancelled: boolean;
+    warnings: string[];
+    window: CodexLocateWindowSummary;
 }
 
 export interface CodexContextProbeThreadMatch {
@@ -133,6 +154,8 @@ export interface CodexDeepLocateHit {
     byteOffset: number;
     snippet: string;
     freshness: "fresh" | "unknown";
+    roundIndexIsRelative?: boolean;
+    sourceRevision?: string;
 }
 
 export interface CodexDeepLocateResult {
@@ -144,6 +167,8 @@ export interface CodexDeepLocateResult {
     hits: CodexDeepLocateHit[];
     truncated: boolean;
     reason?: string;
+    sourceWindows?: CodexLocateWindowSummary[];
+    totalBytesExact?: boolean;
 }
 
 export interface CodexDeepLocateOptions {
@@ -152,6 +177,7 @@ export interface CodexDeepLocateOptions {
     maxBytes?: number;
     maxHits?: number;
     deadlineMs?: number;
+    deadlineAt?: number;
     onProgress?: (progress: {
         stage?: string;
         detail?: string;
@@ -1845,12 +1871,12 @@ export function matchCodexContextProbeInEvents(events: any[], probe: string): Co
 
     const addHit = (role: CodexContextProbeHit["role"], text: string) => {
         if (!text) return;
-        const normalizedText = normalizeProbeText(text);
-        if (!normalizedText.includes(normalizedProbe)) return;
+        const matchedSnippet = matchContextProbeText(text, probe);
+        if (matchedSnippet === null) return;
         hits.push({
             roundIndex: activeRound || Math.max(roundIndex, 1),
             role,
-            snippet: snippet(text),
+            snippet: matchedSnippet,
         });
     };
 
@@ -2079,37 +2105,44 @@ function codexDeepLocateMatched(text: string, query: string, mode: "exact" | "fu
     return hits >= Math.max(1, Math.ceil(tokens.length * 0.6));
 }
 
-function scanCodexRolloutForQuery(
+function* scanCodexRolloutForQuery(
     thread: CodexThreadInfo,
     query: string,
     options: Required<Pick<CodexDeepLocateOptions, "mode" | "maxBytes" | "maxHits">> & {
         deadlineMs: number;
         startedAt: number;
         isCancelled: () => boolean;
+        deadlineAt: number;
+        direction?: "head" | "tail";
+        probe?: boolean;
+        verifiedSource?: CodexHistorySource;
     },
-): { hits: CodexDeepLocateHit[]; scannedBytes: number; sourceSize: number; budgetExhausted: boolean; cancelled: boolean } {
-    const physicalPath = existingCodexRolloutPath(thread.rolloutPath);
-    if (!physicalPath) {
-        return { hits: [], scannedBytes: 0, sourceSize: 0, budgetExhausted: false, cancelled: false };
-    }
-    const readPath = codexRolloutReadPath(physicalPath);
-    const sourceSize = fs.statSync(readPath).size;
-    const fd = fs.openSync(readPath, "r");
+): Generator<void, { hits: CodexDeepLocateHit[]; scannedBytes: number; sourceSize: number; budgetExhausted: boolean; cancelled: boolean; window: CodexLocateWindowSummary }> {
+    const window = createCodexLocateWindow(thread.rolloutPath, {
+        maxBytes: options.maxBytes, direction: options.direction || "head", deadlineAt: options.deadlineAt,
+        isCancelled: options.isCancelled, verifiedSource: options.verifiedSource,
+    });
     const decoder = new StringDecoder("utf8");
-    const buffer = Buffer.allocUnsafe(Math.max(64 * 1024, CODEX_JSONL_READ_CHUNK_BYTES));
     const tokens = deepLocateTokens(query);
     const hits: CodexDeepLocateHit[] = [];
     const state = { roundIndex: 0, activeRound: 0, lastUserMessage: "", lastAssistantMessage: "" };
     let pending = "";
-    let scannedBytes = 0;
     let lineOffset = 0;
     let budgetExhausted = false;
     let cancelled = false;
+    let firstChunk = true;
+    let skipLeadingLine = false;
+    let relativeRounds = false;
+    let lastByteEnd = 0;
+    let ordinalValidator: CodexOrdinalValidator | undefined;
     let pendingAgentsEvent: { event: any; offset: number; text: string } | null = null;
 
     const processEvent = (event: any, offset: number, textOptions: { foldAgents?: boolean } = {}) => {
         for (const entry of makeCodexTextEntriesFromEvent(event, state, textOptions)) {
-            if (!codexDeepLocateMatched(entry.text, query, options.mode, tokens)) continue;
+            const probeSnippet = options.probe ? matchContextProbeText(entry.text, query) : null;
+            const matched = options.probe ? probeSnippet !== null
+                : codexDeepLocateMatched(entry.text, query, options.mode, tokens);
+            if (!matched) continue;
             hits.push({
                 conversationId: thread.id,
                 title: thread.title,
@@ -2118,11 +2151,13 @@ function scanCodexRolloutForQuery(
                 mode: options.mode,
                 roundIndex: entry.roundIndex,
                 role: entry.role,
-                filePath: physicalPath,
-                ...(readPath === physicalPath ? {} : { readPath }),
+                filePath: window.summary.sourcePath,
+                ...(window.summary.readPath === window.summary.sourcePath ? {} : { readPath: window.summary.readPath }),
                 byteOffset: offset,
-                snippet: snippet(entry.text),
+                snippet: probeSnippet ?? snippet(entry.text),
                 freshness: "fresh",
+                ...(relativeRounds || window.summary.warnings.includes("history_base_not_scanned") ? { roundIndexIsRelative: true } : {}),
+                ...(window.summary.sourceRevision ? { sourceRevision: window.summary.sourceRevision } : {}),
             });
             if (hits.length >= options.maxHits) {
                 budgetExhausted = true;
@@ -2141,7 +2176,13 @@ function scanCodexRolloutForQuery(
         const trimmed = line.endsWith("\r") ? line.slice(0, -1) : line;
         if (!trimmed.trim()) return;
         try {
-            const event = sanitizeCodexEvent(JSON.parse(trimmed));
+            const parsed = JSON.parse(trimmed);
+            if (!relativeRounds && window.summary.ordinalMode) {
+                ordinalValidator ??= new CodexOrdinalValidator(window.summary.startOrdinal || 0, window.summary.ordinalMode);
+                ordinalValidator.add(parsed);
+            }
+            assertCodexParsedRecordLimit(parsed, trimmed);
+            const event = sanitizeCodexEvent(parsed);
             if (pendingAgentsEvent) {
                 const mirrorText = eventUserMessageText(event);
                 if (mirrorText && normalizeProbeText(mirrorText) === normalizeProbeText(pendingAgentsEvent.text)) {
@@ -2162,89 +2203,107 @@ function scanCodexRolloutForQuery(
             }
             processEvent(event, offset);
         } catch {
-            // skip malformed lines
+            if (!window.summary.warnings.includes("malformed_record_not_searched")) window.summary.warnings.push("malformed_record_not_searched");
         }
     };
 
     try {
-        while (true) {
+        for (const chunk of window.chunks) {
             if (options.isCancelled()) {
                 cancelled = true;
                 break;
             }
-            if (Date.now() - options.startedAt > options.deadlineMs || scannedBytes >= options.maxBytes) {
+            if (Date.now() >= options.deadlineAt) {
                 budgetExhausted = true;
                 break;
             }
-            const remainingBudget = options.maxBytes - scannedBytes;
-            const bytesRead = fs.readSync(fd, buffer, 0, Math.min(buffer.length, remainingBudget), null);
-            if (bytesRead === 0) break;
-            scannedBytes += bytesRead;
-            pending += decoder.write(buffer.subarray(0, bytesRead));
+            let bytes = chunk.bytes;
+            if (bytes.length) {
+                lastByteEnd = chunk.startByte + bytes.length;
+                if (firstChunk) {
+                    firstChunk = false;
+                    skipLeadingLine = chunk.startByte > 0;
+                    relativeRounds = skipLeadingLine;
+                    lineOffset = chunk.startByte;
+                }
+                if (skipLeadingLine) {
+                    const newline = bytes.indexOf(0x0a);
+                    if (newline < 0) { lineOffset = lastByteEnd; yield; continue; }
+                    bytes = bytes.subarray(newline + 1);
+                    lineOffset = chunk.startByte + newline + 1;
+                    skipLeadingLine = false;
+                }
+            }
+            pending += decoder.write(bytes);
             let newlineIndex = pending.indexOf("\n");
+            let processedLines = 0;
             while (newlineIndex >= 0) {
+                if (options.isCancelled()) { cancelled = true; break; }
+                if (Date.now() >= options.deadlineAt) { budgetExhausted = true; break; }
                 const line = pending.slice(0, newlineIndex);
                 processLine(line, lineOffset);
                 lineOffset += Buffer.byteLength(line) + 1;
                 pending = pending.slice(newlineIndex + 1);
-                if (budgetExhausted || options.isCancelled()) break;
+                if (budgetExhausted || options.isCancelled() || Date.now() >= options.deadlineAt) break;
                 newlineIndex = pending.indexOf("\n");
+                if (++processedLines % 128 === 0) yield;
             }
             if (pending.length > CODEX_JSONL_MAX_LINE_CHARS) {
                 lineOffset += Buffer.byteLength(pending);
                 pending = "";
+                if (!window.summary.warnings.includes("record_limit_not_searched")) window.summary.warnings.push("record_limit_not_searched");
             }
             if (budgetExhausted || options.isCancelled()) {
                 cancelled = options.isCancelled();
                 break;
             }
+            yield;
         }
+        cancelled ||= window.summary.cancelled || options.isCancelled();
+        budgetExhausted ||= window.summary.partial || Date.now() >= options.deadlineAt;
         const tail = decoder.end();
-        if (!budgetExhausted && !cancelled && tail) pending += tail;
-        if (!budgetExhausted && !cancelled && pending) processLine(pending, lineOffset);
-        if (!budgetExhausted && !cancelled) flushPendingAgentsEvent(true);
-    } finally {
-        fs.closeSync(fd);
+        const reachedLeafEnd = !cancelled && Date.now() < options.deadlineAt && lastByteEnd === window.summary.readEndByte;
+        if (reachedLeafEnd && tail) pending += tail;
+        if (reachedLeafEnd && !skipLeadingLine && pending && hits.length < options.maxHits) processLine(pending, lineOffset);
+        if (reachedLeafEnd && hits.length < options.maxHits) flushPendingAgentsEvent(true);
+    } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+        window.summary.partial = true;
+        window.summary.warnings.push("source_missing");
     }
-
-    return { hits, scannedBytes, sourceSize, budgetExhausted, cancelled };
+    return { hits, scannedBytes: window.summary.physicalReadBytes, sourceSize: window.summary.totalBytes,
+        budgetExhausted: budgetExhausted || window.summary.partial || window.summary.warnings.length > 0,
+        cancelled, window: window.summary };
 }
 
-export function deepLocateCodexConversations(
+function* deepLocateCodexConversationSteps(
     query: string,
     threads: CodexThreadInfo[],
     options: CodexDeepLocateOptions = {},
-): CodexDeepLocateResult {
+    bounded = false,
+): Generator<void, CodexDeepLocateResult> {
     const mode = options.mode || "exact";
     const maxFiles = Math.max(1, options.maxFiles || 20);
-    const maxBytes = Math.max(64 * 1024, options.maxBytes || 512 * 1024 * 1024);
+    const maxBytes = bounded ? Math.max(0, Math.floor(options.maxBytes ?? 512 * 1024 * 1024)) : Math.max(64 * 1024, options.maxBytes || 512 * 1024 * 1024);
     const maxHits = Math.max(1, options.maxHits || 20);
     const deadlineMs = Math.max(1000, options.deadlineMs || 5 * 60 * 1000);
     const startedAt = Date.now();
+    const deadlineAt = options.deadlineAt ?? startedAt + (bounded ? Math.max(0, options.deadlineMs ?? 5 * 60 * 1000) : deadlineMs);
     const selected = threads.slice(0, maxFiles);
-    const estimatedSizes = new Map<CodexThreadInfo, number>();
-    let totalBytes = selected.reduce((sum, thread) => {
-        try {
-            const physicalPath = existingCodexRolloutPath(thread.rolloutPath);
-            const size = physicalPath ? fs.statSync(physicalPath).size : 0;
-            estimatedSizes.set(thread, size);
-            return sum + size;
-        } catch (error) {
-            if ((error as NodeJS.ErrnoException).code === "ENOENT") return sum;
-            throw error;
-        }
-    }, 0);
+    let totalBytes = 0;
     const hits: CodexDeepLocateHit[] = [];
     let scannedBytes = 0;
     let scannedFiles = 0;
     let budgetExhausted = false;
     let cancelled = false;
+    const sourceWindows: CodexLocateWindowSummary[] = [];
 
     for (const thread of selected) {
         if (options.isCancelled?.()) {
             cancelled = true;
             break;
         }
+        if (Date.now() >= deadlineAt || scannedBytes >= maxBytes) { budgetExhausted = true; break; }
         options.onProgress?.({
             stage: "raw_scan",
             detail: `${thread.title || thread.id} (${thread.id.slice(0, 8)})`,
@@ -2258,27 +2317,31 @@ export function deepLocateCodexConversations(
             budgetExhausted = true;
             break;
         }
-        const result = scanCodexRolloutForQuery(thread, query, {
+        const result = yield* scanCodexRolloutForQuery(thread, query, {
             mode,
             maxBytes: Math.max(0, maxBytes - scannedBytes),
             maxHits: remainingHits,
             deadlineMs,
             startedAt,
+            deadlineAt,
             isCancelled: () => Boolean(options.isCancelled?.()),
         });
-        totalBytes += result.sourceSize - (estimatedSizes.get(thread) || 0);
+        totalBytes += result.sourceSize;
         scannedBytes += result.scannedBytes;
         hits.push(...result.hits);
         scannedFiles += 1;
+        sourceWindows.push(result.window);
         if (result.cancelled) {
             cancelled = true;
             break;
         }
-        if (result.budgetExhausted || scannedBytes >= maxBytes || Date.now() - startedAt > deadlineMs || hits.length >= maxHits) {
+        budgetExhausted ||= result.budgetExhausted;
+        if (Date.now() >= deadlineAt || hits.length >= maxHits || (scannedBytes >= maxBytes && scannedFiles < selected.length)) {
             budgetExhausted = true;
             break;
         }
     }
+    budgetExhausted ||= scannedFiles < threads.length;
 
     options.onProgress?.({
         stage: cancelled ? "cancelled" : "done",
@@ -2298,32 +2361,74 @@ export function deepLocateCodexConversations(
     return {
         status,
         scannedFiles,
-        totalFiles: selected.length,
+        totalFiles: threads.length,
         scannedBytes,
         totalBytes,
         hits,
-        truncated: budgetExhausted,
-        reason: budgetExhausted ? "budget_exhausted" : undefined,
+        truncated: budgetExhausted || cancelled,
+        reason: cancelled ? "cancelled" : budgetExhausted ? sourceWindows.flatMap(window => window.warnings)[0] || "budget_exhausted" : undefined,
+        sourceWindows,
+        totalBytesExact: scannedFiles === threads.length && sourceWindows.every(window => window.totalBytesExact),
     };
+}
+
+export function deepLocateCodexConversations(query: string, threads: CodexThreadInfo[], options: CodexDeepLocateOptions = {}): CodexDeepLocateResult {
+    const steps = deepLocateCodexConversationSteps(query, threads, options);
+    let next = steps.next();
+    while (!next.done) next = steps.next();
+    return next.value;
+}
+
+export async function deepLocateCodexConversationsBounded(query: string, threads: CodexThreadInfo[], options: CodexDeepLocateOptions = {}): Promise<CodexDeepLocateResult> {
+    const steps = deepLocateCodexConversationSteps(query, threads, options, true);
+    let next = steps.next();
+    while (!next.done) { await eventLoopYield(); next = steps.next(); }
+    return next.value;
 }
 
 export function matchCodexContextProbeInRollout(
     rolloutPath: string,
     probe: string,
-    options: { maxBytes?: number } = {},
+    options: CodexContextProbeScanOptions = {},
 ): CodexContextProbeHit[] {
-    try {
-        rolloutPath = codexRolloutReadPath(rolloutPath);
-    } catch (error) {
-        if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
-        throw error;
+    return scanCodexContextProbeInRolloutSync(rolloutPath, probe, {
+        ...options, maxBytes: Math.max(64 * 1024, options.maxBytes || CODEX_CONTEXT_PROBE_MAX_BYTES),
+    }).hits;
+}
+
+function* codexContextProbeSteps(rolloutPath: string, probe: string, options: CodexContextProbeScanOptions): Generator<void, CodexContextProbeScanResult> {
+    const maxBytes = Math.max(0, Math.floor(options.maxBytes ?? CODEX_CONTEXT_PROBE_MAX_BYTES));
+    const deadlineAt = options.deadlineAt ?? Date.now() + CODEX_CONTEXT_PROBE_DEADLINE_MS;
+    if (normalizeProbeText(probe).length < 12) {
+        const { summary } = createCodexLocateWindow(rolloutPath, { maxBytes });
+        summary.warnings.push("probe_too_short");
+        return { hits: [], scannedBytes: 0, totalBytes: 0, partial: true, cancelled: false, warnings: summary.warnings, window: summary };
     }
-    const maxBytes = Math.max(64 * 1024, options.maxBytes || CODEX_CONTEXT_PROBE_MAX_BYTES);
-    const stat = fs.statSync(rolloutPath);
-    const events = stat.size <= maxBytes
-        ? readRolloutEvents(rolloutPath)
-        : readRolloutTailEvents(rolloutPath, maxBytes);
-    return matchCodexContextProbeInEvents(events, probe);
+    const result = yield* scanCodexRolloutForQuery({ id: parseCodexRolloutFilename(rolloutPath)?.threadId || "", rolloutPath, cwd: "", title: "", source: "codex" }, probe, {
+        mode: "exact", maxBytes, maxHits: 5, deadlineMs: CODEX_CONTEXT_PROBE_DEADLINE_MS, startedAt: Date.now(), deadlineAt,
+        isCancelled: () => Boolean(options.isCancelled?.()), direction: "tail", probe: true, verifiedSource: options.verifiedSource,
+    });
+    return {
+        hits: result.hits.map(hit => ({ roundIndex: hit.roundIndex, role: hit.role, snippet: hit.snippet,
+            ...(hit.roundIndexIsRelative ? { roundIndexIsRelative: true } : {}) })),
+        scannedBytes: result.scannedBytes, totalBytes: result.sourceSize,
+        partial: result.budgetExhausted || result.cancelled, cancelled: result.cancelled,
+        warnings: result.window.warnings, window: result.window,
+    };
+}
+
+export function scanCodexContextProbeInRolloutSync(rolloutPath: string, probe: string, options: CodexContextProbeScanOptions = {}): CodexContextProbeScanResult {
+    const steps = codexContextProbeSteps(rolloutPath, probe, options);
+    let next = steps.next();
+    while (!next.done) next = steps.next();
+    return next.value;
+}
+
+export async function scanCodexContextProbeInRollout(rolloutPath: string, probe: string, options: CodexContextProbeScanOptions = {}): Promise<CodexContextProbeScanResult> {
+    const steps = codexContextProbeSteps(rolloutPath, probe, options);
+    let next = steps.next();
+    while (!next.done) { await eventLoopYield(); next = steps.next(); }
+    return next.value;
 }
 
 export function findCodexContextProbeMatches(

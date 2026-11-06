@@ -15,6 +15,8 @@ import {
     type LocalPbSourceFlavor,
     type LocalPbActivity,
     type LocalPbDiagnostic,
+    type LocalPbReaderOptions,
+    type LocalPbStepCoverage,
 } from "./local-pb-reader.js";
 import { mergeConsecutiveHumanRounds, type ConversationRound } from "./trajectory.js";
 import { readFiniteIntegerEnv, type ConversationSourceFingerprint } from "./conversation-source-cache.js";
@@ -38,6 +40,12 @@ export interface LocalPbConversationResult {
     partial: boolean;
     diagnostics: LocalPbCandidateDiagnostic[];
     localPbActivities: LocalPbActivityData;
+    coverage?: LocalPbStepCoverage;
+}
+
+export interface LocalPbConversationOptions extends Omit<LocalPbReaderOptions, "sourceFlavor"> {
+    maxBytes?: number;
+    onBytesReserved?: (bytes: number) => void;
 }
 
 export interface LocalPbActivityData {
@@ -374,13 +382,26 @@ function localPbCandidateFailure(candidate: LocalPbDiscoveredCandidate, error: u
     };
 }
 
-export function loadLocalPbConversation(host: LocalPbSourceFlavor, conversationId: string): LocalPbConversationResult | null {
+export function loadLocalPbConversation(host: LocalPbSourceFlavor, conversationId: string, options: LocalPbConversationOptions = {}): LocalPbConversationResult | null {
+    const assertActive = () => {
+        if (options.signal?.aborted || options.isCancelled?.()) throw new LocalPbReaderError("CANCELLED", "Local PB read cancelled");
+        if (options.deadlineMs !== undefined && Date.now() >= options.deadlineMs) throw new LocalPbReaderError("DEADLINE_EXCEEDED", "Local PB read deadline exceeded");
+    };
+    assertActive();
     const candidates = discoverLocalPbCandidates(host, conversationId);
     if (candidates.length === 0) return null;
+    if (options.maxBytes !== undefined && (!Number.isSafeInteger(options.maxBytes) || options.maxBytes < 0
+        || candidates.reduce((sum, candidate) => sum + candidate.size, 0) > options.maxBytes)) {
+        throw new LocalPbReaderError("PAYLOAD_TOO_LARGE", "Local PB candidate set exceeds maxBytes; authenticated envelopes require their complete encrypted bytes");
+    }
+    options.onBytesReserved?.(candidates.reduce((sum, candidate) => sum + candidate.size, 0));
+    const before = candidates.map(candidate => fs.statSync(candidate.filePath));
     const successfulCandidates: Array<{ candidate: LocalPbDiscoveredCandidate; result: LocalPbReadResult }> = [];
     const diagnostics: LocalPbCandidateDiagnostic[] = [];
-    const prepared = prepareLocalPbFileCandidates(candidates, { sourceFlavor: host });
+    const prepared = prepareLocalPbFileCandidates(candidates, { ...options, sourceFlavor: host });
+    const compareFullCandidates = prepared.candidates.filter(candidate => candidate.reader).length > 1;
     for (const [index, candidate] of candidates.entries()) {
+        assertActive();
         try {
             const outcome = prepared.candidates[index]!;
             if (!outcome.reader) {
@@ -389,7 +410,7 @@ export function loadLocalPbConversation(host: LocalPbSourceFlavor, conversationI
                     message: failure?.message ?? "Local PB candidate preparation failed" });
                 continue;
             }
-            const result = outcome.reader.read();
+            const result = outcome.reader.read(compareFullCandidates ? undefined : options.stepRange, options);
             successfulCandidates.push({ candidate, result });
             diagnostics.push({
                 kind: candidate.kind,
@@ -398,6 +419,7 @@ export function loadLocalPbConversation(host: LocalPbSourceFlavor, conversationI
                 stepCount: result.trajectory.steps.length,
             });
         } catch (error) {
+            if (error instanceof LocalPbReaderError && (error.code === "CANCELLED" || error.code === "DEADLINE_EXCEEDED")) throw error;
             diagnostics.push(localPbCandidateFailure(candidate, error));
         }
     }
@@ -407,7 +429,23 @@ export function loadLocalPbConversation(host: LocalPbSourceFlavor, conversationI
             .map(diagnostic => `${diagnostic.kind} (${diagnostic.errorCode}): ${diagnostic.message}`);
         throw new Error(`local PB candidates could not be decoded: ${errors.join("; ")}`);
     }
-    const selected = selectCompleteLocalPbResult(successfulCandidates.map(candidate => candidate.result));
+    let selected = selectCompleteLocalPbResult(successfulCandidates.map(candidate => candidate.result));
+    if (compareFullCandidates && options.stepRange) {
+        const candidateIndex = candidates.indexOf(successfulCandidates.find(candidate => candidate.result === selected)!.candidate);
+        selected = prepared.candidates[candidateIndex]!.reader!.read(options.stepRange, options);
+    }
+    for (const [index, candidate] of candidates.entries()) {
+        assertActive();
+        const after = fs.statSync(candidate.filePath);
+        if (!["dev", "ino", "size", "mtimeMs", "ctimeMs"].every(key => after[key as keyof fs.Stats] === before[index]![key as keyof fs.Stats])) {
+            throw new Error("Local PB source changed during projection; retry with a fresh source revision");
+        }
+    }
+    const currentCandidates = discoverLocalPbCandidates(host, conversationId);
+    if (JSON.stringify(currentCandidates.map(candidate => [candidate.kind, candidate.filePath])) !== JSON.stringify(candidates.map(candidate => [candidate.kind, candidate.filePath]))) {
+        throw new Error("Local PB candidate set changed during projection");
+    }
+    assertActive();
     const rounds = localPbResultToRounds(selected);
     const partial = diagnostics.some(diagnostic => diagnostic.status === "failed") || selected.partial === true
         || selected.diagnostics.some(diagnostic => diagnostic.kind === "partial" || diagnostic.kind === "unknown_variant");
@@ -417,7 +455,7 @@ export function loadLocalPbConversation(host: LocalPbSourceFlavor, conversationI
     return {
         selected,
         rounds,
-        totalSteps: selected.trajectory.steps.length,
+        totalSteps: selected.coverage?.totalSteps ?? selected.trajectory.steps.length,
         fingerprint: fingerprintPreparedLocalPbCandidates(candidates, prepared.sourceRevision),
         candidateKinds: successfulCandidates.map(candidate => candidate.candidate.kind),
         partial,
@@ -425,6 +463,7 @@ export function loadLocalPbConversation(host: LocalPbSourceFlavor, conversationI
             diagnostics: selected.trajectory.steps.flatMap(step => step.diagnostics.map(diagnostic => ({ ...diagnostic, stepIndex: step.index }))),
         },
         diagnostics,
+        ...(selected.coverage ? { coverage: selected.coverage } : {}),
     };
 }
 

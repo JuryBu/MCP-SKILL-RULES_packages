@@ -1,6 +1,7 @@
 import type { ConversationRound } from "./trajectory.js";
 import { getRoundUserMessages } from "./trajectory.js";
 import type { UnifiedConversationCandidate, ConversationSource } from "./conversation-filter.js";
+import { matchContextProbeText } from "./context-probe-text.js";
 
 export type LocateMode = "exact" | "fuzzy";
 export type LocateRawSource = "auto" | "local" | "ls" | "cache";
@@ -19,6 +20,7 @@ export interface ConversationContextHit {
     source: "message_body_hit";
     mode: LocateMode;
     roundIndex: number;
+    roundIndexIsRelative?: boolean;
     role: string;
     rawRole?: string;
     snippet: string;
@@ -65,6 +67,7 @@ export interface ContextLocateReadBudget {
 
 export interface ContextLocateRoundSource {
     rounds: Iterable<ConversationRound> | AsyncIterable<ConversationRound>;
+    roundIndexIsRelative?: boolean;
     partial?: boolean;
     warnings?: string[];
     filePath?: string;
@@ -86,6 +89,14 @@ export interface ConversationContextLocateAdapters {
     scanStream?(candidate: UnifiedConversationCandidate, query: string, budget: ContextLocateReadBudget): Promise<ContextLocateScanResult | null>;
 }
 
+export interface ConversationContextLocateSharedBudget {
+    remainingFiles: number;
+    remainingBytes: number;
+    remainingHits: number;
+    activeReads: number;
+    concurrency: number;
+}
+
 export interface ConversationContextLocateOptions {
     mode?: LocateMode;
     probe?: boolean;
@@ -98,6 +109,9 @@ export interface ConversationContextLocateOptions {
     candidatesPartial?: boolean;
     isCancelled?: () => boolean;
     onProgress?: (progress: { current: number; total: number; scannedBytes: number; hits: number; stage: string; detail?: string }) => void;
+    onCheckpoint?: (result: ConversationContextLocateResult) => void | Promise<void>;
+    sharedBudget?: ConversationContextLocateSharedBudget;
+    reserveFollowup?: boolean;
     adapters?: ConversationContextLocateAdapters;
 }
 
@@ -158,8 +172,9 @@ function* roundMessages(round: ConversationRound): Iterable<SearchableMessage> {
     }
 }
 
-function matchingSnippet(text: string, query: string, mode: LocateMode): string | null {
+function matchingSnippet(text: string, query: string, mode: LocateMode, probe = false): string | null {
     const visible = redactLocateText(text);
+    if (probe) return matchContextProbeText(visible, query);
     const display = visible.normalize("NFKC").replace(/\s+/gu, " ").trim();
     const normalized = display.toLowerCase();
     const needle = normalizedText(query);
@@ -203,11 +218,12 @@ async function scanRounds(candidate: UnifiedConversationCandidate, query: string
             const bytes = Buffer.byteLength(message.text, "utf8");
             if (bytes > budget.maxBytes - scannedBytes) { budgetStopped = true; partial = true; break; }
             scannedBytes += bytes;
-            const snippet = matchingSnippet(message.text, query, budget.mode);
+            const snippet = matchingSnippet(message.text, query, budget.mode, budget.probe);
             if (snippet !== null) {
                 hits.push({
                     ...candidateHitIdentity(candidate), ...loaded.verifiedIdentity,
                     source: "message_body_hit", mode: budget.mode, roundIndex: round.roundIndex,
+                    ...(loaded.roundIndexIsRelative ? { roundIndexIsRelative: true } : {}),
                     role: message.role, rawRole: message.rawRole, snippet,
                     filePath: loaded.filePath,
                     sourcePosition: { kind: "round", roundIndex: round.roundIndex, stepIndex: message.stepIndex, childConversationId: message.childConversationId },
@@ -244,18 +260,52 @@ export async function locateConversationContext(candidates: UnifiedConversationC
     let totalBytes = 0;
     let partial = Boolean(options.candidatesPartial) || unique.length > maxFiles;
     let cancelled = false;
+    const checkpoint = (): ConversationContextLocateResult => {
+        const incomplete = partial || scannedFiles < unique.length || cancelled;
+        const identities = new Set(hits.map(hit => `${hit.dataChain}:${hit.conversationId}`));
+        return {
+            status: cancelled ? "cancelled" : incomplete ? hits.length ? "partial_found_scanning" : "budget_exhausted" : hits.length ? "found" : "no_hit_after_full_scan",
+            scannedFiles, totalFiles: unique.length, scannedBytes, totalBytes, hits: [...hits], truncated: incomplete,
+            reason: cancelled ? "cancelled" : incomplete ? "bounded_or_incomplete_source_scan" : undefined,
+            warnings: [...new Set(warnings)].slice(0, 20),
+            resolution: contextLocateResolution(identities.size, incomplete),
+            matchedConversationCount: identities.size, matchIdentityScope: "provided_candidates", candidateFailures: [...candidateFailures],
+            scope: "provided_candidates",
+        };
+    };
     for (const candidate of unique.slice(0, maxFiles)) {
         await new Promise<void>(resolve => setImmediate(resolve));
         if (options.isCancelled?.()) { cancelled = true; break; }
         if (Date.now() >= deadlineAt || scannedBytes >= maxBytes || hits.length >= maxHits) { partial = true; break; }
+        const shared = options.sharedBudget;
+        while (shared && shared.activeReads > 0 && shared.remainingFiles > 0 && (shared.remainingBytes <= 0 || shared.remainingHits <= 0)
+            && Date.now() < deadlineAt && !options.isCancelled?.()) {
+            await new Promise<void>(resolve => setTimeout(resolve, 5));
+        }
+        if (options.isCancelled?.()) { cancelled = true; break; }
+        if (Date.now() >= deadlineAt || shared && (shared.remainingFiles <= 0 || shared.remainingBytes <= 0 || shared.remainingHits <= 0)) { partial = true; break; }
+        const slots = shared ? Math.max(1, Math.min(shared.remainingFiles, maxFiles - scannedFiles,
+            Math.max(1, shared.concurrency - shared.activeReads,
+                Math.min(4, unique.length - scannedFiles + (options.reserveFollowup ? 1 : 0))))) : 1;
+        const reservedBytes = Math.min(maxBytes - scannedBytes, shared ? Math.ceil(shared.remainingBytes / slots) : maxBytes);
+        const reservedHits = Math.min(maxHits - hits.length, shared ? Math.ceil(shared.remainingHits / slots) : maxHits);
+        if (shared) {
+            shared.remainingFiles--;
+            shared.remainingBytes -= reservedBytes;
+            shared.remainingHits -= reservedHits;
+            shared.activeReads++;
+        }
+        const remainingMs = deadlineAt - Date.now();
+        const candidateMs = options.probe ? Math.min(remainingMs, Math.max(250, Math.min(3000, Math.floor(remainingMs / Math.min(4, Math.max(1, Math.min(maxFiles, unique.length) - scannedFiles)))))) : remainingMs;
         const budget: ContextLocateReadBudget = {
-            maxBytes: maxBytes - scannedBytes, maxHits: maxHits - hits.length,
+            maxBytes: reservedBytes, maxHits: reservedHits,
             maxRounds: locatePositiveInteger(options.maxRounds, options.probe ? 100 : 100_000),
-            deadlineAt, isCancelled: () => Boolean(options.isCancelled?.()),
+            deadlineAt: Date.now() + candidateMs, isCancelled: () => Boolean(options.isCancelled?.()),
             source: options.source || "auto", probe: Boolean(options.probe), mode: options.mode || "exact",
         };
+        let result: ContextLocateScanResult | undefined;
         try {
-            const result = await adapters.scanStream?.(candidate, query, budget)
+            result = await adapters.scanStream?.(candidate, query, budget)
                 || await scanRounds(candidate, query, budget, adapters);
             hits.push(...result.hits.slice(0, budget.maxHits));
             scannedBytes += result.scannedBytes;
@@ -269,23 +319,21 @@ export async function locateConversationContext(candidates: UnifiedConversationC
             const message = error instanceof Error ? error.message : String(error);
             candidateFailures.push({ dataChain: candidate.dataChain, conversationId: candidate.id, error: message });
             warnings.push(`${candidate.dataChain}:${candidate.id}: ${message}`);
+        } finally {
+            if (shared) {
+                shared.activeReads--;
+                shared.remainingBytes += reservedBytes - (result ? Math.min(reservedBytes, Math.max(0, result.scannedBytes)) : reservedBytes);
+                shared.remainingHits += reservedHits - Math.min(reservedHits, result?.hits.length || 0);
+            }
         }
         scannedFiles++;
         options.onProgress?.({ current: scannedFiles, total: unique.length, scannedBytes, hits: hits.length, stage: "context_scan", detail: `${candidate.dataChain}:${candidate.id}` });
+        await options.onCheckpoint?.(checkpoint());
         if (cancelled) break;
     }
     cancelled ||= Boolean(options.isCancelled?.());
     partial ||= scannedFiles < unique.length || cancelled;
-    const identities = new Set(hits.map(hit => `${hit.dataChain}:${hit.conversationId}`));
-    return {
-        status: cancelled ? "cancelled" : partial ? hits.length ? "partial_found_scanning" : "budget_exhausted" : hits.length ? "found" : "no_hit_after_full_scan",
-        scannedFiles, totalFiles: unique.length, scannedBytes, totalBytes, hits, truncated: partial,
-        reason: cancelled ? "cancelled" : partial ? "bounded_or_incomplete_source_scan" : undefined,
-        warnings: [...new Set(warnings)].slice(0, 20),
-        resolution: contextLocateResolution(identities.size, partial),
-        matchedConversationCount: identities.size, matchIdentityScope: "provided_candidates", candidateFailures,
-        scope: "provided_candidates",
-    };
+    return checkpoint();
 }
 
 export function contextLocateResolution(matches: number, partial: boolean): ConversationContextLocateResult["resolution"] {
@@ -299,6 +347,9 @@ export function annotateContextLocateCandidates(candidates: UnifiedConversationC
             aliases: [...new Set([...(candidate.aliases ?? []), ...hits.flatMap(hit => hit.aliases ?? [])])],
             uuid: hits.find(hit => hit.uuid)?.uuid ?? candidate.uuid,
             sessionId: hits.find(hit => hit.sessionId)?.sessionId ?? candidate.sessionId,
-            contextProbe: hits.slice(0, 3).map(hit => `[${hit.role}] R${hit.roundIndex}${hit.sourcePosition.childConversationId ? ` child=${hit.sourcePosition.childConversationId}` : ""} ${hit.snippet}`) } : candidate;
+            contextProbe: hits.slice(0, 3).map(hit => {
+                const roundLabel = hit.roundIndexIsRelative ? `相对R${hit.roundIndex}（末段／尾窗起算）` : `R${hit.roundIndex}`;
+                return `[${hit.role}] ${roundLabel}${hit.sourcePosition.childConversationId ? ` child=${hit.sourcePosition.childConversationId}` : ""} ${hit.snippet}`;
+            }) } : candidate;
     });
 }

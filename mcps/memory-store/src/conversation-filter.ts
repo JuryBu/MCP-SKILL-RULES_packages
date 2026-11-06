@@ -8,6 +8,8 @@ import {
 import {
     getClaudeCodeThread,
     listRecentClaudeCodeThreads,
+    discoverClaudeCodeThreads,
+    type ClaudeCodeMetadataDiscoveryResult,
     type ClaudeCodeThreadInfo,
 } from "./claude-code-client.js";
 import {
@@ -23,12 +25,14 @@ import {
     type WindsurfDiscoveryResult,
 } from "./windsurf-client.js";
 import {
-    listDshSessionSnapshots,
-    readDshSession,
+    discoverDshSessionSources,
+    type DshMetadataDiscoveryResult,
+    type DshSessionSource,
     type DshSessionSnapshot,
 } from "./dsh-session-reader.js";
 import { canonicalWorkspacePath } from "./store.js";
-import type { ContextLocateReadBudget, ConversationContextLocateAdapters, ConversationContextLocateResult, LocateRawSource } from "./conversation-context-locate.js";
+import type { ContextLocateReadBudget, ConversationContextLocateAdapters, ConversationContextLocateResult, ConversationContextLocateSharedBudget, LocateRawSource } from "./conversation-context-locate.js";
+import { annotateContextLocateCandidates, contextLocateResolution, locateConversationContext, locatePositiveInteger } from "./conversation-context-locate.js";
 import type { DevinConversationSummary } from "./devin-types.js";
 import { listLocalPbConversationCandidates, type ConversationDiscoveryDiagnostic } from "./conversation-local-list.js";
 import { discoverDevinConversations } from "./devin-sqlite.js";
@@ -109,6 +113,7 @@ export interface ListConversationCandidatesOptions {
     signal?: AbortSignal;
     isCancelled?: () => boolean;
     conversationIds?: string[];
+    onCheckpoint?: (result: ListConversationCandidatesResult) => void | Promise<void>;
 }
 
 export interface ListConversationCandidatesResult {
@@ -144,6 +149,7 @@ export interface ConversationSourceAdapters {
     "claude-code": {
         list(limit: number): Promise<ClaudeCodeThreadInfo[]> | ClaudeCodeThreadInfo[];
         get(id: string): Promise<ClaudeCodeThreadInfo | null> | ClaudeCodeThreadInfo | null;
+        discover?: (limit: number, options: ListConversationCandidatesOptions) => Promise<ClaudeCodeMetadataDiscoveryResult>;
     };
     antigravity: {
         list(limit: number): Promise<Array<{ id: string; title?: string; mtime: Date; sizeKB?: number; workspace?: string }>> | Array<{ id: string; title?: string; mtime: Date; sizeKB?: number; workspace?: string }>;
@@ -156,14 +162,16 @@ export interface ConversationSourceAdapters {
         resolve(id: string): Promise<string | null> | string | null;
     };
     dsh?: {
-        list(limit: number): Promise<DshSessionSnapshot[]> | DshSessionSnapshot[];
-        get(id: string): Promise<DshSessionSnapshot | null> | DshSessionSnapshot | null;
+        list(limit: number): Promise<DshCandidateMetadata[]> | DshCandidateMetadata[];
+        get(id: string): Promise<DshCandidateMetadata | null> | DshCandidateMetadata | null;
+        discover?: (limit: number, options: ListConversationCandidatesOptions) => Promise<DshMetadataDiscoveryResult>;
     };
     localList?: (source: "antigravity" | "windsurf", limit: number, options?: ListConversationCandidatesOptions) => Promise<UnifiedConversationCandidate[]>;
     readWorkspace?: (candidate: UnifiedConversationCandidate) => Promise<string | undefined>;
 }
 
 const DEFAULT_SOURCE_ORDER: ConversationSource[] = ["codex", "antigravity", "claude-code", "windsurf", "dsh"];
+type DshCandidateMetadata = DshSessionSource & Partial<DshSessionSnapshot>;
 
 const DEFAULT_ADAPTERS: ConversationSourceAdapters = {
     codex: {
@@ -172,7 +180,10 @@ const DEFAULT_ADAPTERS: ConversationSourceAdapters = {
     },
     "claude-code": {
         list: limit => listRecentClaudeCodeThreads(limit),
-        get: id => getClaudeCodeThread(id),
+        get: async id => (await discoverClaudeCodeThreads({ conversationIds: [id], limit: 1 })).threads[0] || null,
+        discover: (limit, options) => discoverClaudeCodeThreads({ limit, conversationIds: options.conversationIds,
+            workspaces: options.workspaces, workspaceMode: options.workspaceMode,
+            maxBytes: options.maxBytes, deadlineAt: options.deadlineAt, isCancelled: options.isCancelled }),
     },
     antigravity: {
         list: limit => discoverAntigravityConversations({ limit }).conversations,
@@ -189,14 +200,11 @@ const DEFAULT_ADAPTERS: ConversationSourceAdapters = {
         resolve: id => resolveWindsurfThreadId(id),
     },
     dsh: {
-        list: async limit => (await listDshSessionSnapshots()).slice(0, limit),
-        get: async id => {
-            try {
-                return (await readDshSession(id)).snapshot;
-            } catch {
-                return null;
-            }
-        },
+        list: async limit => (await discoverDshSessionSources({ limit })).sources,
+        get: async id => (await discoverDshSessionSources({ conversationIds: [id], limit: 1 })).sources[0] || null,
+        discover: (limit, options) => discoverDshSessionSources({ limit, conversationIds: options.conversationIds,
+            workspaces: options.workspaces, workspaceMode: options.workspaceMode,
+            maxBytes: options.maxBytes, deadlineAt: options.deadlineAt, isCancelled: options.isCancelled }),
     },
 };
 
@@ -316,7 +324,7 @@ function candidateFromClaudeCodeThread(item: ClaudeCodeThreadInfo): UnifiedConve
     };
 }
 
-function candidateFromDshSession(item: DshSessionSnapshot): UnifiedConversationCandidate {
+function candidateFromDshSession(item: DshCandidateMetadata): UnifiedConversationCandidate {
     const header = item.header as Record<string, unknown>;
     const parentConversationId = typeof header.parentSession === "string" ? header.parentSession : null;
     const isChildThread = parentConversationId !== null || header.origin === "subagent";
@@ -338,7 +346,7 @@ function candidateFromDshSession(item: DshSessionSnapshot): UnifiedConversationC
         detail: [
             "dsh format v0",
             item.provenance.format,
-            `${item.eventCount} events`,
+            typeof item.eventCount === "number" ? `${item.eventCount} events` : "仅会话元数据",
             `${item.provenance.sourceSizeBytes} bytes`,
             isChildThread ? "childThread" : "",
         ].filter(Boolean).join(" / "),
@@ -554,9 +562,14 @@ async function listSourceCandidates(
         return rows.map(item => candidateFromCodexThread(item, parentMap));
     }
     if (source === "claude-code") {
-        const rows = options.conversationIds?.length
+        const discovered = await adapters["claude-code"].discover?.(limit, options);
+        if (discovered) {
+            const warnings = discovered.warnings.length ? discovered.warnings : discovered.partial ? ["Claude Code metadata discovery is incomplete"] : [];
+            diagnostics.push(...warnings.map(message => ({ code: "CC_METADATA_DISCOVERY", sourceKind: "claude-code", message })));
+        }
+        const rows = discovered?.threads || (options.conversationIds?.length
             ? (await Promise.all(options.conversationIds.map(id => adapters["claude-code"].get(id)))).filter((item): item is ClaudeCodeThreadInfo => Boolean(item))
-            : await adapters["claude-code"].list(limit);
+            : await adapters["claude-code"].list(limit));
         return rows.map(candidateFromClaudeCodeThread);
     }
     if (source === "windsurf") {
@@ -578,9 +591,14 @@ async function listSourceCandidates(
     }
     if (source === "dsh") {
         const dsh = (adapters.dsh || DEFAULT_ADAPTERS.dsh)!;
-        const rows = options.conversationIds?.length
-            ? (await Promise.all(options.conversationIds.map(id => dsh.get(id)))).filter((item): item is DshSessionSnapshot => Boolean(item))
-            : await dsh.list(limit);
+        const discovered = await dsh.discover?.(limit, options);
+        if (discovered) {
+            const warnings = discovered.warnings.length ? discovered.warnings : discovered.partial ? ["DSH metadata discovery is incomplete"] : [];
+            diagnostics.push(...warnings.map(message => ({ code: "DSH_METADATA_DISCOVERY", sourceKind: "dsh", message })));
+        }
+        const rows = discovered?.sources || (options.conversationIds?.length
+            ? (await Promise.all(options.conversationIds.map(id => dsh.get(id)))).filter((item): item is DshCandidateMetadata => Boolean(item))
+            : await dsh.list(limit));
         return rows.map(candidateFromDshSession);
     }
     const discovered = await adapters.antigravity.discover?.(limit, options);
@@ -745,28 +763,97 @@ function appendDevinChildren(raw: UnifiedConversationCandidate[], children: Awai
     raw.push(...children.candidates.filter(child => !raw.some(candidate => candidate.id === child.id)));
 }
 
+function partialCandidateDeadlineResult(checkpoint: ListConversationCandidatesResult | undefined, options: ListConversationCandidatesOptions): ListConversationCandidatesResult {
+    const sources = normalizeConversationSources(options.dataChains);
+    const warning = "candidate_discovery_deadline: source or text scan is incomplete";
+    const statuses = sources.map(dataChain => {
+        const previous = checkpoint?.statuses.find(status => status.dataChain === dataChain);
+        return previous ? { ...previous, partial: true, warnings: [...new Set([...(previous.warnings || []), warning])] }
+            : { dataChain, status: "failed" as const, count: 0, error: "Candidate discovery did not complete before its deadline", partial: true, warnings: [warning] };
+    });
+    const previous = checkpoint?.contextLocate;
+    const contextLocate: ConversationContextLocateResult | undefined = options.contextProbe?.trim() ? {
+        ...(previous || { scannedFiles: 0, totalFiles: statuses.reduce((total, status) => total + status.count, 0), scannedBytes: 0, totalBytes: 0,
+            hits: [], scope: "provided_candidates" as const, matchedConversationCount: 0, matchIdentityScope: "listed_threads" as const }),
+        status: previous?.hits.length ? "partial_found_scanning" : "budget_exhausted",
+        truncated: true, reason: "candidate_discovery_deadline", warnings: [...new Set([...(previous?.warnings || []), warning])],
+        resolution: (previous?.matchedConversationCount || 0) > 1 ? "ambiguous" : previous?.hits.length ? "single_match_in_partial_scan" : "unverified",
+    } : undefined;
+    return { candidates: checkpoint?.candidates || [], statuses, partial: true, contextLocate };
+}
+
+function locatedCandidateResult(collected: UnifiedConversationCandidate[], rawBySource: Map<ConversationSource, UnifiedConversationCandidate[]>,
+    sources: ConversationSource[], options: ListConversationCandidatesOptions, sourceStatuses: SourceStatus[], sourcePartial: boolean,
+    sourceLocate: ConversationContextLocateResult): ListConversationCandidatesResult {
+    const contextLocate = { ...sourceLocate, hits: [...sourceLocate.hits], warnings: [...sourceLocate.warnings] };
+    const statuses = sourceStatuses.map(status => ({ ...status, warnings: status.warnings ? [...status.warnings] : undefined }));
+    let partial = sourcePartial;
+    const annotated = annotateContextLocateCandidates(collected, contextLocate);
+    const selected: UnifiedConversationCandidate[] = [];
+    for (const source of sources) {
+        const scoped = annotated.filter(item => item.dataChain === source && item.contextProbe?.length);
+        if (options.parentDataChain && normalizeDataChain(options.parentDataChain) !== source && options.threadMode === "children") continue;
+        const threadResult = applyThreadMode(rawBySource.get(source) || [], scoped, "", [], { ...options, query: undefined });
+        selected.push(...threadResult.filtered.map(item => {
+            if (!item.matchedChildConversationId || item.contextProbe?.length) return item;
+            const child = scoped.find(candidate => candidate.id === item.matchedChildConversationId);
+            return { ...item, contextProbe: child?.contextProbe?.map(note => `[child-hit:${child.id}] ${note}`) };
+        }));
+        if (threadResult.warnings.length) {
+            const status = statuses.find(item => item.dataChain === source);
+            if (status) { status.warnings = [...new Set([...(status.warnings || []), ...threadResult.warnings])]; status.partial = true; }
+            partial = true;
+        }
+    }
+    const matchCount = new Set(selected.map(item => `${item.dataChain}:${item.id}`)).size;
+    contextLocate.truncated ||= partial;
+    if (contextLocate.status !== "cancelled") {
+        contextLocate.status = contextLocate.truncated ? contextLocate.hits.length ? "partial_found_scanning" : "budget_exhausted"
+            : contextLocate.hits.length ? "found" : "no_hit_after_full_scan";
+        contextLocate.reason = contextLocate.truncated ? "bounded_or_incomplete_source_scan" : undefined;
+    }
+    contextLocate.matchedConversationCount = matchCount;
+    contextLocate.matchIdentityScope = "listed_threads";
+    contextLocate.resolution = matchCount > 1 ? "ambiguous" : matchCount === 1 ? contextLocate.truncated ? "single_match_in_partial_scan" : "unique_in_scope" : contextLocate.truncated ? "unverified" : "no_match";
+    const sourceLimit = Math.max(options.limit || 50, 1);
+    return { candidates: selected.slice(0, sourceLimit), statuses, partial: partial || contextLocate.truncated || selected.length > sourceLimit, contextLocate };
+}
+
 export async function listConversationCandidates(options: ListConversationCandidatesOptions = {}): Promise<ListConversationCandidatesResult> {
     const deadlineAt = Math.min(options.deadlineAt ?? Infinity, Date.now() + (options.deadlineMs ?? 12_000));
     if (!options.adapters && !options.contextAdapters && !isIsolatedSourceWorker()) {
-        const { adapters: _adapters, contextAdapters: _contextAdapters, isCancelled, signal, ...payload } = options;
-        return runIsolatedSource<ListConversationCandidatesResult>("candidates", payload, { deadlineAt, isCancelled, signal });
+        const { adapters: _adapters, contextAdapters: _contextAdapters, isCancelled, signal, onCheckpoint: _onCheckpoint, ...payload } = options;
+        let checkpoint: ListConversationCandidatesResult | undefined;
+        try {
+            return await runIsolatedSource<ListConversationCandidatesResult>("candidates", payload, { deadlineAt, isCancelled, signal,
+                onCheckpoint: value => { checkpoint = value as ListConversationCandidatesResult; },
+            }, { timeoutMs: Math.max(1, deadlineAt - Date.now()) });
+        } catch (error) {
+            if ((error as NodeJS.ErrnoException).code === "SOURCE_WORKER_DEADLINE" && !signal?.aborted && !isCancelled?.()) {
+                return partialCandidateDeadlineResult(checkpoint, options);
+            }
+            throw error;
+        }
     }
     const adapters = options.adapters || DEFAULT_ADAPTERS;
     const sources = normalizeConversationSources(options.dataChains);
     const normalizedQuery = normalizeConversationQuery(options.query);
     const queryTerms = splitConversationQueryTerms(options.query);
     const sourceLimit = Math.max(options.limit || 50, 1);
-    const statuses: SourceStatus[] = [];
+    const statuses = new Map<ConversationSource, SourceStatus>();
     const collected: UnifiedConversationCandidate[] = [];
     const rawBySource = new Map<ConversationSource, UnifiedConversationCandidate[]>();
-    let partial = false;
+    const completed = new Set<ConversationSource>();
+    const located = new Map<ConversationSource, ConversationContextLocateResult>();
+    let stopped = false;
     const callerCancelled = options.isCancelled;
     const signal = options.signal;
-    options = { ...options, deadlineAt, isCancelled: () => Boolean(signal?.aborted || callerCancelled?.()) };
+    options = { ...options, deadlineAt, isCancelled: () => Boolean(stopped || signal?.aborted || callerCancelled?.()) };
     const diagnosticsBySource = new Map<ConversationSource, ConversationDiscoveryDiagnostic[]>();
     let deferredDevinLookup: { parents: UnifiedConversationCandidate[]; options: ListConversationCandidatesOptions } | undefined;
+    await options.onCheckpoint?.({ candidates: [], statuses: [], partial: true });
 
-    const settled = await Promise.allSettled(sources.map(async source => {
+    const discoverSource = async (source: ConversationSource) => {
         if (options.isCancelled?.()) throw new Error("candidate discovery cancelled");
         if (Date.now() >= deadlineAt) throw new Error("candidate discovery deadline exceeded");
         if (options.threadMode === "children" && options.parentDataChain && normalizeDataChain(options.parentDataChain) !== source) return { source, filtered: [], warnings: [] };
@@ -862,56 +949,77 @@ export async function listConversationCandidates(options: ListConversationCandid
             warnings.push(...result.warnings);
         }
         return { source, filtered, warnings };
-    }));
+    };
 
-    for (const [idx, item] of settled.entries()) {
-        const source = sources[idx];
-        if (item.status === "fulfilled") {
-            partial ||= item.value.warnings.length > 0;
-            const diagnostics = diagnosticsBySource.get(source);
-            statuses.push({ dataChain: source, status: "ok", count: item.value.filtered.length, warnings: item.value.warnings.length ? item.value.warnings : undefined,
-                partial: item.value.warnings.length > 0 || undefined, diagnostics: diagnostics?.length ? diagnostics : undefined });
-            collected.push(...item.value.filtered);
-        } else {
-            partial = true;
-            const error = item.reason instanceof Error ? item.reason.message : String(item.reason);
-            statuses.push({ dataChain: source, status: "failed", count: 0, error, partial: true, diagnostics: diagnosticsBySource.get(source) });
-        }
-    }
-
-    collected.sort((a, b) => {
-        const queryPriority = candidateQueryPriority(a, normalizedQuery) - candidateQueryPriority(b, normalizedQuery);
-        if (queryPriority !== 0) return queryPriority;
-        return (Date.parse(b.updatedAt || "") || 0) - (Date.parse(a.updatedAt || "") || 0);
-    });
-
-    if (options.contextProbe?.trim()) {
-        const { locateConversationContext, annotateContextLocateCandidates, contextLocateResolution, locatePositiveInteger } = await import("./conversation-context-locate.js");
-        const readers = options.contextAdapters || (await import("./conversation-context-locate-adapters.js")).defaultContextLocateAdapters;
+    const maximumFiles = locatePositiveInteger(options.candidateLimit, 50, 20_000);
+    const maximumBytes = locatePositiveInteger(options.maxBytes, 16 * 1024 * 1024);
+    const maximumHits = locatePositiveInteger(options.maxHits, Math.max(sourceLimit * 3, 20), 1000);
+    const sharedBudget: ConversationContextLocateSharedBudget = {
+        remainingFiles: maximumFiles, remainingBytes: maximumBytes, remainingHits: maximumHits,
+        activeReads: 0, concurrency: sources.length,
+    };
+    const mergeLocations = (results: ConversationContextLocateResult[], incomplete = false): ConversationContextLocateResult => {
+        const hits = results.flatMap(result => result.hits);
+        const truncated = incomplete || results.some(result => result.truncated);
+        const cancelled = results.some(result => result.status === "cancelled");
+        const identities = new Set(hits.map(hit => `${hit.dataChain}:${hit.conversationId}`));
+        return {
+            status: cancelled ? "cancelled" : truncated ? hits.length ? "partial_found_scanning" : "budget_exhausted" : hits.length ? "found" : "no_hit_after_full_scan",
+            scannedFiles: results.reduce((total, result) => total + result.scannedFiles, 0),
+            totalFiles: results.reduce((total, result) => total + result.totalFiles, 0),
+            scannedBytes: results.reduce((total, result) => total + result.scannedBytes, 0),
+            totalBytes: results.reduce((total, result) => total + result.totalBytes, 0),
+            hits, truncated, reason: cancelled ? "cancelled" : truncated ? "bounded_or_incomplete_source_scan" : undefined,
+            warnings: [...new Set(results.flatMap(result => result.warnings))].slice(0, 20),
+            resolution: contextLocateResolution(identities.size, truncated), matchedConversationCount: identities.size,
+            matchIdentityScope: "provided_candidates", candidateFailures: results.flatMap(result => result.candidateFailures || []), scope: "provided_candidates",
+        };
+    };
+    const snapshot = (): ListConversationCandidatesResult => {
+        const sourceStatuses = sources.flatMap(source => statuses.has(source) ? [statuses.get(source)!] : []);
+        const incomplete = completed.size < sources.length || sourceStatuses.some(status => status.status === "failed" || status.partial || status.warnings?.length);
+        const candidates = [...collected].sort((first, second) => candidateQueryPriority(first, normalizedQuery) - candidateQueryPriority(second, normalizedQuery)
+            || (Date.parse(second.updatedAt || "") || 0) - (Date.parse(first.updatedAt || "") || 0));
+        if (!options.contextProbe?.trim()) return { candidates: candidates.slice(0, sourceLimit), statuses: sourceStatuses, partial: incomplete || candidates.length > sourceLimit };
+        const contextLocate = mergeLocations(sources.flatMap(source => located.has(source) ? [located.get(source)!] : []), incomplete);
+        for (const source of sources) if (!completed.has(source)) contextLocate.warnings.push(`source_pending:${source}: metadata or text verification is incomplete`);
+        return locatedCandidateResult(candidates, rawBySource, sources, options, sourceStatuses, incomplete, contextLocate);
+    };
+    const publicationFailures = new Set<unknown>();
+    const publish = async (): Promise<void> => {
+        if (stopped) return;
+        try { await options.onCheckpoint?.(snapshot()); }
+        catch (error) { publicationFailures.add(error); throw error; }
+    };
+    const readers = options.contextProbe?.trim()
+        ? options.contextAdapters || (await import("./conversation-context-locate-adapters.js")).defaultContextLocateAdapters : undefined;
+    const scanSource = async (source: ConversationSource, candidates: UnifiedConversationCandidate[]): Promise<void> => {
+        if (!readers) return;
         const boundContextBudget = (budget: ContextLocateReadBudget): ContextLocateReadBudget => {
             if (options.isCancelled?.() || Date.now() >= deadlineAt) throw new Error("context discovery deadline exceeded or cancelled");
             return { ...budget, deadlineAt: Math.min(budget.deadlineAt, deadlineAt),
-                isCancelled: () => Boolean(options.isCancelled?.()) || Date.now() >= deadlineAt };
+                isCancelled: () => Boolean(options.isCancelled?.()) };
         };
         const contextAdapters: ConversationContextLocateAdapters = {
             readRounds: (candidate, budget) => readers.readRounds(candidate, boundContextBudget(budget)),
             scanStream: readers.scanStream ? (candidate, query, budget) => readers.scanStream!(candidate, query, boundContextBudget(budget)) : undefined,
         };
-        const maximumFiles = locatePositiveInteger(options.candidateLimit, 50, 20_000);
-        const maximumBytes = locatePositiveInteger(options.maxBytes, 16 * 1024 * 1024);
-        const maximumHits = locatePositiveInteger(options.maxHits, Math.max(sourceLimit * 3, 20), 1000);
-        const contextLocate = await locateConversationContext(collected, options.contextProbe, {
+        const contextLocate = await locateConversationContext(candidates, options.contextProbe!, {
             probe: true, source: options.source, maxFiles: maximumFiles,
             maxBytes: maximumBytes, maxHits: maximumHits,
             deadlineMs: Math.max(1, deadlineAt - Date.now()), isCancelled: options.isCancelled,
-            candidatesPartial: partial, adapters: contextAdapters,
+            candidatesPartial: Boolean(statuses.get(source)?.partial), adapters: contextAdapters, sharedBudget,
+            reserveFollowup: source === "windsurf" && Boolean(deferredDevinLookup) && maximumFiles > 1,
+            onCheckpoint: async result => { if (!stopped) { located.set(source, result); await publish(); } },
         });
-        if (deferredDevinLookup) {
-            const sourceStatus = statuses.find(status => status.dataChain === "windsurf");
+        if (stopped) return;
+        located.set(source, contextLocate);
+        if (source === "windsurf" && deferredDevinLookup) {
+            const sourceStatus = statuses.get(source);
             const childWarnings: string[] = [];
-            const remainingFiles = maximumFiles - contextLocate.scannedFiles;
-            const remainingBytes = maximumBytes - contextLocate.scannedBytes;
-            const remainingHits = maximumHits - contextLocate.hits.length;
+            const remainingFiles = sharedBudget.remainingFiles;
+            const remainingBytes = sharedBudget.remainingBytes;
+            const remainingHits = sharedBudget.remainingHits;
             const exhaustedParents = new Set(contextLocate.warnings.flatMap(warning => {
                 const match = /^devin_context_source_budget:(.*):DEVIN_(?:BYTE_BUDGET|NODE_BUDGET)$/u.exec(warning);
                 return match ? [match[1]!] : [];
@@ -927,33 +1035,27 @@ export async function listConversationCandidates(options: ListConversationCandid
                     const children = await adapters.windsurf.discoverChildren!(childParents, {
                         ...deferredDevinLookup.options, maxBytes: undefined,
                     });
+                    if (stopped) return;
                     const raw = rawBySource.get("windsurf") || [];
                     appendDevinChildren(raw, children);
                     childWarnings.push(...children.warnings);
                     const added = children.candidates.filter(candidate => !collected.some(existing => existing.dataChain === candidate.dataChain && existing.id === candidate.id))
                         .filter(candidate => workspaceMatches(candidateWorkspacesForScope(candidate, options.workspaceScope || "any"), options.workspaces || [], options.workspaceMode || "any"));
                     collected.push(...added);
-                    const childLocate = await locateConversationContext(added, options.contextProbe, {
+                    const childLocate = await locateConversationContext(added, options.contextProbe!, {
                         probe: true, source: options.source, maxFiles: remainingFiles, maxBytes: remainingBytes, maxHits: remainingHits,
                         deadlineMs: Math.max(1, deadlineAt - Date.now()), isCancelled: options.isCancelled,
-                        candidatesPartial: partial || childWarnings.length > 0, adapters: contextAdapters,
+                        candidatesPartial: Boolean(sourceStatus?.partial) || childWarnings.length > 0, adapters: contextAdapters, sharedBudget,
+                        onCheckpoint: async result => { if (!stopped) { located.set(source, mergeLocations([contextLocate, result])); await publish(); } },
                     });
-                    contextLocate.hits.push(...childLocate.hits);
-                    contextLocate.scannedFiles += childLocate.scannedFiles;
-                    contextLocate.totalFiles += childLocate.totalFiles;
-                    contextLocate.scannedBytes += childLocate.scannedBytes;
-                    contextLocate.totalBytes += childLocate.totalBytes;
-                    contextLocate.truncated ||= childLocate.truncated;
-                    contextLocate.candidateFailures = [...(contextLocate.candidateFailures || []), ...(childLocate.candidateFailures || [])];
-                    contextLocate.warnings.push(...childLocate.warnings);
-                    if (childLocate.status === "cancelled") contextLocate.status = "cancelled";
+                    if (stopped) return;
+                    Object.assign(contextLocate, mergeLocations([contextLocate, childLocate]));
                     if (sourceStatus) sourceStatus.count += added.length;
                 } catch (error) {
                     childWarnings.push(`devin_child_discovery_failed:${String(error)}`);
                 }
             }
             if (childWarnings.length) {
-                partial = true;
                 contextLocate.truncated = true;
                 contextLocate.warnings = [...new Set([...contextLocate.warnings, ...childWarnings])].slice(0, 20);
                 if (sourceStatus) {
@@ -962,39 +1064,52 @@ export async function listConversationCandidates(options: ListConversationCandid
                 }
             }
         }
-        const annotated = annotateContextLocateCandidates(collected, contextLocate);
-        const selected: UnifiedConversationCandidate[] = [];
-        for (const source of sources) {
-            const scoped = annotated.filter(item => item.dataChain === source && item.contextProbe?.length);
-            if (options.parentDataChain && normalizeDataChain(options.parentDataChain) !== source && options.threadMode === "children") continue;
-            const threadResult = applyThreadMode(rawBySource.get(source) || [], scoped, "", [], { ...options, query: undefined });
-            selected.push(...threadResult.filtered.map(item => {
-                if (!item.matchedChildConversationId || item.contextProbe?.length) return item;
-                const child = scoped.find(candidate => candidate.id === item.matchedChildConversationId);
-                return { ...item, contextProbe: child?.contextProbe?.map(note => `[child-hit:${child.id}] ${note}`) };
-            }));
-            if (threadResult.warnings.length) {
-                const status = statuses.find(item => item.dataChain === source);
-                if (status) {
-                    status.warnings = [...(status.warnings || []), ...threadResult.warnings];
-                    status.partial = true;
-                }
-                partial = true;
+        located.set(source, contextLocate);
+    };
+    let poll: ReturnType<typeof setInterval> | undefined;
+    const interrupted = new Promise<"deadline" | "cancelled">(resolve => {
+        const check = (): void => {
+            if (signal?.aborted || callerCancelled?.()) resolve("cancelled");
+            else if (Date.now() >= deadlineAt) resolve("deadline");
+        };
+        poll = setInterval(check, 10);
+        check();
+    });
+    try {
+        const jobs = sources.map(async source => {
+            try {
+                const result = await discoverSource(source);
+                if (stopped) return;
+                const diagnostics = diagnosticsBySource.get(source);
+                statuses.set(source, { dataChain: source, status: "ok", count: result.filtered.length,
+                    warnings: result.warnings.length ? result.warnings : undefined, partial: result.warnings.length > 0 || undefined,
+                    diagnostics: diagnostics?.length ? diagnostics : undefined });
+                collected.push(...result.filtered);
+                await publish();
+                if (stopped) return;
+                await scanSource(source, result.filtered);
+                if (stopped) return;
+                completed.add(source);
+                await publish();
+            } catch (error) {
+                if (publicationFailures.has(error)) throw error;
+                if (stopped) return;
+                statuses.set(source, { dataChain: source, status: "failed", count: statuses.get(source)?.count || 0,
+                    error: error instanceof Error ? error.message : String(error), partial: true, diagnostics: diagnosticsBySource.get(source) });
+                completed.add(source);
+                await publish();
             }
+        });
+        const outcome = await Promise.race([Promise.all(jobs).then(() => "complete" as const), interrupted]);
+        if (outcome === "cancelled" || signal?.aborted || callerCancelled?.()) {
+            throw Object.assign(new Error("History source reading was cancelled"), { name: "AbortError", code: "SOURCE_WORKER_CANCELLED" });
         }
-        const matchCount = new Set(selected.map(item => `${item.dataChain}:${item.id}`)).size;
-        contextLocate.truncated ||= partial;
-        if (contextLocate.status !== "cancelled") {
-            contextLocate.status = contextLocate.truncated ? contextLocate.hits.length ? "partial_found_scanning" : "budget_exhausted"
-                : contextLocate.hits.length ? "found" : "no_hit_after_full_scan";
-            contextLocate.reason = contextLocate.truncated ? "bounded_or_incomplete_source_scan" : undefined;
-        }
-        contextLocate.matchedConversationCount = matchCount;
-        contextLocate.matchIdentityScope = "listed_threads";
-        contextLocate.resolution = contextLocateResolution(matchCount, contextLocate.truncated);
-        return { candidates: selected.slice(0, sourceLimit), statuses, partial: partial || contextLocate.truncated || selected.length > sourceLimit, contextLocate };
+        const result = snapshot();
+        return outcome === "deadline" ? partialCandidateDeadlineResult(result, options) : result;
+    } finally {
+        stopped = true;
+        if (poll) clearInterval(poll);
     }
-    return { candidates: collected.slice(0, sourceLimit), statuses, partial: partial || collected.length > sourceLimit };
 }
 
 async function resolveIdInSource(

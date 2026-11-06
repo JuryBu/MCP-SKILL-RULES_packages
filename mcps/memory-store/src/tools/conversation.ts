@@ -1970,7 +1970,7 @@ fetch/search/read/recall/export 必须传 conversationId（共享 broker 后端�
             conversationId: z.string().optional()
                 .describe("稳定对话ID。search_all、read_fast、read_hit与deep_locate系列填当前调用者ID，目标筛选使用conversationIds；read_hit兼容旧目标ID用法；fetch/search/read/export填目标ID；WSF接受已验证的UUID/文字别名"),
             conversationIds: z.array(z.string()).optional()
-                .describe("[deep_locate/search_all/read_fast/read_hit] 可选目标范围；read_fast/read_hit最多一个，省略时兼容读取conversationId；单数conversationId指定调用者"),
+                .describe("[list/deep_locate/search_all/read_fast/read_hit] 可选目标范围；read_fast/read_hit最多一个，省略时兼容读取conversationId；list/deep_locate/search_all的单数conversationId指定调用者"),
             allTerms: z.array(z.string().min(1).max(4096)).max(100).optional()
                 .describe("[search_all] 全部包含的词；默认在同一对话满足，intersectionScope可改同轮/同消息"),
             anyTerms: z.array(z.string().min(1).max(4096)).max(100).optional()
@@ -2257,10 +2257,11 @@ fetch/search/read/recall/export 必须传 conversationId（共享 broker 后端�
                 }
 
                 if (action === "list") {
-                    if (contextProbe?.trim() || source === "local" || source === "cache" || chains.dataChain === "dsh" || dataChains?.length || workspaces?.length || threadMode || parentConversationId || parentQuery) {
+                    if ((!query?.trim() && chains.dataChain !== "auto" && source !== "ls") || conversationIds?.length || contextProbe?.trim() || source === "local" || source === "cache" || chains.dataChain === "dsh" || dataChains?.length || workspaces?.length || threadMode || parentConversationId || parentQuery) {
                         const result = await (dependencies.listCandidates || listConversationCandidates)({
                             dataChains: dataChains?.length ? dataChains : [chains.dataChain],
                             source, contextProbe, maxBytes, maxHits, candidateLimit: maxFiles, deadlineMs,
+                            conversationIds,
                             query,
                             workspaces,
                             workspaceMode,
@@ -2290,15 +2291,11 @@ fetch/search/read/recall/export 必须传 conversationId（共享 broker 后端�
                         const lines = [
                             source === "local" ? "🔎 本地对话目录（PB / JSONL / Devin SQLite，按指定链路过滤）" : "🔎 多源候选查询",
                             `候选对话: ${result.candidates.length}${query ? ` | 关键词: ${query}` : ""}`,
-                            result.partial ? "⚠️ partial：候选或正文扫描受预算/源可用性限制，单一命中也不代表全源唯一。" : "",
+                            result.partial ? "⚠️ partial：当前返回已确认的候选，部分来源或正文范围仍待核查。" : "",
                             result.contextLocate ? `contextProbe: ${result.contextLocate.status} / ${result.contextLocate.resolution}；实际命中 ${result.contextLocate.matchedConversationCount ?? new Set(result.contextLocate.hits.map(hit => `${hit.dataChain}:${hit.conversationId}`)).size} 个对话身份。` : "",
-                            result.contextLocate?.resolution === "single_match_in_partial_scan" ? "已找到一个匹配对话，不是多命中歧义；其它候选未完整检查，不能保证全范围唯一。可使用下方命中ID明确读取。" : "",
-                            ...(result.contextLocate?.warnings || []).map(warning => `⚠️ ${warning}`),
+                            result.contextLocate?.resolution === "single_match_in_partial_scan" ? "已确认一个匹配对话，可用下方ID直接读取；范围内其它候选的核查尚未完成。" : "",
                             workspaces?.length ? `工作区过滤: ${workspaces.join(" | ")} (${workspaceMode}, ${workspaceScope})` : "",
                             threadMode ? `线程模式: ${threadMode}${parentConversationId ? ` | parent=${parentConversationId}` : ""}${parentQuery ? ` | parentQuery=${parentQuery}` : ""}` : "",
-                            "",
-                            "🔗 数据源状态:",
-                            ...formatSourceStatuses(result.statuses),
                             "",
                             ...result.candidates.map((item, idx) => {
                                 const title = formatConversationListDisplayTitleForTest(item.title, {
@@ -2312,6 +2309,10 @@ fetch/search/read/recall/export 必须传 conversationId（共享 broker 后端�
                                 const probe = item.contextProbe?.length ? `\n   🎯 contextProbe: ${item.contextProbe.join("；")}` : "";
                                 return `${idx + 1}. [${item.dataChain}] ${title}\n   ID: ${item.id}${aliases.length ? `\n   ${aliases.join(" / ")}` : ""}\n   更新时间: ${item.updatedAt || "(未知)"}${detail}${workspaceLine}${probe}`;
                             }),
+                            "",
+                            "🔗 数据源状态:",
+                            ...formatSourceStatuses(result.statuses),
+                            ...(result.contextLocate?.warnings || []).map(warning => `⚠️ ${warning}`),
                         ].filter(Boolean);
                         return appendTiming({
                             content: [{ type: "text" as const, text: lines.join("\n") }],
@@ -3426,6 +3427,10 @@ fetch/search/read/recall/export 必须传 conversationId（共享 broker 后端�
                         text: formatToolError(`conversation_read_original(${params.action})`, error, {
                             action: params.action,
                             conversationId: params.conversationId,
+                            taskId: params.taskId,
+                            progressiveTaskId: params.progressiveTaskId,
+                            progressive: params.progressive,
+                            source: params.source,
                             query: params.query,
                             mode: params.mode,
                             chain: params.chain,

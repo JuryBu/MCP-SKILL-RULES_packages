@@ -106,9 +106,17 @@ export function createBinaryHostReader(source: "windsurf" | "antigravity", optio
         const id = conversation.canonicalId || conversation.id;
         const candidates: LocalPbFileCandidate[] = options.pbCandidates ? options.pbCandidates(source, id) : discoverLocalPbCandidates(source, id);
         if (!candidates.length) throw new Error(`No ${source} local PB source for ${id}`);
+        const maximum = options.maxSourceBytes ?? 128 * 1024 * 1024;
+        let candidateBytes = 0;
+        for (const candidate of candidates) {
+            assertHostReadActive(control);
+            const stat = await fs.stat(candidate.filePath);
+            if (!stat.isFile()) throw new Error("PB candidate is not a regular file");
+            candidateBytes += stat.size;
+            if (candidateBytes > maximum) throw new Error("PB candidate set exceeds maxSourceBytes; increase the explicit reader budget");
+        }
         const revisions: HostFileRevision[] = [];
         for (const candidate of candidates) revisions.push(await captureHostFile(candidate.filePath, { isCancelled: control.isCancelled }));
-        const maximum = options.maxSourceBytes ?? 128 * 1024 * 1024;
         if (revisions.reduce((sum, value) => sum + value.size, 0) > maximum) throw new Error("PB candidate set exceeds maxSourceBytes; increase the explicit reader budget");
         const key = physicalKey(revisions);
         let reused = false;

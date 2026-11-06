@@ -1,6 +1,6 @@
 import type { DatabaseSync } from "node:sqlite";
 import { setImmediate as yieldImmediate } from "node:timers/promises";
-import type { DevinCompaction, DevinConversationSummary, DevinDesktopMessage, DevinMessageNode, DevinRoundCoverage, DevinRoundRange } from "./devin-types.js";
+import type { DevinCompaction, DevinConversationSummary, DevinDesktopMessage, DevinDiscoveryOptions, DevinMessageNode, DevinRoundCoverage, DevinRoundRange } from "./devin-types.js";
 import { ReadBudget, DevinReadError, asTimestamp, columns, digest, inSnapshot, jsonObject, nodeId } from "./devin-sqlite-store.js";
 
 export interface CliConversation {
@@ -127,7 +127,7 @@ async function readChain(database: DatabaseSync, sessionId: string, head: number
     }
 }
 
-export async function findCliIdentityCandidates(filename: string, budget: ReadBudget, messageIds: string[], toolCallIds: string[]): Promise<{ sessionIds: string[]; uncertain: boolean }> {
+export async function findCliIdentityCandidates(filename: string, budget: ReadBudget, messageIds: string[], toolCallIds: string[], validatedSessionIds: string[] = []): Promise<{ sessionIds: string[]; uncertain: boolean }> {
     return inSnapshot(filename, budget, async database => {
         const userMatch = messageIds.length ? `user_id IN (SELECT value FROM json_each(?))` : "0";
         const toolMatch = toolCallIds.length ? `tool_id IN (SELECT value FROM json_each(?))
@@ -137,21 +137,26 @@ export async function findCliIdentityCandidates(filename: string, budget: ReadBu
         const toolIdsProjection = toolCallIds.length ? `(SELECT json_group_array(json_extract(call.value,'$.id'))
             FROM json_each(chat_message,'$.tool_calls') AS call WHERE call.type='object')` : "NULL";
         const query = (comparison: string) => database.prepare(`WITH page AS MATERIALIZED (
-            SELECT rowid AS identity_cursor FROM message_nodes
-            WHERE rowid ${comparison} ? ORDER BY rowid LIMIT 64),
+            SELECT rowid AS identity_cursor, coalesce(length(CAST(chat_message AS BLOB)),0) + coalesce(length(CAST(metadata AS BLOB)),0) AS source_bytes FROM message_nodes
+            WHERE rowid ${comparison} ? AND (session_id IS NULL OR session_id NOT IN (SELECT value FROM json_each(?))) ORDER BY rowid LIMIT ?),
+            bounded AS MATERIALIZED (SELECT *, sum(source_bytes) OVER (ORDER BY identity_cursor ROWS UNBOUNDED PRECEDING) AS page_bytes FROM page),
+            readable AS MATERIALIZED (SELECT bounded.identity_cursor, session_id, source_bytes,
+                CASE WHEN page_bytes<=? THEN chat_message END AS chat_message,
+                CASE WHEN page_bytes<=? THEN metadata END AS metadata
+                FROM bounded JOIN message_nodes ON message_nodes.rowid=bounded.identity_cursor),
             projected AS MATERIALIZED (
-            SELECT page.identity_cursor, session_id,
+            SELECT identity_cursor, session_id, source_bytes,
                 CASE WHEN json_valid(chat_message) THEN json_type(chat_message) END AS message_kind,
                 CASE WHEN json_valid(chat_message) THEN ${userProjection} END AS user_id,
                 CASE WHEN json_valid(chat_message) THEN ${toolProjection} END AS tool_id,
                 CASE WHEN json_valid(chat_message) THEN ${toolIdsProjection} END AS tool_ids,
                 CASE WHEN metadata IS NOT NULL AND metadata!='' AND (NOT json_valid(metadata) OR json_type(metadata) NOT IN ('object','null')) THEN 1 ELSE 0 END AS invalid_metadata
-            FROM page JOIN message_nodes ON message_nodes.rowid=page.identity_cursor),
-            matches AS MATERIALIZED (SELECT identity_cursor, session_id, CASE WHEN message_kind IS NULL OR message_kind!='object' OR invalid_metadata=1
+            FROM readable),
+            matches AS MATERIALIZED (SELECT identity_cursor, session_id, source_bytes, CASE WHEN message_kind IS NULL OR message_kind!='object' OR invalid_metadata=1
                 THEN 1 ELSE 0 END AS uncertain,
                 CASE WHEN message_kind='object' THEN
                     ${userMatch} OR ${toolMatch} ELSE 0 END AS matched FROM projected)
-            SELECT identity_cursor, session_id, uncertain, matched FROM matches ORDER BY identity_cursor`);
+            SELECT identity_cursor, session_id, source_bytes, uncertain, matched FROM matches ORDER BY identity_cursor`);
         const firstPage = query(">=");
         const nextPage = query(">");
         firstPage.setReadBigInts(true);
@@ -165,8 +170,8 @@ export async function findCliIdentityCandidates(filename: string, budget: ReadBu
         for (;;) {
             budget.check();
             let count = 0;
-            for (const row of statement.iterate(cursor, ...parameters)) {
-                budget.check();
+            for (const row of statement.iterate(cursor, JSON.stringify(validatedSessionIds), Math.min(64, budget.maxNodes - budget.nodes + 1), budget.remainingBytes, budget.remainingBytes, ...parameters)) {
+                await budget.take(Number(row.source_bytes));
                 count++;
                 cursor = row.identity_cursor as bigint;
                 if (Number(row.uncertain) !== 1 && Number(row.matched) !== 1) continue;
@@ -175,7 +180,6 @@ export async function findCliIdentityCandidates(filename: string, budget: ReadBu
                 const identity = JSON.stringify([sessionId, isUncertain]);
                 if (seen.has(identity)) continue;
                 seen.add(identity);
-                await budget.take(Buffer.byteLength(JSON.stringify({ session_id: row.session_id, uncertain: Number(row.uncertain) })));
                 uncertain ||= isUncertain;
                 sessionIds.add(sessionId);
             }
@@ -253,7 +257,7 @@ function knownToolIds(nodes: DevinMessageNode[]): Set<string> {
 }
 
 async function cliSupplement(database: DatabaseSync, sessionId: string, filename: string,
-    mainNodes: DevinMessageNode[], memo: Map<number, DevinMessageNode>, budget: ReadBudget, mainOnly = false): Promise<{
+    mainNodes: DevinMessageNode[], memo: Map<number, DevinMessageNode>, budget: ReadBudget, mainOnly = false, childDiscoveryOnly = false): Promise<{
         messages: DevinDesktopMessage[]; state: unknown[]; warnings: string[];
     }> {
     const messages: DevinDesktopMessage[] = [];
@@ -261,10 +265,16 @@ async function cliSupplement(database: DatabaseSync, sessionId: string, filename
     const warnings: string[] = [];
     const toolIds = knownToolIds(mainNodes);
     if (!mainOnly && columns(database, "subagent_heads").has("chain_node_id")) {
-        const heads = database.prepare("SELECT agent_id, chain_node_id, updated_at FROM subagent_heads WHERE session_id=? ORDER BY agent_id");
+        const heads = database.prepare(`SELECT agent_id, chain_node_id, updated_at FROM subagent_heads WHERE session_id=? ORDER BY agent_id ${childDiscoveryOnly ? "LIMIT 2001" : ""}`);
         for (const head of heads.iterate(sessionId)) {
             await budget.take(Buffer.byteLength(JSON.stringify(head)));
             state.push(head);
+            if (childDiscoveryOnly) {
+                messages.push({ position: messages.length, kind: "subagent", sourcePath: filename,
+                    payload: { kind: "subagent", agentId: String(head.agent_id), parentConversationId: sessionId,
+                        source: "devin-cli-subagent-index", status: "unknown", partial: true, updatedAt: asTimestamp(head.updated_at) } });
+                continue;
+            }
             const chain = await readChain(database, sessionId, nodeId(head.chain_node_id), budget, memo);
             warnings.push(...chain.warnings.map(warning => `DEVIN_SUBAGENT_${warning}`));
             state.push(chain.nodes, chain.compactions);
@@ -291,6 +301,12 @@ async function cliSupplement(database: DatabaseSync, sessionId: string, filename
             });
         }
     }
+    if (childDiscoveryOnly) {
+        warnings.push("DEVIN_CHILD_DISCOVERY_INDEX_ONLY");
+        if (messages.length === 2001) warnings.push("DEVIN_CHILD_INDEX_LIMIT");
+        if (!columns(database, "subagent_heads").has("chain_node_id")) warnings.push("DEVIN_CHILD_INDEX_UNAVAILABLE");
+        return { messages, state, warnings };
+    }
     if (columns(database, "tool_call_state").has("tool_call_id")) {
         const statement = database.prepare(`SELECT tool_call_id,
             coalesce(length(CAST(tool_call_json AS BLOB)),0) + coalesce(length(CAST(tool_call_update_json AS BLOB)),0) AS bytes,
@@ -315,7 +331,7 @@ async function cliSupplement(database: DatabaseSync, sessionId: string, filename
 }
 
 export async function readCliConversations(filename: string, budget: ReadBudget,
-    options: { identityOnly?: boolean; metadataOnly?: boolean; roundRange?: DevinRoundRange; validatedChain?: ValidatedChain; sessionId?: string; conversationIds?: string[]; acceptSummary?: (summary: DevinConversationSummary) => boolean; onConversation?: (conversation: CliConversation) => void; onSession?: () => void; onSessionError?: (id: string, error: unknown) => void } = {}): Promise<CliConversation[]> {
+    options: { identityOnly?: boolean; metadataOnly?: boolean; childDiscoveryOnly?: boolean; excludeHidden?: boolean; maxConversations?: number; discovery?: DevinDiscoveryOptions; roundRange?: DevinRoundRange; validatedChain?: ValidatedChain; sessionId?: string; conversationIds?: string[]; acceptSummary?: (summary: DevinConversationSummary) => boolean; onConversation?: (conversation: CliConversation) => void; onSession?: () => void; onSessionError?: (id: string, error: unknown) => void } = {}): Promise<CliConversation[]> {
     return inSnapshot(filename, budget, async (database, identity, schema) => {
         const sessionColumns = columns(database, "sessions");
         const nodeColumns = columns(database, "message_nodes");
@@ -324,23 +340,39 @@ export async function readCliConversations(filename: string, budget: ReadBudget,
             throw new DevinReadError("DEVIN_SCHEMA_UNSUPPORTED", "The Devin CLI database does not have the supported sessions/message_nodes schema.");
         }
         const selectedColumns = ["id", "main_chain_id", "working_directory", "workspace_dirs", "title", "created_at", "last_activity_at", "hidden", "metadata"];
-        const select = selectedColumns.map(column => sessionColumns.has(column) && !((options.identityOnly || options.metadataOnly) && column === "metadata") ? column : `NULL AS ${column}`).join(", ");
+        const select = selectedColumns.map(column => sessionColumns.has(column) && !((options.identityOnly || options.metadataOnly || options.childDiscoveryOnly) && column === "metadata") ? column : `NULL AS ${column}`).join(", ");
         const results: CliConversation[] = [];
         const ids = options.sessionId !== undefined ? [options.sessionId] : options.conversationIds;
-        const sessions = database.prepare(`SELECT ${select} FROM sessions ${ids?.length ? `WHERE id IN (${ids.map(() => "?").join(",")})` : ""} ORDER BY ${sessionColumns.has("last_activity_at") ? "last_activity_at DESC," : ""} id`);
-        for (const session of sessions.iterate(...(ids || []))) {
+        const predicates = ids?.length ? [`id IN (${ids.map(() => "?").join(",")})`] : [];
+        const parameters = [...(ids || [])];
+        if (options.excludeHidden && sessionColumns.has("hidden")) predicates.push("CAST(coalesce(hidden,0) AS REAL)=0");
+        const requestedWorkspaces = options.discovery?.workspaces?.map(value => {
+            let normalized = value.replace(/^file:\/\/\//iu, "");
+            try { normalized = decodeURIComponent(normalized); } catch {}
+            return normalized.replace(/\\/gu, "/").replace(/\/+$/u, "").toLowerCase();
+        }).filter(Boolean);
+        if (options.discovery?.workspaceScope === "primary" && options.discovery.workspaceMode === "exact" && sessionColumns.has("working_directory")
+            && requestedWorkspaces?.length && requestedWorkspaces.every(value => /^[\x00-\x7f]*$/u.test(value))) {
+            const normalized = "lower(rtrim(replace(CASE WHEN lower(substr(working_directory,1,8))='file:///' THEN substr(working_directory,9) ELSE working_directory END, '\\', '/'), '/'))";
+            predicates.push(`(working_directory IS NULL OR working_directory='' OR instr(working_directory,'%')>0
+                OR length(CAST(working_directory AS BLOB))!=length(working_directory) OR ${normalized} IN (${requestedWorkspaces.map(() => "?").join(",")}))`);
+            parameters.push(...requestedWorkspaces);
+        }
+        const sessions = database.prepare(`SELECT ${select} FROM sessions ${predicates.length ? `WHERE ${predicates.join(" AND ")}` : ""} ORDER BY ${sessionColumns.has("last_activity_at") ? "last_activity_at DESC," : ""} id`);
+        const activityBounds = options.maxConversations !== undefined && sessionColumns.has("last_activity_at") ? database.prepare(`SELECT
+            min(last_activity_at) AS minimum, max(last_activity_at) AS maximum,
+            sum(CASE WHEN last_activity_at IS NOT NULL AND (typeof(last_activity_at) NOT IN ('integer','real') OR last_activity_at<0 OR last_activity_at>8640000000000000) THEN 1 ELSE 0 END) AS invalid
+            FROM sessions`).get() : undefined;
+        const maximumConversations = activityBounds && Number(activityBounds.invalid ?? 0) === 0
+            && (Number(activityBounds.minimum) < 1e12) === (Number(activityBounds.maximum) < 1e12) ? options.maxConversations : undefined;
+        let boundaryActivity: string | undefined;
+        for (const session of sessions.iterate(...parameters)) {
+            if (maximumConversations !== undefined && results.length >= maximumConversations && asTimestamp(session.last_activity_at) !== boundaryActivity) break;
             await budget.take(Buffer.byteLength(JSON.stringify(session)));
             options.onSession?.();
             const sessionId = String(session.id);
             try {
-                const empty = !database.prepare("SELECT 1 FROM message_nodes WHERE session_id=? LIMIT 1").get(sessionId);
-                const memo = new Map<number, DevinMessageNode>();
-                const chain: ChainResult & { coverage?: DevinRoundCoverage } = empty || options.metadataOnly ? { nodes: [], compactions: [], warnings: empty ? ["DEVIN_EMPTY_CONVERSATION"] : [] }
-                    : options.roundRange && !options.identityOnly ? await readChainWindow(database, sessionId, nodeId(session.main_chain_id), budget, memo, options.roundRange, options.validatedChain)
-                    : await readChain(database, sessionId, nodeId(session.main_chain_id), budget, memo, options.identityOnly);
-                const supplement = options.identityOnly || options.metadataOnly ? { messages: [], state: [], warnings: [] }
-                    : await cliSupplement(database, sessionId, filename, chain.nodes, memo, budget, Boolean(options.roundRange));
-                const warnings = [...new Set([...chain.warnings, ...supplement.warnings])];
+                if (options.excludeHidden && Number(session.hidden ?? 0) !== 0) continue;
                 const summary: DevinConversationSummary = {
                     id: sessionId, canonicalId: sessionId, sessionId, aliases: [sessionId],
                     title: typeof session.title === "string" ? session.title : sessionId,
@@ -348,9 +380,20 @@ export async function readCliConversations(filename: string, budget: ReadBudget,
                     workspaceUris: workspaceUris(session.working_directory, session.workspace_dirs),
                     createdAt: asTimestamp(session.created_at), updatedAt: asTimestamp(session.last_activity_at),
                     sourcePath: filename, desktopPaths: [], sourceKind: "devin-cli", matchedMessageIds: 0,
-                    mainChainId: nodeId(session.main_chain_id) ?? undefined, partial: warnings.length > 0, warnings,
+                    mainChainId: nodeId(session.main_chain_id) ?? undefined, partial: false, warnings: [],
                 };
                 if (options.acceptSummary && !options.acceptSummary(summary)) continue;
+                const empty = !database.prepare("SELECT 1 FROM message_nodes WHERE session_id=? LIMIT 1").get(sessionId);
+                if (options.excludeHidden && empty) continue;
+                const memo = new Map<number, DevinMessageNode>();
+                const chain: ChainResult & { coverage?: DevinRoundCoverage } = empty || options.metadataOnly || options.childDiscoveryOnly ? { nodes: [], compactions: [], warnings: empty ? ["DEVIN_EMPTY_CONVERSATION"] : [] }
+                    : options.roundRange && !options.identityOnly ? await readChainWindow(database, sessionId, nodeId(session.main_chain_id), budget, memo, options.roundRange, options.validatedChain)
+                    : await readChain(database, sessionId, nodeId(session.main_chain_id), budget, memo, options.identityOnly);
+                const supplement = options.identityOnly || options.metadataOnly ? { messages: [], state: [], warnings: [] }
+                    : await cliSupplement(database, sessionId, filename, chain.nodes, memo, budget, Boolean(options.roundRange), options.childDiscoveryOnly);
+                const warnings = [...new Set([...chain.warnings, ...supplement.warnings])];
+                summary.partial = warnings.length > 0;
+                summary.warnings = warnings;
                 results.push({
                     summary, nodes: chain.nodes, compactions: chain.compactions, supplements: supplement.messages,
                     messageIds: collectMessageIds(chain.nodes), toolCallIds: knownToolIds(chain.nodes), hidden: Number(session.hidden ?? 0) !== 0,
@@ -358,6 +401,7 @@ export async function readCliConversations(filename: string, budget: ReadBudget,
                     revision: digest([identity, schema, session, [...memo.values()], chain.compactions, supplement.state, warnings]),
                     ...(chain.coverage ? { coverage: chain.coverage } : {}),
                 });
+                if (results.length === maximumConversations) boundaryActivity = asTimestamp(session.last_activity_at);
                 options.onConversation?.(results[results.length - 1]);
             } catch (error) {
                 budget.check();

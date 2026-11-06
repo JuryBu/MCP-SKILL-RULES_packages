@@ -13,6 +13,7 @@ export interface IsolatedSourceControl {
     signal?: AbortSignal;
     isCancelled?: () => boolean;
     onProgress?: (progress: { phase: string; bytes?: number; totalBytes?: number }) => void;
+    onCheckpoint?: (checkpoint: unknown) => void;
 }
 export interface IsolatedSourceOptions {
     target?: { file: string; execArgv?: string[] };
@@ -139,6 +140,7 @@ export async function runIsolatedSource<Result>(operation: IsolatedSourceOperati
             });
             let failure: Error | undefined;
             let result: any;
+            let checkpoint: any;
             let complete = false;
             let settled = false;
             let stderr = "";
@@ -173,6 +175,11 @@ export async function runIsolatedSource<Result>(operation: IsolatedSourceOperati
                 if (failure || settled || !message || typeof message !== "object") return;
                 try {
                     if (message.type === "patch") result = applySourcePatch(result, message.patch);
+                    else if (message.type === "checkpoint-patch") checkpoint = applySourcePatch(checkpoint, message.patch);
+                    else if (message.type === "checkpoint-complete") {
+                        control.onCheckpoint?.(checkpoint);
+                        checkpoint = undefined;
+                    }
                     else if (message.type === "identity-hints") {
                         for (const summary of message.summaries as DevinConversationSummary[]) rememberIsolatedSourceIdentity(summary);
                     }
@@ -201,7 +208,8 @@ export async function runIsolatedSource<Result>(operation: IsolatedSourceOperati
                 stop(sourceError("SOURCE_WORKER_SHUTDOWN", "History source execution was stopped for shutdown"));
                 await closed;
             });
-            try { child.send({ type: "run", operation, payload, deadlineAt, identityHints: [...identityHints.values()] }, error => { if (error) stop(error); }); }
+            const workDeadlineAt = operation === "candidates" ? deadlineAt - Math.min(250, Math.max(0, Math.floor((deadlineAt - Date.now()) / 5))) : deadlineAt;
+            try { child.send({ type: "run", operation, payload, deadlineAt: workDeadlineAt, identityHints: [...identityHints.values()] }, error => { if (error) stop(error); }); }
             catch (error) { stop(error instanceof Error ? error : new Error(String(error))); }
         });
     } finally { release(); }

@@ -61,6 +61,213 @@ export interface CodexHistorySource {
 }
 
 const verifiedHistorySources = new WeakMap<CodexHistorySource, { revision: string; identities: Array<{ path: string; identity: string }> }>();
+const locateVerifiedHistorySources = new Map<string, CodexHistorySource>();
+
+export interface CodexLocateWindowOptions {
+    maxBytes: number;
+    direction?: "head" | "tail";
+    deadlineAt?: number;
+    isCancelled?: () => boolean;
+    verifiedSource?: CodexHistorySource;
+}
+
+export interface CodexLocateWindowSummary {
+    sourcePath: string;
+    readPath?: string;
+    totalBytes: number;
+    totalBytesExact: boolean;
+    readEndByte?: number;
+    physicalReadBytes: number;
+    sourceReadBytes: number;
+    viewReadBytes: number;
+    readCalls: number;
+    searchedBytes: number;
+    partial: boolean;
+    cancelled: boolean;
+    scope: "physical_file" | "logical_history";
+    sourceRevision?: string;
+    physical?: CodexHistoryPhysicalIdentity;
+    headerSha256?: string;
+    startOrdinal?: number;
+    ordinalMode?: CodexOrdinalMode;
+    ranges: Array<{ startByte: number; endByte: number; sha256: string }>;
+    warnings: string[];
+}
+
+export interface CodexLocateWindowChunk {
+    bytes: Buffer;
+    startByte: number;
+}
+
+export function createCodexLocateWindow(
+    rolloutPath: string,
+    options: CodexLocateWindowOptions,
+): { chunks: Generator<CodexLocateWindowChunk, void>; summary: CodexLocateWindowSummary } {
+    if (!Number.isSafeInteger(options.maxBytes) || options.maxBytes < 0) throw new Error("Codex locate maxBytes must be a non-negative safe integer");
+    if (options.deadlineAt !== undefined && !Number.isFinite(options.deadlineAt)) throw new Error("Codex locate deadlineAt must be finite");
+    const summary: CodexLocateWindowSummary = {
+        sourcePath: normalizeCodexHistoryPath(rolloutPath), totalBytes: 0, totalBytesExact: false, physicalReadBytes: 0,
+        sourceReadBytes: 0, viewReadBytes: 0, readCalls: 0, searchedBytes: 0,
+        partial: true, cancelled: false, scope: "physical_file", ranges: [], warnings: [],
+    };
+    const warn = (reason: string) => { if (!summary.warnings.includes(reason)) summary.warnings.push(reason); };
+    const stopped = () => {
+        if (options.isCancelled?.()) { summary.cancelled = true; warn("cancelled"); return true; }
+        if (options.deadlineAt !== undefined && Date.now() >= options.deadlineAt) { warn("deadline_exhausted"); return true; }
+        return false;
+    };
+    function* chunks(): Generator<CodexLocateWindowChunk, void> {
+        if (stopped()) return;
+        const matches = existingHistoryFiles(summary.sourcePath);
+        summary.sourcePath = matches[0]!;
+        const sourcePhysical = codexHistoryPhysicalIdentity(fs.statSync(summary.sourcePath));
+        summary.physical = sourcePhysical;
+        summary.totalBytes = sourcePhysical.size;
+        summary.totalBytesExact = !parseCodexRolloutFilename(summary.sourcePath);
+        const cached = options.verifiedSource ?? locateVerifiedHistorySources.get(summary.sourcePath);
+        let verified: { source: CodexHistorySource; identities: Array<{ path: string; identity: string }> } | undefined;
+        if (cached) {
+            const proof = verifiedHistorySources.get(cached);
+            let unchanged = Boolean(proof && proof.revision === cached.revision && cached.leafPath === summary.sourcePath
+                && buildRevision(cached.leafPath, cached.segments) === proof.revision);
+            for (const entry of proof?.identities || []) {
+                if (stopped()) return;
+                try { unchanged &&= entry.identity === JSON.stringify(codexHistoryPhysicalIdentity(fs.statSync(entry.path))); }
+                catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; unchanged = false; }
+            }
+            const knownPaths = cached.segments.at(-1);
+            unchanged &&= matches.every(candidate => candidate === knownPaths?.path || knownPaths?.replicas?.some(replica => replica.path === candidate));
+            if (unchanged && proof) verified = { source: cached, identities: proof.identities };
+            else {
+                locateVerifiedHistorySources.delete(summary.sourcePath);
+                if (options.verifiedSource) throw new CodexHistorySourceMismatchError("Codex locate verified source is stale or was not fully verified");
+            }
+        }
+        const segment = verified?.source.segments.at(-1);
+        if (/\.zst$/iu.test(summary.sourcePath) && !segment) { warn("compressed_source_requires_verified_view"); return; }
+        const readPath = segment ? codexHistorySegmentReadPath(segment) : summary.sourcePath;
+        const readPhysical = codexHistoryPhysicalIdentity(fs.statSync(readPath));
+        if (verified && verified.identities.find(entry => entry.path === readPath)?.identity !== JSON.stringify(readPhysical)) {
+            throw new CodexHistorySourceMismatchError("Codex locate verified view changed before window read");
+        }
+        summary.readPath = readPath;
+        const endByte = segment?.endByte ?? readPhysical.size;
+        summary.readEndByte = endByte;
+        summary.headerSha256 = segment?.headerSha256;
+        summary.startOrdinal = segment?.startOrdinal;
+        summary.ordinalMode = segment?.ordinalMode;
+        summary.totalBytes = verified?.source.totalBytes ?? endByte;
+        if (verified) {
+            summary.totalBytesExact = true;
+            summary.scope = "logical_history";
+            summary.sourceRevision = verified.source.revision;
+            if (verified.source.segments.length > 1) warn("history_base_not_scanned");
+        } else if (matches.length > 1) warn("replicas_not_verified");
+        if (stopped()) return;
+        const descriptor = fs.openSync(readPath, "r");
+        let reachedEnd = false;
+        let range: { startByte: number; endByte: number; hash: ReturnType<typeof crypto.createHash> } | undefined;
+        const finishRange = () => {
+            if (!range) return;
+            summary.ranges.push({ startByte: range.startByte, endByte: range.endByte, sha256: range.hash.digest("hex") });
+            range = undefined;
+        };
+        const read = (position: number, length: number): Buffer => {
+            const buffer = Buffer.allocUnsafe(Math.min(length, 16 * 1024, options.maxBytes - summary.physicalReadBytes));
+            if (!buffer.length) return buffer;
+            const count = fs.readSync(descriptor, buffer, 0, buffer.length, position);
+            summary.readCalls += 1;
+            summary.physicalReadBytes += count;
+            if (readPath === summary.sourcePath) summary.sourceReadBytes += count;
+            else summary.viewReadBytes += count;
+            const bytes = buffer.subarray(0, count);
+            if (count) {
+                if (range && range.endByte !== position) finishRange();
+                range ??= { startByte: position, endByte: position, hash: crypto.createHash("sha256") };
+                range.hash.update(bytes);
+                range.endByte += count;
+            }
+            return bytes;
+        };
+        try {
+            if (JSON.stringify(readPhysical) !== JSON.stringify(codexHistoryPhysicalIdentity(fs.fstatSync(descriptor)))) throw new CodexHistorySourceMismatchError("Codex locate source changed before opening");
+            const headerChunks: Buffer[] = [];
+            let position = 0;
+            if (!verified && parseCodexRolloutFilename(summary.sourcePath)) {
+                let headerEnd = -1;
+                while (position < endByte && summary.physicalReadBytes < options.maxBytes && headerEnd < 0) {
+                    if (stopped()) return;
+                    const bytes = read(position, Math.min(4096, endByte - position));
+                    if (!bytes.length) throw new CodexHistorySourceMismatchError("Codex locate source shortened while reading its header");
+                    headerChunks.push(bytes);
+                    const newline = bytes.indexOf(0x0a);
+                    if (newline >= 0) headerEnd = position + newline;
+                    position += bytes.length;
+                    if (position > MAX_HEADER_BYTES) throw new Error("Codex locate header exceeds the safe read limit");
+                    yield { bytes: Buffer.alloc(0), startByte: position };
+                }
+                if (headerEnd < 0 && position < endByte) { warn("header_not_covered"); return; }
+                const headerBytes = Buffer.concat(headerChunks);
+                const header = parseHeader(summary.sourcePath, headerEnd < 0 ? headerBytes : headerBytes.subarray(0, headerEnd));
+                summary.headerSha256 = sha256(header.header);
+                summary.startOrdinal = header.historyBase?.endOrdinalExclusive || 0;
+                summary.ordinalMode = header.ordinalMode;
+                if (header.historyBase?.endByte) warn("history_base_not_scanned");
+                else if (matches.length === 1) { summary.scope = "logical_history"; summary.totalBytesExact = true; }
+            }
+            const tail = options.direction === "tail" && endByte > options.maxBytes;
+            if (tail) {
+                position = Math.max(position, endByte - (options.maxBytes - summary.physicalReadBytes));
+                warn("window_not_full");
+            } else {
+                let headerPosition = 0;
+                for (const bytes of headerChunks) {
+                    if (stopped()) return;
+                    summary.searchedBytes += bytes.length;
+                    yield { bytes, startByte: headerPosition };
+                    headerPosition += bytes.length;
+                }
+            }
+            while (position < endByte && summary.physicalReadBytes < options.maxBytes) {
+                if (stopped()) return;
+                const bytes = read(position, endByte - position);
+                if (!bytes.length) throw new CodexHistorySourceMismatchError("Codex locate source shortened while reading its window");
+                summary.searchedBytes += bytes.length;
+                yield { bytes, startByte: position };
+                position += bytes.length;
+            }
+            reachedEnd = position === endByte;
+            if (!reachedEnd) warn("byte_budget_exhausted");
+            stopped();
+        } finally {
+            finishRange();
+            let openedAfter: CodexHistoryPhysicalIdentity;
+            try { openedAfter = codexHistoryPhysicalIdentity(fs.fstatSync(descriptor)); }
+            finally { fs.closeSync(descriptor); }
+            const assertUnchanged = (filePath: string, expected: string) => {
+                try {
+                    if (JSON.stringify(codexHistoryPhysicalIdentity(fs.statSync(filePath))) === expected) return;
+                } catch (error) {
+                    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+                }
+                throw new CodexHistorySourceMismatchError("Codex locate source changed during window read");
+            };
+            if (JSON.stringify(openedAfter) !== JSON.stringify(readPhysical)) throw new CodexHistorySourceMismatchError("Codex locate opened source changed during window read");
+            assertUnchanged(readPath, JSON.stringify(readPhysical));
+            assertUnchanged(summary.sourcePath, JSON.stringify(sourcePhysical));
+            stopped();
+            if (verified) {
+                for (const entry of verified.identities) {
+                    if (stopped()) break;
+                    assertUnchanged(entry.path, entry.identity);
+                }
+            }
+            if (!reachedEnd && !summary.warnings.length) warn("window_consumer_stopped");
+            summary.partial = !reachedEnd || summary.warnings.length > 0;
+        }
+    }
+    return { chunks: chunks(), summary };
+}
 
 async function historyValidationIdentities(source: { segments: Array<Pick<CodexHistorySegment, "path" | "readPath" | "replicas">> }): Promise<Array<{ path: string; identity: string }>> {
     const paths = [...new Set(source.segments.flatMap(segment => [segment.path, ...(segment.readPath ? [segment.readPath] : []), ...(segment.replicas || []).flatMap(replica => [replica.path, ...(replica.archive ? [replica.archive.viewPath] : [])])]))].sort();
@@ -671,6 +878,9 @@ async function verifyCapturedHistorySource(source: CodexHistorySource, identitie
         if (JSON.stringify(before) === JSON.stringify(after)) {
             throwIfCodexReadCancelled(isCancelled);
             verifiedHistorySources.set(source, { revision: source.revision, identities: after });
+            locateVerifiedHistorySources.delete(source.leafPath);
+            locateVerifiedHistorySources.set(source.leafPath, source);
+            while (locateVerifiedHistorySources.size > 32) locateVerifiedHistorySources.delete(locateVerifiedHistorySources.keys().next().value!);
             return;
         }
         if (attempt >= 2 || !pinnedLeafAppend(leaf, before, after)) throw new CodexHistorySourceMismatchError("Codex history changed during source capture");
