@@ -46,9 +46,13 @@ async function execute(payload: ProgressiveTaskPayload): Promise<string> {
         await writeReady();
     };
     let publicationOrder = 0;
+    const ancestryWarning = "CODEX_HISTORY_ANCESTRY_PENDING: 当前明文窗口已发布为相对轮号，声明的祖先尚未认证，完整范围仍未完成";
     const publishRaw = async (range: CodexHistoryWindowRange): Promise<void> => {
         check();
         const source = projectProgressiveSource(range.source, request);
+        const sourceRangeVerified = (source.snapshot as { source?: { sourceRangeVerified?: boolean } })?.source?.sourceRangeVerified !== false;
+        if (!sourceRangeVerified && !ready.warnings.includes(ancestryWarning)) ready.warnings.push(ancestryWarning);
+        if (sourceRangeVerified) ready.warnings = ready.warnings.filter(warning => warning !== ancestryWarning);
         const cacheDirectory = range.publication === "append" && ready.current?.source.revision === source.revision
             ? ready.current.directory : path.join(directory, "ranges", hash([source.revision, range.rangeId]));
         const cache = await openProgressiveCache({ root: cacheDirectory, source });
@@ -90,9 +94,9 @@ async function execute(payload: ProgressiveTaskPayload): Promise<string> {
             ready.preferredBlockIds = status.blocks.filter(block => preferred.has(block.blockId))
                 .sort((first, second) => (first.order ?? 0) - (second.order ?? 0)).map(block => block.blockId);
         }
-        ready.requestedRangeComplete = status.relativeReadyRounds >= request.initialRounds
+        ready.requestedRangeComplete = sourceRangeVerified && (status.relativeReadyRounds >= request.initialRounds
             || range.coverage.requestedRangeComplete
-            || (request.direction === "latest" ? range.coverage.historyStartReached : range.coverage.snapshotEndReached);
+            || (request.direction === "latest" ? range.coverage.historyStartReached : range.coverage.snapshotEndReached));
         await select(cacheDirectory, source);
         await send({ type: "progress", stage: ready.phase, current: status.relativeReadyRounds,
             detail: "已就绪 " + status.relativeReadyRounds + " 轮，可立即读、搜、定位；其余内容继续准备" });
@@ -105,7 +109,8 @@ async function execute(payload: ProgressiveTaskPayload): Promise<string> {
     try { await readCodexHistoryWindow({
         conversationId: request.conversationId, sourcePath: thread.rolloutPath,
         direction: request.direction, maxRounds: request.initialRounds,
-        continueHistory: request.buildFull,
+        continueHistory: request.buildFull && request.direction !== "latest",
+        fillRequestedRange: !request.buildFull,
         rangeRounds: Math.min(25, request.initialRounds), messageRoles: projection.messageRoles,
         isCancelled: () => cancelled,
         onRange: publishRaw,
@@ -122,6 +127,11 @@ async function execute(payload: ProgressiveTaskPayload): Promise<string> {
     }
     check();
     if (!request.buildFull) {
+        if (!ready.requestedRangeComplete) ready.warnings.push("CODEX_WINDOW_RECOVERY: 当前局部范围或祖先认证尚未完成，可用以下请求继续完整准备；仍保留原资源上限：" + JSON.stringify({
+            action: "prepare", conversationId: request.ownerId, conversationIds: [request.conversationId], dataChain: "codex",
+            lastRounds: request.initialRounds, prepareCache: true, buildOrder: request.direction, waitSeconds: 0,
+            messageRoles: request.messageRoles, depth: request.depth,
+        }));
         ready.phase = "requested-range-ready";
         await writeReady();
         return JSON.stringify({ taskId: payload.taskId, ready });
@@ -134,9 +144,15 @@ async function execute(payload: ProgressiveTaskPayload): Promise<string> {
     const { projectCodexCorpusRound } = await import("./conversation-corpus-reader-projection.js");
     const loaded = await loadConversationData("codex", request.conversationId, {
         source: "local", refresh: true, link: request.link || "reference", includeRounds: false, requestClass: "background", isCancelled: () => cancelled,
+    }).catch(async error => {
+        ready.warnings.push("CODEX_FULL_CACHE_PENDING: 完整历史准备失败，已发布范围及原引用继续保留；" + (error instanceof Error ? error.message : String(error)));
+        await writeReady();
+        throw error;
     });
     check();
     if (!loaded?.cacheKey || !loaded.cacheGeneration || loaded.sourcePartial || loaded.cacheBuildFailure) {
+        ready.warnings.push("CODEX_FULL_CACHE_PENDING: 完整历史未通过全部来源验证，已发布局部范围继续可读");
+        await writeReady();
         throw new Error("Full history cache is not completely verified; ready ranges remain available");
     }
     const bounds = getConversationRoundIndexBounds(loaded);
@@ -178,6 +194,7 @@ async function execute(payload: ProgressiveTaskPayload): Promise<string> {
     await cache.finish(writer);
     active = undefined;
     ready.phase = "complete";
+    ready.warnings = ready.warnings.filter(warning => !warning.startsWith("CODEX_HISTORY_ANCESTRY_PENDING:") && !warning.startsWith("CODEX_WINDOW_RECOVERY:") && !warning.startsWith("CODEX_FULL_CACHE_PENDING:"));
     ready.preferredBlockIds = undefined;
     ready.fullCacheGeneration = loaded.cacheGeneration;
     ready.requestedRangeComplete = true;

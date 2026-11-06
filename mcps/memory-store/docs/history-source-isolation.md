@@ -32,6 +32,12 @@
 
 Codex冷压缩原文需要完整解压和内容校验后才能做完整正文定位。有界探针会保留`compressed_source_requires_verified_view`与具体准备参数；先以目标ID调用`fetch(source="local", progressive=false, background=true)`，沿原后台任务等到完整缓存提交成功，再用`source="cache"`的`list/search/read`。已提交的同一generation可在新进程重用，缓存检索会保留原来源及覆盖。尚未准备的原始压缩来源继续显示部分状态。
 
+## Codex近期窗口与旧历史
+
+目标对话采用显式ordinal的明文追加段时，近期读取先使用对话元数据指定的当前段，核对session身份、头部声明、物理快照及记录顺序。较老压缩祖先尚未读取时，当前段已取得的正文可以先使用；它保留祖先的字节和ordinal边界声明，轮次按局部相对位置返回。
+
+这种窗口的`sourceRangeVerified=false`、`requestedRangeComplete=false`和`fullSourceComplete=false`会继续保留，已发布的正文与固定`rangeRef`仍可读取。当前段不足所需轮数、来源在读取中变化或完整祖先核验受限时，结果说明实际覆盖及未完成部分，沿原任务继续查询，避免重复新建任务。完整fetch、Record和recall仍走原完整来源规则；压缩、记录、字节及内存上限保持。
+
 ## 其它同类修复
 
 记忆关键词检索改为分批异步读取所需的正文前缀，保留原先前3000个UTF-16代码单元的匹配语义，减少为短预览读完整大文件的开销。旧Codex bridge的元数据/来源指纹使用已有异步入口。PDF附加文件的Python探测和嵌入改为有界异步子进程，并在进程关闭后结算。

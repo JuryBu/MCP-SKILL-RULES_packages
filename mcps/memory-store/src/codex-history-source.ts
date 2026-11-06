@@ -1023,6 +1023,8 @@ export interface CodexStreamingHistorySegment {
 export interface CodexStreamingHistorySource {
     leafPath: string;
     segments: CodexStreamingHistorySegment[];
+    unverifiedHistoryBase?: HistoryBase;
+    sourceRangeVerified?: boolean;
 }
 
 export interface CodexStreamingHistoryPosition {
@@ -1148,7 +1150,7 @@ export async function readCodexStreamingSessionMeta(filePath: string, options: C
 
 export async function resolveCodexStreamingHistorySource(
     rolloutPath: string,
-    options: { roots?: string[]; pathsByRolloutId?: Map<string, string[]>; archive?: CodexHistoryArchiveOptions; isCancelled?: () => boolean } = {},
+    options: { roots?: string[]; pathsByRolloutId?: Map<string, string[]>; archive?: CodexHistoryArchiveOptions; isCancelled?: () => boolean; deferAncestors?: boolean } = {},
 ): Promise<CodexStreamingHistorySource> {
     const archive = { ...options.archive, isCancelled: options.isCancelled ?? options.archive?.isCancelled };
     const requestedPath = normalizeCodexHistoryPath(rolloutPath);
@@ -1176,6 +1178,10 @@ export async function resolveCodexStreamingHistorySource(
         reverse.push({ path: selectedPath, replicas: matches.filter(candidate => candidate !== selectedPath), ...header.identity, startOrdinal: header.historyBase?.endOrdinalExclusive || 0, endOrdinalExclusive, endByte, headerSha256: sha256(header.header), ordinalMode: header.ordinalMode, physical });
         const base = header.historyBase;
         if (!base || base.endByte === 0) break;
+        if (seen.has(base.rolloutId)) throw new Error("Circular Codex history_base reference");
+        if (options.deferAncestors && reverse.length === 1 && header.ordinalMode === "explicit" && !/\.zst$/iu.test(selectedPath)) {
+            return { leafPath, segments: reverse, unverifiedHistoryBase: base, sourceRangeVerified: false };
+        }
         index ??= await indexRoots(uniqueRoots(leafPath, options.roots), archive.isCancelled);
         matches = [...new Set(index.get(base.rolloutId) || [])];
         if (!matches.length && options.pathsByRolloutId) {
@@ -1195,6 +1201,7 @@ export async function scanCodexStreamingHistory(
     onEvent: (event: any, position: CodexStreamingHistoryPosition) => void | Promise<void>,
     options: { archive?: CodexHistoryArchiveOptions; isCancelled?: () => boolean; onProgress?: (bytes: number) => void; replayFrom?: CodexStreamingHistoryPosition; previousVerification?: CodexStreamingHistoryVerification; onPrefixProof?: (proof: CodexStreamingPrefixProof) => void } = {},
 ): Promise<CodexStreamingHistoryVerification> {
+    if (source.unverifiedHistoryBase !== undefined || source.sourceRangeVerified === false) throw new CodexHistorySourceMismatchError("Full Codex history scan requires verified ancestry");
     const verified: CodexStreamingHistoryVerification["segments"] = [];
     const archive = { ...options.archive, isCancelled: options.isCancelled ?? options.archive?.isCancelled };
     let previousMode: CodexOrdinalMode | undefined;

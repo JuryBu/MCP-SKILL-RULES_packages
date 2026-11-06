@@ -35,6 +35,7 @@ export interface CodexHistoryWindowOptions {
     maxRounds?: number;
     rangeRounds?: number;
     continueHistory?: boolean;
+    fillRequestedRange?: boolean;
     messageRoles?: CorpusMessageRole[];
     archive?: CodexHistoryArchiveOptions;
     maxRecordBytes?: number;
@@ -200,9 +201,13 @@ export async function readCodexHistoryWindow(options: CodexHistoryWindowOptions)
     let sourcePath = options.sourcePath;
     if (!options.source && !sourcePath) sourcePath = (await (await import("./codex-client.js")).getCodexThreadAsync(options.conversationId))?.rolloutPath;
     if (!options.source && !sourcePath) throw new Error("Codex window source not found");
-    const snapshot = structuredClone(options.source ?? await resolveCodexStreamingHistorySource(sourcePath!, { roots: options.roots, pathsByRolloutId: options.pathsByRolloutId, archive: options.archive, isCancelled: options.isCancelled }));
+    const snapshot = structuredClone(options.source ?? await resolveCodexStreamingHistorySource(sourcePath!, { roots: options.roots, pathsByRolloutId: options.pathsByRolloutId, archive: options.archive, isCancelled: options.isCancelled, deferAncestors: direction === "latest" && !options.continueHistory }));
     if (!snapshot.segments.length || snapshot.segments.some(segment => segment.threadId !== options.conversationId)) throw new Error("Codex window source conversation mismatch");
     if (snapshot.segments.some(segment => segment.replicas.length)) throw new Error("Codex window replica verification required; use full canonical reader");
+    if (snapshot.unverifiedHistoryBase) {
+        if (direction !== "latest" || options.continueHistory || snapshot.segments.length !== 1 || snapshot.segments[0]!.path !== snapshot.leafPath || snapshot.sourceRangeVerified !== false) throw new Error("Codex window deferred ancestry requires a partial latest leaf");
+        Object.freeze(snapshot.unverifiedHistoryBase);
+    }
     for (const segment of snapshot.segments) { Object.freeze(segment.physical); Object.freeze(segment.replicas); Object.freeze(segment); }
     Object.freeze(snapshot.segments); Object.freeze(snapshot);
     assertSource(snapshot);
@@ -280,7 +285,10 @@ export async function readCodexHistoryWindow(options: CodexHistoryWindowOptions)
         if (segmentIndex > 0) {
             const parent = snapshot.segments[segmentIndex - 1]!;
             if (!base || base.thread_id !== parent.rolloutId || base.end_byte_offset !== parent.endByte || base.end_ordinal_exclusive !== parent.endOrdinalExclusive || base.end_ordinal_exclusive !== segment.startOrdinal) throw new Error("Codex window adopted declaration mismatch");
-        } else if (base && base.end_byte_offset !== 0) throw new Error("Codex window adopted prefix missing");
+        } else if (base && base.end_byte_offset !== 0) {
+            const pending = snapshot.unverifiedHistoryBase;
+            if (!pending || base.thread_id !== pending.rolloutId || base.end_byte_offset !== pending.endByte || base.end_ordinal_exclusive !== pending.endOrdinalExclusive || base.end_ordinal_exclusive !== segment.startOrdinal) throw new Error("Codex window adopted prefix missing");
+        } else if (snapshot.unverifiedHistoryBase) throw new Error("Codex window deferred ancestry declaration mismatch");
         origins.set(segment.path, codexCorpusThreadOrigin(metadata, options.conversationId));
         options = { ...options, cwd: options.cwd ?? metadata.cwd as string | undefined };
         const reverse = direction === "latest" && !/\.zst$/iu.test(segment.path) && segment.ordinalMode === "explicit";
@@ -297,7 +305,7 @@ export async function readCodexHistoryWindow(options: CodexHistoryWindowOptions)
         for await (const record of records) {
             const event = parse(record);
             const ordinal = event.ordinal ?? forwardOrdinal;
-            if (segment.ordinalMode === "explicit" && event.ordinal === undefined || !Number.isSafeInteger(ordinal) || ordinal < 0 || previousOrdinal !== undefined && (reverse ? ordinal >= previousOrdinal : ordinal <= previousOrdinal)) throw new Error("Codex window ordinal ordering mismatch");
+            if (segment.ordinalMode === "explicit" && event.ordinal === undefined || !Number.isSafeInteger(ordinal) || ordinal < 0 || ordinal < segment.startOrdinal || !Number.isSafeInteger(ordinal + 1) || previousOrdinal !== undefined && (reverse ? ordinal >= previousOrdinal : ordinal <= previousOrdinal)) throw new Error("Codex window ordinal ordering mismatch");
             if (!boundaryChecked && reverse && segment.endOrdinalExclusive !== undefined && ordinal !== segment.endOrdinalExclusive - 1) throw new Error("Codex window adopted ordinal boundary mismatch");
             previousOrdinal = ordinal; forwardOrdinal = ordinal + 1; boundaryChecked = true;
             if (record.startByte === 0) {
@@ -330,7 +338,7 @@ export async function readCodexHistoryWindow(options: CodexHistoryWindowOptions)
         if (!reverse && !stoppedEarly && segment.endOrdinalExclusive !== undefined && forwardOrdinal !== segment.endOrdinalExclusive) throw new Error("Codex window adopted ordinal boundary mismatch");
         const chronological = reverse ? segmentEntries.reverse() : segmentEntries;
         entries = direction === "latest" ? chronological.concat(entries) : entries.concat(chronological);
-        historyStartReached = direction === "oldest" || reachedStart && segment === snapshot.segments[0];
+        historyStartReached = !snapshot.unverifiedHistoryBase && (direction === "oldest" || reachedStart && segment === snapshot.segments[0]);
         snapshotEndReached = direction === "latest" || !stoppedEarly && segment === snapshot.segments.at(-1);
         progress.segmentsRead += 1;
         const publication = await publishAvailable(false, entries);
@@ -338,8 +346,29 @@ export async function readCodexHistoryWindow(options: CodexHistoryWindowOptions)
         if (options.continueHistory) entries = publication.remaining;
     }
     await publishAvailable(true, entries);
+    const selected = priorityResult ?? result!;
+    if (!options.source && direction === "latest" && !options.continueHistory && options.fillRequestedRange !== false
+        && snapshot.unverifiedHistoryBase && !selected.coverage.requestedRangeComplete && !selected.coverage.historyStartReached) {
+        assertSource(snapshot);
+        cancelled(options);
+        const remainingBytes = (options.maxReadBytes ?? 8 * 1024 ** 3) - progress.bytesRead;
+        if (remainingBytes <= 0) throw new Error("Codex window read byte limit");
+        const completeSource = await resolveCodexStreamingHistorySource(snapshot.leafPath, {
+            roots: options.roots, pathsByRolloutId: options.pathsByRolloutId, archive: options.archive, isCancelled: options.isCancelled,
+        });
+        cancelled(options);
+        const cumulative = (next: CodexHistoryWindowProgress): CodexHistoryWindowProgress => ({ ...next,
+            bytesRead: progress.bytesRead + next.bytesRead, recordsRead: progress.recordsRead + next.recordsRead,
+            segmentsRead: progress.segmentsRead + next.segmentsRead,
+        });
+        const completed = await readCodexHistoryWindow({ ...options, source: completeSource, maxReadBytes: remainingBytes,
+            onRange: range => options.onRange?.({ ...range, progress: cumulative(range.progress) }),
+            onProgress: next => options.onProgress?.(cumulative(next)),
+        });
+        return { ...completed, progress: cumulative(completed.progress) };
+    }
     await options.onProgress?.({ ...progress, phase: "complete", roundsReady: options.continueHistory ? totalPublished : result?.rounds.length ?? 0 });
     assertSource(snapshot);
     cancelled(options);
-    return priorityResult ?? result!;
+    return selected;
 }
