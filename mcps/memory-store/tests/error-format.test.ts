@@ -61,6 +61,13 @@ check("invalid_input → invalid_input + 不可重试", () => {
     assert.equal(r2.category, "invalid_input");
 });
 
+check("明确来源参数错误 code → invalid_input + 不可重试", () => {
+    const classified = classifyError(errWithCode("Unsupported corpus source", "CORPUS_SOURCE_INVALID"));
+    assert.equal(classified.category, "invalid_input");
+    assert.equal(classified.retryable, false);
+    assert.doesNotMatch(classified.hint, /谨慎重试|重试一次/u);
+});
+
 check("network → network + retryable", () => {
     const r = classifyError(errWithCode("connect ECONNREFUSED", "ECONNREFUSED"));
     assert.equal(r.category, "network");
@@ -74,6 +81,8 @@ check("普通 Error → unknown + 不可重试", () => {
     assert.equal(r.category, "unknown");
     assert.equal(r.retryable, false);
     assert.equal(r.message, "something weird happened");
+    assert.match(r.hint, /核对本次调用状态与已有结果/u);
+    assert.doesNotMatch(r.hint, /重试/u);
 });
 
 check("字符串错误不抛、可归类", () => {
@@ -126,6 +135,24 @@ check("undefined 入参不回显", () => {
     const text = formatToolError("memory_query", new Error("boom"), { query: undefined, mode: "auto" });
     assert.ok(!text.includes("query="), "undefined 的键不应出现");
     assert.ok(text.includes("mode=auto"), "有值的白名单键应出现");
+});
+
+check("source 只回显安全来源枚举", () => {
+    for (const source of ["auto", "local", "ls", "cache"]) {
+        const text = formatToolError("conversation_read_original", new Error("boom"), { source });
+        assert.ok(text.includes(`source=${source}`));
+    }
+    for (const source of ["private-source", "cache\nprivate-source", null, { token: "private-source" }, ["cache"]]) {
+        const text = formatToolError("conversation_read_original", new Error("boom"), { source });
+        assert.doesNotMatch(text, /source=|private-source/u);
+    }
+});
+
+check("unknown 的不可重试标记与建议一致", () => {
+    const text = formatToolError("conversation_read_original", new Error("boom"));
+    assert.match(text, /分类: unknown/u);
+    assert.match(text, /可重试: 否/u);
+    assert.doesNotMatch(text, /谨慎重试|重试一次/u);
 });
 
 check("formatToolError 对非 Error 不抛", () => {

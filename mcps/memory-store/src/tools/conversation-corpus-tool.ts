@@ -87,7 +87,7 @@ export async function runCorpusAction(params: CorpusToolParams, supplied?: Corpu
     const createsRequest = ["search_all", "read_hit", "read_fast"].includes(params.action);
     const sources = createsRequest || params.dataChain !== undefined || params.dataChains !== undefined || params.chain !== undefined
         ? resolveCorpusSources(params) : undefined;
-    if (params.source === "ls" || params.source === "cache") throw new Error("search_all/read_hit/read_fast使用来源校验后的正文投影，请使用source=auto/local；固定旧fetch缓存可用search/read");
+    if (params.source === "ls" || params.source === "cache") throw Object.assign(new Error("search_all/read_hit/read_fast使用来源校验后的正文投影，请移除source或设置source=auto/local；固定旧fetch缓存generation请使用旧search/read(source=cache)"), { code: "CORPUS_SOURCE_INVALID" });
     if (params.forceRefresh && params.action !== "search_all") throw new Error("forceRefresh仅用于新建search_all，既有任务和命中展开保持原来源版本");
     const api = supplied || await implementation();
     const roles = selectedRoles(params.messageRoles);

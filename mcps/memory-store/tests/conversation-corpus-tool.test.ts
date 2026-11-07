@@ -6,6 +6,7 @@ import { createHash } from "node:crypto";
 import { corpusToolResult, isCorpusAction, runCorpusAction as runCorpusActionRaw, type CorpusToolImplementation } from "../src/tools/conversation-corpus-tool.js";
 import type { CorpusConversation } from "../src/conversation-corpus-types.js";
 import { registerConversation } from "../src/tools/conversation.js";
+import { classifyError } from "../src/error-format.js";
 
 const runCorpusAction = (params: Parameters<typeof runCorpusActionRaw>[0], supplied?: CorpusToolImplementation) =>
     runCorpusActionRaw({ dataChain: "codex", ...params }, supplied);
@@ -65,7 +66,20 @@ assert.equal(calls.filter(call => call.operation === "prepare").length, preparat
 await assert.rejects(() => runCorpusAction({ action: "read_fast", conversationId: "caller-a", conversationIds: ["target", "other"], lastRounds: 1 }, api), /一个目标/u);
 await assert.rejects(() => runCorpusAction({ action: "read_fast", conversationId: "target", sourceRevision: "old", lastRounds: 1 }, api), /read_hit/u);
 await assert.rejects(() => runCorpusAction({ action: "read_fast", conversationId: "target", startRound: 4, endRound: 3 }, api), /startRound/u);
-for (const source of ["cache", "ls"] as const) await assert.rejects(() => runCorpusAction({ action: "read_fast", conversationId: "target", source, lastRounds: 1 }, api), /source=auto\/local/u);
+for (const action of ["search_all", "read_hit", "read_fast"] as const) {
+    for (const source of ["cache", "ls"] as const) {
+        const callsBeforeRejection = calls.length;
+        await assert.rejects(() => runCorpusAction({ action, conversationId: "target", source, lastRounds: 1 }, api), (error: unknown) => {
+            assert.ok(error instanceof Error);
+            assert.match(error.message, /请移除source或设置source=auto\/local/u);
+            assert.match(error.message, /旧search\/read\(source=cache\)/u);
+            assert.equal(classifyError(error).category, "invalid_input");
+            assert.equal(classifyError(error).retryable, false);
+            return true;
+        });
+        assert.equal(calls.length, callsBeforeRejection);
+    }
+}
 await assert.rejects(() => runCorpusAction({ action: "read_fast", conversationId: "target", forceRefresh: true, lastRounds: 1 }, api), /forceRefresh仅用于新建search_all/u);
 await assert.rejects(() => runCorpusAction({ action: "search_all", query: "word" }, api), /调用者/u);
 await assert.rejects(() => runCorpusAction({ action: "read_hit", conversationId: "target", startRound: 1 }, api), /sourceRevision/u);
@@ -93,6 +107,32 @@ assert.equal(missingIdentity.isError, true);
 const missingCache = await handler({ action: "read", conversationId: "10000000-0000-4000-8000-000000000061", source: "cache", dataChain: "codex", startRound: 1, endRound: 1 });
 assert.equal(missingCache.isError, true);
 
+for (const action of ["search_all", "read_hit", "read_fast"] as const) {
+    const arguments_ = { action, conversationId: "caller-a", conversationIds: ["target"], dataChain: "codex", query: "缓存",
+        sourceRevision: action === "read_hit" ? "revision-a" : undefined, lastRounds: 1, prepareCache: false };
+    for (const source of ["cache", "ls"] as const) {
+        const callsBeforeRejection = calls.length;
+        const rejected = await handler({ ...arguments_, source });
+        assert.equal(rejected.isError, true);
+        const text = rejected.content[0].text;
+        assert.match(text, /分类: invalid_input/u);
+        assert.match(text, /可重试: 否/u);
+        assert.match(text, /请移除source或设置source=auto\/local/u);
+        assert.match(text, /旧search\/read\(source=cache\)/u);
+        assert.ok(text.includes(`source=${source}`));
+        assert.doesNotMatch(text, /谨慎重试|重试一次/u);
+        assert.equal(calls.length, callsBeforeRejection);
+    }
+    for (const source of [undefined, "auto", "local"] as const) {
+        const accepted = await handler({ ...arguments_, ...(source === undefined ? {} : { source }) });
+        assert.notEqual(accepted.isError, true, accepted.content[0].text);
+        const value = JSON.parse(accepted.content[0].text);
+        if (action === "search_all") assert.equal(value.taskId, "task-a");
+        else if (action === "read_hit") assert.equal(value.revision, "revision-a");
+        else assert.equal(value.requestedRangeComplete, true);
+    }
+}
+
 const large = { text: "原文".repeat(50000) };
 const result = await corpusToolResult(large);
 const delivery = JSON.parse(result.content[0].text);
@@ -107,4 +147,4 @@ assert.equal(path.dirname(directory), os.tmpdir());
 assert.match(path.basename(directory), /^memory-store-corpus-/u);
 await fs.unlink(delivery.artifactPath);
 await fs.rmdir(directory);
-console.log("PASS corpus tool routes caller/target identities, revision/round linkage, bounded status and complete hashed artifacts");
+console.log("PASS corpus tool routes caller/target identities, revision/round linkage, bounded status, complete hashed artifacts and source diagnostics");

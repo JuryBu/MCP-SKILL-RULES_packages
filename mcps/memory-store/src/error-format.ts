@@ -40,6 +40,7 @@ const KEY_ARG_ALLOWLIST = new Set<string>([
     "chain",
     "dataChain",
     "modelChain",
+    "source",
     "stageId",
     "background",
     "query",
@@ -172,7 +173,7 @@ export function classifyError(err: unknown): ClassifiedError {
     return {
         category: "unknown",
         retryable: false,
-        hint: "未归类错误：原样重试未必有效，建议结合错误信息排查；若怀疑是瞬时问题可谨慎重试一次。",
+        hint: "未归类错误：请先核对本次调用状态与已有结果，再结合错误信息排查原因。",
         message,
     };
 }
@@ -209,6 +210,7 @@ function sanitizeKeyArgs(keyArgs?: Record<string, unknown>): Array<[string, stri
         if (!KEY_ARG_ALLOWLIST.has(key)) continue;
         const value = keyArgs[key];
         if (value === undefined) continue;
+        if (key === "source" && (typeof value !== "string" || !["auto", "local", "ls", "cache"].includes(value))) continue;
         out.push([key, formatKeyArgValue(value)]);
     }
     return out;
