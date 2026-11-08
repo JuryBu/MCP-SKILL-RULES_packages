@@ -106,7 +106,7 @@ export async function executeHostProgressivePreparation(payload: ProgressiveTask
         && (candidate.id === request.conversationId || candidate.canonicalId === request.conversationId || candidate.aliases?.includes(request.conversationId)));
     if (!conversation) throw new Error("Conversation is unavailable in the explicitly selected source");
     if (conversation.isChildThread && request.messageRolesExplicit === false) {
-        request.messageRoles = ["subagent"];
+        request.messageRoles = request.depth === "full" ? ["tool", "subagent"] : ["subagent"];
         projection = normalizeProgressiveProjection(request.messageRoles, request.depth);
     }
     let initialWindow = ready.initialWindow;

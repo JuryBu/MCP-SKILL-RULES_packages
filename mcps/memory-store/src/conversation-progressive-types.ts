@@ -102,6 +102,8 @@ export interface ProgressiveSearchResult {
     status: ProgressiveStatus;
     match: CorpusConversationMatch | null;
     hits: Array<{ ref: string; round: number; blockId: string; kind: ProgressiveCoverage["kind"] }>;
+    totalHits: number;
+    hasMoreHits: boolean;
     scannedRounds: number;
     scannedMessages: number;
     searchedRanges: ProgressiveReadyRange[];

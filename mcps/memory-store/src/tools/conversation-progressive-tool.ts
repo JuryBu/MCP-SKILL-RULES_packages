@@ -27,6 +27,7 @@ export interface ProgressiveToolParams {
     waitSeconds?: number;
     afterProgressRevision?: string;
     query?: string;
+    maxHits?: number;
     allTerms?: string[];
     anyTerms?: string[];
     excludeTerms?: string[];
@@ -60,9 +61,13 @@ function verifiedSourceRange(source: ProgressiveSource): boolean {
 }
 
 function withAvailableRoles(value: unknown): unknown {
-    const status = value as { request?: ProgressiveRequest; ready?: { source: ProgressiveSource } };
+    const status = value as { request?: ProgressiveRequest; ready?: { source: ProgressiveSource }; next?: { action?: string } };
     const projection = normalizeProgressiveProjection(status.request?.messageRoles, status.request?.depth);
-    return { ...status, availableMessageRoles: status.ready?.source ? availableProgressiveRoles(status.ready.source) : projection.messageRoles,
+    const availableMessageRoles = status.ready?.source ? availableProgressiveRoles(status.ready.source) : undefined;
+    return { ...status, requestedMessageRoles: projection.messageRoles, availableMessageRoles,
+        messageRolesVerified: availableMessageRoles !== undefined,
+        next: status.next?.action === "read_ready" && availableMessageRoles
+            ? { ...status.next, messageRoles: availableMessageRoles, depth: projection.depth } : status.next,
         preparedDepth: projection.depth };
 }
 
@@ -87,8 +92,9 @@ export async function runProgressiveAction(params: ProgressiveToolParams): Promi
         const started = await startProgressivePreparation(request) as { taskId: string };
         const status = await getProgressiveTaskStatus({ ownerId, taskId: started.taskId,
             waitMs: Math.min(45000, Math.max(0, (params.waitSeconds ?? (params.action === "read_fast" ? 1 : 0)) * 1000)) });
-        const effectiveRoles = params.messageRoles === undefined && (status as { ready?: { source?: ProgressiveSource } }).ready?.source?.conversation?.isChildThread
-            ? normalizeProgressiveProjection(["subagent"], request.depth).messageRoles : request.messageRoles;
+        const readySource = (status as { ready?: { source?: ProgressiveSource } }).ready?.source;
+        const effectiveRoles = params.messageRoles === undefined && readySource?.conversation?.isChildThread
+            ? availableProgressiveRoles(readySource) : request.messageRoles;
         return { ...(withAvailableRoles(status) as object), next: (status as { rangeAvailable?: boolean }).rangeAvailable ? {
             status: { action: "prepare_status", conversationId: ownerId, dataChain, taskId: started.taskId, waitSeconds: 30,
                 afterProgressRevision: (status as { revision?: string }).revision },
@@ -113,16 +119,19 @@ export async function runProgressiveAction(params: ProgressiveToolParams): Promi
     if (!preparation.rangeAvailable && !params.rangeRef) return withAvailableRoles(preparation);
     const { cache, ready, row } = await openProgressiveTaskCache(identity, params.rangeRef);
     const status = await cache.status();
+    const availableMessageRoles = availableProgressiveRoles(status.source);
     const selectedRoles = params.messageRoles === undefined && status.source.conversation?.isChildThread
-        ? normalizeProgressiveProjection(["subagent"], params.depth).messageRoles : roles(params);
+        ? availableMessageRoles.filter(role => role === "subagent" || (params.depth === "full" && role === "tool")) : roles(params);
     if ((params.depth === "full" || params.extraTypes?.length) && preparation.request.depth !== "full") {
         throw new Error("此任务按normal准备，尚无完整思考和工具详情。请用prepare、depth=full及所需messageRoles准备对应范围，再沿返回的taskId读取");
     }
-    const availableMessageRoles = availableProgressiveRoles(status.source);
     const missingRoles = selectedRoles.filter(role => !availableMessageRoles.includes(role));
     if (missingRoles.length) throw new Error("Requested message roles were not prepared: " + missingRoles.join(", ") + ". Available message roles: " + availableMessageRoles.join(", ")
-        + ". Next call: " + JSON.stringify({ action: "prepare", conversationId: ownerId, conversationIds: [status.source.conversationId],
-            lastRounds: params.lastRounds ?? 5, prepareCache: false, dataChain: status.source.host, messageRoles: selectedRoles, depth: params.depth || "normal" }));
+        + ". Next call: " + JSON.stringify(status.source.conversation?.isChildThread
+            ? { action: "read_ready", conversationId: ownerId, taskId, dataChain: status.source.host,
+                lastRounds: params.lastRounds ?? 5, messageRoles: availableMessageRoles, depth: preparation.request.depth || "normal" }
+            : { action: "prepare", conversationId: ownerId, conversationIds: [status.source.conversationId],
+                lastRounds: params.lastRounds ?? 5, prepareCache: false, dataChain: status.source.host, messageRoles: selectedRoles, depth: params.depth || "normal" }));
     if (params.action === "locate_ready") {
         if (!params.rangeRef || !row) throw new Error("locate_ready requires a previously returned rangeRef");
         return { taskId, source: status.source, availableMessageRoles, ref: row.ref, blockId: row.blockId,
@@ -139,7 +148,7 @@ export async function runProgressiveAction(params: ProgressiveToolParams): Promi
         const result = await cache.search({
             query: params.query, allTerms: params.allTerms, anyTerms: params.anyTerms, excludeTerms: params.excludeTerms,
             expression: params.searchExpression, intersectionScope: params.intersectionScope, sort: params.searchSort,
-            caseSensitive: params.caseSensitive, messageRoles: selectedRoles,
+            caseSensitive: params.caseSensitive, messageRoles: selectedRoles, maxHits: params.maxHits,
         }, selection);
         const sourceRangeVerified = verifiedSourceRange(result.status.source);
         const originRevision = (result.status.source.snapshot as { source?: { revision?: string } })?.source?.revision;

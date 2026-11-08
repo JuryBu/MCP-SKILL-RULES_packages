@@ -2031,7 +2031,7 @@ fetch/search/read/recall/export 必须传 conversationId（共享 broker 后端�
             maxBytes: z.number().optional()
                 .describe("[deep_locate/search_all] 每次执行的来源扫描字节预算；[read] 单段交付字节上限，会覆盖默认约100K字符预算"),
             maxHits: z.number().optional()
-                .describe("[deep_locate/search] 最大命中数；search的limit别名；[search_all] 每次执行新增命中对话数，limit只控制返回页大小"),
+                .describe("[deep_locate/search] 最大命中数；search的limit别名；[search_ready] 返回的命中轮次引用上限，totalHits保留总数；[search_all] 每次执行新增命中对话数，limit只控制返回页大小"),
             deadlineMs: z.number().int().min(1).max(600000).optional()
                 .describe("[list contextProbe/deep_locate/search_all/read_hit/read_fast] 本次执行总时间预算（毫秒）；search_all到期保留已确认结果并暂停为partial，沿原taskId恢复"),
             startRound: z.number().optional()

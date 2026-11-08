@@ -34,7 +34,7 @@ conversationId是当前调用者的稳定ID，conversationIds是目标对话ID�
 
 完整fetch继续用于完整规范化缓存、recall及Record等需要完整来源的任务；日常快读和关键词找对话直接选择对应新入口。requestedRangeComplete表示本次所需范围可确认完整，fullSourceComplete表示整个来源完成，未查范围不能计作零命中。来源改变后核修订，失败保留已发布缓存，不跳过内容认证。
 
-初始范围与完整构建分开调度，完整构建最多占一个默认后台位置。deadlineMs包含初始排队和读取，后续完整构建有独立运行期限。未就绪返回原状态及查询next；后台失败已有范围时返回partial/preparationError。search_ready的hits[].next直接读取固定引用，cacheRevision只标识缓存投影，存在原始版本时另给originRevision及命中sourceRevision。
+初始范围与完整构建分开调度，完整构建最多占一个默认后台位置。deadlineMs包含初始排队和读取，后续完整构建有独立运行期限。未就绪返回原状态及查询next；requestedMessageRoles仅表示请求，messageRolesVerified=true时availableMessageRoles才表示已核可用角色，就绪next带可用角色与深度，直接沿用。子任务full默认保留tool与subagent。后台失败已有范围时返回partial/preparationError。search_ready的maxHits限制返回的命中轮次引用及片段，totalHits保留本次范围的命中轮次总数，hasMoreHits表示还有未返回引用；hits[].next直接读取固定引用。cacheRevision只标识缓存投影，存在原始版本时另给originRevision及命中sourceRevision。
 
 单端搜索示例：{"action":"search_all","conversationId":"caller-id","dataChain":"claude-code","allTerms":["缓存","轮次"]}。多端搜索将dataChain替换为dataChains:["codex","windsurf"]。快读示例：{"action":"read_fast","conversationId":"caller-id","dataChain":"dsh","conversationIds":["target-id"],"lastRounds":3}。完整参数与来源差异见随包docs/five-host-search.md；详细搜索教程见docs/local-corpus-search.md。
 

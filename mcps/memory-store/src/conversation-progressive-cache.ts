@@ -520,6 +520,7 @@ class DiskProgressiveCache implements ProgressiveCache {
     }
 
     async search(request: CorpusSearchRequest, selection: ProgressiveSelection = {}): Promise<ProgressiveSearchResult> {
+        if (request.maxHits !== undefined && (!Number.isSafeInteger(request.maxHits) || request.maxHits < 1 || request.maxHits > 100000)) fail("size_limit", "maxHits must be a positive bounded integer");
         const manifest = await this.manifest(); const status = this.statusOf(manifest);
         const conversation = manifest.source.conversation ?? { id: manifest.source.conversationId, source: "codex" as const, title: "", workspace: "" };
         const accumulator = new CorpusSearchAccumulator(conversation, compileCorpusSearch(request), { revision: manifest.source.revision });
@@ -538,13 +539,17 @@ class DiskProgressiveCache implements ProgressiveCache {
             for (const message of row.messages) accumulator.append({ ...message, id: `${row.blockId}:${message.id}`, round: scannedRounds });
         }
         const match = accumulator.snapshot(status.complete);
-        const hits = match?.rounds.map(round => locators.get(round)!) ?? [];
+        const matchedRounds = match?.rounds ?? [];
+        const selectedRounds = request.maxHits === undefined ? matchedRounds : matchedRounds.slice(0, request.maxHits);
+        const hits = selectedRounds.map(round => locators.get(round)!);
+        const selectedRoundSet = new Set(selectedRounds);
         if (match) {
-            match.round = match.round === null ? null : locators.get(match.round)!.round;
+            match.round = match.round !== null && selectedRoundSet.has(match.round) ? locators.get(match.round)!.round : hits[0]?.round ?? null;
             match.rounds = hits.map(hit => hit.round);
-            match.snippets = match.snippets.map(snippet => ({ ...snippet, round: locators.get(snippet.round)!.round, messageId: snippet.messageId.slice(65) }));
+            match.snippets = match.snippets.filter(snippet => selectedRoundSet.has(snippet.round))
+                .map(snippet => ({ ...snippet, round: locators.get(snippet.round)!.round, messageId: snippet.messageId.slice(65) }));
         }
-        return { semanticVersion: CORPUS_QUERY_SEMANTIC_VERSION, status, match, hits, scannedRounds,
+        return { semanticVersion: CORPUS_QUERY_SEMANTIC_VERSION, status, match, hits, totalHits: matchedRounds.length, hasMoreHits: hits.length < matchedRounds.length, scannedRounds,
             scannedMessages: accumulator.scannedMessages, searchedRanges, requestedRangeComplete: this.rangeComplete(status, selection), provisional: !status.complete };
     }
 }
