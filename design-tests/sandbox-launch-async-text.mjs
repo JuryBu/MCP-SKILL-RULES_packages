@@ -14,18 +14,20 @@ const typescript = localRequire("typescript");
 const fixture = fs.mkdtempSync(path.join(os.tmpdir(), "sandbox-launch-async-text-"));
 const taskDirectory = path.join(fixture, "tasks");
 fs.mkdirSync(taskDirectory);
-const wait = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds));
-let activeReads = 0;
-let maximumReads = 0;
-let timerTicks = 0;
-const isolatedFs = { ...fs, promises: { ...fs.promises, async readFile(...args) {
-    activeReads += 1;
-    maximumReads = Math.max(maximumReads, activeReads);
-    try {
-        await wait(35);
-        return await fs.promises.readFile(...args);
-    } finally { activeReads -= 1; }
-} } };
+let trackChunkReads = false;
+let chunkReads = 0;
+const readBursts = [];
+const isolatedFs = { ...fs, readFileSync(filename, ...args) {
+    if (trackChunkReads && path.dirname(String(filename)) === taskDirectory) chunkReads += 1;
+    return fs.readFileSync(filename, ...args);
+} };
+const observedImmediate = (callback, ...args) => {
+    if (trackChunkReads && chunkReads > 0) {
+        readBursts.push(chunkReads);
+        chunkReads = 0;
+    }
+    return setImmediate(callback, ...args);
+};
 const forbidden = () => { throw new Error("unexpected process/resource operation in isolated test"); };
 const stubs = new Map([
     ["../lifecycle.js", { touchActivity() {}, formatElapsed: String, ensureModelVisibleToolResult: value => value }],
@@ -36,7 +38,7 @@ const stubs = new Map([
     ["../memory-limits.js", { inferMemoryRequestMB: forbidden, PROCESS_TREE_MAX_MEMORY_MB: 4096, validateProcessTreeMemory: forbidden }],
 ]);
 const cache = new Map();
-const context = vm.createContext({ Buffer, TextDecoder, console, setTimeout, clearTimeout, setImmediate,
+const context = vm.createContext({ Buffer, TextDecoder, console, setTimeout, clearTimeout, setImmediate: observedImmediate,
     setInterval, clearInterval, process: { ...process, env: { SANDBOX_LAUNCH_DIR: fixture } } });
 function loadSource(filename, extraExports = "") {
     if (cache.has(filename)) return cache.get(filename).exports;
@@ -64,6 +66,10 @@ try {
     fs.writeFileSync(path.join(taskDirectory, "foreign.json"), JSON.stringify(task("foreign", { ownerId: "owner-beta" })));
     fs.writeFileSync(path.join(taskDirectory, "broken.json"), "{");
     fs.writeFileSync(path.join(taskDirectory, "gone.json"), JSON.stringify({ id: "gone", deleted: true }));
+    for (let index = 0; index < 128; index += 1) {
+        const id = `chunk-${String(index).padStart(3, "0")}`;
+        fs.writeFileSync(path.join(taskDirectory, `${id}.json`), JSON.stringify(task(id, { ownerId: "owner-beta" })));
+    }
     fs.writeFileSync(path.join(fixture, "registry.json"), JSON.stringify([
         task("current", { command: "obsolete" }), task("broken"), task("gone"), task("legacy"),
     ]));
@@ -73,17 +79,18 @@ try {
     const launch = loadSource(launchFilename, "\nexport { readAllTasks, readAllTasksAsync, decodeLaunchLog, tailFile, pendingTaskWrites, writeTaskIfUnchanged, formatLaunchTaskElapsed };\n");
     launch.pendingTaskWrites.set("current", task("current", { command: "pending wins" }));
     const expected = JSON.stringify(launch.readAllTasks());
-    const pulse = setInterval(() => { timerTicks += 1; }, 5);
     const startedAt = performance.now();
     let actual;
-    try { actual = await launch.readAllTasksAsync(); } finally { clearInterval(pulse); }
+    trackChunkReads = true;
+    try { actual = await launch.readAllTasksAsync(); } finally { trackChunkReads = false; }
     const queryMs = performance.now() - startedAt;
     assert.equal(JSON.stringify(actual), expected);
-    assert.deepEqual(Array.from(actual, value => value.id), ["current", "foreign", "legacy"]);
+    assert.equal(actual.length, 131);
+    assert.deepEqual(Array.from(actual.filter(value => !value.id.startsWith("chunk-")), value => value.id), ["current", "foreign", "legacy"]);
     const owner = loadSource(path.join(sourceRoot, "owner.ts"));
     assert.deepEqual(Array.from(actual.filter(value => owner.hasOwnerAccess(value.ownerId, "owner-alpha")), value => value.id), ["current", "legacy"]);
-    assert.ok(timerTicks >= 3, `timer did not advance: ${timerTicks}`);
-    assert.ok(maximumReads > 1 && maximumReads <= 64, `read concurrency ${maximumReads}`);
+    assert.deepEqual(readBursts, [64, 64, 4]);
+    assert.equal(chunkReads, 0);
     assert.deepEqual(tracked.map(fingerprint), before);
     assert.match(fs.readFileSync(launchFilename, "utf8"), /\(await readAllTasksAsync\(\)\)\.filter/u);
     const stale = task("stale", { status: "running", exitCode: null });
@@ -140,8 +147,8 @@ try {
     const logHash = fingerprint(logPath);
     assert.match(launch.tailFile(logPath, 10), /TRAINING_1199_SHORT_TASK_OK 中文执行/u);
     assert.equal(fingerprint(logPath), logHash);
-    console.log(JSON.stringify({ ok: true, node: process.version, queryMs: Number(queryMs.toFixed(1)), timerTicks,
-        maximumReads, fixtureFiles: tracked.length, originalBytes: original.length, originalSha256: logHash,
+    console.log(JSON.stringify({ ok: true, node: process.version, queryMs: Number(queryMs.toFixed(1)), readBursts,
+        fixtureFiles: tracked.length, originalBytes: original.length, originalSha256: logHash,
         coverage: "registry parity/authoritative-corruption/tombstone/pending/owner/timer/terminal-elapsed/running-elapsed/unknown-end/list-status-elapsed-wiring/utf8/gb18030/binary/unchanged-log" }));
 } finally {
     const resolved = fs.realpathSync(fixture);
