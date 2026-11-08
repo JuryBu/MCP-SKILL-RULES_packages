@@ -1,4 +1,6 @@
-# MCP Sandbox v1.19.8
+# MCP Sandbox v1.19.9
+
+本版任务列表先筛选调用方可见的任务，再查询进程状态；短任务先完成时按本次任务的完成标记返回真实退出结果，进程身份暂时查不到时保留原任务供继续查询。CLI显式请求等待支持125000毫秒，启动等待仍为独立的120000毫秒上限。
 
 本版修复旧版Python执行长中文代码行时的错误编码报告：临时Python脚本缺少编码声明时加入UTF-8 BOM（文件开头的编码标记），保留已有声明、正文和原行号，无需调用方手工转义中文。未升级或修改系统Python及环境变量。相关行为见[CPython问题82936](https://github.com/python/cpython/issues/82936)和[Python编码声明说明](https://docs.python.org/3.9/reference/lexical_analysis.html#encoding-declarations)。
 

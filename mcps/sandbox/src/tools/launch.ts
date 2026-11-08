@@ -11,7 +11,7 @@ import { touchActivity, ensureModelVisibleToolResult, formatElapsed } from "../l
 import { killProcessTree } from "../executor.js";
 import { hasOwnerAccess, newUuid, normalizeOwnerId, ownerMismatchText } from "../owner.js";
 import { acquireResourceLease, adoptResourceLease, resourceAdmission, serializeResourceAdmissionError, type ManagedResourceLease } from "../resource-admission-runtime.js";
-import { getWindowsJobRunnerPath, hasWindowsJobRunner, readWindowsJobMetadata } from "../windows-job-runner.js";
+import { getWindowsJobRunnerPath, hasWindowsJobRunner } from "../windows-job-runner.js";
 import { inferMemoryRequestMB, PROCESS_TREE_MAX_MEMORY_MB, validateProcessTreeMemory } from "../memory-limits.js";
 
 /**
@@ -51,6 +51,7 @@ interface LaunchTask {
     stderrLog: string;
     specPath?: string;
     exitMarkerPath?: string;
+    launchToken?: string;
     createdAtMs?: number;
     finishedAtMs?: number;
     missingPidSinceMs?: number;
@@ -63,9 +64,11 @@ interface LaunchTask {
     peakMemoryMB?: number;
     memoryLimitHit?: boolean;
     statusReason?: string;
+    registryWriteError?: string;
 }
 
 const launchLeases = new Map<string, ManagedResourceLease>();
+const pendingTaskWrites = new Map<string, LaunchTask>();
 
 function releaseLaunchLease(taskId: string): void {
     launchLeases.get(taskId)?.release();
@@ -79,6 +82,8 @@ interface LaunchTombstone {
 }
 
 interface ExitMarker {
+    launchToken?: string;
+    pid?: number;
     done?: boolean;
     exitCode?: number | null;
     signal?: NodeJS.Signals | string | null;
@@ -209,6 +214,7 @@ function readAllTasks(): LaunchTask[] {
         if (current.tombstones.has(task.id) || byId.has(task.id) || current.authoritativeFiles.has(path.basename(taskRegistryPath(task.id)))) continue;
         byId.set(task.id, task);
     }
+    for (const task of pendingTaskWrites.values()) byId.set(task.id, { ...task });
     return [...byId.values()];
 }
 
@@ -228,6 +234,8 @@ async function readLegacyRegistryStrict(): Promise<LaunchTask[]> {
 }
 
 function readTask(taskId: string): LaunchTask | null {
+    const pending = pendingTaskWrites.get(taskId);
+    if (pending) return { ...pending };
     try {
         const parsed = JSON.parse(fs.readFileSync(taskRegistryPath(taskId), "utf-8"));
         if (isRecord(parsed) && parsed.deleted === true) return null;
@@ -282,7 +290,22 @@ function writeJsonAtomic(filePath: string, value: unknown): void {
 }
 
 function writeTask(task: LaunchTask): void {
-    writeJsonAtomic(taskRegistryPath(task.id), task);
+    const persisted = { ...task };
+    delete persisted.registryWriteError;
+    try {
+        writeJsonAtomic(taskRegistryPath(task.id), persisted);
+        pendingTaskWrites.delete(task.id);
+        delete task.registryWriteError;
+    } catch (err) {
+        task.registryWriteError = err instanceof Error ? err.message : String(err);
+        pendingTaskWrites.set(task.id, { ...task });
+    }
+}
+
+function registryWriteWarning(task: LaunchTask): string {
+    return task.registryWriteError
+        ? `\n⚠️ 任务登记尚未落盘，仅当前后端保留原 taskId 与真实状态；请保留当前后端并沿原 taskId 查询，勿重跑: ${task.registryWriteError}`
+        : "";
 }
 
 function deleteTask(taskId: string): void {
@@ -292,6 +315,7 @@ function deleteTask(taskId: string): void {
         deletedAtMs: Date.now(),
     };
     writeJsonAtomic(taskRegistryPath(taskId), tombstone);
+    pendingTaskWrites.delete(taskId);
 }
 
 function generateId(): string {
@@ -369,6 +393,8 @@ try {
   child.on("error", (err) => {
     try { writeHandshake({ error: err.message }); } catch {}
     writeMarker(spec.exitMarkerPath, {
+      launchToken: spec.launchToken,
+      pid: child.pid,
       done: true,
       exitCode: null,
       signal: null,
@@ -391,6 +417,8 @@ try {
     let memory = null;
     try { memory = spec.memoryMetadataPath ? JSON.parse(fs.readFileSync(spec.memoryMetadataPath, "utf8")) : null; } catch {}
     writeMarker(spec.exitMarkerPath, {
+      launchToken: spec.launchToken,
+      pid: child.pid,
       done: true,
       exitCode: code,
       signal,
@@ -404,6 +432,7 @@ try {
 } catch (err) {
   try {
     writeMarker(spec.exitMarkerPath, {
+      launchToken: spec.launchToken,
       done: true,
       exitCode: null,
       signal: null,
@@ -479,7 +508,16 @@ function readExitMarker(task: LaunchTask): ExitMarker | null {
     if (!task.exitMarkerPath) return null;
     try {
         if (!fs.existsSync(task.exitMarkerPath)) return null;
-        return JSON.parse(fs.readFileSync(task.exitMarkerPath, "utf-8")) as ExitMarker;
+        const marker = JSON.parse(fs.readFileSync(task.exitMarkerPath, "utf-8")) as ExitMarker;
+        if (task.launchToken && (marker?.done !== true
+            || marker.launchToken !== task.launchToken || marker.pid !== task.pid
+            || !Number.isFinite(marker.startedAtMs) || !Number.isFinite(marker.finishedAtMs)
+            || Number(marker.startedAtMs) < (task.createdAtMs ?? task.startTime)
+            || Number(marker.finishedAtMs) < Number(marker.startedAtMs)
+            || Number(marker.finishedAtMs) > Date.now()
+            || (marker.exitCode !== null && !Number.isInteger(marker.exitCode))
+            || (marker.exitCode === 0 && (marker.error || marker.signal || marker.memoryLimitHit)))) return null;
+        return marker;
     } catch {
         return null;
     }
@@ -614,15 +652,16 @@ async function readLaunchProcessIdentityAsync(pid: number): Promise<LaunchProces
     return info?.startId ? { pid, startId: info.startId } : undefined;
 }
 
-async function waitForLaunchProcessIdentity(pid: number, timeoutMs = 3_000): Promise<LaunchProcessIdentity | undefined> {
+async function waitForLaunchProcessIdentity(task: LaunchTask, timeoutMs = 3_000): Promise<LaunchProcessIdentity | undefined> {
     const deadline = Date.now() + timeoutMs;
     do {
-        const identity = await readLaunchProcessIdentityAsync(pid);
+        if (readExitMarker(task)?.done) return undefined;
+        const identity = await readLaunchProcessIdentityAsync(task.pid);
         if (identity) return identity;
-        if (!isPidAlive(pid)) return undefined;
+        if (readExitMarker(task)?.done) return undefined;
         await new Promise(resolve => setTimeout(resolve, 50));
     } while (Date.now() < deadline);
-    return readLaunchProcessIdentityAsync(pid);
+    return undefined;
 }
 
 async function waitForLaunchWorkerHandshake(
@@ -830,6 +869,11 @@ function yieldToEventLoop(): Promise<void> {
 }
 
 async function reapLaunchTasksInBackground(): Promise<void> {
+    for (const pending of [...pendingTaskWrites.values()]) {
+        const task = { ...pending };
+        writeTask(task);
+        if (task.status === "running") activeReaperTasks.set(task.id, task);
+    }
     let entries: fs.Dirent[];
     try {
         entries = await fs.promises.readdir(TASK_REGISTRY_DIR, { withFileTypes: true });
@@ -863,7 +907,8 @@ async function reapLaunchTasksInBackground(): Promise<void> {
 
     for (const trackedTask of [...activeReaperTasks.values()]) {
         const fileName = `${safeTaskFileName(trackedTask.id)}.json`;
-        let task: LaunchTask | LaunchTombstone | null = await readTaskFile(fileName);
+        let task: LaunchTask | LaunchTombstone | null = pendingTaskWrites.has(trackedTask.id)
+            ? readTask(trackedTask.id) : await readTaskFile(fileName);
         if (!task && !scannedTaskFiles.has(fileName)) {
             task = readLegacyRegistry().find(candidate => candidate.id === trackedTask.id) || null;
         }
@@ -1068,11 +1113,10 @@ export function registerLaunch(server: McpServer): void {
 
             // ── list ──
             if (action === "list") {
-                const tasks = readAllTasks();
-                for (const task of tasks) {
-                    if (await refreshTaskStatusAsync(task)) writeTask(task);
+                const visibleTasks = readAllTasks().filter(task => hasOwnerAccess(task.ownerId, ownerId));
+                for (const task of visibleTasks) {
+                    if (await refreshTaskStatusAsync(task) || task.registryWriteError) writeTask(task);
                 }
-                const visibleTasks = tasks.filter(t => hasOwnerAccess(t.ownerId, ownerId));
 
                 if (visibleTasks.length === 0) {
                     return appendTiming({
@@ -1083,7 +1127,7 @@ export function registerLaunch(server: McpServer): void {
                 const lines = visibleTasks.map(t => {
                     const elapsed = formatElapsed(Date.now() - t.startTime);
                     const statusIcon = t.status === "running" ? "🔄" : t.status === "done" ? "✅" : "❌";
-                    return `  ${statusIcon} ${t.id} | owner=${t.ownerId || "global"} | ${t.command.slice(0, 60)} | ${t.status} | ${elapsed} | PID ${t.pid}`;
+                    return `  ${statusIcon} ${t.id} | owner=${t.ownerId || "global"} | ${t.command.slice(0, 60)} | ${t.status} | ${elapsed} | PID ${t.pid}${registryWriteWarning(t)}`;
                 });
 
                 return appendTiming({
@@ -1105,6 +1149,10 @@ export function registerLaunch(server: McpServer): void {
 
                 let cleaned = 0;
                 for (const t of toClean) {
+                    if (t.registryWriteError) {
+                        writeTask(t);
+                        if (t.registryWriteError) continue;
+                    }
                     try { fs.unlinkSync(t.stdoutLog); } catch { /* */ }
                     try { fs.unlinkSync(t.stderrLog); } catch { /* */ }
                     try { if (t.exitMarkerPath) fs.unlinkSync(t.exitMarkerPath); } catch { /* */ }
@@ -1146,7 +1194,7 @@ export function registerLaunch(server: McpServer): void {
                 // ── kill ──
                 if (action === "kill") {
                     const beforeRefresh = JSON.stringify(task);
-                    if (await refreshTaskStatusAsync(task)) writeTaskIfUnchanged(task, beforeRefresh);
+                    if (await refreshTaskStatusAsync(task) || task.registryWriteError) writeTaskIfUnchanged(task, beforeRefresh);
                     if (task.status !== "running") {
                         return appendTiming({
                             content: [{ type: "text" as const, text: `⚠️ 任务 ${taskId} 已结束 (${task.status})\n` }],
@@ -1200,7 +1248,7 @@ export function registerLaunch(server: McpServer): void {
                 const changedWhileWaiting = await waitForLaunchTask(task, waitSeconds);
 
                 // 刷新状态
-                if (changedWhileWaiting || await refreshTaskStatusAsync(task)) {
+                if (changedWhileWaiting || await refreshTaskStatusAsync(task) || task.registryWriteError) {
                     writeTaskIfUnchanged(task, beforeWaiting);
                 }
 
@@ -1213,7 +1261,7 @@ export function registerLaunch(server: McpServer): void {
                     return appendTiming({
                         content: [{
                             type: "text" as const,
-                            text: `🔄 ${taskId} 运行中 | owner=${task.ownerId || "global"} | ${elapsed} | PID ${task.pid}\n📄 stdout ${stdoutSize} bytes | stderr ${stderrSize} bytes\n📋 最近 ${tailLines} 行:\n${logTail}\n`,
+                            text: `🔄 ${taskId} 运行中 | owner=${task.ownerId || "global"} | ${elapsed} | PID ${task.pid}\n📄 stdout ${stdoutSize} bytes | stderr ${stderrSize} bytes\n📋 最近 ${tailLines} 行:\n${logTail}\n${registryWriteWarning(task)}`,
                         }],
                     });
                 } else {
@@ -1221,7 +1269,7 @@ export function registerLaunch(server: McpServer): void {
                     return appendTiming({
                         content: [{
                             type: "text" as const,
-                            text: `${icon} ${taskId} ${task.status === "done" ? "已完成" : "已失败"} | ${elapsed} | exitCode=${task.exitCode}${task.statusReason ? `\n⚠️ 状态说明: ${task.statusReason}` : ""}\n📄 stdout ${stdoutSize} bytes | stderr ${stderrSize} bytes\n📋 最近 ${tailLines} 行:\n${logTail}\n`,
+                            text: `${icon} ${taskId} ${task.status === "done" ? "已完成" : "已失败"} | ${elapsed} | exitCode=${task.exitCode}${task.statusReason ? `\n⚠️ 状态说明: ${task.statusReason}` : ""}\n📄 stdout ${stdoutSize} bytes | stderr ${stderrSize} bytes\n📋 最近 ${tailLines} 行:\n${logTail}\n${registryWriteWarning(task)}`,
                         }],
                     });
                 }
@@ -1266,6 +1314,7 @@ export function registerLaunch(server: McpServer): void {
             const handshakePath = path.join(logDir, `${taskId}.worker.json`);
             const memoryMetadataPath = path.join(logDir, `${taskId}.memory.json`);
             const hash = commandHash(command, cwd);
+            const launchToken = generateId();
             const maxMemoryMB = (params.maxMemoryMB as number | undefined) ?? 256;
             const reservationMB = (params.memoryRequestMB as number | undefined)
                 ?? inferMemoryRequestMB(maxMemoryMB);
@@ -1281,6 +1330,7 @@ export function registerLaunch(server: McpServer): void {
                 stdoutLog,
                 stderrLog,
                 exitMarkerPath,
+                launchToken,
                 memoryMetadataPath,
                 windowsJobRunner: process.platform === "win32" ? getWindowsJobRunnerPath() : null,
                 maxMemoryMB,
@@ -1289,6 +1339,7 @@ export function registerLaunch(server: McpServer): void {
 
             let resourceLease: ManagedResourceLease | null = null;
             let workerPid: number | null = null;
+            let task: LaunchTask | undefined;
             try {
                 const acquiredLease = await acquireResourceLease({
                     ownerId,
@@ -1318,40 +1369,18 @@ export function registerLaunch(server: McpServer): void {
                 if (!Number.isInteger(workerPid) || workerPid <= 0) {
                     throw new Error(`launch bootstrap 未返回 worker PID${handshake?.error ? `: ${handshake.error}` : ""}`);
                 }
-                const bootstrapExited = bootstrap.exitCode !== null || await Promise.race([
-                    new Promise<boolean>(resolve => bootstrap.once("close", () => resolve(true))),
-                    new Promise<boolean>(resolve => setTimeout(() => resolve(false), 1_000)),
-                ]);
-                if (!bootstrapExited) {
-                    await Promise.all([
-                        killProcessTree(workerPid),
-                        bootstrap.pid ? killProcessTree(bootstrap.pid) : Promise.resolve(),
-                    ]);
-                    throw new Error("launch bootstrap 未在 1 秒内退出，已停止 worker 以避免 backend 重拉误伤");
-                }
-                const processIdentity = await waitForLaunchProcessIdentity(workerPid);
-                if (!processIdentity) {
-                    const memory = readWindowsJobMetadata(memoryMetadataPath);
-                    await killProcessTree(workerPid);
-                    if (memory?.memoryLimitHit) {
-                        throw new Error(`任务启动阶段触发 ${maxMemoryMB}MB 进程树内存硬上限`);
-                    }
-                    throw new Error("无法读取新任务的 PID 启动标识，已停止任务以避免后续 PID 复用误杀");
-                }
-                try { fs.unlinkSync(handshakePath); } catch { }
-
-                const task: LaunchTask = {
+                task = {
                     id: taskId,
                     pid: workerPid,
                     command,
                     commandHash: hash,
-                    processIdentity,
                     ownerId,
                     cwd,
                     stdoutLog,
                     stderrLog,
                     specPath,
                     exitMarkerPath,
+                    launchToken,
                     createdAtMs,
                     startTime: createdAtMs,
                     status: "running",
@@ -1360,20 +1389,40 @@ export function registerLaunch(server: McpServer): void {
                     maxMemoryMB,
                     memoryMetadataPath,
                 };
-
                 launchLeases.set(taskId, acquiredLease);
                 acquiredLease.markStarted();
-
                 writeTask(task);
-
+                const bootstrapExited = bootstrap.exitCode !== null || await Promise.race([
+                    new Promise<boolean>(resolve => bootstrap.once("close", () => resolve(true))),
+                    new Promise<boolean>(resolve => setTimeout(() => resolve(false), 1_000)),
+                ]);
+                if (!bootstrapExited) {
+                    bootstrap.kill();
+                    throw new Error("launch bootstrap 未在 1 秒内退出，worker 已登记并保留，等待状态确认");
+                }
+                task.processIdentity = await waitForLaunchProcessIdentity(task);
+                if (readExitMarker(task)?.done) refreshTaskStatus(task);
+                else if (!task.processIdentity) task.statusReason = "无法读取 PID 启动标识，保留任务与资源等待确认，未终止进程";
+                try { fs.unlinkSync(handshakePath); } catch { }
+                writeTask(task);
+                const outcome = task.status === "running"
+                    ? task.statusReason ? `⚠️ 长任务启动状态待确认: ${task.statusReason}` : "🚀 长任务已启动"
+                    : `${task.status === "done" ? "✅ 长任务已完成" : "❌ 长任务已失败"} | exitCode=${task.exitCode}`;
                 return appendTiming({
                     content: [{
                         type: "text" as const,
-                        text: `🚀 长任务已启动\n📋 taskId: ${taskId}\n👤 ownerId: ${ownerId}\n📂 PID: ${task.pid}\n📁 cwd: ${cwd}\n调度请求: ${reservationMB}MB\n内存硬上限: ${maxMemoryMB}MB\n📄 stdout: ${stdoutLog}\n📄 stderr: ${stderrLog}\n📄 exitMarker: ${exitMarkerPath}\n\n💡 用法:\n  sandbox_launch(action="status", taskId="${taskId}", tailLines=5, waitSeconds=60)\n  sandbox_launch(action="kill", taskId="${taskId}")\n`,
+                        text: `${outcome}${registryWriteWarning(task)}\n📋 taskId: ${taskId}\n👤 ownerId: ${ownerId}\n📂 PID: ${task.pid}\n📁 cwd: ${cwd}\n调度请求: ${reservationMB}MB\n内存硬上限: ${maxMemoryMB}MB\n📄 stdout: ${stdoutLog}\n📄 stderr: ${stderrLog}\n📄 exitMarker: ${exitMarkerPath}\n\n💡 用法:\n  sandbox_launch(action="status", taskId="${taskId}", tailLines=5, waitSeconds=60)\n  sandbox_launch(action="kill", taskId="${taskId}")\n`,
                     }],
                 });
             } catch (err) {
-                if (workerPid) await killProcessTree(workerPid);
+                if (task) {
+                    if (readExitMarker(task)?.done) refreshTaskStatus(task);
+                    else task.statusReason = `启动状态待确认，保留任务与资源: ${err instanceof Error ? err.message : String(err)}`;
+                    writeTask(task);
+                    return appendTiming({
+                        content: [{ type: "text" as const, text: `⚠️ taskId: ${taskId} | status=${task.status} | exitCode=${task.exitCode}\n${task.statusReason || "任务已结束"}${registryWriteWarning(task)}\n📄 stdout: ${stdoutLog}\n📄 stderr: ${stderrLog}\n` }],
+                    });
+                }
                 resourceLease?.release();
                 try { fs.unlinkSync(specPath); } catch { /* */ }
                 try { fs.unlinkSync(handshakePath); } catch { /* */ }

@@ -104,8 +104,8 @@ export async function main(argv = process.argv.slice(2), streams: CliStreams = {
         }
         const timeoutMs = typeof parsed.options['timeout-ms'] === 'number' ? parsed.options['timeout-ms'] : undefined;
         const startupTimeoutMs = typeof parsed.options['startup-timeout-ms'] === 'number' ? parsed.options['startup-timeout-ms'] : undefined;
-        for (const [name, duration] of [['timeout-ms', timeoutMs], ['startup-timeout-ms', startupTimeoutMs]] as const) {
-            if (duration !== undefined && (duration < 1 || duration > 120_000)) throw usage(`--${name}须在1至120000毫秒之间`);
+        for (const [name, duration, maximum] of [['timeout-ms', timeoutMs, 125_000], ['startup-timeout-ms', startupTimeoutMs, 120_000]] as const) {
+            if (duration !== undefined && (duration < 1 || duration > maximum)) throw usage(`--${name}须在1至${maximum}毫秒之间`);
         }
         const interactive = parsed.words.length === 0 && streams.stdin.isTTY === true && streams.stderr.isTTY === true && !json;
         if (parsed.words.length === 0 && !interactive) throw usage('非TTY模式需要一个命令；正文须用runs start及--text、--input-file或--stdin明确提交');
