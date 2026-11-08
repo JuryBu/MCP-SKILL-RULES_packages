@@ -99,6 +99,7 @@ export class FetchTransport implements HttpTransport {
             if (controller.signal.aborted || signal?.aborted) throw new ProviderFault('E_CANCELLED', '网络准备期间请求已取消', { acceptance: 'not_sent', transportPhase });
             if (Date.now() >= deadlineAt) throw new ProviderFault('E_DEADLINE', '网络准备完成前已到请求期限', { acceptance: 'not_sent', transportPhase });
             transportPhase = 'fetch_invoked';
+            try { request.onPhase?.(transportPhase, { route: network.routeFor(request.url) }); } catch {}
             const response = await network.fetch(request.url, { method: request.method, headers: request.headers,
                 body: request.body, signal: controller.signal, redirect: 'error' });
             status = response.status;
@@ -106,6 +107,7 @@ export class FetchTransport implements HttpTransport {
                 if (!/authorization|cookie|api.?key|token|secret/i.test(name)) headers[name] = value;
             });
             transportPhase = 'response_headers';
+            try { request.onPhase?.(transportPhase, { httpStatus: status }); } catch {}
             const declared = Number(response.headers.get('content-length'));
             if (Number.isFinite(declared) && declared > maximum) {
                 await response.body?.cancel();
@@ -113,6 +115,7 @@ export class FetchTransport implements HttpTransport {
                     { acceptance: status >= 200 && status < 300 ? 'accepted' : 'unknown', httpStatus: status, transportPhase });
             }
             transportPhase = 'response_body';
+            try { request.onPhase?.(transportPhase, { httpStatus: status }); } catch {}
             const reader = response.body?.getReader();
             let total = 0;
             if (reader) {

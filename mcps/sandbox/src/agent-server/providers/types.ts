@@ -194,6 +194,7 @@ export interface HttpRequest {
     body?: string;
     timeoutMs: number;
     maxResponseBytes?: number;
+    onPhase?: (phase: TransportPhase, detail: { httpStatus?: number; route?: { route: string; source: string; reason: string; proxyConfigured: boolean } }) => void;
     onChunk?: (chunk: Uint8Array, response: { status: number; headers: Record<string, string> }) => void | Promise<void>;
 }
 

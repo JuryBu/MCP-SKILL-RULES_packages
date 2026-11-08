@@ -137,8 +137,12 @@ export class AgentClient extends EventEmitter {
                 try {
                     this.remainingTimeout(this.options.connectionTimeoutMs ?? 10_000);
                     await this.connect();
-                    const timeoutMs = this.remainingTimeout(options.timeoutMs ?? (method === 'events.read' && typeof parsed.data.waitMs === 'number'
-                        ? Math.max(this.options.requestTimeoutMs ?? 3_000, parsed.data.waitMs + 3_000) : this.options.requestTimeoutMs ?? 3_000));
+                    const defaultTimeoutMs = method === 'conversations.countTokens'
+                        ? Math.min(125_000, Math.max(this.options.requestTimeoutMs ?? 3_000,
+                            (typeof parsed.data.timeoutMs === 'number' ? parsed.data.timeoutMs : 120_000) + 5_000))
+                        : method === 'events.read' && typeof parsed.data.waitMs === 'number'
+                            ? Math.max(this.options.requestTimeoutMs ?? 3_000, parsed.data.waitMs + 3_000) : this.options.requestTimeoutMs ?? 3_000;
+                    const timeoutMs = this.remainingTimeout(options.timeoutMs ?? defaultTimeoutMs);
                     return await this.control!.request<Data>(method, parsed.data as Record<string, unknown>, { timeoutMs });
                 } catch (error) {
                     if (attempt > 0 || this.disposed || this.connected || !(error instanceof AgentFault) || error.code !== 'IPC_UNAVAILABLE') {

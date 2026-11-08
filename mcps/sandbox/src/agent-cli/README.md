@@ -198,6 +198,14 @@ try {
 
 ## 验证边界
 
+### 只计数输入
+
+`conversations.countTokens` 使用当前会话选定的Gemini配置、模型及参数，对 `input: { text, references }` 明确给定的文本与已准备附件计数。通过现有 `rpc` 命令或 `AgentClient.request` 调用，参数另带 `conversationId`，可选 `timeoutMs` 最大120000。凭据沿核心现有受保护入口使用，不接受Key或任意文件路径。
+
+结果的 `scope=provided_input_only`、`historyIncluded=false` 表示只包含这次给定的输入，未加入历史。此方法不生成内容、不创建执行、不追加对话，也不修改费用预算；可先用它检查原图或重复附件的真实计数，再提交明确任务。`AgentClient` 自动等待计数期限加5秒，最多125秒，显式调用等待和调用方绝对期限继续优先。
+
+普通执行中的计数按实际序列化字节确定一次总等待预算，短输入保持15秒，大输入递增至最多120秒，并受原任务剩余期限约束。所有计数重试共用这一期限。成功或失败诊断保留请求字节/hash、尝试数、安全路由及发送/响应阶段时间，不包含凭据或图片正文。
+
 正式控制链、配置导入、分页与 PTY 脚本位于 `tests/agent/e2e/cli*.mjs`。`cli-control`、`cli-profiles`、`cli-pty` 支持持久 evidence root，报告保留原始命令输出、构建哈希与资源关闭结果。`cli-pty --long` 使用超过 90 秒的真实控制租约轨迹，使用自身 ConPTY 和虚拟材料，不操作用户窗口。
 
 当前草稿切换与未知回执记录保留在前台内存，跨进程草稿恢复等待正式服务端草稿端口。引用使用 `ref add/show`，规则与技能使用 `rules list/show/reload`、`skill list/show/load/unload`；`changes restore/rewind` 先预览，`changes commit` 带原恢复计划明确提交。命令按当前核心提供的方法和状态检查执行。

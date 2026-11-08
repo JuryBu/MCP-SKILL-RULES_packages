@@ -24,6 +24,9 @@ export interface GeminiTokenCountResult {
         deadlineAt: string;
         requestDeadlineAt?: string;
         requestAttempts?: number;
+        requestBodyBytes?: number;
+        requestBudgetMs?: number;
+        requestTimeline?: JsonObject[];
     };
 }
 
@@ -37,7 +40,7 @@ export interface GeminiTokenCounterOptions {
 
 export function createGeminiTokenCounter(options: GeminiTokenCounterOptions) {
     const now = options.now ?? Date.now;
-    const requestTimeoutMs = options.requestTimeoutMs ?? 15_000;
+    const requestTimeoutMs = options.requestTimeoutMs ?? 120_000;
     if (!Number.isFinite(requestTimeoutMs) || requestTimeoutMs <= 0) throw new AgentFault('E_COUNT_TOKENS_CONFIG', '原生计数单次期限必须为正数');
     const adapter = new GeminiAdapter();
     const active = new Map<AbortController, Promise<GeminiTokenCountResult>>();
@@ -48,14 +51,18 @@ export function createGeminiTokenCounter(options: GeminiTokenCounterOptions) {
         if (closed) return Promise.reject(new AgentFault('E_COUNT_TOKENS_CLOSED', '计数端口已经关闭'));
         const executionDeadline = Date.parse(deadlineAt);
         if (!Number.isFinite(executionDeadline) || executionDeadline <= now()) return Promise.reject(new AgentFault('E_COUNT_TOKENS_DEADLINE', '原生计数期限已经到期或无效'));
-        const deadline = Math.min(executionDeadline, now() + Math.min(15_000, requestTimeoutMs));
-        const timeoutCode = deadline < executionDeadline ? 'E_COUNT_TOKENS_TIMEOUT' : 'E_COUNT_TOKENS_DEADLINE';
-        const timeoutMessage = deadline < executionDeadline ? '原生计数超过单次等待期限' : '原生计数超过本次执行期限';
+        const startedAt = now();
+        let requestBudgetMs = Math.min(15_000, requestTimeoutMs);
+        let deadline = Math.min(executionDeadline, startedAt + requestBudgetMs);
+        const requestTimeline: JsonObject[] = [];
+        const progress: JsonObject = { requestPurpose: 'input_token_count', generationDispatch: 'not_started', requestAttempts: 0, phase: 'preparing', requestTimeline };
         const controller = new AbortController();
         const stop = (code: string, message: string) => controller.abort(new AgentFault(code, message,
-            { executionDeadlineAt: deadlineAt, requestDeadlineAt: new Date(deadline).toISOString() }));
+            { ...progress, executionDeadlineAt: deadlineAt, requestDeadlineAt: new Date(deadline).toISOString(), requestBudgetMs }));
+        const stopTimeout = () => stop(deadline < executionDeadline ? 'E_COUNT_TOKENS_TIMEOUT' : 'E_COUNT_TOKENS_DEADLINE',
+            deadline < executionDeadline ? '原生计数超过当前输入的等待期限' : '原生计数超过本次执行期限');
         const check = () => {
-            if (now() >= deadline && !controller.signal.aborted) stop(timeoutCode, timeoutMessage);
+            if (now() >= deadline && !controller.signal.aborted) stopTimeout();
             if (controller.signal.aborted) throw controller.signal.reason;
         };
         const aborted = new Promise<never>((_resolve, reject) => {
@@ -64,7 +71,7 @@ export function createGeminiTokenCounter(options: GeminiTokenCounterOptions) {
         const cancel = () => stop('E_CANCELLED', '原生计数已取消');
         signal?.addEventListener('abort', cancel, { once: true });
         if (signal?.aborted) cancel();
-        const timer = setTimeout(() => stop(timeoutCode, timeoutMessage), Math.max(1, deadline - now()));
+        let timer = setTimeout(stopTimeout, Math.max(1, deadline - now()));
         const work = Promise.resolve().then(async (): Promise<GeminiTokenCountResult> => {
             check();
             const profile = await options.profiles.get(profileId);
@@ -82,24 +89,39 @@ export function createGeminiTokenCounter(options: GeminiTokenCounterOptions) {
                 throw new AgentFault('E_COUNT_TOKENS_UNAVAILABLE', '原生计数须使用当前API配置同源同模型的countTokens端点');
             }
             const body = canonicalJson(encodeGeminiCountTokensRequest(view, modelId, parameters));
-            if (Buffer.byteLength(body) > 64 * 1024 * 1024) throw new AgentFault('E_COUNT_TOKENS_LIMIT', '原生计数请求超过64MiB字节上限');
+            const requestBodyBytes = Buffer.byteLength(body);
+            if (requestBodyBytes > 64 * 1024 * 1024) throw new AgentFault('E_COUNT_TOKENS_LIMIT', '原生计数请求超过64MiB字节上限');
+            check();
+            requestBudgetMs = options.requestTimeoutMs === undefined
+                ? requestBodyBytes <= 256 * 1024 ? 15_000 : Math.min(120_000, 15_000 + Math.ceil(requestBodyBytes / (1024 * 1024)) * 15_000)
+                : Math.min(120_000, requestTimeoutMs);
+            deadline = Math.min(executionDeadline, startedAt + requestBudgetMs);
+            clearTimeout(timer);
+            timer = setTimeout(stopTimeout, Math.max(1, deadline - now()));
             if (profile.credentialRef && !options.credentialAccess) throw new AgentFault('E_SECRET_BACKEND', '原生计数缺少受保护的凭据读取端口');
             const requestBodyHash = sha256(body);
             const requestHash = sha256(canonicalJson({ method: 'POST', endpoint: endpoint.href, profileId: profile.profileId,
                 profileRevision: profile.revision, credentialGeneration: profile.credentialGeneration, modelId: bareModel, requestBodyHash }));
+            Object.assign(progress, { endpoint: endpoint.href, modelId: bareModel, profileId, profileRevision: profile.revision,
+                requestBodyHash, requestHash, requestBodyBytes });
             check();
             const send = async (credential?: string) => {
                 check();
                 if (credential !== undefined && (!credential || /[\r\n]/.test(credential))) throw new AgentFault('E_AUTH', '凭据内容无效');
                 return decodeResponse(await options.transport.request({ method: 'POST', url: endpoint.href,
                     headers: { 'Content-Type': 'application/json', ...(credential ? { 'x-goog-api-key': credential } : {}) }, body,
-                    timeoutMs: Math.max(1, deadline - now()), maxResponseBytes: 64 * 1024 }, controller.signal), 'gemini', endpoint.href);
+                    timeoutMs: Math.max(1, deadline - now()), maxResponseBytes: 64 * 1024,
+                    onPhase: (phase, detail) => {
+                        Object.assign(progress, { transportPhase: phase, ...detail });
+                        if (requestTimeline.length < 16) requestTimeline.push({ phase, elapsedMs: now() - startedAt, ...detail });
+                    } }, controller.signal), 'gemini', endpoint.href);
             };
             let raw: RawProviderResponse | undefined;
             let requestAttempts = 0;
             while (!raw) {
                 check();
                 requestAttempts++;
+                Object.assign(progress, { requestAttempts, phase: 'count_request' });
                 try {
                     raw = profile.credentialRef
                         ? await options.credentialAccess!.withCredential(profile.credentialRef, profile.credentialGeneration, send) : await send();
@@ -112,6 +134,7 @@ export function createGeminiTokenCounter(options: GeminiTokenCounterOptions) {
                     const wait = Math.max(250 * 2 ** (requestAttempts - 1) + Math.floor(Math.random() * 250),
                         error instanceof ProviderFault ? error.retryAfterMs ?? 0 : 0);
                     if (transient && requestAttempts < 3 && now() + wait < deadline) {
+                        Object.assign(progress, { phase: 'retry_backoff', retryAfterMs: wait, lastTransportCause: cause });
                         await delay(wait, undefined, { signal: controller.signal });
                         continue;
                     }
@@ -126,7 +149,7 @@ export function createGeminiTokenCounter(options: GeminiTokenCounterOptions) {
                     Object.assign(fault.details!, { requestPurpose: 'input_token_count', generationDispatch: 'not_started',
                         countRequestAcceptance: error.acceptance, originalErrorCode: error.code, endpoint: endpoint.href,
                         modelId: bareModel, profileId, profileRevision: profile.revision, requestHash, requestBodyHash,
-                        requestAttempts, executionDeadlineAt: deadlineAt, requestDeadlineAt: new Date(deadline).toISOString(),
+                        requestAttempts, requestBodyBytes, requestBudgetMs, requestTimeline, executionDeadlineAt: deadlineAt, requestDeadlineAt: new Date(deadline).toISOString(),
                         ...(error.rawResponse ? { countResponse: { httpStatus: error.rawResponse.httpStatus, body: error.rawResponse.body } } : {}) });
                     throw fault;
                 }
@@ -137,7 +160,8 @@ export function createGeminiTokenCounter(options: GeminiTokenCounterOptions) {
             return freezeOwned({ inputTokens, raw, source: { kind: 'gemini_count_tokens' as const, endpoint: endpoint.href,
                 modelId: bareModel, profileId: profile.profileId, profileRevision: profile.revision,
                 credentialGeneration: profile.credentialGeneration, requestHash, requestBodyHash,
-                observedAt: new Date(now()).toISOString(), deadlineAt, requestDeadlineAt: new Date(deadline).toISOString(), requestAttempts } });
+                observedAt: new Date(now()).toISOString(), deadlineAt, requestDeadlineAt: new Date(deadline).toISOString(), requestAttempts,
+                requestBodyBytes, requestBudgetMs, requestTimeline } });
         });
         const result = Promise.race([work, aborted]).finally(() => {
             clearTimeout(timer);

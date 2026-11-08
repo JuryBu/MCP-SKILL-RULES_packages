@@ -91,6 +91,26 @@ for (const scenario of ['recover', 'exhaust']) test(`formal same-CID image follo
         }
         assert.equal(observed.generation, scenario === 'recover' ? 2 : 1);
         assert.equal(observed.count, scenario === 'recover' ? 2 : 3);
+        if (scenario === 'recover') {
+            const before = await services.dispatch('conversations.get', { conversationId: control.conversationId }, client);
+            const historyBefore = await services.dispatch('conversations.readHistory', { conversationId: control.conversationId }, client);
+            const counted = await services.dispatch('conversations.countTokens', { conversationId: control.conversationId,
+                input: { text: 'Count only; do not append this to the conversation' }, timeoutMs: 5000 }, client);
+            assert.equal(counted.ok, true, JSON.stringify(counted));
+            assert.equal(counted.data.inputTokens, 128);
+            assert.equal(counted.data.scope, 'provided_input_only');
+            assert.equal(counted.data.generationRequests, 0);
+            const after = await services.dispatch('conversations.get', { conversationId: control.conversationId }, client);
+            const historyAfter = await services.dispatch('conversations.readHistory', { conversationId: control.conversationId }, client);
+            assert.deepEqual(after, before);
+            assert.deepEqual(historyAfter, historyBefore);
+            assert.equal(observed.generation, 2);
+            assert.equal(observed.count, 3);
+            const rejected = await services.dispatch('conversations.countTokens', { conversationId: control.conversationId,
+                input: { text: 'Must not reach the provider' } }, { ...client, principalId: 'other-principal' });
+            assert.equal(rejected.ok, false);
+            assert.equal(observed.count, 3);
+        }
         console.log(JSON.stringify({ scenario, ...observed, realLocalHttp: true, sameConversation: true, modelCharges: 0 }));
     } finally {
         await runtime?.close(); await services?.close(); await store?.close();

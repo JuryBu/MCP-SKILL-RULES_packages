@@ -203,6 +203,8 @@ export const METHOD_SPECS: Record<string, MethodSpec> = {
     'conversations.reopen': spec({ ...conversationFields, ...commandFields, ...controlFields }, true, 'conversation', '重开未过期持久会话'),
     'conversations.readHistory': spec({ ...conversationFields, ...pageFields, startRound: revision.optional(), endRound: revision.optional(), maxBytes: z.number().int().min(1).max(512 * 1024).optional() }, false, 'conversation', '有界读取原始历史'),
     'conversations.context': spec({ ...conversationFields, candidateId: identifier.optional() }, false, 'conversation', '查看上下文水位、压缩状态，或按原candidateId查看候选'),
+    'conversations.countTokens': spec({ ...conversationFields, input: z.record(z.unknown()),
+        timeoutMs: z.number().int().min(1).max(120_000).optional() }, false, 'conversation', '只计数指定输入与已准备附件，不生成、不追加历史或修改预算'),
     'conversations.compact': spec({ ...conversationFields, ...commandFields, ...controlFields,
         mode: z.enum(['preview', 'manual']).default('manual'), budget: z.record(z.unknown()).optional() },
     true, 'conversation', '预览压缩范围，或以独立维护执行和共享费用上限压缩当前对话'),

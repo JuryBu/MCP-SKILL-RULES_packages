@@ -930,6 +930,28 @@ export async function createAgentServices(options: ServerServiceOptions) {
                     return { ok: true, data: { items, allProcessed: items.every(item => (item as Record<string, JsonValue>).status !== 'failed') } };
                 });
             }
+            if (method === 'conversations.countTokens') {
+                const conversationId = String(params.conversationId);
+                const allowed = await options.runtime.dispatch('conversations.get', { conversationId }, client);
+                if (!allowed.ok) return allowed;
+                const deadlineAt = new Date(Date.now() + Number(params.timeoutMs ?? 120_000)).toISOString();
+                const conversation = await options.store.getRecord<{ options: Record<string, unknown> }>({
+                    conversationId, kind: 'conversation', id: conversationId });
+                const selected = conversation?.value.options;
+                if (typeof selected?.profileId !== 'string') throw new AgentFault('E_PROFILE_REQUIRED', '先选择本次使用的API配置');
+                const profile = await provider.profiles.get(selected.profileId);
+                if (!profile) throw new AgentFault('E_PROFILE_NOT_FOUND', 'API配置不存在或已停用');
+                if (profile.protocol !== 'gemini' || profile.routePolicy.kind !== 'direct') throw new AgentFault('E_COUNT_TOKENS_UNAVAILABLE', '当前原生计数仅支持Gemini协议直接路由');
+                const modelId = typeof selected.modelId === 'string' ? selected.modelId : profile.defaultModel;
+                if (!modelId) throw new AgentFault('E_MODEL_REQUIRED', '先选择本次计数使用的模型');
+                const { entry } = await provider.models.get(profile.profileId, modelId);
+                const view = await inputAttachments.appendUser(conversationId, { protocol: 'gemini', contents: [] },
+                    params.input as JsonValue, { profile, entry }, metadataAbort.signal);
+                const counted = await provider.countRequestTokens(profile.profileId, modelId, view, metadataAbort.signal,
+                    deadlineAt, (selected.parameters ?? {}) as JsonObject);
+                return { ok: true, data: { ...counted, scope: 'provided_input_only', historyIncluded: false,
+                    generationRequests: 0, historyWrites: 0, budgetMutations: 0 } as unknown as JsonValue };
+            }
             if (method === 'conversations.context') {
                 const allowed = await options.runtime.dispatch('conversations.get', { conversationId: params.conversationId }, client);
                 if (!allowed.ok) return allowed;
