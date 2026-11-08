@@ -70,7 +70,7 @@ try {
     const tracked = [path.join(fixture, "registry.json"), ...fs.readdirSync(taskDirectory).map(name => path.join(taskDirectory, name))];
     const before = tracked.map(fingerprint);
     const launchFilename = path.join(sourceRoot, "tools/launch.ts");
-    const launch = loadSource(launchFilename, "\nexport { readAllTasks, readAllTasksAsync, decodeLaunchLog, tailFile, pendingTaskWrites, writeTaskIfUnchanged };\n");
+    const launch = loadSource(launchFilename, "\nexport { readAllTasks, readAllTasksAsync, decodeLaunchLog, tailFile, pendingTaskWrites, writeTaskIfUnchanged, formatLaunchTaskElapsed };\n");
     launch.pendingTaskWrites.set("current", task("current", { command: "pending wins" }));
     const expected = JSON.stringify(launch.readAllTasks());
     const pulse = setInterval(() => { timerTicks += 1; }, 5);
@@ -95,6 +95,28 @@ try {
     assert.equal(launch.writeTaskIfUnchanged({ ...staleSnapshot, status: "done", exitCode: 0 }, JSON.stringify(staleSnapshot)), false);
     assert.deepEqual(JSON.parse(fs.readFileSync(stalePath, "utf8")), deleted);
     assert.ok(fs.readFileSync(launchFilename, "utf8").includes("if (await refreshTaskStatusAsync(task) || task.registryWriteError) writeTaskIfUnchanged(task, beforeRefresh);"));
+    const fixedNow = 10_000;
+    for (const status of ["done", "failed"]) {
+        const completed = task(`elapsed-${status}`, { status, startTime: 1_000, finishedAtMs: 3_000 });
+        const completedBefore = JSON.stringify(completed);
+        assert.equal(launch.formatLaunchTaskElapsed(completed, fixedNow), "2000");
+        assert.equal(launch.formatLaunchTaskElapsed(completed, fixedNow + 60_000), "2000");
+        assert.equal(JSON.stringify(completed), completedBefore);
+        for (const finishedAtMs of [undefined, null, "3000", NaN, Infinity, -Infinity, 999]) {
+            const invalid = task(`elapsed-invalid-${status}`, { status, startTime: 1_000, finishedAtMs });
+            assert.equal(launch.formatLaunchTaskElapsed(invalid, fixedNow), "结束时间未知");
+            assert.equal(launch.formatLaunchTaskElapsed(invalid, fixedNow + 60_000), "结束时间未知");
+        }
+    }
+    const running = task("elapsed-running", { status: "running", startTime: 1_000, finishedAtMs: 3_000 });
+    assert.equal(launch.formatLaunchTaskElapsed(running, fixedNow), "9000");
+    assert.equal(launch.formatLaunchTaskElapsed(running, fixedNow + 1_000), "10000");
+    assert.equal(launch.formatLaunchTaskElapsed(task("elapsed-zero", { startTime: 1_000, finishedAtMs: 1_000 }), fixedNow), "0");
+    assert.equal(launch.formatLaunchTaskElapsed(task("elapsed-invalid-start", { startTime: NaN, finishedAtMs: 3_000 }), fixedNow), "结束时间未知");
+    assert.equal(launch.formatLaunchTaskElapsed(task("elapsed-overflow", { startTime: -Number.MAX_VALUE, finishedAtMs: Number.MAX_VALUE }), fixedNow), "结束时间未知");
+    const launchSource = fs.readFileSync(launchFilename, "utf8");
+    assert.match(launchSource, /const lines = visibleTasks\.map\(t => \{\s+const elapsed = formatLaunchTaskElapsed\(t\);/u);
+    assert.match(launchSource, /const elapsed = formatLaunchTaskElapsed\(task\);\s+const logTail = tailFile/u);
     const utf8 = Buffer.from("正常 UTF-8 中文执行 😀\r\n", "utf8");
     assert.equal(launch.decodeLaunchLog(utf8).text, utf8.toString("utf8"));
     const colored = Buffer.from("\u001b[32m正常中文\u001b[0m\u001b]0;title\u0007\r\n", "utf8");
@@ -120,7 +142,7 @@ try {
     assert.equal(fingerprint(logPath), logHash);
     console.log(JSON.stringify({ ok: true, node: process.version, queryMs: Number(queryMs.toFixed(1)), timerTicks,
         maximumReads, fixtureFiles: tracked.length, originalBytes: original.length, originalSha256: logHash,
-        coverage: "registry parity/authoritative-corruption/tombstone/pending/owner/timer/utf8/gb18030/binary/unchanged-log" }));
+        coverage: "registry parity/authoritative-corruption/tombstone/pending/owner/timer/terminal-elapsed/running-elapsed/unknown-end/list-status-elapsed-wiring/utf8/gb18030/binary/unchanged-log" }));
 } finally {
     const resolved = fs.realpathSync(fixture);
     assert.equal(path.dirname(resolved), fs.realpathSync(os.tmpdir()));

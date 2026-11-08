@@ -353,6 +353,16 @@ function registryWriteWarning(task: LaunchTask): string {
         : "";
 }
 
+function formatLaunchTaskElapsed(task: LaunchTask, now: number = Date.now()): string {
+    if (task.status === "running") return formatElapsed(Math.max(0, now - task.startTime));
+    const finishedAtMs = task.finishedAtMs;
+    if (typeof finishedAtMs !== "number" || !Number.isFinite(finishedAtMs) || !Number.isFinite(task.startTime)) {
+        return "结束时间未知";
+    }
+    const elapsedMs = finishedAtMs - task.startTime;
+    return Number.isFinite(elapsedMs) && elapsedMs >= 0 ? formatElapsed(elapsedMs) : "结束时间未知";
+}
+
 function deleteTask(taskId: string): void {
     const tombstone: LaunchTombstone = {
         id: taskId,
@@ -1211,7 +1221,7 @@ export function registerLaunch(server: McpServer): void {
                 }
 
                 const lines = visibleTasks.map(t => {
-                    const elapsed = formatElapsed(Date.now() - t.startTime);
+                    const elapsed = formatLaunchTaskElapsed(t);
                     const statusIcon = t.status === "running" ? "🔄" : t.status === "done" ? "✅" : "❌";
                     return `  ${statusIcon} ${t.id} | owner=${t.ownerId || "global"} | ${t.command.slice(0, 60)} | ${t.status} | ${elapsed} | PID ${t.pid}${registryWriteWarning(t)}`;
                 });
@@ -1338,7 +1348,7 @@ export function registerLaunch(server: McpServer): void {
                     writeTaskIfUnchanged(task, beforeWaiting);
                 }
 
-                const elapsed = formatElapsed(Date.now() - task.startTime);
+                const elapsed = formatLaunchTaskElapsed(task);
                 const logTail = tailFile(task.stdoutLog, tailLines);
                 const stdoutSize = getFileSize(task.stdoutLog);
                 const stderrSize = getFileSize(task.stderrLog);
