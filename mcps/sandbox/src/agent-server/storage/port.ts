@@ -285,6 +285,7 @@ export interface StorePort {
     listRecords<Value = Record<string, unknown>>(query: StoreRecordQuery): Promise<StorePage<StoreRecord<Value>>>;
     getReceipt(key: ReceiptKey): Promise<StoredReceipt | undefined>;
     readContent(conversationId: string, contentId: string): Promise<JsonValue | undefined>;
+    readContextMediaContent?(conversationId: string, contentId: string): Promise<JsonValue | undefined>;
     readEvents(query: StoreEventQuery): Promise<StorePage<AgentEvent>>;
     readHistory(query: HistoryQuery): Promise<HistoryPage>;
     readHistoryMetadata?(query: HistoryMetadataQuery): Promise<HistoryMetadataResult>;

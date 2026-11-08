@@ -3,7 +3,8 @@ import type { HistoryItem, StorePort } from '../storage/port.js';
 import type { ContextSourcePort, SourceBlock } from './contracts.js';
 import { hashBytes } from './config.js';
 import { checkAbort, ContextFault } from './errors.js';
-import { createHistorySourcePort, projectHistoryContent, validateSourceRead } from './sources.js';
+import { createHistorySourcePort, historyMatchesReference, MAX_MEDIA_HISTORY_SOURCE_BYTES, projectHistoryContent,
+    validateMediaHistoryExpansion, validateSourceRead } from './sources.js';
 
 export function contextArtifactFrameBytes(requested = 262144): number {
     if (!Number.isSafeInteger(requested) || requested < 1) throw new ContextFault('CONFIG_INVALID', 'Context原件分片上限须为正安全整数');
@@ -58,11 +59,26 @@ export class ArtifactProjectionCache {
     }
 }
 
-export async function readHistoryArtifact(store: Pick<StorePort, 'readArtifact'>, input: {
-    conversationId: string; item: HistoryItem; maxBytes?: number; maxReadBytes?: number; signal?: AbortSignal;
+export async function readHistoryArtifact(store: Pick<StorePort, 'readArtifact'> & {
+    readContextMediaContent?: (conversationId: string, contentId: string) => Promise<JsonValue | undefined>;
+}, input: {
+    conversationId: string; item: HistoryItem; maxBytes?: number; maxReadBytes?: number; signal?: AbortSignal; mediaExpansion?: boolean;
 }): Promise<JsonValue> {
     const maximum = input.maxBytes ?? 32 * 1024 * 1024;
     const frameMaximum = contextArtifactFrameBytes(input.maxReadBytes);
+    if (Number.isSafeInteger(maximum) && maximum >= 1 && input.item.objectRef.rawBytes > maximum && input.mediaExpansion
+        && input.item.kind === 'model_step' && input.item.objectRef.rawBytes <= MAX_MEDIA_HISTORY_SOURCE_BYTES) {
+        checkAbort(input.signal);
+        if (!store.readContextMediaContent) throw new ContextFault('SOURCE_GAP', '大媒体历史需要专用有界原件读取端口',
+            { itemId: input.item.itemId, requiredPort: 'readContextMediaContent' });
+        const value = await store.readContextMediaContent(input.conversationId, input.item.contentId);
+        checkAbort(input.signal);
+        if (value === undefined || !historyMatchesReference(input.item, value)) {
+            throw new ContextFault('HISTORY_STALE', '大媒体原件与历史引用的长度或哈希不一致', { itemId: input.item.itemId });
+        }
+        validateMediaHistoryExpansion(value);
+        return value;
+    }
     if (!Number.isSafeInteger(maximum) || maximum < 1 || input.item.objectRef.rawBytes > maximum) {
         throw new ContextFault('INPUT_BUDGET', '原生正文超过明确材料预算或读取帧上限', { itemId: input.item.itemId, maximum });
     }
@@ -112,7 +128,7 @@ export function createArtifactHistorySourcePort(store: Pick<StorePort, 'readCont
         checkAbort(signal);
         const existing = cache.get(input.conversationId, item.contentId, item.objectRef.hash);
         if (existing) return existing;
-        const value = await readHistoryArtifact(store, { ...input, item, maxReadBytes, signal });
+        const value = await readHistoryArtifact(store, { ...input, item, maxReadBytes, signal, mediaExpansion: true });
         const projection = projectHistoryContent(item, value);
         cache.set(input.conversationId, item.contentId, item.objectRef.hash, projection);
         return projection;
@@ -121,7 +137,7 @@ export function createArtifactHistorySourcePort(store: Pick<StorePort, 'readCont
         async describe(item, signal) {
             return (await load(item, signal)).map(block => ({ itemId: item.itemId, blockId: block.blockId, contentId: item.contentId, seq: item.seq,
                 roundId: item.roundId!, kind: block.kind, byteLength: block.bytes.length, sha256: blockHash(block.bytes),
-                retrieval: block.retrieval, ...(block.mediaType ? { mediaType: block.mediaType } : {}) }));
+                retrieval: { ...block.retrieval, historyKind: item.kind }, ...(block.mediaType ? { mediaType: block.mediaType } : {}) }));
         },
         async read(request) {
             validateSourceRead(request, maxReadBytes);
@@ -129,7 +145,8 @@ export function createArtifactHistorySourcePort(store: Pick<StorePort, 'readCont
             const size = request.block.retrieval.rawObjectBytes;
             if (typeof hash !== 'string' || typeof size !== 'number') throw new ContextFault('SOURCE_GAP', '大正文缺少不可变原文引用');
             const item: HistoryItem = { itemId: request.block.itemId, contentId: request.block.contentId, seq: request.block.seq,
-                roundId: request.block.roundId, role: 'system', kind: 'source', view: 'raw', effective: true, runId: null, runEpoch: null, stepId: null,
+                roundId: request.block.roundId, role: 'system', kind: request.block.retrieval.historyKind === 'model_step' ? 'model_step' : 'source',
+                view: 'raw', effective: true, runId: null, runEpoch: null, stepId: null,
                 objectRef: { hash, rawBytes: size } };
             const block = (await load(item, request.signal)).find(entry => entry.blockId === request.block.blockId);
             if (!block || block.bytes.length !== request.block.byteLength || blockHash(block.bytes) !== request.block.sha256) {

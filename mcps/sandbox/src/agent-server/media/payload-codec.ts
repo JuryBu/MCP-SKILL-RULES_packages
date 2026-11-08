@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import { AgentFault } from '../protocol.js';
 import type { JsonValue } from '../protocol.js';
+import { binaryObjectPath } from './binary-files.js';
 import { base64Chunks, inspectBase64, normalizeMime, requireMediaSlice } from './validation.js';
 import type { BinaryPayloadRef, BinaryPayloadStore, PreparedBinaryPayload } from './types.js';
 
@@ -38,7 +39,10 @@ export interface EncodedMediaPayload {
 
 export interface MediaCodecLimits {
     maxSourceBytes: number;
+    maxMetadataBytes: number;
+    maxDecodedBytes: number;
     maxPayloadBytes: number;
+    maxTotalPayloadBytes: number;
     maxPayloads: number;
     maxStrings: number;
     maxNodes: number;
@@ -48,7 +52,9 @@ export interface MediaCodecLimits {
 }
 
 const DEFAULT_LIMITS: Readonly<MediaCodecLimits> = Object.freeze({ maxSourceBytes: 32 * 1024 * 1024,
-    maxPayloadBytes: 32 * 1024 * 1024, maxPayloads: 256, maxStrings: 8192, maxNodes: 200_000,
+    maxMetadataBytes: 32 * 1024 * 1024, maxDecodedBytes: 32 * 1024 * 1024,
+    maxPayloadBytes: 32 * 1024 * 1024, maxTotalPayloadBytes: 32 * 1024 * 1024,
+    maxPayloads: 256, maxStrings: 8192, maxNodes: 200_000,
     maxDepth: 96, maxAdjustments: 16_384, minPayloadBytes: 32 });
 const PAYLOAD_KEYS = new Set(['dataBase64', 'b64_json', 'data', 'image_base64', 'audio_data', 'bytes', 'result', 'thoughtSignature']);
 const TEXT_CHUNK = 16 * 1024;
@@ -208,6 +214,7 @@ export class MediaPayloadCodec {
     encode(value: unknown, onPreparedBinary?: (payload: PreparedBinaryPayload) => void): EncodedMediaPayload | undefined {
         const candidates = new Map<string, Candidate>();
         const unique = new Map<string, Candidate>();
+        let totalPayloadBytes = 0;
         let adjustments = 0;
         const register = (text: string, mime: string, eligible: boolean): Candidate | undefined => {
             const known = candidates.get(text);
@@ -241,10 +248,14 @@ export class MediaPayloadCodec {
             const previous = unique.get(info.sha256);
             const index = previous?.spelling.payload ?? unique.size;
             if (!previous && unique.size >= this.limits.maxPayloads) throw new AgentFault('MEDIA_CODEC_LIMIT', '媒体唯一原件数量超过编码上限');
+            if (!previous && totalPayloadBytes + info.byteLength > this.limits.maxTotalPayloadBytes) {
+                throw new AgentFault('MEDIA_CONTENT_LIMIT', '媒体唯一原件累计字节超过上限',
+                    { bytes: totalPayloadBytes + info.byteLength, maxBytes: this.limits.maxTotalPayloadBytes, scope: 'unique_payloads' });
+            }
             const candidate: Candidate = { clean, spelling: { payload: index, prefix, padded: info.padded, alphabet, whitespace },
                 reference: { sha256: info.sha256, byteLength: info.byteLength, mime } };
             candidates.set(text, candidate);
-            if (!previous) unique.set(info.sha256, candidate);
+            if (!previous) { unique.set(info.sha256, candidate); totalPayloadBytes += info.byteLength; }
             adjustments += whitespace.length;
             return candidate;
         };
@@ -309,14 +320,20 @@ export class MediaPayloadCodec {
             return result;
         };
         const skeleton = clone(value, []);
-        const payloads: BinaryPayloadRef[] = [];
+        const payloads: BinaryPayloadRef[] = [...unique.values()].map(candidate => ({ ...candidate.reference,
+            path: binaryObjectPath(candidate.reference.sha256) }));
+        const encoded: EncodedMediaPayload = { codec: MEDIA_PAYLOAD_CODEC, version: 1, sourceHash: source.hash, sourceBytes: source.bytes,
+            value: skeleton, payloads, strings };
+        this.validateEnvelope(encoded);
+        let payloadIndex = 0;
         for (const candidate of unique.values()) {
             const prepared = this.binary.prepare(base64Chunks(candidate.clean), candidate.reference);
             onPreparedBinary?.(prepared);
-            payloads.push({ sha256: prepared.sha256, byteLength: prepared.byteLength, mime: prepared.mime, path: prepared.path });
+            payloads[payloadIndex] = { sha256: prepared.sha256, byteLength: prepared.byteLength, mime: prepared.mime, path: prepared.path };
+            payloadIndex += 1;
         }
-        return { codec: MEDIA_PAYLOAD_CODEC, version: 1, sourceHash: source.hash, sourceBytes: source.bytes,
-            value: skeleton, payloads, strings };
+        this.validateEnvelope(encoded);
+        return encoded;
     }
 
     references(encoded: EncodedMediaPayload): BinaryPayloadRef[] {
@@ -324,16 +341,27 @@ export class MediaPayloadCodec {
         return encoded.payloads.map(reference => ({ ...reference }));
     }
 
-    decode(encoded: EncodedMediaPayload): JsonValue {
+    decode(encoded: EncodedMediaPayload, options: { maxBytes?: number } = {}): JsonValue {
+        const maxBytes = options.maxBytes ?? Math.min(this.limits.maxDecodedBytes, this.limits.maxSourceBytes);
+        if (!Number.isSafeInteger(maxBytes) || maxBytes < 1 || maxBytes > this.limits.maxSourceBytes) {
+            throw new AgentFault('INVALID_PARAMS', '媒体整份读取预算无效', { maxBytes: this.limits.maxSourceBytes });
+        }
         const recipes = this.recipeMap(encoded);
+        if (encoded.sourceBytes > maxBytes) {
+            throw new AgentFault('STORAGE_DECOMPRESS_LIMIT', '媒体原始JSON超过整份读取上限，请使用原件分片读取',
+                { bytes: encoded.sourceBytes, maxBytes });
+        }
         let nodes = 0;
         let restored = 0;
+        let restoredBytes = 0;
         const restore = (entry: JsonValue, path: JsonPath, depth: number): JsonValue => {
             nodes += 1;
             if (nodes > this.limits.maxNodes || depth > this.limits.maxDepth) throw new AgentFault('MEDIA_CODEC_LIMIT', '媒体对象结构超过解码上限');
             const replacement = recipes.get(JSON.stringify(path));
             if (replacement) {
                 if (entry !== null) throw new AgentFault('STORAGE_SEGMENT_CORRUPT', '媒体字符串占位无效');
+                restoredBytes += replacement.sourceBytes;
+                if (restoredBytes > maxBytes) throw new AgentFault('STORAGE_DECOMPRESS_LIMIT', '媒体字符串累计恢复字节超过整份读取预算', { maxBytes });
                 restored += 1;
                 return [...this.stringParts(encoded, replacement)].join('');
             }
@@ -349,7 +377,7 @@ export class MediaPayloadCodec {
         };
         const result = restore(encoded.value, [], 0);
         if (restored !== recipes.size) throw new AgentFault('STORAGE_SEGMENT_CORRUPT', '媒体恢复清单包含无效路径');
-        const actual = digestParts(canonicalParts(result, this.limits), this.limits.maxSourceBytes);
+        const actual = digestParts(canonicalParts(result, this.limits), maxBytes);
         this.checkSource(encoded, actual);
         return result;
     }
@@ -428,10 +456,23 @@ export class MediaPayloadCodec {
             || !Array.isArray(encoded.strings) || encoded.strings.length < 1 || encoded.strings.length > this.limits.maxStrings) {
             throw new AgentFault('STORAGE_SEGMENT_CORRUPT', '媒体对象编码头无效或超过声明上限');
         }
-        for (const reference of encoded.payloads) if (!objectValue(reference) || !/^[a-f0-9]{64}$/.test(reference.sha256)
-            || !Number.isSafeInteger(reference.byteLength) || reference.byteLength < 0 || reference.byteLength > this.limits.maxPayloadBytes) {
-            throw new AgentFault('STORAGE_SEGMENT_CORRUPT', '媒体原字节引用无效');
+        let totalPayloadBytes = 0;
+        const payloadHashes = new Set<string>();
+        for (const reference of encoded.payloads) {
+            if (!objectValue(reference) || !/^[a-f0-9]{64}$/.test(reference.sha256)
+                || !Number.isSafeInteger(reference.byteLength) || reference.byteLength < 0 || reference.byteLength > this.limits.maxPayloadBytes
+                || payloadHashes.has(reference.sha256)) throw new AgentFault('STORAGE_SEGMENT_CORRUPT', '媒体原字节引用无效或重复');
+            payloadHashes.add(reference.sha256);
+            totalPayloadBytes += reference.byteLength;
+            if (totalPayloadBytes > this.limits.maxTotalPayloadBytes) {
+                throw new AgentFault('MEDIA_CONTENT_LIMIT', '媒体唯一原件累计字节超过上限',
+                    { bytes: totalPayloadBytes, maxBytes: this.limits.maxTotalPayloadBytes, scope: 'unique_payloads' });
+            }
         }
+        const metadataLimits = { ...this.limits, maxDepth: this.limits.maxDepth + 8,
+            maxNodes: this.limits.maxNodes + this.limits.maxStrings * (this.limits.maxDepth + 16)
+                + this.limits.maxAdjustments * 4 + this.limits.maxPayloads * 8 };
+        digestParts(canonicalParts(encoded, metadataLimits), this.limits.maxMetadataBytes);
     }
 
     private recipeMap(encoded: EncodedMediaPayload): Map<string, MediaStringRecipe> {

@@ -80,7 +80,7 @@ sandbox_agent model get <modelId> --profile <profileId> --json
 
 Key 导入只提交 `sourcePath/format/field`，CLI 不读取导入文件。格式为 `plain/env/json`，后两种要求明确字段。配置保存和本地校验不发送模型请求，目录联网刷新使用单独的 `model refresh`。不接受 `--api-key`，通用 `rpc` 入口拒绝凭据与握手方法。
 
-模型执行需要明确的根预算，以及 Profile 引用的供应商跨任务总限额。总限额通过 `budget configure-limit` 配置，所需账户额度组见脱敏 Profile；授权金额、币种和来源由实际使用时提供。`model declare --params <JSON>` 可提交有来源依据的精确模型条目。
+人工交互首用按菜单选择服务商、导入 Key、选择模型，再确认工作区与保存方式即可聊天；人工执行默认使用 `metered` 计量，记录实际用量和费用，无需先配置强制金额预算，也可显式选择预算。主 Agent 通过 MCP 或非交互 CLI 调用时，仍须提供根预算和 Profile 引用的供应商累计预算，并保持稳定的 `callerHost/callerConversationId` 身份。累计预算通过 `budget configure-limit` 配置；授权金额、币种和来源由实际使用时提供。`model declare --params <JSON>` 用于有来源依据的精确模型条目，正常首用可从服务商模型目录选择。
 
 模型目录记录上下文窗口、最大输出、输入输出模态、工具与流式能力、价格及参数证据。参数声明包含类型、枚举、范围、默认值和协议映射位置 `wirePath`，证据带来源、观察时间和适用范围，缺少声明时显示 `unknown`。`model refresh --profile <profileId>` 显式联网刷新目录；配置和本地目录查询走正常 discovery，必要时会启动本产品私有核心。
 
@@ -92,7 +92,7 @@ sandbox_agent exec --text <正文> --budget <JSON对象> --detach --command-id <
 
 根预算字段包含 `wallMs/maxModelCalls/maxOutputTokens/costMode/currency/maxCostMicros`。预算在提交前按核心校验规则检查。`exec` 新建会话使用默认归档方式；同一显式命令 ID 对应确定的创建子命令 ID，重复提交可查询原创建和原执行回执。已有或新建的临时会话均不接受 `--detach`。
 
-累计额度的 `definition.amountMode` 与根预算的 `costMode` 默认均为 `hard`，执行前需要可靠的完整计费上界。旧额度省略 `amountMode` 时保持原定义和旧回执；显式写 `hard` 仍对应同一额度定义。金额以微货币单位表示，1.00 个货币单位为 `1000000`。
+主 Agent 调用的累计额度 `definition.amountMode` 与根预算 `costMode` 默认均为 `hard`，执行前需要可靠的完整计费上界；人工交互采用上面的 `metered` 路径。旧额度省略 `amountMode` 时保持原定义和旧回执；显式写 `hard` 仍对应同一额度定义。金额以微货币单位表示，1.00 个货币单位为 `1000000`。
 
 需要按估计金额运行时，通过 `budget configure-limit --amount-mode estimated` 创建新的累计额度，并在本次根预算中显式设置 `costMode="estimated"`；两处同时选择才接受有来源、有限非零的估计。已有额度 ID 的模式保持固定，切换模式须创建新 ID。CLI 表单和查询结果会显示所选模式及单次费用可能超出估计的提示。
 
@@ -117,7 +117,7 @@ sandbox_agent --conversation <id> session mode ttl --ttl 2h --policy-revision <�
 
 `artifact save` 会在显式目标创建持久副本，保存前确认用途和目标授权，覆盖已有文件加 `--force`。临时会话拒绝 `exec --detach`，外部编辑器只对归档与限时会话生成文件。
 
-BPC（后台渐进压缩）整理后续请求所用的较早内容，压缩模型依次取会话 `compressionModelSelection/compressionModel`、API Profile 的 `compressionModelRef`、当前任务模型。未另配时沿用当前模型，压缩使用相应根预算与供应商累计上限。手动 `compact` 会启动有预算的维护执行，`compact --preview` 只查看范围。
+BPC（后台渐进压缩）整理后续请求所用的较早内容，压缩模型依次取会话 `compressionModelSelection/compressionModel`、API Profile 的 `compressionModelRef`、当前任务模型。未另配时沿用当前模型，压缩沿所属执行的计量或预算方式处理；主 Agent 调用继续受根预算与供应商累计上限约束。手动 `compact` 启动维护执行，人工交互未显式配置预算时使用计量模式，`compact --preview` 只查看范围。
 
 压缩后的请求通过摘要和引用使用旧内容，完整原文、图片及供应商原生响应引用在所选保存生命周期内保留，原图以 MIME、字节数和 SHA256 校验。原生签名块按已接入协议保存与续传，实际模型支持范围按目录和对应适配器核对。
 
@@ -131,9 +131,9 @@ Agent 需要核对较早的对话时，可按下面的顺序查回并反馈：
 
 历史轮号按保存的原轮编号，压缩后保留的最近几轮继续使用原编号。优先直接使用返回的 `originalRead` 与 `usefulHit` 参数，分片读取沿 `nextRead` 继续；内部身份字段不作为模型自行填写的查回参数。
 
-发送给模型的未决要求保留逐字原句、要求ID及原文的UTF-8字节范围，来源项目采用可还原的共享前缀表，减少重复身份和校验信息占用。完整来源、哈希和解决证据仍按原会话保存，查回与发布继续使用完整原件校验。
+Task.md、Plan.md 和任务完成状态由主模型维护，压缩模型只整理事实、交流与原文检索线索，返回 `unresolved:[]` 并省略 `resolutions`。已有未决要求仅作只读交接材料，保留原句与来源；实体 Task/Plan 接管显示后，压缩视图停止展示这份旧交接表。
 
-BPC 根据后续原文中的完成或替代证据更新活动要求。更正或撤回须来自可信的后续用户原文；工具或助手的完成证据还须具有可信的成功终态。简短确认可以完成当轮的确认要求，承诺稍后撰写的报告继续保留。原要求同时包含阈值、格式和报告时，更正阈值只替换相应片段，其余原句继续有效。原要求和解决证据均按会话保存策略保留，失败或结果未知的动作继续按原状态处理。
+原文保存在原会话的历史与内容记录中，压缩记录保存摘要、来源引用和压缩尝试，用于构造后续请求与查回原件。两类记录按会话保存策略保留；核对原话时使用 `history_search/history_read`，核对压缩发布时使用原 `candidateId/attempt`。失败或结果未知的动作继续按原状态查询，停止自动重发。
 
 压缩会计入保留原文、当前输入、规则和工具定义。供应商提供完整原生计数时使用该计数；摘要内部的保守文本估计与供应商 token 数分别处理，已发布视图复用经过完整请求核查的摘要预算，显式指定的摘要限制仍然生效。后台摘要已知过大时停止自动重复生成，保留旧视图与失败证据；完整当前输入仍在限额内的业务可以继续，达到硬限额则暂停新的模型请求并返回具体预算错误。
 
@@ -154,7 +154,7 @@ sandbox_agent --conversation <id> artifact save <artifactId> <目标路径> --js
 
 ## 人工输入
 
-启动菜单默认选择新建归档会话，也提供已有会话、临时、显式 TTL、服务商、模型与预算。输入可以在后台连接期间进行。会话打开只展示现状，继续原执行需要明确操作。
+启动菜单默认选择新建归档会话，也提供已有会话、临时和显式 TTL。新会话先选服务商与模型，再确认工作目录及允许写入的目录；目录使用系统文件夹选择器，确认后保存。输入可以在后台连接期间进行。会话打开只展示现状，继续原执行需要明确操作。
 
 | 操作 | 键位或命令 |
 |---|---|
@@ -162,6 +162,8 @@ sandbox_agent --conversation <id> artifact save <artifactId> <目标路径> --js
 | 命令、历史、外部编辑器 | `/` 或 Ctrl+G、Ctrl+R、Ctrl+X 后 Ctrl+E |
 | 字素编辑、撤销与重做 | 左右/Home/End/Delete/Backspace、Ctrl+Z/Ctrl+Y |
 | 清当前行、返回、取消 | Ctrl+U、Esc、Ctrl+C |
+
+Alt+M 打开模型选择，Alt+W 打开工作区与写入目录，Alt+S 打开设置；对应命令为 `/model`、`/workspace`、`/settings`。
 
 粘贴始终作为一次草稿编辑，多行也不自动发送。草稿上限 1 MiB；收到对应修订的回执后才清理该修订，迟到回执保留后续修改。命令与正文使用不同草稿，`//` 和 `@@` 可发送字面前缀。
 
@@ -171,7 +173,7 @@ sandbox_agent --conversation <id> artifact save <artifactId> <目标路径> --js
 
 ## 终端与角色
 
-角色复用 `assets/agent/` 已批准素材，常规占用 30×17、紧凑占用 15×9 列行。先用字符显示，确认 Sixel 能力及 10×20 像素单元后才升级；没有适配尺寸或 Kitty 帧时保留字符并说明原因。`NO_COLOR` 和 `--color never` 使用单色字符；`--plain/--accessible` 使用线性文字输出。
+角色复用 `assets/agent/` 已批准素材，常规占用 30×17、紧凑占用 15×9 列行。Windows 交互终端在原生图形辅助程序可用时，可使用原生高清动画，经典 CMD 也走此路径；辅助程序不可用时回退到终端图形或字符。Sixel 等终端图形仍按实际能力与适配尺寸选择。`NO_COLOR` 和 `--color never` 使用单色字符；`--plain/--accessible` 使用线性文字输出。
 
 `--reduce-motion` 和 `/terminal motion reduced|off` 使用状态静帧。完成表现要求核心终态与资源回收确认。`--diagnostics --renderer full|diff --image-cache off|on` 只改变本前台渲染策略。图像缓存上限 8 MiB、24 帧，退出只恢复本前台修改过的终端状态。
 
@@ -191,6 +193,8 @@ try {
 ```
 
 `AgentClient` 复用公共发现、HMAC 挑战认证、JSON-RPC schema、回执和事件游标。控制与事件使用独立连接。连接关闭会清理本客户端的 timer/socket，调用者仍需显式选择取消或脱离逻辑执行。
+
+正式服务的 `server.info.capabilities.automaticModelExecution=true` 表示已提供 Provider 模型执行能力；`executor` 保留当前激活状态，`executorActivation` 为 `on_profile_run` 或 `active`。首次携带已选 Profile 的执行才激活执行器，查询能力不会发送模型请求。单独使用的纯 runtime 保持原有能力含义。
 
 ## 验证边界
 

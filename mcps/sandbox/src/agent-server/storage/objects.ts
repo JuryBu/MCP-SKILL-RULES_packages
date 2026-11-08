@@ -6,7 +6,7 @@ import { AgentFault, canonicalJson } from '../protocol.js';
 import type { SqlDatabase, SqlRow } from './internal.js';
 import { DEFAULT_ARTIFACT_BYTES, MAX_ARTIFACT_BYTES } from './port.js';
 import { BinaryObjectFiles } from '../media/binary-files.js';
-import { MediaPayloadCodec, MEDIA_PAYLOAD_CODEC } from '../media/payload-codec.js';
+import { canonicalJsonByteChunks, MediaPayloadCodec, MEDIA_PAYLOAD_CODEC } from '../media/payload-codec.js';
 import type { EncodedMediaPayload } from '../media/payload-codec.js';
 import type { BinaryPayloadRef, PreparedBinaryPayload } from '../media/types.js';
 import { insertBinaryObject } from './media-transactions.js';
@@ -39,27 +39,39 @@ export function sha256(bytes: Uint8Array | string): string {
 export class ObjectFiles {
     private readonly payloadCodec: MediaPayloadCodec;
     private readonly representationLimit: number;
+    private readonly sourceLimit: number;
 
     constructor(private readonly root: string, private readonly maxBytes: number) {
         const maxPayloadBytes = Math.min(maxBytes, 32 * 1024 * 1024);
-        this.payloadCodec = new MediaPayloadCodec(new BinaryObjectFiles(root, maxPayloadBytes),
-            { maxSourceBytes: maxBytes, maxPayloadBytes });
         this.representationLimit = maxBytes + Math.min(maxBytes, 8 * 1024 * 1024);
+        this.sourceLimit = Math.min(256 * 1024 * 1024, maxBytes * 8);
+        this.payloadCodec = new MediaPayloadCodec(new BinaryObjectFiles(root, maxPayloadBytes),
+            { maxSourceBytes: this.sourceLimit, maxPayloadBytes, maxTotalPayloadBytes: maxPayloadBytes,
+                maxMetadataBytes: this.representationLimit, maxDecodedBytes: maxBytes });
     }
 
     prepare(value: unknown, kind: string, onPreparedBinary?: (payload: PreparedBinaryPayload) => void): PreparedObject {
         const encoded = this.payloadCodec.encode(value, onPreparedBinary);
+        if (!encoded) {
+            try { for (const _chunk of canonicalJsonByteChunks(value, { maxBytes: this.maxBytes })) { } }
+            catch (error) {
+                if (error instanceof AgentFault && error.code === 'TEMPORARY_CONTENT_LIMIT') {
+                    throw new AgentFault('STORAGE_CONTENT_LIMIT', '单个持久对象超过当前读取上限', { maxBytes: this.maxBytes });
+                }
+                throw error;
+            }
+        }
         const bytes = Buffer.from(canonicalJson(encoded ?? value));
         const rawBytes = encoded?.sourceBytes ?? bytes.length;
         const hash = encoded?.sourceHash ?? sha256(bytes);
         const codec = encoded ? MEDIA_PAYLOAD_CODEC : 'identity';
         const storedHash = sha256(bytes);
-        if (rawBytes > this.maxBytes || bytes.length > this.representationLimit) {
+        if (rawBytes > (encoded ? this.sourceLimit : this.maxBytes) || bytes.length > this.representationLimit) {
             throw new AgentFault('STORAGE_CONTENT_LIMIT', '单个持久对象超过当前读取上限',
-                { bytes: rawBytes, maxBytes: this.maxBytes });
+                { bytes: rawBytes, maxBytes: encoded ? this.sourceLimit : this.maxBytes });
         }
         const identityPath = join('objects', hash.slice(0, 2), hash);
-        if (encoded && existsSync(storagePath(this.root, identityPath))) {
+        if (encoded && rawBytes <= this.maxBytes && existsSync(storagePath(this.root, identityPath))) {
             this.readBytes(identityPath, hash, rawBytes);
             return { hash, kind, bytes: rawBytes, path: identityPath, created: false,
                 codec: 'identity', storedHash: hash, storedBytes: rawBytes, mediaRefs: [] };
@@ -121,6 +133,29 @@ export class ObjectFiles {
         }
     }
 
+    readProviderResponse(database: SqlDatabase, hash: string): unknown {
+        return this.readProviderObject(database, hash, 'provider_response');
+    }
+
+    readProviderFailure(database: SqlDatabase, hash: string): unknown {
+        return this.readProviderObject(database, hash, 'provider_failure');
+    }
+
+    readContextMediaContent(database: SqlDatabase, hash: string): unknown {
+        return this.readProviderObject(database, hash, 'model_step');
+    }
+
+    private readProviderObject(database: SqlDatabase, hash: string, kind: 'provider_response' | 'provider_failure' | 'model_step'): unknown {
+        const row = this.objectRow(database, hash);
+        if (row.kind !== kind) {
+            throw new AgentFault('INVALID_PARAMS', '供应商对象读取类型与持久索引不一致', { hash, kind });
+        }
+        if (row.codec === MEDIA_PAYLOAD_CODEC) {
+            return this.payloadCodec.decode(this.envelope(row, hash), { maxBytes: this.sourceLimit });
+        }
+        return this.read(database, hash);
+    }
+
     readSlice(database: SqlDatabase, hash: string, offset = 0, maxBytes = DEFAULT_ARTIFACT_BYTES) {
         if (!Number.isSafeInteger(offset) || offset < 0 || !Number.isSafeInteger(maxBytes)
             || maxBytes < 1 || maxBytes > MAX_ARTIFACT_BYTES) {
@@ -177,10 +212,11 @@ export class ObjectFiles {
     }
 
     private objectRow(database: SqlDatabase, hash: string): SqlRow {
-        const row = database.prepare('SELECT path,raw_bytes,stored_bytes,stored_hash,codec,state FROM objects WHERE hash = ?').get(hash);
+        const row = database.prepare('SELECT kind,path,raw_bytes,stored_bytes,stored_hash,codec,state FROM objects WHERE hash = ?').get(hash);
         if (!row || row.state !== 'ready' || !/^[a-f0-9]{64}$/.test(hash)
             || !['identity', MEDIA_PAYLOAD_CODEC].includes(String(row.codec))
-            || !Number.isSafeInteger(Number(row.raw_bytes)) || Number(row.raw_bytes) < 0 || Number(row.raw_bytes) > this.maxBytes
+            || !Number.isSafeInteger(Number(row.raw_bytes)) || Number(row.raw_bytes) < 0
+            || Number(row.raw_bytes) > (row.codec === MEDIA_PAYLOAD_CODEC ? this.sourceLimit : this.maxBytes)
             || !/^[a-f0-9]{64}$/.test(String(row.stored_hash))
             || (row.codec === 'identity' && (row.stored_hash !== hash || Number(row.stored_bytes) !== Number(row.raw_bytes)))) {
             throw new AgentFault('STORAGE_SEGMENT_CORRUPT', '内容对象索引缺失或表示不可读', { hash });

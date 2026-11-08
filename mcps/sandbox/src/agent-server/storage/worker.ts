@@ -415,6 +415,14 @@ function dispatch(request: WorkerRequest): unknown {
             const row = database!.prepare('SELECT object_hash FROM content_items WHERE cid = ? AND content_id = ?').get(params.conversationId, params.contentId);
             return row ? files.read(database!, String(row.object_hash)) as JsonValue : undefined;
         }
+        case 'readContextMediaContent': {
+            const params = request.params as { conversationId: string; contentId: string };
+            const row = database!.prepare('SELECT kind,object_hash FROM content_items WHERE cid = ? AND content_id = ?')
+                .get(params.conversationId, params.contentId);
+            if (!row) return undefined;
+            if (row.kind !== 'model_step') throw new AgentFault('INVALID_PARAMS', '媒体上下文读取仅适用于原会话模型步骤');
+            return files.readContextMediaContent(database!, String(row.object_hash)) as JsonValue;
+        }
         case 'readArtifact': {
             const params = request.params as ArtifactQuery;
             const row = database!.prepare('SELECT object_hash FROM content_items WHERE cid = ? AND content_id = ?')

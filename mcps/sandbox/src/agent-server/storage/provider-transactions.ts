@@ -45,11 +45,16 @@ export class ProviderTransactions {
     readAttempt(attemptId: string): PersistedProviderAttempt | undefined {
         const row = this.row(attemptId);
         if (!row) return undefined;
+        const rawArtifact = row.raw_object_hash ? this.database.prepare(
+            'SELECT content_items.content_id,objects.hash,objects.raw_bytes FROM content_items JOIN objects ON objects.hash = content_items.object_hash WHERE content_items.cid = ? AND content_items.content_id = ? AND objects.hash = ?')
+            .get(this.attemptConversationId(row), `provider-raw:${attemptId}`, String(row.raw_object_hash)) : undefined;
         return { state: row.state as PersistedProviderAttempt['state'],
             attempt: this.files.read(this.database, String(row.attempt_object_hash)) as ProviderAttempt,
             upperBound: JSON.parse(String(row.upper_bound_json)) as UpperBound,
-            ...(row.response_object_hash ? { response: { ...this.files.read(this.database, String(row.response_object_hash)) as NormalizedResponse, canExecuteTools: false } } : {}),
-            ...(row.failure_object_hash ? { failure: this.files.read(this.database, String(row.failure_object_hash)) as RecordedFailure } : {}),
+            ...(row.response_object_hash ? { response: { ...this.files.readProviderResponse(this.database, String(row.response_object_hash)) as NormalizedResponse, canExecuteTools: false } } : {}),
+            ...(rawArtifact ? { rawResponseArtifact: { artifactId: String(rawArtifact.content_id),
+                sha256: String(rawArtifact.hash), totalBytes: Number(rawArtifact.raw_bytes) } } : {}),
+            ...(row.failure_object_hash ? { failure: this.files.readProviderFailure(this.database, String(row.failure_object_hash)) as RecordedFailure } : {}),
             toolsAuthorized: Number(row.tools_authorized) === 1, lateResponse: Number(row.late_response) === 1 };
     }
 
@@ -60,7 +65,7 @@ export class ProviderTransactions {
         if (previous) {
             if (previous.intent_hash !== intentHash) throw new AgentFault('E_ATTEMPT_CONFLICT', '同一尝试的冻结请求或费用上界已经变化');
             if (previous.state === 'committed') return { status: 'committed', response: {
-                ...this.files.read(this.database, String(previous.response_object_hash)) as NormalizedResponse, canExecuteTools: false } };
+                ...this.files.readProviderResponse(this.database, String(previous.response_object_hash)) as NormalizedResponse, canExecuteTools: false } };
             return { status: previous.state === 'dispatching' ? 'already_dispatching' : previous.state as 'unknown' | 'rejected' };
         }
         this.requireLiveRun(attempt.snapshot, true);
@@ -100,8 +105,19 @@ export class ProviderTransactions {
             if (row.response_object_hash !== sha256(canonicalJson(response))) throw new AgentFault('E_RESPONSE_CONFLICT', '该尝试已经提交不同原生响应');
             return { canExecuteTools: false };
         }
-        const normalized = this.files.prepare(response, 'provider_response');
         const raw = this.files.prepare(response.raw, 'provider_raw_response');
+        this.atomic([raw], () => {
+            const current = this.requireAttempt(attempt);
+            if (current.raw_object_hash && current.raw_object_hash !== raw.hash) {
+                throw new AgentFault('E_RESPONSE_CONFLICT', '该尝试已经保存不同的原生响应');
+            }
+            this.database.prepare('UPDATE provider_attempt_journal SET raw_object_hash = ?,updated_at = ? WHERE attempt_id = ?')
+                .run(raw.hash, new Date().toISOString(), attempt.attemptId);
+            this.database.prepare('INSERT INTO content_items (cid,content_id,kind,object_hash) VALUES (?,?,?,?) ON CONFLICT(cid,content_id) DO NOTHING')
+                .run(attempt.snapshot.conversationId, `provider-raw:${attempt.attemptId}`, 'provider_raw_response', raw.hash);
+            this.reference(attempt, 'raw', raw.hash);
+        });
+        const normalized = this.files.prepare(response, 'provider_response');
         const usage = this.files.prepare(response.usage, 'provider_usage');
         const tools = this.files.prepare(response.toolCalls, 'provider_tool_intents');
         const toolObjects = response.toolCalls.length <= 128 ? response.toolCalls.map(call => this.files.prepare(call, 'provider_tool_intent')) : [];
@@ -183,6 +199,11 @@ export class ProviderTransactions {
 
     private row(attemptId: string): SqlRow | undefined {
         return this.database.prepare('SELECT * FROM provider_attempt_journal WHERE attempt_id = ?').get(attemptId);
+    }
+
+    private attemptConversationId(row: SqlRow): string {
+        const attempt = this.database.prepare('SELECT cid FROM attempts WHERE attempt_id = ?').get(String(row.attempt_id));
+        return String(attempt?.cid ?? '');
     }
 
     private requireAttempt(attempt: ProviderAttempt): SqlRow {

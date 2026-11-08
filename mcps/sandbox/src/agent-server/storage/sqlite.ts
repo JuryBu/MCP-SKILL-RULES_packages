@@ -229,6 +229,10 @@ export class SqliteStore implements StorePort {
         return this.request('readContent', { conversationId, contentId });
     }
 
+    readContextMediaContent(conversationId: string, contentId: string): Promise<JsonValue | undefined> {
+        return this.request('readContextMediaContent', { conversationId, contentId });
+    }
+
     inspectConversationLifecycle(input: LifecycleInspectWorkerParams): Promise<LifecycleInspectWorkerResult> {
         return this.request('lifecycle.inspect', input);
     }

@@ -255,13 +255,14 @@ export class ProviderFault extends AgentFault {
         acceptance: Acceptance; phase?: DispatchPhase; httpStatus?: number; nativeCode?: string; nativeReason?: string;
         transportCause?: TransportCause; transportPhase?: TransportPhase;
         retryAfterMs?: number; retryable?: boolean; rawResponse?: RawProviderResponse;
-        partialResponse?: NormalizedResponse; usage?: NormalizedUsage;
+        partialResponse?: NormalizedResponse; usage?: NormalizedUsage; attemptId?: string; actionId?: string;
     }) {
         const phase = options.phase ?? (options.acceptance === 'not_sent' ? 'prepared' : options.acceptance === 'unknown' ? 'unknown' : options.acceptance);
         super(code, message, { acceptance: options.acceptance, phase,
             httpStatus: options.httpStatus, nativeCode: options.nativeCode, nativeReason: options.nativeReason, retryAfterMs: options.retryAfterMs,
             ...(options.transportCause ? { transportCause: { ...options.transportCause } } : {}),
-            ...(options.transportPhase ? { transportPhase: options.transportPhase } : {}) },
+            ...(options.transportPhase ? { transportPhase: options.transportPhase } : {}),
+            ...(options.attemptId ? { attemptId: options.attemptId } : {}), ...(options.actionId ? { actionId: options.actionId } : {}) },
         options.acceptance === 'accepted' || options.acceptance === 'unknown', options.retryable ?? false);
         this.name = 'ProviderFault';
         this.acceptance = options.acceptance;

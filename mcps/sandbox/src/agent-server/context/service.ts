@@ -19,6 +19,8 @@ import { historicalToolGroup } from './history-tool-outcomes.js';
 import type { HistoricalToolResultResolver } from './history-tool-outcomes.js';
 import type { NativeHistoryAdapter } from './native-view-build.js';
 import type { ToolDeliveryIdentity, ToolDeliveryPolicy, ToolDelivery } from './tool-delivery.js';
+import { hasInlineHistoryMedia, historyMatchesReference, MAX_MEDIA_HISTORY_SOURCE_BYTES, MAX_ORDINARY_HISTORY_BYTES,
+    nativeHistoryMaterialBytes, validateMediaHistoryExpansion } from './sources.js';
 
 export interface ContextServiceOptions {
     compactor?: ContextCompactor;
@@ -326,6 +328,8 @@ export class ContextService {
         let previousSeq = Number.MAX_SAFE_INTEGER;
         let bytes = Buffer.byteLength(canonicalJson(input.baseView)) + Buffer.byteLength(rendered.text);
         const baseBytes = bytes;
+        let restoredSourceBytes = 0;
+        let ordinarySourceBytes = 0;
         const capturedPages: HistoryPage[] = [];
         let capturedPageBytes = 0;
         let replayIndex = 0;
@@ -356,23 +360,34 @@ export class ContextService {
                 if (item.seq <= coveredEndSeq) { reachedCovered = true; break; }
                 if (selected.length >= this.maxViewItems) throw new ContextFault('INPUT_BUDGET', '发送尾部达到有界项目上限，需要先压缩',
                     { maxViewItems: this.maxViewItems, appendSeq: page.appendSeq, coveredEndSeq });
-                if (bytes + item.objectRef.rawBytes > maxViewBytes) throw new ContextFault('INPUT_BUDGET', '有界历史尚未完整载入发送尾部，需要压缩或扩大明确视图预算',
-                    { maxViewBytes, loadedBytes: bytes, nextItemId: item.itemId, appendSeq: page.appendSeq, coveredEndSeq });
+                restoredSourceBytes += item.objectRef.rawBytes;
+                if (!Number.isSafeInteger(item.objectRef.rawBytes) || item.objectRef.rawBytes < 0
+                    || restoredSourceBytes > MAX_MEDIA_HISTORY_SOURCE_BYTES) throw new ContextFault('INPUT_BUDGET', '历史原件累计恢复量超过有界媒体预算',
+                    { maxRecoveryBytes: MAX_MEDIA_HISTORY_SOURCE_BYTES, nextItemId: item.itemId });
+                if (item.objectRef.rawBytes > MAX_ORDINARY_HISTORY_BYTES && (item.kind !== 'model_step' || item.role !== 'assistant' || !input.readItem)) {
+                    throw new ContextFault('INPUT_BUDGET', '普通历史正文超过32MiB材料预算', { itemId: item.itemId });
+                }
                 const cachedValue = replayPages ? offered?.values.get(item.contentId) : undefined;
                 let value = cachedValue !== undefined ? cachedValue : await readValue(item);
-                let serialized = canonicalJson(value);
-                let matchesReference = Buffer.byteLength(serialized) === item.objectRef.rawBytes && hashBytes(serialized) === item.objectRef.hash;
+                let matchesReference = historyMatchesReference(item, value);
                 if (cachedValue !== undefined && !matchesReference) {
                     value = await readValue(item);
-                    serialized = canonicalJson(value);
-                    matchesReference = Buffer.byteLength(serialized) === item.objectRef.rawBytes && hashBytes(serialized) === item.objectRef.hash;
+                    matchesReference = historyMatchesReference(item, value);
                 }
                 if (!matchesReference) {
                     throw new ContextFault('HISTORY_STALE', '原生尾部正文与不可变历史引用不一致', { itemId: item.itemId });
                 }
+                if (hasInlineHistoryMedia(value)) validateMediaHistoryExpansion(value);
+                else {
+                    ordinarySourceBytes += item.objectRef.rawBytes;
+                    if (ordinarySourceBytes > MAX_ORDINARY_HISTORY_BYTES) throw new ContextFault('INPUT_BUDGET', '普通历史累计正文超过32MiB材料预算');
+                }
+                const materialBytes = nativeHistoryMaterialBytes(value, maxViewBytes);
+                if (bytes + materialBytes > maxViewBytes) throw new ContextFault('INPUT_BUDGET', '实际原生重放材料超过发送视图预算',
+                    { maxViewBytes, loadedBytes: bytes, nextItemId: item.itemId });
                 values.set(item.contentId, value);
                 selected.push(item);
-                bytes += item.objectRef.rawBytes;
+                bytes += materialBytes;
             }
             if (reachedCovered || !page.hasMore) break;
             if (!page.items.length || !page.nextCursor || cursorSet.has(page.nextCursor)) throw new ContextFault('SOURCE_GAP', '反向历史分页未推进');
@@ -462,7 +477,7 @@ export class ContextService {
         checkAbort(input.context.signal);
         validateContextEstimateForView(estimate, view, { modelId: input.modelId, adapterVersion: input.adapter.version });
         if (input.readTailReuse === 'offer') this.offerReadTail(input.conversationId, { context: input.context, coveredEndSeq,
-            history: metadata, pages: capturedPages, values, bytes: capturedPageBytes + bytes - baseBytes });
+            history: metadata, pages: capturedPages, values, bytes: capturedPageBytes + restoredSourceBytes });
         return { view, estimate, nativeReplayHash: hashContext(rawTail.map(item => [item.itemId, item.objectRef.hash])),
             attachmentManifestHash: hashContext(attachmentManifest),
             history: { ...metadata, firstSeq: rawTail[0]?.seq ?? null, lastSeq: rawTail.at(-1)?.seq ?? null, loadedItems: rawTail.length, pages, completeTail: true },

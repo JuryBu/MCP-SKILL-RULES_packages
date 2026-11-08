@@ -171,6 +171,13 @@ export class AgentStore implements StorePort {
         return (await this.conversationStore(conversationId)).readContent(conversationId, contentId);
     }
 
+    async readContextMediaContent(conversationId: string, contentId: string): Promise<JsonValue | undefined> {
+        this.assertOpen();
+        const store: StorePort = await this.conversationStore(conversationId);
+        return store.readContextMediaContent ? store.readContextMediaContent(conversationId, contentId)
+            : store.readContent(conversationId, contentId);
+    }
+
     async readArtifact(query: ArtifactQuery): Promise<ArtifactChunk> {
         this.assertOpen();
         return (await this.conversationStore(query.conversationId)).readArtifact(query);

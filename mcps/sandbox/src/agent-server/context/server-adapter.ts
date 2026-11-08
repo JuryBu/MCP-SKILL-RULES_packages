@@ -534,7 +534,8 @@ export function createContextServerAdapter(options: ContextServerAdapterOptions)
         return { ...overrides, dynamicContext: taskPlanDynamicContext(overrides, context, plan), readTailReuse: 'consume', policy: binding.config.policy,
             resolveHistoricalToolResults: overrides.resolveHistoricalToolResults ?? createHistoricalToolResultResolver(options.store),
             readItem: overrides.readItem ?? ((item, bounds) => item.value !== undefined ? Promise.resolve(item.value) : readHistoryArtifact(options.store,
-                { conversationId: context.snapshot.conversationId, item, maxReadBytes: bounds.maxReadBytes, signal: bounds.signal })),
+                { conversationId: context.snapshot.conversationId, item, maxReadBytes: bounds.maxReadBytes, signal: bounds.signal,
+                    mediaExpansion: item.kind === 'model_step' })),
             compression: binding, baseView: { ...(overrides.baseView ?? { protocol: plan.adapter.protocol }), ...(input?.tools ? { tools: input.tools } : {}) } };
     }, (built, details) => {
         const conversationId = details.conversationId;
@@ -552,7 +553,8 @@ export function createContextServerAdapter(options: ContextServerAdapterOptions)
             const viewInput = { ...overrides, dynamicContext: taskPlanDynamicContext(overrides, context, plan), readTailReuse: 'offer' as const, conversationId: context.snapshot.conversationId, context, adapter: plan.adapter,
                 resolveHistoricalToolResults: overrides.resolveHistoricalToolResults ?? createHistoricalToolResultResolver(options.store),
                 readItem: overrides.readItem ?? ((item, bounds) => item.value !== undefined ? Promise.resolve(item.value) : readHistoryArtifact(options.store,
-                    { conversationId: context.snapshot.conversationId, item, maxReadBytes: bounds.maxReadBytes, signal: bounds.signal })),
+                    { conversationId: context.snapshot.conversationId, item, maxReadBytes: bounds.maxReadBytes, signal: bounds.signal,
+                        mediaExpansion: item.kind === 'model_step' })),
                 modelId: plan.modelId, parameters: plan.parameters,
                 baseView: { ...(overrides.baseView ?? { protocol: plan.adapter.protocol }), ...(input?.tools ? { tools: input.tools } : {}) } };
             const built = await service.buildView(viewInput);

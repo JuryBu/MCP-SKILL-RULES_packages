@@ -557,7 +557,8 @@ export function createProviderExecutor(services: ExecutionServices): AgentExecut
                 const currentAcceptance = error instanceof ProviderFault ? error.acceptance : error.mayHaveStarted ? 'unknown' : acceptance;
                 const releasedEffects = confirmedToolEffects.some(effect => effect.cleanupState === 'released');
                 const facts = { acceptance: currentAcceptance, cleanupEvidence: cleanupState === 'released' || releasedEffects ? 'resources_released' as const : 'no_resources_created' as const,
-                    actionId: currentActionId ?? null, attemptId: confirmedAttemptId ?? null };
+                    actionId: currentActionId ?? (typeof error.details?.actionId === 'string' ? error.details.actionId : null),
+                    attemptId: confirmedAttemptId ?? (typeof error.details?.attemptId === 'string' ? error.details.attemptId : null) };
                 if (confirmedToolEffects.length && ['not_sent', 'rejected'].includes(currentAcceptance)) {
                     const detail = { ...error.toJSON(), ...(currentActionId ? { actionId: currentActionId } : {}),
                         ...(confirmedAttemptId ? { attemptId: confirmedAttemptId } : {}),

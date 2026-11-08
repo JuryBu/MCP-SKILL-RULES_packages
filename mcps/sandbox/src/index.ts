@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * MCP Sandbox Server v1.19.4
+ * MCP Sandbox Server v1.19.5
  *
  * 代码执行沙箱，解决 Antigravity IDE 中 run_command 的痛点。
  *

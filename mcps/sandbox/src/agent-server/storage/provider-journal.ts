@@ -8,6 +8,7 @@ export interface PersistedProviderAttempt {
     attempt: ProviderAttempt;
     upperBound: UpperBound;
     response?: NormalizedResponse;
+    rawResponseArtifact?: { artifactId: string; sha256: string; totalBytes: number };
     failure?: RecordedFailure;
     toolsAuthorized: boolean;
     lateResponse: boolean;

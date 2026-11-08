@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { AgentFault } from '../protocol.js';
 import type { AgentError } from '../protocol.js';
 import type { UpperBound } from '../accounting/budget-ledger.js';
@@ -84,6 +85,33 @@ export class ProviderDispatcher {
         }
     }
 
+    private async recordFailure(attempt: ProviderAttempt, failure: RecordedFailure): Promise<void> {
+        try {
+            await this.options.journal.recordFailure(attempt, failure);
+            return;
+        } catch (error) {
+            const persistenceCode = error instanceof AgentFault ? error.code : 'E_FAILURE_PERSISTENCE';
+            if (['MEDIA_CODEC_LIMIT', 'STORAGE_CONTENT_LIMIT', 'STORAGE_DECOMPRESS_LIMIT'].includes(persistenceCode)
+                && (failure.rawResponse || failure.partialResponse)) {
+                const raw = failure.rawResponse ?? failure.partialResponse?.raw;
+                const compact: RecordedFailure = { acceptance: failure.acceptance,
+                    error: { ...failure.error, details: { ...failure.error.details,
+                        responsePersistence: { code: persistenceCode, completeResponseSaved: false,
+                            ...(raw ? { httpStatus: raw.httpStatus, bodyBytes: Buffer.byteLength(raw.body),
+                                bodySha256: createHash('sha256').update(raw.body).digest('hex') } : {}) } } },
+                    ...(failure.usage ? { usage: failure.usage } : {}) };
+                try {
+                    await this.options.journal.recordFailure(attempt, compact);
+                    return;
+                } catch {}
+            }
+            throw new ProviderFault(failure.error.code, '原请求的派发状态保留，执行回执尚未可靠保存，请核对原尝试',
+                { acceptance: failure.acceptance, nativeCode: persistenceCode, nativeReason: failure.error.code,
+                    rawResponse: failure.rawResponse, partialResponse: failure.partialResponse, usage: failure.usage,
+                    attemptId: attempt.attemptId, actionId: attempt.snapshot.actionId, retryable: false });
+        }
+    }
+
     async execute(adapter: ProviderAdapter, snapshot: RequestSnapshot, rootBudgetId: string, upperBound: UpperBound,
         options: { signal?: AbortSignal; attemptId?: string;
             onPartial?: (attempt: ProviderAttempt, partial: ProviderPartial) => void | Promise<void> } = {}): Promise<NormalizedResponse> {
@@ -136,7 +164,7 @@ export class ProviderDispatcher {
                     ? new ProviderFault(error instanceof AgentFault ? error.code : adapterEntered ? 'E_TRANSPORT_UNSENT' : 'E_SECRET_BACKEND', '请求发送前的准备未完成',
                         { acceptance: 'not_sent', phase: 'prepared', transportPhase: 'preflight', transportCause: safeTransportCause(error) })
                     : asProviderFault(error);
-                await this.options.journal.recordFailure(attempt, { error: { ...fault.toJSON(), actionId: snapshot.actionId, attemptId: attempt.attemptId },
+                await this.recordFailure(attempt, { error: { ...fault.toJSON(), actionId: snapshot.actionId, attemptId: attempt.attemptId },
                     acceptance: fault.acceptance, ...(fault.rawResponse ? { rawResponse: fault.rawResponse } : {}),
                     ...(fault.partialResponse ? { partialResponse: fault.partialResponse } : {}), ...(fault.usage ? { usage: fault.usage } : {}) });
                 const retryable = ['not_sent', 'rejected'].includes(fault.acceptance) && fault.retryable && !failureHasExecutionEvidence(fault)
@@ -157,8 +185,10 @@ export class ProviderDispatcher {
                 return freezeOwned({ ...response, canExecuteTools: response.canExecuteTools && committed.canExecuteTools
                     && !options.signal?.aborted });
             } catch {
-                const fault = new ProviderFault('E_COMMIT_UNKNOWN', '远端结果已收到，本地提交尚未确认，保留原尝试并停止工具执行', { acceptance: 'accepted' });
-                await this.options.journal.recordFailure(attempt, { error: { ...fault.toJSON(), attemptId: attempt.attemptId, actionId: snapshot.actionId }, acceptance: 'accepted', rawResponse: response.raw });
+                const fault = new ProviderFault('E_COMMIT_UNKNOWN', '远端结果已收到，本地提交尚未确认，保留原尝试并停止工具执行',
+                    { acceptance: 'accepted', attemptId: attempt.attemptId, actionId: snapshot.actionId });
+                await this.recordFailure(attempt, { error: { ...fault.toJSON(), attemptId: attempt.attemptId, actionId: snapshot.actionId },
+                    acceptance: 'accepted', rawResponse: response.raw, usage: response.usage });
                 throw fault;
             }
         }

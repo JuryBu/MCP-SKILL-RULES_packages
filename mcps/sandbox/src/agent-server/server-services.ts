@@ -3,6 +3,7 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { homedir, tmpdir } from 'node:os';
 import { AgentFault, canonicalJson, failure, operationHash, validateParams } from './protocol.js';
+import { reconcileRunFailureView } from './run-failure-view.js';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { createHash, randomUUID } from 'node:crypto';
 import type { ClientIdentity, JsonObject, JsonValue, RpcResult } from './protocol.js';
@@ -391,7 +392,7 @@ export async function createAgentServices(options: ServerServiceOptions) {
         },
         requireIdle: async (conversation, client) => { await options.runtime.assertConversationIdle(conversation.value.conversationId, client, true); },
     });
-    inputAttachments = new InputAttachmentService({ store: options.store, media,
+    inputAttachments = new InputAttachmentService({ store: options.store, media, limits: { maxViewBytes: 32 * 1024 * 1024 },
         readNativeSource: async (source, signal) => {
             if (signal?.aborted) throw new AgentFault('E_ATTACHMENT_CANCELLED', '本次原生来源读取已取消，原记录保持原样');
             const branched = await readLifecycleNativeOrigin(options.store, source);
@@ -686,6 +687,20 @@ export async function createAgentServices(options: ServerServiceOptions) {
     const dispatch = async (method: string, params: Record<string, unknown>, client: ClientIdentity): Promise<RpcResult> => {
         try {
             if (closed) throw new AgentFault('INVALID_STATE', '核心正在关闭');
+            if (method === 'server.info') {
+                const result = await options.runtime.dispatch(method, params, client);
+                if (!result.ok) return result;
+                const info = result.data as JsonObject;
+                const capabilities = info.capabilities as JsonObject;
+                return { ...result, data: { ...info, capabilities: { ...capabilities,
+                    automaticModelExecution: true,
+                    executorActivation: capabilities.executor ? 'active' : 'on_profile_run' } } };
+            }
+            if (method === 'runs.get') {
+                const result = await options.runtime.dispatch(method, params, client);
+                return reconcileRunFailureView(result, { readBudget: rootBudgetId => accountingPort.read(rootBudgetId),
+                    readAttempt: attemptId => journal.readAttempt(attemptId) });
+            }
             const configurationResult = await configuration.dispatch(method, params, client);
             if (configurationResult) return configurationResult;
             if (Object.hasOwn(CONVERSATION_LIFECYCLE_RPC_METHOD_SPECS, method)) {

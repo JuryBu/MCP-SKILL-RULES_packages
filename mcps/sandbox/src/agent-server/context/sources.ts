@@ -1,4 +1,8 @@
 import { canonicalJson } from '../protocol.js';
+import { createHash } from 'node:crypto';
+import { canonicalJsonByteChunks, MediaPayloadCodec } from '../media/payload-codec.js';
+import { MemoryBinaryPayloads } from '../media/memory-payloads.js';
+import { inspectBase64, normalizeMime, validateMediaBytes } from '../media/validation.js';
 import type { JsonObject, JsonValue } from '../protocol.js';
 import type { HistoryItem } from '../storage/port.js';
 import type { ContextHistoryPort, ContextSourcePort, SourceBlock, SourceRead } from './contracts.js';
@@ -9,6 +13,59 @@ interface ProjectedBlock { blockId: string; kind: 'text' | 'nativeAnchor'; bytes
 
 const objectValue = (value: unknown): Record<string, unknown> | null => value !== null && typeof value === 'object' && !Array.isArray(value)
     ? value as Record<string, unknown> : null;
+
+export const MAX_MEDIA_HISTORY_SOURCE_BYTES = 256 * 1024 * 1024;
+export const MAX_ORDINARY_HISTORY_BYTES = 32 * 1024 * 1024;
+
+function historyDigest(value: unknown, maxBytes = MAX_MEDIA_HISTORY_SOURCE_BYTES): { bytes: number; hash: string } {
+    const checksum = createHash('sha256');
+    let bytes = 0;
+    for (const chunk of canonicalJsonByteChunks(value, { maxBytes })) { bytes += chunk.length; checksum.update(chunk); }
+    return { bytes, hash: checksum.digest('hex') };
+}
+
+export function historyMatchesReference(item: HistoryItem, value: JsonValue): boolean {
+    try {
+        const actual = historyDigest(value, Math.min(item.objectRef.rawBytes, MAX_MEDIA_HISTORY_SOURCE_BYTES));
+        return actual.bytes === item.objectRef.rawBytes && actual.hash === item.objectRef.hash;
+    } catch { return false; }
+}
+
+export function hasInlineHistoryMedia(value: JsonValue): boolean {
+    const root = objectValue(value), response = objectValue(root?.response);
+    return root?.kind === 'model' && Array.isArray(response?.blocks) && response.blocks.some(entry => {
+        const block = objectValue(entry);
+        return block && ['image', 'audio', 'video', 'file'].includes(String(block.type)) && typeof block.dataBase64 === 'string';
+    });
+}
+
+export function validateMediaHistoryExpansion(value: JsonValue): void {
+    if (!hasInlineHistoryMedia(value)) throw new ContextFault('INPUT_BUDGET', '仅合法内联媒体历史可使用额外恢复预算');
+    const binary = new MemoryBinaryPayloads(MAX_ORDINARY_HISTORY_BYTES);
+    try {
+        const response = objectValue(objectValue(value)!.response)!;
+        for (const entry of response.blocks as JsonValue[]) {
+            const block = objectValue(entry);
+            if (!block || typeof block.dataBase64 !== 'string' || !['image', 'audio', 'video', 'file'].includes(String(block.type))) continue;
+            const info = inspectBase64(block.dataBase64, MAX_ORDINARY_HISTORY_BYTES);
+            validateMediaBytes(block.type as 'image' | 'audio' | 'video' | 'file', normalizeMime(block.mime), info);
+        }
+        const codec = new MediaPayloadCodec(binary, { maxSourceBytes: MAX_MEDIA_HISTORY_SOURCE_BYTES,
+            maxMetadataBytes: MAX_ORDINARY_HISTORY_BYTES, maxTotalPayloadBytes: MAX_ORDINARY_HISTORY_BYTES });
+        if (!codec.encode(value)) throw new ContextFault('INPUT_BUDGET', '媒体历史没有可验证的有界原件');
+    } catch (error) {
+        if (error instanceof ContextFault) throw error;
+        throw new ContextFault('INPUT_BUDGET', '媒体历史超过原件或元数据恢复预算',
+            { cause: error instanceof Error ? error.message : String(error) });
+    } finally { binary.close(); }
+}
+
+export function nativeHistoryMaterialBytes(value: JsonValue, maxBytes: number): number {
+    const root = objectValue(value), response = objectValue(root?.response);
+    const material = root?.kind === 'model' && Array.isArray(response?.replayMessages) ? response.replayMessages : value;
+    try { return historyDigest(material, maxBytes).bytes; }
+    catch { throw new ContextFault('INPUT_BUDGET', '实际原生重放材料超过发送视图预算', { maxViewBytes: maxBytes }); }
+}
 
 export function projectHistoryContent(item: HistoryItem, value: JsonValue): ProjectedBlock[] {
     const blocks: ProjectedBlock[] = [];
@@ -30,7 +87,7 @@ export function projectHistoryContent(item: HistoryItem, value: JsonValue): Proj
         });
         if (Array.isArray(response.toolCalls)) response.toolCalls.forEach((call, index) => add(`response.toolCalls.${index}`, canonicalJson(call)));
         add('response.raw', canonicalJson({ contentId: item.contentId, protocol: root.protocol ?? item.providerProtocol ?? null,
-            complete: response.complete ?? false, rawHash: hashBytes(canonicalJson(response.raw ?? null)) }), 'nativeAnchor');
+            complete: response.complete ?? false, rawHash: historyDigest(response.raw ?? null).hash }), 'nativeAnchor');
     } else if (root?.kind === 'tool') add('result', canonicalJson(root.result ?? null));
     else if (root && typeof root.text === 'string') {
         add('text', root.text);
