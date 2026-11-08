@@ -1,4 +1,6 @@
-# MCP Sandbox v1.19.4
+# MCP Sandbox v1.19.8
+
+本版修复旧版Python执行长中文代码行时的错误编码报告：临时Python脚本缺少编码声明时加入UTF-8 BOM（文件开头的编码标记），保留已有声明、正文和原行号，无需调用方手工转义中文。未升级或修改系统Python及环境变量。相关行为见[CPython问题82936](https://github.com/python/cpython/issues/82936)和[Python编码声明说明](https://docs.python.org/3.9/reference/lexical_analysis.html#encoding-declarations)。
 
 本版整理 Agent 人用 CLI 的首用、模型、工作区与用量显示，补齐原命令行内高清动画和中文输入；上下文按语义末段增量更新，原文查回及有用命中反馈参与后续压缩，主体模型维护实体 Task/Plan。人工交互按实际使用计量，自动调用继续要求明确预算。原回执、未知结果和费用沿原命令保留。
 

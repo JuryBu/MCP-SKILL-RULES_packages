@@ -61,6 +61,14 @@ function generateTempFilename(prefix: string, ext: string): string {
  * 保存临时脚本文件（用于 code 模式执行）
  * @returns 文件绝对路径
  */
+function pythonDeclaresSourceEncoding(code: string): boolean {
+    const firstLines = code.split(/\r\n?|\n/, 2);
+    const encodingCookie = /^[ \t\f]*#[^\r\n]*?coding[:=][ \t]*[-\w.]+/;
+    const firstLine = firstLines[0] ?? "";
+    return encodingCookie.test(firstLine)
+        || (/^[ \t\f]*(?:#|$)/.test(firstLine) && encodingCookie.test(firstLines[1] ?? ""));
+}
+
 export function saveTempScript(language: string, code: string): string {
     ensureTempDir();
     const extMap: Record<string, string> = {
@@ -75,7 +83,10 @@ export function saveTempScript(language: string, code: string): string {
     const filePath = path.join(TEMP_DIR, filename);
 
     // PowerShell 5.1 读 .ps1 文件默认用系统编码(GBK)，必须加 UTF-8 BOM 才能正确解析
-    if (language === "powershell") {
+    const pythonNeedsBom = language === "python"
+        && !code.startsWith("\uFEFF")
+        && !pythonDeclaresSourceEncoding(code);
+    if (language === "powershell" || pythonNeedsBom) {
         const bom = Buffer.from([0xEF, 0xBB, 0xBF]);
         const content = Buffer.from(code, "utf-8");
         fs.writeFileSync(filePath, Buffer.concat([bom, content]));
