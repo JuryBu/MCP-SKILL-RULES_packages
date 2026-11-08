@@ -9,7 +9,7 @@ import { StringDecoder } from "string_decoder";
 
 export const GUARD_EVIDENCE_INDEX_START = "<<<GUARD_EVIDENCE_INDEX>>>";
 export const GUARD_EVIDENCE_INDEX_END = "<<<END_GUARD_EVIDENCE_INDEX>>>";
-const GUARD_EVIDENCE_INDEX_VERSION = 2;
+const GUARD_EVIDENCE_INDEX_VERSION = 4;
 const DEFAULT_PER_FILE_CHARS = Number(process.env.MEMORY_STORE_GUARD_EVIDENCE_FILE_CHARS || 24_000);
 const DEFAULT_TOTAL_CHARS = Number(process.env.MEMORY_STORE_GUARD_EVIDENCE_TOTAL_CHARS || 80_000);
 const DIRECT_TEXT_MAX_BYTES = Number(process.env.MEMORY_STORE_GUARD_EVIDENCE_DIRECT_TEXT_BYTES || 2 * 1024 * 1024);
@@ -68,6 +68,7 @@ export interface GuardEvidenceIndexItem {
     artifactPath?: string;
     cachePath?: string;
     sizeBytes?: number;
+    sourceSha256?: string;
     mtimeMs?: number;
     text: string;
     warnings: string[];
@@ -238,7 +239,7 @@ function parseRange(range: string | undefined, lines: string[], prefixTruncated:
     throw new Error(`不支持的文本范围: ${range}`);
 }
 
-function readUtf8Prefix(filePath: string, maxBytes: number): { text: string; truncated: boolean } {
+function readUtf8Prefix(filePath: string, maxBytes: number): { text: string; truncated: boolean; sha256?: string } {
     const stat = fs.statSync(filePath);
     const byteCount = Math.min(stat.size, maxBytes);
     const descriptor = fs.openSync(filePath, "r");
@@ -247,7 +248,8 @@ function readUtf8Prefix(filePath: string, maxBytes: number): { text: string; tru
         const bytesRead = fs.readSync(descriptor, buffer, 0, byteCount, 0);
         const truncated = bytesRead < stat.size;
         const decoder = new StringDecoder("utf8");
-        return { text: decoder.write(buffer.subarray(0, bytesRead)) + (truncated ? "" : decoder.end()), truncated };
+        const bytes = buffer.subarray(0, bytesRead);
+        return { text: decoder.write(bytes) + (truncated ? "" : decoder.end()), truncated, sha256: truncated ? undefined : crypto.createHash("sha256").update(bytes).digest("hex") };
     } finally {
         fs.closeSync(descriptor);
     }
@@ -386,11 +388,15 @@ function buildUnreadableItem(input: GuardEvidenceAssetInput, resolvedPath: strin
 
 function indexTextFile(input: GuardEvidenceAssetInput, resolvedPath: string, kind: GuardEvidenceKind): GuardEvidenceSourceItem {
     const prefix = readUtf8Prefix(resolvedPath, DIRECT_TEXT_MAX_BYTES);
-    const scoped = parseRange(input.range, prefix.text.split(/\r?\n/u), prefix.truncated);
+    const jsonSelection = input.range?.startsWith("json:");
+    const scoped = jsonSelection
+        ? selectGuardJsonFields(prefix.text, input.range!.slice(5), prefix.truncated)
+        : parseRange(input.range, prefix.text.split(/\r?\n/u), prefix.truncated);
     const markdown = [
         ...formatBaseHeader(input, resolvedPath, kind),
         "## 类型与读取方式",
-        `- 读取方式：UTF-8 前缀读取${prefix.truncated ? "（源文件过大，已按字节预算截断）" : ""}`,
+        `- 读取方式：${jsonSelection ? "指定JSON Pointer原字段；未选择字段不进入审查输入" : "UTF-8 前缀读取"}${prefix.truncated ? "（源文件过大，已按字节预算截断）" : ""}`,
+        ...(jsonSelection && prefix.sha256 ? [`- 源文件SHA256：${prefix.sha256}`] : []),
         "",
         "## 文本摘录",
         "```text",
@@ -407,7 +413,8 @@ function indexTextFile(input: GuardEvidenceAssetInput, resolvedPath: string, kin
         role: input.role,
         kind,
         ingestMode: "direct_text",
-        parser: kind === "csv" ? "csv/text-prefix" : "utf8-prefix",
+        parser: jsonSelection ? "json-pointer-fields" : kind === "csv" ? "csv/text-prefix" : "utf8-prefix",
+        sourceSha256: prefix.sha256,
         ok: true,
         artifactPath,
         text: markdown,
@@ -419,6 +426,29 @@ function indexTextFile(input: GuardEvidenceAssetInput, resolvedPath: string, kin
         coverageGaps: scoped.gaps,
         ...metadataFor(resolvedPath),
     };
+}
+
+export function selectGuardJsonFields(text: string, selection: string, prefixTruncated = false): { text: string; complete: boolean; gaps: string[] } {
+    if (prefixTruncated) return { text: "", complete: false, gaps: ["json_source_incomplete: JSON源文件超过读取预算，未解析不完整原件"] };
+    const pointers: unknown = selection.startsWith("[") ? JSON.parse(selection) : [selection];
+    if (!Array.isArray(pointers) || !pointers.length || pointers.length > 64 || pointers.some(pointer => typeof pointer !== "string" || (pointer !== "" && !pointer.startsWith("/")))) throw new Error("json range requires 1-64 JSON Pointers");
+    const source = JSON.parse(text.replace(/^\uFEFF/u, ""));
+    const fields: Array<{ pointer: string; value: unknown }> = [];
+    const gaps: string[] = [];
+    for (const pointer of pointers as string[]) {
+        if (/~(?:[^01]|$)/u.test(pointer)) throw new Error(`invalid JSON Pointer escape: ${pointer}`);
+        let value: unknown = source;
+        let found = true;
+        for (const segment of pointer === "" ? [] : pointer.slice(1).split("/")) {
+            const key = segment.replace(/~1/gu, "/").replace(/~0/gu, "~");
+            if (Array.isArray(value) && (!/^(?:0|[1-9]\d*)$/u.test(key) || !Number.isSafeInteger(Number(key)) || Number(key) >= value.length)) { found = false; break; }
+            if (value === null || typeof value !== "object" || !Object.prototype.hasOwnProperty.call(value, key)) { found = false; break; }
+            value = (value as Record<string, unknown>)[key];
+        }
+        if (found) fields.push({ pointer, value });
+        else gaps.push(`json_pointer_missing: ${pointer}`);
+    }
+    return { text: JSON.stringify({ fields }, null, 2), complete: gaps.length === 0, gaps };
 }
 
 function indexImageMetadata(input: GuardEvidenceAssetInput, resolvedPath: string): GuardEvidenceSourceItem {
@@ -870,7 +900,12 @@ async function buildOneIndex(input: GuardEvidenceAssetInput, options: Required<B
     const cachePath = cachePathFor(cacheKey(input, resolvedPath, kind));
     if (options.indexMode === "reuse" || options.indexMode === "auto") {
         const cached = readCachedIndex(cachePath);
-        if (cached) return { ...cached, cachePath };
+        if (cached) {
+            if (kind !== "text" && kind !== "csv") return { ...cached, cachePath };
+            const current = readUtf8Prefix(resolvedPath, DIRECT_TEXT_MAX_BYTES);
+            if (current.sha256 && current.sha256 === cached.sourceSha256) return { ...cached, cachePath };
+            if (options.indexMode === "reuse") return buildUnreadableItem(input, resolvedPath, kind, "原件SHA已变化或来源不完整，旧索引未复用；使用auto重新读取原件");
+        }
         if (options.indexMode === "reuse") {
             return buildUnreadableItem(input, resolvedPath, kind, `未找到可复用索引缓存: ${cachePath}`);
         }

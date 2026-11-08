@@ -22,6 +22,7 @@ import type { Chain, DataChain } from "./chain.js";
 import { DEFAULT_ANTIGRAVITY_LS_MODEL } from "./ls-model-defaults.js";
 import { hasCodexModelRefusalClaim, type CodexBridgeDiagnostics, type CodexDiagnosticContext } from "./codex-bridge-diagnostics.js";
 import { resolveGuardTargetDocument, sanitizeGuardTargetLines } from "./guard-target-scope.js";
+import { resolveGuardEvidenceDeclarations } from "./guard-evidence-declarations.js";
 export { validateGuardTargetScope, findDeclaredGuardPlanFiles } from "./guard-target-scope.js";
 
 /**
@@ -1179,14 +1180,14 @@ export async function getConversationExecutionRecord(
     startRound: number,
     charBudget: number,
     dataChain: DataChain = "auto",
-    control: { deadlineAt?: number; isCancelled?: () => boolean; allowUnavailable?: boolean } = {},
+    control: { deadlineAt?: number; isCancelled?: () => boolean; allowUnavailable?: boolean; cacheOnly?: boolean } = {},
 ): Promise<GuardExecutionEvidence> {
     const unavailable = (reason: string): GuardExecutionEvidence => ({ text: "", startRound, includedRounds: 0, sourceChars: 0, includedChars: 0, sourceCharsKnown: false, coverageGaps: [`executionRecord: ${reason}`] });
     if (charBudget > 10_000) {
         try {
             const { isIsolatedSourceWorker, runIsolatedSource } = await import("./conversation-isolated-source.js");
-            if (!isIsolatedSourceWorker()) return await runIsolatedSource("guard-record", { conversationId, startRound, charBudget, dataChain, allowUnavailable: control.allowUnavailable }, control, { timeoutMs: 30_000 });
-            if (dataChain !== "auto") {
+            if (!isIsolatedSourceWorker()) return await runIsolatedSource("guard-record", { conversationId, startRound, charBudget, dataChain, allowUnavailable: control.allowUnavailable, cacheOnly: control.cacheOnly }, control, { timeoutMs: control.cacheOnly ? 2_000 : 30_000 });
+            if (dataChain !== "auto" && !control.cacheOnly) {
                 const { normalizeCorpusSource } = await import("./conversation-corpus-sources.js");
                 const { createMultiCorpusProvider } = await import("./conversation-corpus-reader-multi.js");
                 const source = normalizeCorpusSource(dataChain);
@@ -1221,6 +1222,7 @@ export async function getConversationExecutionRecord(
             const loaded = await loadConversationData(dataChain || "auto", conversationId, {
                 link: "summary",
                 includeRounds: false,
+                ...(control.cacheOnly ? { source: "cache" as const, publishedCacheOnly: true } : {}),
                 isCancelled: control.isCancelled,
                 sourceReadBudget: { deadlineMs: control.deadlineAt, isCancelled: control.isCancelled },
             });
@@ -1235,7 +1237,13 @@ export async function getConversationExecutionRecord(
                     : null;
                 const targetRounds: Iterable<ConversationRound> = cachedRounds?.rounds || loaded.rounds;
 
-                return collectGuardExecutionEvidence(targetRounds, startRound, charBudget, loaded.chainUsed);
+                const evidence = collectGuardExecutionEvidence(targetRounds, startRound, charBudget, loaded.chainUsed);
+                if (control.cacheOnly) {
+                    evidence.text = `[Reference only; published cache generation=${loaded.cacheGeneration || "unknown"}; live source was not refreshed]\n` + evidence.text;
+                    evidence.includedChars = evidence.text.length;
+                    evidence.coverageGaps.push("executionRecord: cache-only reference; current live source and later rounds were not refreshed");
+                }
+                return evidence;
             }
             return unavailable("conversation source unavailable");
         } catch (err) {
@@ -1281,7 +1289,7 @@ ${referenceExecution
 
 ## 评判标准
 - [x] 标记的项目：核对对应代码、测试输出、产物等实际证据；缺少必需原件时输出EVIDENCE_INSUFFICIENT，实际未做时输出FAIL
-- [ ] 或 [/] 标记的项目：视为未完成
+- [ ] 或 [/] 标记的项目：核对实际执行与原件；尚未执行时输出FAIL，仅等待本次Guard判断后勾选的项目按实质证据判断
 - 用户明确说"跳过"或"不做了"的项目：视为已完成
 - Plan 中的关键要求：检查是否被实际落实，而非仅在 Task 中标记
 - 用户在对话中提出的修改要求：检查 AI 是否真正执行了，还是口头应承但未操作
@@ -1294,6 +1302,7 @@ ${referenceExecution
 - MISSING: [任务标识] 具体描述（标注是"未做"还是"虚标"还是"偏离用户要求"）
 
 如果coverage显示必需证据未进入输入，请输出EVIDENCE_INSUFFICIENT。reference聊天的覆盖缺口按参考角色处理；HTTP原始日志、测试输出和实际产物等必需原件的缺失仍须阻断。命令及路径清单只供定位，参考材料出现的历史命令不会增加本阶段验收义务。
+本次是轻量单轮审查，只分析已提供的Task、Plan、原字段和取证覆盖，不调用Shell、MCP、联网或额外文件读取。缺少原件时在结果中列出对应任务与所需原件，交由调用者补齐。
 `;
 
     if (coverageText) {
@@ -1596,17 +1605,25 @@ export async function runGuardCheck(
         backgroundTaskId?: string;
         onCodexDiagnostics?: (diagnostics: CodexBridgeDiagnostics) => void;
         executionEvidenceRole?: "required" | "reference";
+        hasInputRevisionChanged?: () => boolean;
     } = {},
 ): Promise<GuardCheckResult> {
     const progress = (stage: string) => {
         try { options.onProgress?.(stage); } catch {}
     };
     progress("input");
+    const declaredEvidence = resolveGuardEvidenceDeclarations({ taskFiles: state.taskFiles, stageId: state.stageId, childScopeId: state.childScopeId || "main", assets: options.evidenceAssets });
+    const evidenceAssets = declaredEvidence.assets;
     // 1. 分段读取 Plan + Task 文件并生成 coverage / evidence manifest
     const scopeSelectors = normalizeGuardScopeSelectors(state.scopeSelectors);
     const initialInputBundle = buildGuardInputBundle(state.planFiles, state.taskFiles, state.stageId, scopeSelectors);
+    if (declaredEvidence.gaps.length) initialInputBundle.coverage.requiredGaps = [...(initialInputBundle.coverage.requiredGaps || []), ...declaredEvidence.gaps];
     if (shouldAbortGuardRun(options)) return createAbortedGuardResult(Boolean(options.isCancelled?.()));
-    if (initialInputBundle.coverage.requiredGaps?.length) return guardPreflightResult(state, initialInputBundle.coverage, undefined, options.evidenceAssets);
+    if (initialInputBundle.coverage.requiredGaps?.length) return guardPreflightResult(state, initialInputBundle.coverage, undefined, evidenceAssets);
+    const externalEvidence = await buildGuardEvidenceIndexes(evidenceAssets, { indexMode: options.evidenceIndexMode || "auto" });
+    const externalCoverage = mergeGuardFinalCoverage(initialInputBundle.coverage, externalEvidence);
+    if (externalCoverage.requiredGaps?.length) return guardPreflightResult(state, externalCoverage, externalEvidence);
+    if (shouldAbortGuardRun(options)) return createAbortedGuardResult(Boolean(options.isCancelled?.()));
     const diagnosticContext = { conversationId: state.conversationId, guardId: state.guardId, childScopeId: state.childScopeId, stageId: state.stageId, backgroundTaskId: options.backgroundTaskId };
     const inputBundle = scopeSelectors.length > 0
         ? initialInputBundle
@@ -1649,20 +1666,21 @@ export async function runGuardCheck(
 
     // 2. 有明确 startRound 时只注入该轮及之后的对话，不混入无轮次边界的旧 Record 摘要。
     progress("evidence");
+    if (shouldAbortGuardRun(options)) return createAbortedGuardResult(Boolean(options.isCancelled?.()));
+    const hasRequiredAssets = externalEvidence.items.some(item => !["reference", "context", "optional"].includes((item.role || "").trim().toLowerCase()));
+    const referenceExecution = options.executionEvidenceRole === "reference" && hasRequiredAssets;
     const recordContext = state.conversationId && state.startRound <= 0
         ? getRecordContext(state.conversationId, state.stageId, RECORD_CONTEXT_BUDGET, scopeSelectors)
         : "";
     const conversationExecution = state.conversationId
         ? await getConversationExecutionRecord(state.conversationId, state.startRound, EXECUTION_RECORD_BUDGET, state.chain || "auto", {
-            deadlineAt: Date.now() + (options.executionEvidenceRole === "reference" ? 5_000 : 30_000),
+            deadlineAt: Date.now() + (referenceExecution ? 2_000 : 30_000),
             isCancelled: () => shouldAbortGuardRun(options),
-            allowUnavailable: options.executionEvidenceRole === "reference",
+            allowUnavailable: referenceExecution,
+            cacheOnly: referenceExecution,
         })
         : { text: "", startRound: state.startRound, includedRounds: 0, sourceChars: 0, includedChars: 0, sourceCharsKnown: true, coverageGaps: [] };
 
-    const externalEvidence = await buildGuardEvidenceIndexes(options.evidenceAssets, {
-        indexMode: options.evidenceIndexMode || "auto",
-    });
     if (shouldAbortGuardRun(options)) {
         return createAbortedGuardResult(Boolean(options.isCancelled?.()));
     }
@@ -1680,11 +1698,9 @@ export async function runGuardCheck(
     const evidenceManifestPath = saveTempFile(
         `stage_guard_evidence_manifest_${Date.now()}`,
         "Stage Guard Evidence Manifest",
-        JSON.stringify(mergedEvidenceManifest, null, 2)
+        JSON.stringify({ ...mergedEvidenceManifest, declaredEvidenceSources: declaredEvidence.declarations }, null, 2)
     );
     const { text: executionText, ...executionEvidence } = conversationExecution;
-    const hasRequiredAssets = externalEvidence.items.some(item => !["reference", "context", "optional"].includes((item.role || "").trim().toLowerCase()));
-    const referenceExecution = options.executionEvidenceRole === "reference" && hasRequiredAssets;
     const baseCoverage = { ...inputBundle.coverage, executionEvidence: { ...executionEvidence, role: referenceExecution ? "reference" as const : "required" as const }, requiredGaps: [
         ...(inputBundle.coverage.requiredGaps || []),
         ...(options.executionEvidenceRole === "reference" && !hasRequiredAssets ? ["executionEvidenceRole=reference requires explicit required external evidence"] : []),
@@ -1717,6 +1733,9 @@ export async function runGuardCheck(
         return createAbortedGuardResult(Boolean(options.isCancelled?.()));
     }
     progress("model");
+    if (options.hasInputRevisionChanged?.()) return guardPreflightResult(state, {
+        ...initialCoverage, requiredGaps: [...(initialCoverage.requiredGaps || []), "input_revision_changed: 原件或任务在准备期间变化，本次未发模型；保留原任务后重新核对输入"],
+    }, externalEvidence);
     const response = await callFlashWithChain(
         provider => renderGuardPromptForProvider(promptInput, provider),
         resolveGuardModelChain(state),

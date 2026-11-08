@@ -1,5 +1,6 @@
 ﻿import fs from "fs";
 import { z } from "zod";
+import crypto from "crypto";
 import path from "path";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { touchActivity } from "../lifecycle.js";
@@ -20,6 +21,7 @@ import {
     cancelBackgroundTask,
     formatBackgroundTask,
     getBackgroundTask,
+    findActiveBackgroundTaskByPrefix,
     registerBackgroundTaskRecoveryHandler,
     startBackgroundTask,
     stableJsonHash,
@@ -32,6 +34,7 @@ import { formatToolError } from "../error-format.js";
 import { dataChainInputSchema, modelChainInputSchema } from "./schema-utils.js";
 import type { ResumePayloadValue } from "../background-recovery.js";
 import { DATA_ROOT, writeJsonAtomic } from "../store.js";
+import { resolveGuardEvidenceDeclarations } from "../guard-evidence-declarations.js";
 
 /**
  * Stage Guard — 任务完整性自动验证工具
@@ -78,18 +81,18 @@ const StageGuardSchema = z.object({
     evidenceAssets: z.array(z.object({
         path: z.string().describe("外部证据文件绝对路径或相对路径"),
         label: z.string().optional().describe("证据标签，便于 Guard 报告显示"),
-        type: z.string().optional().describe("可选类型提示：text/csv/image/pdf/doc/sheet/epub/video/binary"),
+        type: z.string().optional().describe("可选类型提示：text/csv/image/pdf/doc/sheet/epub/video/binary；manifest读取version=1的显式证据清单"),
         role: z.string().optional().describe("reference/context/optional为参考，其它角色及省略值均为必需；如report/screenshot/spec/output"),
-        range: z.string().optional().describe("可选范围提示，如 1-80、first200、last120"),
+        range: z.string().optional().describe("可选范围：1-80、first200、last120；JSON原件可用json:/field或json:[\"/request\",\"/result/status\"]精确取原字段，缺字段在本地报告"),
         maxChars: z.number().optional().describe("单项完整序列化字符硬限，包含正文、路径、标签和诊断；不足时报告完整所需及差额"),
     })).optional()
-        .describe("check 时可选：结构化外部证据文件输入，比 evidenceFiles 能提供更多标签和范围信息"),
+        .describe("check时可选：结构化外部原件；也会自动加载Task内匹配当前stageId/childScopeId的guard-evidence代码块声明，避免重复拼送材料"),
     evidenceIndexMode: z.enum(["auto", "reuse", "rebuild", "off"]).optional()
         .describe("外部证据索引策略：auto=复用新鲜索引或重建，reuse=只复用缓存，rebuild=强制重建，off=只记录未读取提示"),
     executionEvidenceRole: z.enum(["required", "reference"]).optional()
         .describe("check 时可选，默认 required；仅有显式必需外部证据时可把对话执行记录设为参考，覆盖缺口仍显示"),
         background: z.boolean().optional()
-            .describe("check 三态后台：true=强制后台立即返回 taskId / false=强制同步 / 不传时保持同步；Guard 默认不自动后台化"),
+            .describe("true立即返回taskId；false或未填先同步等待最多45秒，未结束返回同一持久taskId继续查，始终以明确通过结果解除锁"),
     taskId: z.string().optional()
         .describe("check 时查询、cancel 时取消同一个后台 Guard 检查任务的 taskId"),
     waitSeconds: z.number().optional()
@@ -427,6 +430,7 @@ interface StageGuardCheckResumePayloadV1 {
     evidenceAssets?: z.infer<typeof StageGuardSchema>["evidenceAssets"];
     evidenceIndexMode?: z.infer<typeof StageGuardSchema>["evidenceIndexMode"];
     executionEvidenceRole?: z.infer<typeof StageGuardSchema>["executionEvidenceRole"];
+    evidenceRevision?: string;
 }
 
 interface StageGuardCheckResumePayloadV2 extends Omit<StageGuardCheckResumePayloadV1, "version"> {
@@ -546,6 +550,7 @@ function finalizeGuardPassReceipt(receipt: StageGuardPassReceipt, recovered: boo
 function buildStageGuardCheckResumePayload(
     params: z.infer<typeof StageGuardSchema>,
     state: GuardState,
+    evidenceRevision?: string,
 ): StageGuardCheckResumePayload {
     return {
         version: 2,
@@ -564,6 +569,7 @@ function buildStageGuardCheckResumePayload(
         evidenceAssets: params.evidenceAssets ? params.evidenceAssets.map(asset => ({ ...asset })) : undefined,
         evidenceIndexMode: params.evidenceIndexMode,
         executionEvidenceRole: params.executionEvidenceRole || "required",
+        evidenceRevision,
     };
 }
 
@@ -609,12 +615,13 @@ function normalizeEvidenceAssets(
 function makeStageGuardCheckTaskId(
     params: z.infer<typeof StageGuardSchema>,
     state: GuardState,
+    evidenceRevision?: string,
 ): string {
     const effectiveModelChain = params.modelChain
         ? resolveModelChain(params)
         : (state.modelChain || resolveModelChain(params));
     const normalizedInput = {
-        version: 1,
+        version: 2,
         guardId: state.guardId,
         conversationId: state.conversationId,
         stageId: state.stageId,
@@ -628,9 +635,33 @@ function makeStageGuardCheckTaskId(
         evidenceAssets: normalizeEvidenceAssets(params.evidenceAssets),
         evidenceIndexMode: params.evidenceIndexMode || "auto",
         executionEvidenceRole: params.executionEvidenceRole || "required",
+        evidenceRevision: evidenceRevision || stableJsonHash(guardEvidenceRevision(params, state)),
     };
     const guardKey = stableJsonHash({ guardId: state.guardId }).slice(0, 24);
     return `stage-guard-check-${guardKey}-${stableJsonHash(normalizedInput)}`;
+}
+
+function guardEvidenceRevision(params: z.infer<typeof StageGuardSchema>, state: GuardState): unknown {
+    const declared = resolveGuardEvidenceDeclarations({ taskFiles: state.taskFiles, stageId: state.stageId, childScopeId: state.childScopeId, assets: [
+        ...(params.evidenceFiles || []).map(filePath => ({ path: filePath })), ...(params.evidenceAssets || []),
+    ] });
+    const paths = [...new Set([...state.taskFiles, ...state.planFiles, ...declared.assets.map(asset => asset.path)])].sort();
+    return { declarations: declared.declarations, gaps: declared.gaps, files: paths.map(filePath => {
+        try {
+            const stat = fs.statSync(filePath);
+            let sha256: string | undefined;
+            if (stat.isFile() && stat.size <= 2 * 1024 * 1024) {
+                const descriptor = fs.openSync(filePath, "r");
+                try {
+                    const buffer = Buffer.alloc(stat.size + 1);
+                    const count = fs.readSync(descriptor, buffer, 0, buffer.length, 0);
+                    if (count !== stat.size) throw new Error("input_revision_changed: file size changed while hashing");
+                    sha256 = crypto.createHash("sha256").update(buffer.subarray(0, count)).digest("hex");
+                } finally { fs.closeSync(descriptor); }
+            }
+            return { path: filePath, size: stat.size, mtimeMs: stat.mtimeMs, ctimeMs: stat.ctimeMs, ino: stat.ino, sha256 };
+        } catch (error) { return { path: filePath, error: (error as NodeJS.ErrnoException).code || "unreadable" }; }
+    }) };
 }
 
 function isStageGuardCheckResumePayload(value: unknown): value is StageGuardCheckResumePayload {
@@ -808,20 +839,22 @@ async function handleCheck(
     if (isBackgroundTaskAborted(taskContext)) {
         return formatAbortedGuardCheckText(taskContext);
     }
-    if (state.chain === "windsurf") {
-        const source = await guardConversationLoader("windsurf", convId, { link: "summary", includeRounds: false });
-        try {
-            assertConversationConsumerSourceComplete(source);
-        } catch {
-            return text("🛡 Stage Guard 检查未完成：WSF 原文证据不可用、过期或不完整，未调用模型，也未写入检查结果或 PASS receipt。");
-        }
+    const checkEvidence = resolveGuardEvidenceDeclarations({ taskFiles: state.taskFiles, stageId: state.stageId, childScopeId: state.childScopeId, assets: [
+        ...(params.evidenceFiles || []).map(filePath => ({ path: filePath })), ...(params.evidenceAssets || []),
+    ] });
+    if (checkEvidence.gaps.length) return text(`🛡 原件声明不完整，尚未调用模型：\n${checkEvidence.gaps.join("\n")}`);
+    const activeCheck = findActiveBackgroundTaskByPrefix(`stage-guard-check-${stableJsonHash({ guardId: state.guardId }).slice(0, 24)}-`);
+    if (activeCheck && activeCheck.id !== taskContext?.taskId) {
+        const owner = activeCheck.resumePayload as Partial<StageGuardCheckResumePayloadV2> | undefined;
+        if (activeCheck.kind !== "stage-guard-check" || owner?.guardId !== state.guardId || owner.conversationId !== state.conversationId || owner.stageId !== state.stageId || owner.childScopeId !== state.childScopeId || owner.guardStartedAt !== state.startedAt) return text(`🛡 在途检查身份冲突，未发起新模型：${activeCheck.id}`);
+        return text(["🛡 本Guard已有检查进行中，继续使用原任务，未重复调用模型。", `🆔 taskId: ${activeCheck.id}`, ...targetBindingLines(state), "材料变更保留在文件中，先查询原检查终态，再核对是否需要新检查。"].join("\n"));
     }
+    const referenceWithRequired = params.executionEvidenceRole === "reference" && checkEvidence.assets.some(asset => !["reference", "context", "optional"].includes((asset.role || "").trim().toLowerCase()));
 
-    // Plan_30：stage_guard check 默认保持同步，避免阶段还未明确通过就被提前标记完成；
-    // 仅显式 background=true 时才转后台。
-    if (decision.useBackground) {
-        const resumePayload = buildStageGuardCheckResumePayload(params, state);
-        const taskId = makeStageGuardCheckTaskId(params, state);
+    const evidenceRevision = stableJsonHash(guardEvidenceRevision(params, state));
+    if (!taskContext) {
+        const resumePayload = buildStageGuardCheckResumePayload(params, state, evidenceRevision);
+        const taskId = makeStageGuardCheckTaskId(params, state, evidenceRevision);
         const existingTask = getBackgroundTask(taskId);
         if (existingTask && existingTask.kind !== "stage-guard-check") {
             return text(`❌ Stage Guard 后台任务 taskId 冲突，已有任务类型为 ${existingTask.kind}`);
@@ -838,7 +871,7 @@ async function handleCheck(
                     childScopeId: state.childScopeId,
                     scopeSelectors: [...state.scopeSelectors],
                 },
-                true,
+                backgroundModel || decision.useBackground,
                 backgroundTaskContext,
                 state,
             );
@@ -847,6 +880,11 @@ async function handleCheck(
             taskId,
             resumePayload: resumePayload as unknown as ResumePayloadValue,
         });
+        if (!decision.useBackground) {
+            const settled = await waitForBackgroundTask(task.id, 45);
+            if (settled?.status === "done") return text(settled.result || "🛡 检查已结束，请用原taskId读取完整结果");
+            return text(["🛡 本次检查已保存为同一持久任务，尚未返回通过结论。", `🆔 taskId: ${task.id}`, formatBackgroundTask(settled || task), "继续查询原taskId，不重新创建检查。"].join("\n"));
+        }
         return text([
             "🚀 Stage Guard 检查已转入后台任务",
             existingTask ? "♻️ 已复用相同 Guard 与规范化输入的已有后台任务" : "",
@@ -858,8 +896,16 @@ async function handleCheck(
         ].filter(Boolean).join("\n"));
     }
 
+    if (state.chain === "windsurf" && !referenceWithRequired) {
+        const source = await guardConversationLoader("windsurf", convId, { link: "summary", includeRounds: false });
+        try { assertConversationConsumerSourceComplete(source); }
+        catch { return text("🛡 Stage Guard 检查未完成：WSF 原文证据不可用、过期或不完整，未调用模型，也未写入检查结果或 PASS receipt。"); }
+    }
+
     // 调用 Flash 比对引擎
     const effectiveState = { ...state, modelChain: params.modelChain ? resolveModelChain(params) : (state.modelChain || resolveModelChain(params)) };
+    const originalPayload = getBackgroundTask(taskContext.taskId)?.resumePayload as StageGuardCheckResumePayload | undefined;
+    const expectedEvidenceRevision = originalPayload?.evidenceRevision || evidenceRevision;
     const evidenceAssets = [
         ...(params.evidenceFiles || []).map(filePath => ({ path: filePath })),
         ...(params.evidenceAssets || []),
@@ -883,6 +929,7 @@ async function handleCheck(
         evidenceAssets,
         evidenceIndexMode: params.evidenceIndexMode,
         executionEvidenceRole: params.executionEvidenceRole || "required",
+        hasInputRevisionChanged: () => stableJsonHash(guardEvidenceRevision(params, state)) !== expectedEvidenceRevision,
         isCancelled: taskContext?.isCancelled,
         isSettled: taskContext?.isSettled,
         onProgress: stage => taskContext?.updateProgress({ stage: `guard:${stage}`, detail: `Stage Guard ${stage}` }),

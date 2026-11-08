@@ -46,7 +46,7 @@ async function execute(operation: IsolatedSourceOperation, payload: any, deadlin
     }
     if (operation === "guard-record") {
         const { getConversationExecutionRecord } = await import("./guard-engine.js");
-        return getConversationExecutionRecord(payload.conversationId, payload.startRound, payload.charBudget, payload.dataChain, { deadlineAt, isCancelled, allowUnavailable: payload.allowUnavailable });
+        return getConversationExecutionRecord(payload.conversationId, payload.startRound, payload.charBudget, payload.dataChain, { deadlineAt, isCancelled, allowUnavailable: payload.allowUnavailable, cacheOnly: payload.cacheOnly });
     }
     if (operation === "candidates") {
         const { listConversationCandidates } = await import("./conversation-filter.js");

@@ -32,6 +32,39 @@ childScopeId区分并行实例，scopeSelectors指定子任务内容，两者共
 
 Task勾选作为任务自述，完成情况由实际证据核验。当前check返回后才能写的通过记录可以在检查后保存，HTTP原始日志、测试结果等实质材料须在审查时提供。
 
+## 每阶段登记一次原件
+
+Task内可声明当前阶段的原件清单，后续check沿原Guard自动加载，省去反复组装evidenceAssets。声明只用于匹配的stageId和childScopeId，路径相对Task所在目录：
+
+````markdown
+```guard-evidence
+{"version":1,"stageId":"Stage 3","childScopeId":"main","manifest":"evidence/stage3.json"}
+```
+````
+
+清单文件保存显式原件位置，路径相对清单所在目录。也可把assets直接写进Task声明，或在evidenceAssets中传type="manifest"和清单路径：
+
+```json
+{
+  "version": 1,
+  "stageId": "Stage 3",
+  "childScopeId": "main",
+  "assets": [{
+    "path": "original-request.json",
+    "label": "请求与最终结果",
+    "range": "json:[\"/request\",\"/response/status\",\"/response/result\",\"/finishedAt\"]",
+    "role": "required",
+    "maxChars": 12000
+  }]
+}
+```
+
+JSON范围使用JSON Pointer定位原字段，支持数组下标及~0、~1转义。选择的字段按原值进入输入，源文件SHA与所选路径一同保留，其余字段未进入本次审查。字段缺失、JSON不完整或声明错误会在调用模型前列出具体缺口；必需材料过大时继续显示实际预算差额。声明文件限512KiB，累计最多128项，不递归展开清单或遍历未声明目录。
+
+必需原件先读取并检查，之后再处理聊天。executionEvidenceRole="reference"时只尝试已发布缓存，保留缓存代次及当前来源未刷新的说明，缺缓存时继续依据必需原件审查。最终模型只分析已提供输入，缺原件时指出所需内容，保持单轮小阶段检查。
+
+Task、Plan或清单原件改变后，新的check按输入版本区分结果；同一Guard已有运行中或挂起的检查时继续返回原taskId，不重复发模型。查询既有taskId始终读取那一次检查，原返回与诊断保留。
+
 ## 看懂材料预算
 
 maxChars限制一项证据进入提示的完整字符数，包括取得的索引正文、路径、标签、状态和诊断。若完整序列化需要2015字符、maxChars为1800，缺额为215；补到完整所需额度后，工具才能完整注入这项材料。
@@ -71,4 +104,4 @@ Codex诊断分别保存stdout事件和stderr原文。stderr中的明确工具拒
 
 Codex来源固定读取边界，边界后的纯追加可继续，边界内改写、截断、替换或祖先冲突会触发校验。原历史保持只读，报告保存实际来源和覆盖范围。
 
-后台check显式传background=true，用原taskId加waitSeconds=30～45查询，取消也针对该原任务。审查通过后再保存阶段完成记录，后续模型或进程恢复继续核原任务与副作用。
+后台check显式传background=true，立即返回原taskId；默认或background=false先同步等待最多45秒，未结束时返回同一持久任务，继续用原taskId加waitSeconds=30～45查询。同步与后台共用同Guard在途登记，取消也针对该原任务。审查通过后再保存阶段完成记录，后续模型或进程恢复继续核原任务与副作用。

@@ -1746,6 +1746,19 @@ export function getBackgroundTask(taskId: string): BackgroundTask | null {
     return reconcileStaleTask(persisted);
 }
 
+export function findActiveBackgroundTaskByPrefix(prefix: string): BackgroundTask | null {
+    if (!/^[a-z0-9-]+-$/u.test(prefix)) return null;
+    const taskIds = new Set([...tasks.keys()].filter(taskId => taskId.startsWith(prefix)));
+    if (fs.existsSync(TASKS_DIR)) {
+        for (const name of fs.readdirSync(TASKS_DIR)) {
+            if (name.startsWith(prefix) && name.endsWith(".json")) taskIds.add(name.slice(0, -5));
+        }
+    }
+    return [...taskIds].map(taskId => getBackgroundTask(taskId))
+        .filter((task): task is BackgroundTask => Boolean(task && (task.status === "running" || task.status === "suspended")))
+        .sort((left, right) => left.startedAt.localeCompare(right.startedAt))[0] || null;
+}
+
 export function cleanOldTasks(maxAgeDays = DEFAULT_CLEAN_OLD_TASK_DAYS): CleanOldTasksSummary {
     const summary: CleanOldTasksSummary = {
         deletedTaskIds: [],

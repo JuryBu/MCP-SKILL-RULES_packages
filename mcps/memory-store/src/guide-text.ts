@@ -280,8 +280,11 @@ MCP 进程与父 LS 绑定（ppid），与窗口同生共死：
 - coverage 不足、锚点缺失或截断风险时，工具返回证据不足/审查未完成，不累计未通过次数，也不触发三次失败裁定
 - check 时可传 evidence 补录证据（如 Guard start 之前完成的修改）
 - check 时可传 evidenceFiles 或 evidenceAssets 追加外部证据文件；evidenceAssets 支持 path、label、type、role、range、maxChars，适合报告、截图、PDF、Word、Excel、视频和原始日志
+- Task可放guard-evidence代码块，显式声明version=1、当前stageId、childScopeId和assets，或manifest路径；check自动读取匹配的阶段清单，路径相对Task或清单所在目录，不遍历未声明目录。清单格式为{"version":1,"assets":[{"path":"原回执.json","range":"json:/response/status","role":"required"}]}，也可用evidenceAssets的type=manifest显式传清单
+- JSON原件range支持json:/field或json:["/request","/response/status","/finishedAt"]，只取指定原字段并登记源SHA；缺字段或文件未读全会在调用模型前报告，未选字段不作为本次已读取内容
 - maxChars是单项正文、路径、标签和诊断的完整序列化硬限；manifest的budget分别记录正文/元数据/完整所需/分配/差额与完整来源是否已知。必需短原件先分配，items保持输入顺序，includedStart/includedEnd指向实际优先顺序的提示位置
 - executionEvidenceRole默认required；有显式必需外证时可设reference，程序与提示均按必需原件核验，参考聊天缺口单列。参考资产role使用reference/context/optional，其它角色及省略值均为必需
+- 必需原件先读取并检查预算、缺件，再取执行记录；reference聊天只读已发布缓存且保留未刷新说明，缺缓存时继续核验必需原件。最终审查只分析已提供输入，不额外调用Shell/MCP补读，保持轻量单轮
 - evidenceIndexMode: auto(默认，复用缓存或按需重建) / reuse(只用已有索引) / rebuild(强制重建) / off(只登记文件元数据，不读取内容)
 - 外部证据索引写入 temp/stage-guard-evidence-indexes，artifact 内有 <<<GUARD_EVIDENCE_INDEX>>> 标记；Guard prompt 只注入短索引和 artifactPath，不直接塞入大文件、图片 base64 或完整 PDF/Word 内容
 - 图片默认只登记尺寸和元数据；需要真正理解图片内容时可开启 CLI 索引或改用支持视觉的模型链路，Guard 会显式提示“未读取图片视觉内容”
@@ -291,7 +294,7 @@ MCP 进程与父 LS 绑定（ppid），与窗口同生共死：
 - Guard 对话数据固定绑定当前宿主的明确 conversationId，不跨宿主操作异源 Guard
 - "modelChain=\"auto|antigravity|codex|claude-code|cc|grok|agy\"" 只控制审核模型；旧 chain 参数继续作为 modelChain 兼容别名；显式 grok 使用 progrok proxy，显式 agy 使用本地三模型 fallback，显式 claude-code 使用 Claude Code CLI，普通 auto 不默认消耗 CC 额度
 - Codex 链路下，审核上下文来自本地线程索引与事件流重建结果，子代理线程默认作为引用或摘要处理
-- Codex HTTP broker 下，start/status/check/cancel 必须显式传 conversationId；check 默认同步作为门禁特例，只有显式 background=true 才进入后台任务；后台检查后用 taskId + waitSeconds=30-45 轮询
+- Codex HTTP broker下，start/status/check/cancel显式传conversationId；每次check持久保存同一task，background=true立即返回，默认或false先等最多45秒，未结束用原taskId及waitSeconds=30-45查询，明确通过前保持阶段锁
 - 后台任务使用独立 FIFO 队列，默认 lane 并发 2（MEMORY_STORE_BACKGROUND_MAX_CONCURRENCY / MEMORY_STORE_BACKGROUND_TASK_CONCURRENCY 可调），并带 deadline 与 timedOut 状态。Record update 与 batch update 各有独立的有界 materialization/任务执行 lane，可用 MEMORY_STORE_RECORD_UPDATE_BACKGROUND_CONCURRENCY / MEMORY_STORE_RECORD_BATCH_UPDATE_BACKGROUND_CONCURRENCY 调高，但有效并发不会低于 provider 物理上限 8；这两个 lane 不是模型许可，真实模型 active 仍只由 provider adapter/pump 控制。Record update/batch update 默认 60 分钟，conversation batch export 默认 30 分钟，Guard/Golden Extract 默认 15 分钟；超时只标记任务 error，不重启 MCP 后端
 
 ## 三级搜索引擎 (v1.10+)
