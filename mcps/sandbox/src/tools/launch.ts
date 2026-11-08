@@ -4,6 +4,8 @@ import path from "path";
 import os from "os";
 import { createHash } from "crypto";
 import { promisify } from "util";
+import { TextDecoder, stripVTControlCharacters } from "node:util";
+import { decodeFileText } from "../agent-server/workspace/diff.js";
 import { isPreviousBootZeroRecord } from "./launch-record-compat.js";
 import { z } from "zod";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -213,6 +215,49 @@ function readAllTasks(): LaunchTask[] {
     for (const task of readLegacyRegistry()) {
         if (current.tombstones.has(task.id) || byId.has(task.id) || current.authoritativeFiles.has(path.basename(taskRegistryPath(task.id)))) continue;
         byId.set(task.id, task);
+    }
+    for (const task of pendingTaskWrites.values()) byId.set(task.id, { ...task });
+    return [...byId.values()];
+}
+
+async function readAllTasksAsync(): Promise<LaunchTask[]> {
+    const byId = new Map<string, LaunchTask>();
+    const tombstones = new Set<string>();
+    const authoritativeFiles = new Set<string>();
+    try {
+        const entries = await fs.promises.readdir(TASK_REGISTRY_DIR, { withFileTypes: true });
+        const files = entries.filter(entry => entry.isFile() && entry.name.endsWith(".json"));
+        for (let offset = 0; offset < files.length; offset += 64) {
+            const parsedFiles = await Promise.all(files.slice(offset, offset + 64).map(async entry => {
+                authoritativeFiles.add(entry.name);
+                try {
+                    const parsed: unknown = JSON.parse(await fs.promises.readFile(path.join(TASK_REGISTRY_DIR, entry.name), "utf-8"));
+                    return parsed;
+                } catch {
+                    return null;
+                }
+            }));
+            for (const parsed of parsedFiles) {
+                if (isRecord(parsed) && parsed.deleted === true && typeof parsed.id === "string") tombstones.add(parsed.id);
+                else {
+                    const task = normalizeLaunchTask(parsed);
+                    if (task) byId.set(task.id, task);
+                }
+            }
+            await yieldToEventLoop();
+        }
+    } catch {
+    }
+    try {
+        const parsed: unknown = JSON.parse(await fs.promises.readFile(REGISTRY_FILE, "utf-8"));
+        if (Array.isArray(parsed)) {
+            for (const value of parsed) {
+                const task = normalizeLaunchTask(value);
+                if (task && !tombstones.has(task.id) && !byId.has(task.id)
+                    && !authoritativeFiles.has(path.basename(taskRegistryPath(task.id)))) byId.set(task.id, task);
+            }
+        }
+    } catch {
     }
     for (const task of pendingTaskWrites.values()) byId.set(task.id, { ...task });
     return [...byId.values()];
@@ -997,6 +1042,39 @@ async function waitForLaunchTask(task: LaunchTask, waitSeconds: number): Promise
 /**
  * 读取文件尾部 N 行
  */
+function decodeLaunchLog(bytes: Buffer): { text: string | null; notice: string } {
+    const decoded = decodeFileText(bytes);
+    const plainText = decoded.text === null ? null : stripVTControlCharacters(decoded.text);
+    if (plainText !== null && !/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/u.test(plainText)) {
+        return { text: plainText, notice: "" };
+    }
+    const hasEncodingBom = bytes.subarray(0, 3).equals(Buffer.from([239, 187, 191]))
+        || bytes.subarray(0, 2).equals(Buffer.from([255, 254]))
+        || bytes.subarray(0, 2).equals(Buffer.from([254, 255]));
+    if (decoded.text === null && !bytes.includes(0)) {
+        try {
+            const decoder = new TextDecoder("utf-8", { fatal: true });
+            const prefix = stripVTControlCharacters(decoder.decode(bytes, { stream: true }));
+            let incomplete = false;
+            try { decoder.decode(); } catch { incomplete = true; }
+            if (incomplete && !/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/u.test(prefix)) {
+                return { text: prefix, notice: "(尾部可能是尚未写齐的 UTF-8 字符，暂仅显示完整前缀，原始字节保留)\n" };
+            }
+        } catch {
+        }
+    }
+    if (decoded.text === null && !hasEncodingBom && !bytes.includes(0)) {
+        try {
+            const text = stripVTControlCharacters(new TextDecoder("gb18030", { fatal: true, ignoreBOM: true }).decode(bytes));
+            if (!/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/u.test(text)) {
+                return { text, notice: "(日志按 GB18030 解码，编码为推测，原始字节保留)\n" };
+            }
+        } catch {
+        }
+    }
+    return { text: null, notice: `(日志含未知编码或非文本字节，未作为完整文本呈现；前 32 bytes hex=${bytes.subarray(0, 32).toString("hex")})` };
+}
+
 function tailFile(filePath: string, lines: number): string {
     try {
         if (!fs.existsSync(filePath)) return "(日志文件尚未创建)";
@@ -1019,10 +1097,17 @@ function tailFile(filePath: string, lines: number): string {
                 for (const byte of buffer) if (byte === 10) newlineCount += 1;
                 readBytes += length;
             }
-            const content = Buffer.concat(chunks).toString("utf-8");
-            const allLines = content.trimEnd().split("\n");
+            let bytes = Buffer.concat(chunks);
+            if (remaining > 0) {
+                const boundary = bytes.indexOf(10);
+                if (boundary < 0) return `(日志尾部已限于 ${maxBytes} bytes，窗口内没有完整行，原日志保留)`;
+                bytes = bytes.subarray(boundary + 1);
+            }
+            const decoded = decodeLaunchLog(bytes);
+            if (decoded.text === null) return decoded.notice;
+            const allLines = decoded.text.trimEnd().split("\n");
             const tail = allLines.slice(-lines).join("\n");
-            return remaining > 0 ? `(日志尾部已限于 ${maxBytes} bytes)\n${tail}` : tail || "(日志为空)";
+            return decoded.notice + (remaining > 0 ? `(日志尾部已限于 ${maxBytes} bytes)\n${tail}` : tail || "(日志为空)");
         } finally {
             fs.closeSync(descriptor);
         }
@@ -1113,9 +1198,10 @@ export function registerLaunch(server: McpServer): void {
 
             // ── list ──
             if (action === "list") {
-                const visibleTasks = readAllTasks().filter(task => hasOwnerAccess(task.ownerId, ownerId));
+                const visibleTasks = (await readAllTasksAsync()).filter(task => hasOwnerAccess(task.ownerId, ownerId));
                 for (const task of visibleTasks) {
-                    if (await refreshTaskStatusAsync(task) || task.registryWriteError) writeTask(task);
+                    const beforeRefresh = JSON.stringify(task);
+                    if (await refreshTaskStatusAsync(task) || task.registryWriteError) writeTaskIfUnchanged(task, beforeRefresh);
                 }
 
                 if (visibleTasks.length === 0) {

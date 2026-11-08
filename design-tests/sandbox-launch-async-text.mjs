@@ -1,0 +1,132 @@
+import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { createRequire } from "node:module";
+import { fileURLToPath } from "node:url";
+import vm from "node:vm";
+
+const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const sourceRoot = path.join(root, "mcps/sandbox/src");
+const localRequire = createRequire(path.join(root, "mcps/sandbox/package.json"));
+const typescript = localRequire("typescript");
+const fixture = fs.mkdtempSync(path.join(os.tmpdir(), "sandbox-launch-async-text-"));
+const taskDirectory = path.join(fixture, "tasks");
+fs.mkdirSync(taskDirectory);
+const wait = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds));
+let activeReads = 0;
+let maximumReads = 0;
+let timerTicks = 0;
+const isolatedFs = { ...fs, promises: { ...fs.promises, async readFile(...args) {
+    activeReads += 1;
+    maximumReads = Math.max(maximumReads, activeReads);
+    try {
+        await wait(35);
+        return await fs.promises.readFile(...args);
+    } finally { activeReads -= 1; }
+} } };
+const forbidden = () => { throw new Error("unexpected process/resource operation in isolated test"); };
+const stubs = new Map([
+    ["../lifecycle.js", { touchActivity() {}, formatElapsed: String, ensureModelVisibleToolResult: value => value }],
+    ["../executor.js", { killProcessTree: forbidden }],
+    ["../resource-admission-runtime.js", { acquireResourceLease: forbidden, adoptResourceLease: forbidden,
+        resourceAdmission: { setRecoveryPending: forbidden }, serializeResourceAdmissionError: forbidden }],
+    ["../windows-job-runner.js", { getWindowsJobRunnerPath: forbidden, hasWindowsJobRunner: () => false }],
+    ["../memory-limits.js", { inferMemoryRequestMB: forbidden, PROCESS_TREE_MAX_MEMORY_MB: 4096, validateProcessTreeMemory: forbidden }],
+]);
+const cache = new Map();
+const context = vm.createContext({ Buffer, TextDecoder, console, setTimeout, clearTimeout, setImmediate,
+    setInterval, clearInterval, process: { ...process, env: { SANDBOX_LAUNCH_DIR: fixture } } });
+function loadSource(filename, extraExports = "") {
+    if (cache.has(filename)) return cache.get(filename).exports;
+    const module = { exports: {} };
+    cache.set(filename, module);
+    const source = fs.readFileSync(filename, "utf8") + extraExports;
+    const compiled = typescript.transpileModule(source, { compilerOptions: {
+        target: typescript.ScriptTarget.ES2022, module: typescript.ModuleKind.CommonJS, esModuleInterop: true,
+    } }).outputText;
+    const importSource = specifier => {
+        if (filename.endsWith(`${path.sep}tools${path.sep}launch.ts`) && stubs.has(specifier)) return stubs.get(specifier);
+        if (specifier === "fs") return isolatedFs;
+        if (specifier.startsWith(".")) return loadSource(path.resolve(path.dirname(filename), specifier.replace(/\.js$/u, ".ts")));
+        return localRequire(specifier);
+    };
+    vm.runInContext(`(function(require,module,exports){${compiled}\n})`, context, { filename })(importSource, module, module.exports);
+    return module.exports;
+}
+const task = (id, overrides = {}) => ({ id, pid: 1, command: `fixture ${id}`, ownerId: "owner-alpha",
+    cwd: fixture, stdoutLog: path.join(fixture, `${id}.stdout`), stderrLog: path.join(fixture, `${id}.stderr`),
+    startTime: 1, status: "done", exitCode: 0, ...overrides });
+const fingerprint = filename => createHash("sha256").update(fs.readFileSync(filename)).digest("hex");
+try {
+    fs.writeFileSync(path.join(taskDirectory, "current.json"), JSON.stringify(task("current")));
+    fs.writeFileSync(path.join(taskDirectory, "foreign.json"), JSON.stringify(task("foreign", { ownerId: "owner-beta" })));
+    fs.writeFileSync(path.join(taskDirectory, "broken.json"), "{");
+    fs.writeFileSync(path.join(taskDirectory, "gone.json"), JSON.stringify({ id: "gone", deleted: true }));
+    fs.writeFileSync(path.join(fixture, "registry.json"), JSON.stringify([
+        task("current", { command: "obsolete" }), task("broken"), task("gone"), task("legacy"),
+    ]));
+    const tracked = [path.join(fixture, "registry.json"), ...fs.readdirSync(taskDirectory).map(name => path.join(taskDirectory, name))];
+    const before = tracked.map(fingerprint);
+    const launchFilename = path.join(sourceRoot, "tools/launch.ts");
+    const launch = loadSource(launchFilename, "\nexport { readAllTasks, readAllTasksAsync, decodeLaunchLog, tailFile, pendingTaskWrites, writeTaskIfUnchanged };\n");
+    launch.pendingTaskWrites.set("current", task("current", { command: "pending wins" }));
+    const expected = JSON.stringify(launch.readAllTasks());
+    const pulse = setInterval(() => { timerTicks += 1; }, 5);
+    const startedAt = performance.now();
+    let actual;
+    try { actual = await launch.readAllTasksAsync(); } finally { clearInterval(pulse); }
+    const queryMs = performance.now() - startedAt;
+    assert.equal(JSON.stringify(actual), expected);
+    assert.deepEqual(Array.from(actual, value => value.id), ["current", "foreign", "legacy"]);
+    const owner = loadSource(path.join(sourceRoot, "owner.ts"));
+    assert.deepEqual(Array.from(actual.filter(value => owner.hasOwnerAccess(value.ownerId, "owner-alpha")), value => value.id), ["current", "legacy"]);
+    assert.ok(timerTicks >= 3, `timer did not advance: ${timerTicks}`);
+    assert.ok(maximumReads > 1 && maximumReads <= 64, `read concurrency ${maximumReads}`);
+    assert.deepEqual(tracked.map(fingerprint), before);
+    assert.match(fs.readFileSync(launchFilename, "utf8"), /\(await readAllTasksAsync\(\)\)\.filter/u);
+    const stale = task("stale", { status: "running", exitCode: null });
+    const stalePath = path.join(taskDirectory, "stale.json");
+    fs.writeFileSync(stalePath, JSON.stringify(stale));
+    const staleSnapshot = (await launch.readAllTasksAsync()).find(value => value.id === "stale");
+    const deleted = { id: "stale", deleted: true, deletedAtMs: 1 };
+    fs.writeFileSync(stalePath, JSON.stringify(deleted));
+    assert.equal(launch.writeTaskIfUnchanged({ ...staleSnapshot, status: "done", exitCode: 0 }, JSON.stringify(staleSnapshot)), false);
+    assert.deepEqual(JSON.parse(fs.readFileSync(stalePath, "utf8")), deleted);
+    assert.ok(fs.readFileSync(launchFilename, "utf8").includes("if (await refreshTaskStatusAsync(task) || task.registryWriteError) writeTaskIfUnchanged(task, beforeRefresh);"));
+    const utf8 = Buffer.from("正常 UTF-8 中文执行 😀\r\n", "utf8");
+    assert.equal(launch.decodeLaunchLog(utf8).text, utf8.toString("utf8"));
+    const colored = Buffer.from("\u001b[32m正常中文\u001b[0m\u001b]0;title\u0007\r\n", "utf8");
+    assert.equal(launch.decodeLaunchLog(colored).text, "正常中文\r\n");
+    const partialUtf8 = Buffer.concat([Buffer.from("完整中文\n", "utf8"), Buffer.from([0xe4, 0xb8])]);
+    assert.equal(launch.decodeLaunchLog(partialUtf8).text, "完整中文\n");
+    assert.match(launch.decodeLaunchLog(partialUtf8).notice, /UTF-8.*完整前缀/u);
+    assert.equal(launch.decodeLaunchLog(Buffer.from([0xef, 0xbb, 0xbf, 0x41, 0xe4, 0xb8])).text, "A");
+    assert.equal(launch.decodeLaunchLog(Buffer.from([0xef, 0xbb, 0xbf, 0x41, 0xff, 0x42])).text, null);
+    const original = Buffer.from("545241494e494e475f313139395f53484f52545f5441534b5f4f4b20d6d0cec4d6b4d0d00d0a", "hex");
+    assert.throws(() => new TextDecoder("utf-8", { fatal: true }).decode(original));
+    const decoded = launch.decodeLaunchLog(original);
+    assert.equal(decoded.text, "TRAINING_1199_SHORT_TASK_OK 中文执行\r\n");
+    assert.match(decoded.notice, /GB18030.*推测/u);
+    const coloredOriginal = Buffer.concat([Buffer.from("\u001b[32m"), original, Buffer.from("\u001b[0m")]);
+    assert.equal(launch.decodeLaunchLog(coloredOriginal).text, decoded.text);
+    assert.equal(launch.decodeLaunchLog(Buffer.from([0, 255, 1])).text, null);
+    assert.equal(launch.decodeLaunchLog(Buffer.from([0x81])).text, null);
+    const logPath = path.join(fixture, "original.stdout");
+    fs.writeFileSync(logPath, original);
+    const logHash = fingerprint(logPath);
+    assert.match(launch.tailFile(logPath, 10), /TRAINING_1199_SHORT_TASK_OK 中文执行/u);
+    assert.equal(fingerprint(logPath), logHash);
+    console.log(JSON.stringify({ ok: true, node: process.version, queryMs: Number(queryMs.toFixed(1)), timerTicks,
+        maximumReads, fixtureFiles: tracked.length, originalBytes: original.length, originalSha256: logHash,
+        coverage: "registry parity/authoritative-corruption/tombstone/pending/owner/timer/utf8/gb18030/binary/unchanged-log" }));
+} finally {
+    const resolved = fs.realpathSync(fixture);
+    assert.equal(path.dirname(resolved), fs.realpathSync(os.tmpdir()));
+    assert.ok(path.basename(resolved).startsWith("sandbox-launch-async-text-"));
+    for (const name of fs.readdirSync(taskDirectory)) fs.unlinkSync(path.join(taskDirectory, name));
+    fs.rmdirSync(taskDirectory);
+    for (const name of fs.readdirSync(fixture)) fs.unlinkSync(path.join(fixture, name));
+    fs.rmdirSync(fixture);
+}
