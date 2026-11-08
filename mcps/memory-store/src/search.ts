@@ -3,6 +3,7 @@ import fs from "fs";
 import path from "path";
 import { type MemoryIndexEntry } from "./cache.js";
 import { WORKSPACES_DIR, GENERAL_DIR, readWorkspaceIndex, readGeneralIndex } from "./store.js";
+import { projectCurrentAutoSummary } from "./auto-summary-currentness.js";
 
 /**
  * MCP Memory Store 搜索引擎 v2
@@ -122,9 +123,11 @@ function substringMatchScore(entry: MemoryIndexEntry, token: string): number {
 export function fuseSearch(
     entries: MemoryIndexEntry[],
     query: string,
-    limit: number = 10
+    limit: number = 10,
+    sourceHash?: string,
 ): Array<{ entry: MemoryIndexEntry; score: number }> {
     if (entries.length === 0) return [];
+    entries = entries.map(entry => projectCurrentAutoSummary(entry, sourceHash));
 
     // === 单词查询：直接走 fuse.js ===
     if (!isMultiWord(query)) {
@@ -269,9 +272,12 @@ export function checkDuplicates(
     entries: MemoryIndexEntry[],
     title: string,
     searchSummary: string,
-    threshold: number = 0.2
+    threshold: number = 0.2,
+    sourceHash?: string,
 ): Array<{ entry: MemoryIndexEntry; score: number }> {
     if (entries.length === 0) return [];
+
+    entries = entries.map(entry => projectCurrentAutoSummary(entry, sourceHash));
 
     const resultMap = new Map<string, { entry: MemoryIndexEntry; fuseScore: number; subScore: number }>();
     const searchQuery = `${title} ${searchSummary}`;

@@ -27,6 +27,7 @@ import { resolveModelOnlyChainSplit } from "../chain.js";
 import { formatToolError } from "../error-format.js";
 import type { SearchMode } from "../search-engine.js";
 import { modelChainInputSchema } from "./schema-utils.js";
+import { autoSummaryCurrentnessNotice, inspectIndexedAutoSummaryCurrentness, projectCurrentAutoSummaryAsync } from "../auto-summary-currentness.js";
 
 /**
  * memory_batch — 批量操作
@@ -205,12 +206,15 @@ export function registerBatch(server: McpServer): void {
                                 }
                                 const wsIdx = hash === "general" ? readGeneralIndex() : readWorkspaceIndex(hash);
                                 const { search: engineSearch } = await import("../search-engine.js");
-                                const blocks = wsIdx.entries.map(e => ({
-                                    id: e.id,
-                                    title: e.title,
-                                    content: `${e.title}\n${e.searchSummary || ""}\n${(e as any).autoSummary || ""}\n${e.tags.join(" ")}`,
-                                    tags: e.tags,
-                                }));
+                                const blocks: Array<{ id: string; title: string; content: string; tags: string[] }> = [];
+                                for (let offset = 0; offset < wsIdx.entries.length; offset += 16) {
+                                    blocks.push(...await Promise.all(wsIdx.entries.slice(offset, offset + 16).map(async e => ({
+                                        id: e.id,
+                                        title: e.title,
+                                        content: `${e.title}\n${e.searchSummary || ""}\n${(await projectCurrentAutoSummaryAsync(e, hash)).autoSummary || ""}\n${e.tags.join(" ")}`,
+                                        tags: e.tags,
+                                    }))));
+                                }
                                 const requestedMode = (op.mode || "auto") as SearchMode;
                                 const chains = resolveModelOnlyChainSplit({ chain: op.chain, modelChain: op.modelChain });
                                 let engineResults = await engineSearch(blocks, op.query, {
@@ -228,9 +232,11 @@ export function registerBatch(server: McpServer): void {
                                 if (engineResults.length === 0) {
                                     result = `🔍 "${op.query}" 无结果`;
                                 } else {
-                                    const parts = engineResults.map(r =>
-                                        `  [${r.id}] ${r.title} (${r.matchType}, score: ${r.score.toFixed(2)})`
-                                    );
+                                    const parts = engineResults.map(r => {
+                                        const entry = wsIdx.entries.find(candidate => candidate.id === r.id);
+                                        const notice = entry ? autoSummaryCurrentnessNotice(inspectIndexedAutoSummaryCurrentness(entry, hash)) : "";
+                                        return `  [${r.id}] ${r.title} (${r.matchType}, score: ${r.score.toFixed(2)})${notice ? `\n    ${notice}` : ""}`;
+                                    });
                                     result = `🔍 "${op.query}" 找到 ${engineResults.length} 条:\n${parts.join("\n")}`;
                                 }
                                 successCount++;

@@ -1,6 +1,8 @@
-# MCP Memory Store v1.27.7
+# MCP Memory Store v1.27.8
 
 原文各入口统一使用`conversationId`记录调用者、`conversationIds`选择目标。单条`fetch/search/read/recall/export`接受一个目标，旧调用省略目标数组时仍按`conversationId`读取；批量导出显式使用`exportBatch=true`。历史范围先准备所需内容，再把完整构建沿原任务排入后台，已发布引用继续可读。
+
+自动摘要会核对生成状态和来源指纹；已知失败或来源已变化的摘要退出检索，来源未核的旧摘要保留为带提示的候选线索，补缺继续跳过。可用性失败保留本次原诊断，详见[摘要当前性与失败来源](docs/auto-summary-currentness.md)。
 
 Codex采用明文追加段时，近期窗口可先返回局部正文，旧压缩祖先的核验单独保留状态。祖先未核实的窗口继续标为相对轮次和部分覆盖；完整缓存、Record与recall仍要求完整来源核验，详见[近期窗口与旧历史](docs/history-source-isolation.md#codex近期窗口与旧历史)。
 

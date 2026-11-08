@@ -34,6 +34,7 @@ import {
 import { resolveModelOnlyChainSplit, type Chain } from "../chain.js";
 import { formatToolError } from "../error-format.js";
 import { modelChainInputSchema } from "./schema-utils.js";
+import { inspectAutoSummaryCurrentness, inspectIndexedAutoSummaryCurrentnessAsync } from "../auto-summary-currentness.js";
 
 /**
  * 校验导入/解归档的文件名是否安全（防路径遍历攻击）
@@ -55,13 +56,14 @@ function isSafeFilename(entriesDir: string, filename: string): boolean {
  * memory_stats — 统计和管理
  * overview / detail / gc / archive / unarchive / export / import
  */
-export function registerStats(server: McpServer): void {
+export function registerStats(server: McpServer, dependencies: { generateAutoSummary?: typeof generateAutoSummaryResult } = {}): void {
+    const handleEnhance = (workspace?: string, chain: Chain = "auto") => generateMissingSummaries(workspace, chain, dependencies.generateAutoSummary || generateAutoSummaryResult);
     server.tool(
         "memory_stats",
         "查看记忆系统统计信息，管理冷热归档，导出/导入记忆。",
         {
             action: z.enum(["overview", "detail", "gc", "archive", "unarchive", "export", "import", "enhance"]).optional()
-                .describe("操作类型，默认 overview。enhance: 批量为缺少 autoSummary 的记忆生成摘要"),
+                .describe("操作类型，默认 overview。enhance: 为缺少当前有效autoSummary的记忆补缺；保留未核来源、正在生成及需处理原调用状态的项目"),
             workspace: z.string().optional().describe("指定工作区（detail/archive/unarchive/export/enhance 时使用）"),
             ids: z.array(z.string()).optional().describe("指定记忆 ID 列表（export 时使用）"),
             savePath: z.string().optional().describe("导出文件保存路径（export 时必须）"),
@@ -575,7 +577,7 @@ function handleImport(zipPath?: string) {
 }
 
 // === enhance ===
-async function handleEnhance(workspace?: string, chain: Chain = "auto") {
+async function generateMissingSummaries(workspace?: string, chain: Chain = "auto", generateSummary: typeof generateAutoSummaryResult = generateAutoSummaryResult) {
     // 收集需要增强的记忆
     const targets: Array<{ hash: string; entry: { id: string; title: string; tags: string[] } }> = [];
     let skipped = 0;
@@ -590,7 +592,8 @@ async function handleEnhance(workspace?: string, chain: Chain = "auto") {
             const recovery = autoSummaryRecoveryInfo(hash, entry.id);
             if (recovery && recovery.phase !== "complete" && recovery.phase !== "restored") await recoverAutoSummaryWriteback(hash, entry.id);
             const currentEntry = readWorkspaceIndex(hash).entries.find(candidate => candidate.id === entry.id) || entry;
-            if (currentEntry.autoSummary) {
+            const summaryState = await inspectIndexedAutoSummaryCurrentnessAsync(currentEntry, hash);
+            if (summaryState.status === "current" || summaryState.retryBlocked) {
                 skipped++;
             } else {
                 targets.push({ hash, entry: { id: entry.id, title: entry.title, tags: entry.tags } });
@@ -599,7 +602,7 @@ async function handleEnhance(workspace?: string, chain: Chain = "auto") {
     }
 
     if (targets.length === 0) {
-        return { content: [{ type: "text" as const, text: `✅ 无需增强，所有 ${skipped} 条记忆已有 autoSummary` }] };
+        return { content: [{ type: "text" as const, text: `✅ 无可执行的摘要补缺，${skipped} 条为当前有效摘要或仍在生成／需先处理原调用状态` }] };
     }
 
     let success = 0;
@@ -618,10 +621,12 @@ async function handleEnhance(workspace?: string, chain: Chain = "auto") {
             const fileContent = fs.readFileSync(filePath, "utf-8");
             const parsed = parseMemoryFile(fileContent);
             if (!parsed) { failed++; continue; }
+            const summaryState = inspectAutoSummaryCurrentness(fileContent);
+            if (summaryState.status === "current" || summaryState.retryBlocked) { staleSkipped++; continue; }
 
             const snapshot = captureAutoSummaryFileSnapshot(fileContent, target.entry.title, target.entry.tags);
             if (!snapshot) { failed++; continue; }
-            const generated = await generateAutoSummaryResult(snapshot.title, snapshot.tags, snapshot.body, chain);
+            const generated = await generateSummary(snapshot.title, snapshot.tags, snapshot.body, chain);
             const summary = generated.summary;
 
             const writeResult = await writeAutoSummaryIfUnchanged({
@@ -662,7 +667,7 @@ async function handleEnhance(workspace?: string, chain: Chain = "auto") {
     return {
         content: [{
             type: "text" as const,
-            text: `🔄 增强完成: 成功 ${success} / 跳过 ${skipped} (已有) / 过期跳过 ${staleSkipped} / 失败 ${failed}`,
+            text: `🔄 增强完成: 成功 ${success} / 跳过 ${skipped} (当前有效或原调用待处理) / 状态变化跳过 ${staleSkipped} / 失败 ${failed}`,
         }],
     };
 }

@@ -22,7 +22,8 @@ import { resolveModelOnlyChainSplit } from "../chain.js";
 import { formatToolError } from "../error-format.js";
 import type { SearchMode, TextBlock } from "../search-engine.js";
 import { modelChainInputSchema } from "./schema-utils.js";
-import { readMemoryQueryPrefix } from "../memory-query-prefix.js";
+import { readMemoryQueryBodyPrefix } from "../memory-query-prefix.js";
+import { autoSummaryCurrentnessNotice, inspectIndexedAutoSummaryCurrentness, projectCurrentAutoSummaryAsync } from "../auto-summary-currentness.js";
 
 /** 携带来源 hash 的条目（用于全局查询） */
 interface EntryWithSource extends MemoryIndexEntry {
@@ -38,11 +39,12 @@ async function buildSearchBlocks(entries: MemoryIndexEntry[], hash: string): Pro
     for (let offset = 0; offset < entries.length; offset += BODY_READ_BATCH_SIZE) {
         const batch = await Promise.allSettled(entries.slice(offset, offset + BODY_READ_BATCH_SIZE).map(async entry => {
             const sourceHash = (entry as EntryWithSource)._sourceHash || hash;
-            const body = await readMemoryQueryPrefix(getEntryPath(sourceHash, entry.id), BODY_SNIPPET_LIMIT) || "";
+            const body = await readMemoryQueryBodyPrefix(getEntryPath(sourceHash, entry.id), BODY_SNIPPET_LIMIT) || "";
+            const currentEntry = await projectCurrentAutoSummaryAsync(entry, sourceHash);
             return {
                 id: entry.id,
                 title: entry.title,
-                content: `${entry.title}\n${entry.searchSummary || ""}\n${entry.autoSummary || ""}\n${entry.tags.join(" ")}\n${body}`,
+                content: `${entry.title}\n${entry.searchSummary || ""}\n${currentEntry.autoSummary || ""}\n${entry.tags.join(" ")}\n${body}`,
                 tags: entry.tags,
                 metadata: { updatedAt: entry.updatedAt },
             };
@@ -207,7 +209,7 @@ export function registerQuery(server: McpServer): void {
                                 score: sr.score,
                             })).filter(r => r.entry);
                         } catch {
-                            results = fuseSearch(entries, query, maxResults);
+                            results = fuseSearch(entries, query, maxResults, hash);
                         }
                     } else {
                         results = [];
@@ -437,7 +439,8 @@ function formatResults(
             const sourceHash = (entry as EntryWithSource)._sourceHash || hash;
             const content = readMemoryFile(sourceHash, entry.id);
             if (content) {
-                parts.push(`# ${entry.title}\nID: ${entry.id}\n\n${content}\n`);
+                const notice = autoSummaryCurrentnessNotice(inspectIndexedAutoSummaryCurrentness(entry, sourceHash));
+                parts.push(`# ${entry.title}\nID: ${entry.id}${notice ? `\n${notice}` : ""}\n\n${content}\n`);
             }
         }
 
@@ -456,16 +459,18 @@ function formatResults(
     const lines = results.map((r, i) => {
         const e = r.entry;
         const scoreStr = r.score !== undefined ? ` (匹配: ${Math.min(1, Math.max(0, r.score)).toFixed(2)})` : "";
+        const sourceHash = (e as EntryWithSource)._sourceHash || hash;
+        const notice = autoSummaryCurrentnessNotice(inspectIndexedAutoSummaryCurrentness(e, sourceHash));
 
         if (depth === "summary") {
             const catStr = e.category ? ` | ${e.category}` : "";
             const dateStr = e.updatedAt ? ` | ${e.updatedAt.slice(0, 10)}` : "";
             return `${i + 1}. [${e.id}] ${e.title}${scoreStr}\n` +
-                `   标签: [${e.tags.join(", ")}]${catStr}${dateStr} | ${e.lineCount}行 | ${(e.sizeBytes / 1024).toFixed(1)}KB`;
+                `   标签: [${e.tags.join(", ")}]${catStr}${dateStr} | ${e.lineCount}行 | ${(e.sizeBytes / 1024).toFixed(1)}KB${notice ? `\n   ${notice}` : ""}`;
         }
 
         // index 模式（默认）
-        return `${i + 1}. [${e.id}] ${e.title} [${e.tags.join(",")}]${scoreStr}`;
+        return `${i + 1}. [${e.id}] ${e.title} [${e.tags.join(",")}]${scoreStr}${notice ? `\n   ${notice}` : ""}`;
     });
 
     return {

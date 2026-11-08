@@ -133,6 +133,7 @@ export async function generateAutoSummaryResult(
             ...(result.safetyStopped ? { safetyStopped: true } : {}),
             ...(result.timedOut ? { timedOut: true } : {}),
             ...(result.failureClass ? { failureClass: result.failureClass } : {}),
+            ...(!summary && result.grokAvailabilityDiagnostics ? { grokAvailabilityDiagnostics: { ...result.grokAvailabilityDiagnostics } } : {}),
         },
     };
 }

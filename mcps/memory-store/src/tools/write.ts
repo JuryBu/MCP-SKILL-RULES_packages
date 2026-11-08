@@ -124,7 +124,7 @@ export function registerWrite(server: McpServer): void {
 
                 // 去重检测
                 let dedupWarning = "";
-                const duplicates = checkDuplicates(existingEntries, title, actualSearchSummary);
+                const duplicates = checkDuplicates(existingEntries, title, actualSearchSummary, 0.2, hash);
                 if (duplicates.length > 0) {
                     dedupWarning = "\n\n⚠️ 发现相似记忆：\n" +
                         duplicates.slice(0, 3).map(d =>

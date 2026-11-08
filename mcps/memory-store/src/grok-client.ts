@@ -69,6 +69,7 @@ export interface GrokAvailabilityDiagnostics {
     failure?: "cancelled" | "timeout" | "http" | "admission" | "transport";
     status?: number;
     errorCode?: string;
+    cacheHit?: boolean;
 }
 
 type JsonParseResult<T> =
@@ -95,6 +96,7 @@ const GROK_CALL_POLL_MS = 25;
 let grokAvailableCache: boolean | null = null;
 let grokAvailableAt = 0;
 let grokAvailabilityDiagnostics: GrokAvailabilityDiagnostics | null = null;
+let grokCachedAvailabilityDiagnostics: GrokAvailabilityDiagnostics | null = null;
 let grokCallAdaptiveGate: { max: number; gate: AdaptiveConcurrencyGate } | null = null;
 
 function grokProxyUrl(): string {
@@ -513,20 +515,33 @@ export async function callGrokExec(
     }
 }
 
-export async function isGrokBridgeAvailable(options: { signal?: AbortSignal } = {}): Promise<boolean> {
+export async function isGrokBridgeAvailable(options: { signal?: AbortSignal; onDiagnostics?: (diagnostics: GrokAvailabilityDiagnostics) => void } = {}): Promise<boolean> {
     const now = Date.now();
-    if (options.signal?.aborted) return false;
+    const timeoutMs = Math.min(60_000, readPositiveIntEnv("MEMORY_STORE_GROK_STATUS_TIMEOUT_MS", GROK_STATUS_TIMEOUT_MS));
+    const report = (diagnostics: GrokAvailabilityDiagnostics): void => {
+        try { options.onDiagnostics?.({ ...diagnostics }); } catch {}
+    };
+    if (options.signal?.aborted) {
+        report({ available: false, checkedAtMs: now, durationMs: 0, timeoutMs, phase: "admission", failure: "cancelled", cacheHit: false });
+        return false;
+    }
     const cacheTtlMs = grokAvailableCache ? GROK_STATUS_TTL_MS : GROK_STATUS_FAILURE_TTL_MS;
     if (grokAvailableCache !== null && now - grokAvailableAt < cacheTtlMs) {
+        if (grokCachedAvailabilityDiagnostics) report({ ...grokCachedAvailabilityDiagnostics, cacheHit: true });
         return grokAvailableCache;
     }
 
-    const timeoutMs = Math.min(60_000, readPositiveIntEnv("MEMORY_STORE_GROK_STATUS_TIMEOUT_MS", GROK_STATUS_TIMEOUT_MS));
     const timeoutSignal = AbortSignal.timeout(timeoutMs);
     const signal = options.signal ? AbortSignal.any([options.signal, timeoutSignal]) : timeoutSignal;
     const startedAt = performance.now();
     let probeStarted = false;
     let diagnostics: GrokAvailabilityDiagnostics;
+    const onAbort = (): void => report({
+        available: false, checkedAtMs: Date.now(), durationMs: performance.now() - startedAt,
+        timeoutMs, phase: probeStarted ? "transport" : "admission",
+        failure: options.signal?.aborted ? "cancelled" : "timeout", cacheHit: false,
+    });
+    signal.addEventListener("abort", onAbort, { once: true });
     try {
         const resp = await getProviderTransportAdapter().execute(
             "grok",
@@ -561,9 +576,16 @@ export async function isGrokBridgeAvailable(options: { signal?: AbortSignal } = 
             ...(typeof causeCode === "string" && /^[A-Z0-9_]{1,64}$/u.test(causeCode) ? { errorCode: causeCode } : {}),
         };
         if (!cancelled) grokAvailableCache = false;
+    } finally {
+        signal.removeEventListener("abort", onAbort);
     }
+    diagnostics.cacheHit = false;
     grokAvailabilityDiagnostics = diagnostics;
-    if (diagnostics.failure !== "cancelled") grokAvailableAt = diagnostics.checkedAtMs;
+    if (diagnostics.failure !== "cancelled") {
+        grokAvailableAt = diagnostics.checkedAtMs;
+        grokCachedAvailabilityDiagnostics = { ...diagnostics };
+    }
+    report(diagnostics);
     return diagnostics.available;
 }
 
@@ -575,6 +597,7 @@ export function resetGrokBridgeAvailabilityForTest(): void {
     grokAvailableCache = null;
     grokAvailableAt = 0;
     grokAvailabilityDiagnostics = null;
+    grokCachedAvailabilityDiagnostics = null;
 }
 
 export function resetGrokCallConcurrencyForTest(): void {

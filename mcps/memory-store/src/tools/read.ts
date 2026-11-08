@@ -5,6 +5,7 @@ import { readMemoryFile, findMemoryById } from "../store.js";
 import { describeUnavailableMemory } from "../memory-availability.js";
 import { saveTempFile } from "../temp-store.js";
 import { formatToolError } from "../error-format.js";
+import { autoSummaryCurrentnessNotice, inspectAutoSummaryCurrentness } from "../auto-summary-currentness.js";
 
 /**
  * memory_read — 读取单条记忆
@@ -46,6 +47,9 @@ export function registerRead(server: McpServer): void {
                     }, startTime);
                 }
 
+                const summaryNotice = autoSummaryCurrentnessNotice(inspectAutoSummaryCurrentness(content));
+                const summarySuffix = summaryNotice ? `\n⚠️ ${summaryNotice}` : "";
+
                 // 有范围参数 → 直接返回指定行
                 if (startLine !== undefined || endLine !== undefined) {
                     const lines = content.split(/\r?\n/);
@@ -57,7 +61,7 @@ export function registerRead(server: McpServer): void {
                     return appendTiming({
                         content: [{
                             type: "text" as const,
-                            text: `📄 [${id}] "${entry.title}" 第 ${start}-${end} 行（共 ${lines.length} 行）\n\n${rangeContent}`,
+                            text: `📄 [${id}] "${entry.title}" 第 ${start}-${end} 行（共 ${lines.length} 行）${summarySuffix}\n\n${rangeContent}`,
                         }],
                     }, startTime);
                 }
@@ -70,7 +74,7 @@ export function registerRead(server: McpServer): void {
                 return appendTiming({
                     content: [{
                         type: "text" as const,
-                        text: `📄 记忆已导出到临时文件\n路径: ${tempPath}\n标题: ${entry.title}\n总行数: ${lines.length}\n大小: ${sizeKB} KB\n用 view_file 读取即可`,
+                        text: `📄 记忆已导出到临时文件\n路径: ${tempPath}\n标题: ${entry.title}\n总行数: ${lines.length}\n大小: ${sizeKB} KB${summarySuffix}\n用 view_file 读取即可`,
                     }],
                 }, startTime);
             } catch (error) {

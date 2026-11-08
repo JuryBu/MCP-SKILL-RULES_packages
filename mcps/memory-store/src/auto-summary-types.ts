@@ -1,4 +1,5 @@
 import type { ModelBridgeAttemptFailure } from "./model-bridge.js";
+import type { GrokAvailabilityDiagnostics } from "./grok-client.js";
 
 export interface AutoSummaryProvenance {
     version: 1;
@@ -12,6 +13,7 @@ export interface AutoSummaryProvenance {
     safetyStopped?: boolean;
     timedOut?: boolean;
     failureClass?: string;
+    grokAvailabilityDiagnostics?: GrokAvailabilityDiagnostics;
 }
 
 export interface AutoSummaryGenerationResult {

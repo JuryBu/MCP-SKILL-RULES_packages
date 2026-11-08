@@ -490,21 +490,21 @@ function collectAllEntries(targetWorkspace?: string): MemoryIndexEntry[] {
     if (targetWorkspace) {
         if (targetWorkspace === "general") {
             const index = readGeneralIndex();
-            allEntries.push(...index.entries);
+            allEntries.push(...index.entries.map(entry => ({ ...entry, _sourceHash: "general" })));
         } else {
             const h = workspaceHash(targetWorkspace);
             const idx = readWorkspaceIndex(h);
-            allEntries.push(...idx.entries);
+            allEntries.push(...idx.entries.map(entry => ({ ...entry, _sourceHash: h })));
         }
     } else {
         // 搜索全部
         const generalIndex = readGeneralIndex();
-        allEntries.push(...generalIndex.entries);
+        allEntries.push(...generalIndex.entries.map(entry => ({ ...entry, _sourceHash: "general" })));
 
         const hashes = listWorkspaceHashes();
         for (const hash of hashes) {
             const wsIndex = readWorkspaceIndex(hash);
-            allEntries.push(...wsIndex.entries);
+            allEntries.push(...wsIndex.entries.map(entry => ({ ...entry, _sourceHash: hash })));
         }
     }
 

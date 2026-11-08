@@ -198,9 +198,9 @@ format="json"和structuredContent包含items、selection、coverage、sourceTimi
 ### Auto Summary 双轨制 (v1.5+)
 - memory_write 的 searchSummary 参数现在是可选的
 - 写入后系统异步生成autoSummary，默认模型链路Grok优先，显式modelChain保持指定范围，不阻塞返回
-- 搜索时 autoSummary 和 searchSummary 合并匹配，大幅提升检索召回率
+- 搜索会排除最新生成失败、正在生成或来源指纹已变化的autoSummary；来源未核的旧摘要保留为候选线索，结果、读取和导出提示按正文核对，状态仍为unverified且补缺继续跳过；原件与来源保持
 - memory_update 修改 content/append 时自动重新生成 autoSummary
-- memory_stats(action="enhance"): 批量为所有缺少 autoSummary 的老记忆生成
+- memory_stats(action="enhance"): 显式为缺少当前有效摘要的记忆补缺；已有旧摘要仍会检查状态与来源指纹，未核来源的旧格式摘要、正在生成、已取消、安全停止或结果未知的原调用先保留等待处理，不批量重生未知旧摘要
 - 新建、更新和补缺统一校验完整停用通知、服务错误包装与空响应，记录实际provider/model、时间及失败来源；生成失败保留已有摘要，正文改变时提交前重新核版本。确认异常的旧摘要使用docs/auto-summary-repair.md的定点检查/备份/恢复流程，正常摘要不批量重生
 
 ### conversation_golden_extract — 黄金片段提取 (v1.5+)

@@ -8,7 +8,7 @@ import { StringDecoder } from "node:string_decoder";
 import { callGetModelResponseDetailed as callLsModelDetailed, isLsAvailable } from "./ls-client.js";
 import { normalizeChain, type Chain } from "./chain.js";
 import { callAgyWithFallback, type AgyAttempt } from "./agy-client.js";
-import { callGrokExec, isGrokBridgeAvailable, mapGrokMaxTokens, mapGrokModel, type GrokContext, type GrokExecDiagnostics, type GrokTrafficClass } from "./grok-client.js";
+import { callGrokExec, isGrokBridgeAvailable, mapGrokMaxTokens, mapGrokModel, type GrokAvailabilityDiagnostics, type GrokContext, type GrokExecDiagnostics, type GrokTrafficClass } from "./grok-client.js";
 import { getProviderTransportAdapter, mapProviderTrafficClass, type ProviderTransportLease, type ProviderTransportSettlementKind } from "./provider-transport-adapter.js";
 import type { ProviderTrafficClass } from "./provider-control-contracts.js";
 import type { FailureClass } from "./record-scheduler-contracts.js";
@@ -77,6 +77,7 @@ export interface ModelBridgeResult {
     timedOut?: boolean;
     cancelled?: boolean;
     grokDiagnostics?: GrokExecDiagnostics;
+    grokAvailabilityDiagnostics?: GrokAvailabilityDiagnostics;
     failureClass?: FailureClass;
     retryStrategy?: ModelBridgeRetryStrategy;
     agyAttempts?: readonly AgyAttempt[];
@@ -599,6 +600,7 @@ function mapClaudeCodeModel(model: string): string {
 export async function resolveModelChainCandidates(
     chain: Chain = "auto",
     options: ModelBridgeOptions = {},
+    onGrokAvailabilityDiagnostics?: (diagnostics: GrokAvailabilityDiagnostics) => void,
 ): Promise<ResolvedChain[]> {
     chain = normalizeChain(chain as string);
     const cancellation = createAgyCancellationBridge(options);
@@ -623,11 +625,11 @@ export async function resolveModelChainCandidates(
         if (chain === "antigravity") return (await available(isLsAvailable)) ? ["antigravity"] : [];
         if (chain === "codex") return (await available(isCodexBridgeAvailable)) ? ["codex"] : [];
         if (chain === "claude-code") return (await available(isClaudeCodeBridgeAvailable)) ? ["claude-code"] : [];
-        if (chain === "grok") return (await available(() => isGrokBridgeAvailable(scopedOptions))) ? ["grok"] : [];
+        if (chain === "grok") return (await available(() => isGrokBridgeAvailable({ ...scopedOptions, onDiagnostics: onGrokAvailabilityDiagnostics }))) ? ["grok"] : [];
         if (chain === "agy") return (await available(() => isAgyBridgeAvailable(scopedOptions))) ? ["agy"] : [];
 
         const candidates: ResolvedChain[] = [];
-        if (await available(() => isGrokBridgeAvailable(scopedOptions))) candidates.push("grok");
+        if (await available(() => isGrokBridgeAvailable({ ...scopedOptions, onDiagnostics: onGrokAvailabilityDiagnostics }))) candidates.push("grok");
         if (isAgyAutoEnabled() && await available(() => isAgyBridgeAvailable(scopedOptions))) candidates.push("agy");
         if (await available(isLsAvailable)) candidates.push("antigravity");
         if (await available(isCodexBridgeAvailable)) candidates.push("codex");
@@ -992,7 +994,9 @@ export async function callModelResponse(
     options: ModelBridgeOptions = {},
 ): Promise<ModelBridgeResult> {
     const failures: ModelBridgeAttemptFailure[] = [];
-    const result = await callModelResponseInternal(model, prompt, chain, timeoutMs, options, failures);
+    let availability: GrokAvailabilityDiagnostics | undefined;
+    const result = await callModelResponseInternal(model, prompt, chain, timeoutMs, options, failures, diagnostics => { availability = { ...diagnostics }; });
+    if (availability) result.grokAvailabilityDiagnostics = { ...availability };
     if (!result.text && result.error && !failures.some(failure => failure.reason === result.error)) {
         failures.push({ provider: result.chainUsed, model: result.modelUsed || null, reason: result.error, occurredAt: new Date().toISOString(), kind: "provider", failureClass: result.failureClass });
     }
@@ -1006,6 +1010,7 @@ async function callModelResponseInternal(
     timeoutMs: number,
     options: ModelBridgeOptions,
     failures: ModelBridgeAttemptFailure[],
+    onGrokAvailabilityDiagnostics: (diagnostics: GrokAvailabilityDiagnostics) => void,
 ): Promise<ModelBridgeResult> {
     const deadline = createModelBridgeDeadline(timeoutMs, options);
     const deadlineFailure = (phase: "preflight" | "execution"): ModelBridgeResult => ({
@@ -1050,7 +1055,7 @@ async function callModelResponseInternal(
             ? [options.preResolvedCandidate]
             : resolvedChain === "auto"
                 ? (["grok", ...(isAgyAutoEnabled() ? ["agy"] : []), "antigravity", "codex", ...(options.allowClaudeCodeFallback ? ["claude-code"] : [])] as ResolvedChain[])
-                : await resolveModelChainCandidates(resolvedChain, { ...options, signal: deadline.signal });
+                : await resolveModelChainCandidates(resolvedChain, { ...options, signal: deadline.signal }, onGrokAvailabilityDiagnostics);
     if (deadline.remainingMs() === 0) return deadlineFailure("preflight");
     let preflightMs = deadline.elapsedMs();
     const autoChecked = new Set<ResolvedChain>();
@@ -1058,7 +1063,7 @@ async function callModelResponseInternal(
     if (resolvedChain === "auto" && !options.providerLease) {
         for (const candidate of candidates.slice(0, isAgyAutoEnabled() ? 2 : 1)) {
             const probeStartedAt = performance.now();
-            const available = await resolveModelChainCandidates(candidate, { ...options, signal: deadline.signal });
+            const available = await resolveModelChainCandidates(candidate, { ...options, signal: deadline.signal }, onGrokAvailabilityDiagnostics);
             preflightMs += Math.max(0, Math.round(performance.now() - probeStartedAt));
             if (deadline.remainingMs() === 0) return deadlineFailure("preflight");
             autoChecked.add(candidate);
@@ -1115,7 +1120,7 @@ async function callModelResponseInternal(
         if (resolvedChain === "auto" && !options.providerLease) {
             if (!autoChecked.has(resolved)) {
                 const probeStartedAt = performance.now();
-                const available = await resolveModelChainCandidates(resolved, { ...options, signal: deadline.signal });
+                const available = await resolveModelChainCandidates(resolved, { ...options, signal: deadline.signal }, onGrokAvailabilityDiagnostics);
                 preflightMs += Math.max(0, Math.round(performance.now() - probeStartedAt));
                 if (deadline.remainingMs() === 0) return deadlineFailure("preflight");
                 autoChecked.add(resolved);
