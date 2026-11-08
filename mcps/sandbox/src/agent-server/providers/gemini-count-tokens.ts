@@ -1,8 +1,10 @@
 import { AgentFault, canonicalJson, type JsonObject } from '../protocol.js';
+import { setTimeout as delay } from 'node:timers/promises';
 import { tokenCount } from '../accounting/usage.js';
 import { freezeOwned, sha256 } from './assemble.js';
 import { GeminiAdapter, encodeGeminiCountTokensRequest } from './gemini.js';
-import { decodeResponse } from './http.js';
+import { decodeResponse, safeTransportCause } from './http.js';
+import { ProviderFault } from './types.js';
 import type { CredentialAccess } from './dispatch.js';
 import type { HttpTransport, NativeSendView, ProviderProfile, RawProviderResponse } from './types.js';
 
@@ -21,6 +23,7 @@ export interface GeminiTokenCountResult {
         observedAt: string;
         deadlineAt: string;
         requestDeadlineAt?: string;
+        requestAttempts?: number;
     };
 }
 
@@ -90,17 +93,51 @@ export function createGeminiTokenCounter(options: GeminiTokenCounterOptions) {
                 if (credential !== undefined && (!credential || /[\r\n]/.test(credential))) throw new AgentFault('E_AUTH', '凭据内容无效');
                 return decodeResponse(await options.transport.request({ method: 'POST', url: endpoint.href,
                     headers: { 'Content-Type': 'application/json', ...(credential ? { 'x-goog-api-key': credential } : {}) }, body,
-                    timeoutMs: Math.max(1, deadline - now()), maxResponseBytes: 64 * 1024 }, controller.signal));
+                    timeoutMs: Math.max(1, deadline - now()), maxResponseBytes: 64 * 1024 }, controller.signal), 'gemini', endpoint.href);
             };
-            const raw = profile.credentialRef
-                ? await options.credentialAccess!.withCredential(profile.credentialRef, profile.credentialGeneration, send) : await send();
+            let raw: RawProviderResponse | undefined;
+            let requestAttempts = 0;
+            while (!raw) {
+                check();
+                requestAttempts++;
+                try {
+                    raw = profile.credentialRef
+                        ? await options.credentialAccess!.withCredential(profile.credentialRef, profile.credentialGeneration, send) : await send();
+                } catch (error) {
+                    check();
+                    const cause = error instanceof ProviderFault ? error.transportCause : safeTransportCause(error);
+                    const transient = error instanceof ProviderFault && !['E_AUTH', 'E_QUOTA', 'E_MODEL_UNAVAILABLE', 'E_PARAMETER_INVALID', 'E_CANCELLED', 'E_RESPONSE_LIMIT'].includes(error.code)
+                        && (['ECONNRESET', 'EPIPE', 'ETIMEDOUT', 'EAI_AGAIN', 'UND_ERR_SOCKET', 'UND_ERR_CONNECT_TIMEOUT'].includes(String(cause?.causeCode ?? cause?.code))
+                            || [500, 502, 503, 504].includes(error.httpStatus ?? 0) || error.code === 'E_RATE_LIMIT' && error.retryable);
+                    const wait = Math.max(250 * 2 ** (requestAttempts - 1) + Math.floor(Math.random() * 250),
+                        error instanceof ProviderFault ? error.retryAfterMs ?? 0 : 0);
+                    if (transient && requestAttempts < 3 && now() + wait < deadline) {
+                        await delay(wait, undefined, { signal: controller.signal });
+                        continue;
+                    }
+                    if (!(error instanceof ProviderFault)) throw error;
+                    const fault = new ProviderFault(['E_RESULT_UNKNOWN', 'E_TRANSPORT_UNSENT'].includes(error.code)
+                        ? 'E_COUNT_TOKENS_TRANSPORT' : error.code, '输入计数请求未完成，生成请求尚未派发', {
+                        acceptance: 'not_sent', phase: 'prepared', httpStatus: error.httpStatus,
+                        nativeCode: error.nativeCode, nativeReason: error.nativeReason,
+                        transportCause: cause, transportPhase: error.transportPhase, retryable: transient,
+                        retryAfterMs: error.retryAfterMs, rawResponse: error.rawResponse,
+                    });
+                    Object.assign(fault.details!, { requestPurpose: 'input_token_count', generationDispatch: 'not_started',
+                        countRequestAcceptance: error.acceptance, originalErrorCode: error.code, endpoint: endpoint.href,
+                        modelId: bareModel, profileId, profileRevision: profile.revision, requestHash, requestBodyHash,
+                        requestAttempts, executionDeadlineAt: deadlineAt, requestDeadlineAt: new Date(deadline).toISOString(),
+                        ...(error.rawResponse ? { countResponse: { httpStatus: error.rawResponse.httpStatus, body: error.rawResponse.body } } : {}) });
+                    throw fault;
+                }
+            }
             check();
             const inputTokens = tokenCount(raw.json.totalTokens);
             if (inputTokens === null) throw new AgentFault('E_COUNT_TOKENS_INVALID', '原生计数响应缺少明确的非负整数totalTokens');
             return freezeOwned({ inputTokens, raw, source: { kind: 'gemini_count_tokens' as const, endpoint: endpoint.href,
                 modelId: bareModel, profileId: profile.profileId, profileRevision: profile.revision,
                 credentialGeneration: profile.credentialGeneration, requestHash, requestBodyHash,
-                observedAt: new Date(now()).toISOString(), deadlineAt, requestDeadlineAt: new Date(deadline).toISOString() } });
+                observedAt: new Date(now()).toISOString(), deadlineAt, requestDeadlineAt: new Date(deadline).toISOString(), requestAttempts } });
         });
         const result = Promise.race([work, aborted]).finally(() => {
             clearTimeout(timer);
