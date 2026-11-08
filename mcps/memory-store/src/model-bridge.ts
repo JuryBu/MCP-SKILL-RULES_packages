@@ -104,6 +104,7 @@ export interface ClaudeCodeExecResult {
 }
 
 export interface ModelBridgeOptions {
+    inputOnly?: boolean;
     responseValidator?: (candidate: ModelResponseCandidate) => string | null;
     allowClaudeCodeFallback?: boolean;
     agyCommand?: string;
@@ -651,10 +652,12 @@ function mapModelName(model: string): string {
     return CODEX_DEFAULT_MODEL;
 }
 
-export async function callCodexExec(prompt: string, model: string, timeoutMs: number, diagnosticContext?: CodexDiagnosticContext, control: Pick<ModelBridgeOptions, "shouldCancel" | "signal"> & { isDeadlineTimeout?: () => boolean } = {}): Promise<CodexExecResult> {
+export async function callCodexExec(prompt: string, model: string, timeoutMs: number, diagnosticContext?: CodexDiagnosticContext, control: Pick<ModelBridgeOptions, "shouldCancel" | "signal" | "inputOnly"> & { isDeadlineTimeout?: () => boolean } = {}): Promise<CodexExecResult> {
     if (isModelBridgeCancelled(control)) return { text: null, cancelled: true, error: "Codex 模型桥已取消，CLI未启动" };
     const effectiveTimeoutMs = Math.max(1, Math.min(timeoutMs, CODEX_MAX_TIMEOUT_MS));
     const codexModel = mapModelName(model);
+    const inputOnlyDirectory = control.inputOnly ? fs.mkdtempSync(path.join(os.tmpdir(), "memory-store-summary-input-")) : undefined;
+    const workingDirectory = inputOnlyDirectory || process.cwd();
     const outputPath = path.join(
         os.tmpdir(),
         `memory-store-codex-bridge-${Date.now()}-${Math.random().toString(16).slice(2)}.txt`,
@@ -667,12 +670,26 @@ export async function callCodexExec(prompt: string, model: string, timeoutMs: nu
         "--ephemeral",
         "--ignore-rules",
         "--ignore-user-config",
+        ...(control.inputOnly ? [
+            "--disable", "shell_tool",
+            "--disable", "unified_exec",
+            "--disable", "apps",
+            "--disable", "view_image",
+            "--disable", "code_mode_host",
+            "--disable", "browser_use",
+            "--disable", "computer_use",
+            "--disable", "plugins",
+            "-c", "agents.enabled=false",
+            "-c", "web_search=disabled",
+            "-c", "mcp_servers={}",
+            "-c", "project_doc_max_bytes=0",
+        ] : []),
         "--sandbox", "read-only",
         "-m", codexModel,
         "-c", `model_reasoning_effort=${CODEX_DEFAULT_REASONING_EFFORT}`,
         "-c", `service_tier=${CODEX_SERVICE_TIER}`,
         "-c", `features.fast_mode=${CODEX_FAST_MODE}`,
-        "-C", process.cwd(),
+        "-C", workingDirectory,
         "-o", outputPath,
         "-",
     ];
@@ -680,7 +697,7 @@ export async function callCodexExec(prompt: string, model: string, timeoutMs: nu
     const codexCommand = getCodexCommand();
     const commandString = `${quoteForCmd(codexCommand)} ${args.map(quoteForCmd).join(" ")}`;
     const diagnostics = new CodexDiagnosticRecorder({
-        command: codexCommand, args, cwd: process.cwd(), model: codexModel,
+        command: codexCommand, args, cwd: workingDirectory, model: codexModel,
         reasoningEffort: CODEX_DEFAULT_REASONING_EFFORT, requestedServiceTier: CODEX_SERVICE_TIER,
         requestedFastMode: CODEX_FAST_MODE, timeoutMs: effectiveTimeoutMs,
         promptSha256: crypto.createHash("sha256").update(prompt, "utf8").digest("hex"), context: diagnosticContext,
@@ -693,7 +710,7 @@ export async function callCodexExec(prompt: string, model: string, timeoutMs: nu
             {
                 stdio: ["pipe", "pipe", "pipe"],
                 windowsHide: true,
-                cwd: process.cwd(),
+                cwd: workingDirectory,
                 env: process.env,
                 detached: process.platform !== "win32",
                 windowsVerbatimArguments: process.platform === "win32",
@@ -746,6 +763,9 @@ export async function callCodexExec(prompt: string, model: string, timeoutMs: nu
             finalResult = { ...finalResult, codexDiagnostics: audit };
             try {
                 cleanupOutputFile(outputPath);
+                if (inputOnlyDirectory) {
+                    try { fs.rmdirSync(inputOnlyDirectory); } catch {}
+                }
             } finally {
                 const stderrSummary = previewStderr(stderr);
                 if (finalResult.error) {

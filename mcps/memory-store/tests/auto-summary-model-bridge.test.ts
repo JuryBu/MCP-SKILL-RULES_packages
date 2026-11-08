@@ -42,6 +42,8 @@ const ls = await import("../src/ls-client.ts");
 const rpc = await import("../src/ls-rpc.ts");
 const transport = await import("../src/provider-transport-adapter.ts");
 const bridge = await import("../src/model-bridge.ts");
+delete process.env.MEMORY_STORE_AUTOSUMMARY_TIMEOUT_MS;
+const summary = await import("../src/auto-summary.ts");
 ls.__setParentLsForTest({ info: { pid: process.pid, csrfToken: "synthetic", workspaceId: "synthetic", ports: [1] }, port: 1 });
 rpc.__setLsRpcImplForTest(async (_info, _port, method, payload) => {
     assert.equal(method, "GetModelResponse");
@@ -55,6 +57,16 @@ await transport.configureProviderTransportAdapterForTest({ mode: "shadow" });
 const options = { responseValidator: (candidate: { text: string }) => validateAutoSummaryCandidate(candidate.text) };
 
 try {
+    const suppliedTextOnly = await summary.generateAutoSummaryResult("合成记忆", ["fixture"], "已有修复和待办。", "codex", {
+        callModel: async (_model, prompt, _chain, timeoutMs, bridgeOptions) => {
+            assert.equal(timeoutMs, 90000);
+            assert.equal(bridgeOptions?.inputOnly, true);
+            assert.match(prompt, /不要调用工具、运行命令、读取文件或规则/u);
+            return { text: "记录合成案例的实际修复、验证与后续安排。", chainUsed: "grok", modelUsed: "fixture" };
+        },
+    });
+    assert.equal(suppliedTextOnly.provenance.status, "generated");
+
     const fallback = await bridge.callModelResponse("summary-primary", "synthetic only", "auto", 5_000, options);
     assert.equal(fallback.chainUsed, "antigravity");
     assert.equal(fallback.modelUsed, "summary-fallback");
