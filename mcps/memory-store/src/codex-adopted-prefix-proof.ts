@@ -2,7 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import { renameSync } from "node:fs";
 import path from "node:path";
-import { resolveCodexHistoryArchiveLimits, streamCodexHistoryArchive, type CodexHistoryArchiveOptions } from "./codex-history-archive.js";
+import { resolveCodexHistoryArchiveStreamLimits, streamCodexHistoryArchive, type CodexHistoryArchiveOptions } from "./codex-history-archive.js";
 import { codexHistoryPhysicalIdentity, type CodexStreamingHistorySegment } from "./codex-history-source.js";
 import { CodexHistorySourceMismatchError, throwIfCodexReadCancelled } from "./codex-history-integrity.js";
 
@@ -28,8 +28,8 @@ export async function proveCodexAdoptedPrefix(options: AdoptedPrefixProofOptions
     throwIfCodexReadCancelled(options.isCancelled);
     const { segment } = options;
     if (!/\.zst$/iu.test(segment.path) || segment.replicas.length || !Number.isSafeInteger(options.endByte) || options.endByte < 1 || !/^[a-f0-9]{64}$/u.test(options.expectedSha256)) throw new Error("Adopted prefix proof requires a compressed source, complete replica discovery and a valid boundary");
-    const limits = resolveCodexHistoryArchiveLimits(options.archive);
-    const archive = { ...options.archive, maxCompressedBytes: limits.compressed, maxDecompressedBytes: limits.logical, maxWindowBytes: limits.window, minFreeBytes: limits.reserve };
+    const limits = resolveCodexHistoryArchiveStreamLimits(options.archive);
+    const archive = { ...options.archive, maxWindowBytes: limits.window, minFreeBytes: limits.reserve };
     const identity = {
         format: FORMAT, path: path.resolve(segment.path), physical: segment.physical, replicas: segment.replicas,
         headerSha256: segment.headerSha256, startOrdinal: segment.startOrdinal, endOrdinalExclusive: segment.endOrdinalExclusive,

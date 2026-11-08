@@ -169,6 +169,7 @@ export type FormatRoundForMessageRolesOptions = {
     deadlineAt?: number;
     shouldAbort?: () => boolean;
     onBudgetExceeded?: () => void;
+    subagentSource?: boolean;
 };
 export type FormatRoundForMessageRolesBudgetResult = {
     text: string;
@@ -553,8 +554,9 @@ function thinkingSummaryLabel(thinking: string): string {
         : `💭 思考 (${thinking.length}字)`;
 }
 
-function formatAiHeading(stepIndex: number): string {
-    return Number.isFinite(stepIndex) ? `### 🤖 AI (step ${stepIndex})` : "### 🤖 AI";
+function formatAiHeading(stepIndex: number, subagentSource = false): string {
+    const label = subagentSource ? "🤝 子代理回复" : "🤖 AI";
+    return Number.isFinite(stepIndex) ? `### ${label} (step ${stepIndex})` : `### ${label}`;
 }
 
 /**
@@ -627,14 +629,18 @@ function renderAiResponseLines(
 
 /** 渲染单条工具调用（非 brief），保持旧分支的单行输出格式。 */
 function renderToolCallLine(lines: string[], tc: ToolCallInfo, depth: Depth, extraTypes: ExtraType[]): void {
-    let line = `- ${tc.name}`;
     if (depth === "full" || extraTypes.includes("tool_results")) {
-        line += `(${recoverToolSummary(tc.argsSummary, tc.argsFull, 120)})`;
-        if (tc.resultSummary) {
-            line += ` → ${truncate(recoverToolSummary(tc.resultSummary, tc.resultFull, 500), depth === "full" ? 500 : 200)}`;
-        }
+        lines.push(formatCompleteToolCall(tc));
+        return;
     }
-    lines.push(line);
+    lines.push(`- ${tc.name}`);
+}
+
+function formatCompleteToolCall(tc: ToolCallInfo): string {
+    const indent = (value: string): string => escapeUnpairedUnicode(value).split("\n").map(line => `    ${line}`).join("\n");
+    const argumentsLabel = tc.argsFull === undefined ? "参数摘要（来源未保存完整参数）" : "参数";
+    const resultLabel = tc.resultFull === undefined ? "结果摘要（来源未保存完整回执）" : "结果";
+    return [`- ${tc.name}`, "", `${argumentsLabel}：`, "", indent(tc.argsFull ?? tc.argsSummary), "", `${resultLabel}：`, "", indent(tc.resultFull ?? tc.resultSummary ?? ""), ""].join("\n");
 }
 
 type ParsedAnnotationMessage = {
@@ -1256,7 +1262,9 @@ export function formatRoundForMessageRoles(
             const stepIndex = message.stepIndex ?? round.startStep;
             if (!pushLine(lines, asSystem
                 ? `### 🧩 系统/压缩内容 (step ${stepIndex})`
-                : `### 👤 用户 (step ${stepIndex})`)) break;
+                : options?.subagentSource
+                    ? `### 🤝 子代理任务 (step ${stepIndex})`
+                    : `### 👤 用户 (step ${stepIndex})`)) break;
             const messageLines: string[] = [];
             renderHumanMessageContent(messageLines, message, depth, truncateForRoleView);
             for (const line of messageLines) {
@@ -1321,7 +1329,7 @@ export function formatRoundForMessageRoles(
     const renderAiBlock = (ai: ConversationRound["aiResponses"][number]): boolean => {
         const showThinking = Boolean(ai.thinking) && (depth === "full" || extraTypes.includes("thinking"));
         if (!ai.response && !showThinking) return true;
-        if (!pushLine(lines, formatAiHeading(ai.stepIndex))) return false;
+        if (!pushLine(lines, formatAiHeading(ai.stepIndex, options?.subagentSource))) return false;
         if (ai.response && !pushLine(lines, truncateForRoleView(ai.response, depth))) return false;
         if (ai.thinking && (depth === "full" || extraTypes.includes("thinking"))) {
             if (!pushLine(lines, "")) return false;
@@ -1334,12 +1342,8 @@ export function formatRoundForMessageRoles(
     };
 
     const renderToolLine = (tc: ConversationRound["toolCalls"][number]): boolean => {
-        let line = `- ${tc.name}`;
-        if (depth === "full" || extraTypes.includes("tool_results")) {
-            line += `(${recoverToolSummary(tc.argsSummary, tc.argsFull, 120)})`;
-            if (tc.resultSummary) line += ` → ${truncateForRoleView(recoverToolSummary(tc.resultSummary, tc.resultFull, 500), depth === "full" ? "normal" : depth)}`;
-        }
-        return pushLine(lines, line);
+        if (depth === "full" || extraTypes.includes("tool_results")) return pushLine(lines, formatCompleteToolCall(tc));
+        return pushLine(lines, `- ${tc.name}`);
     };
 
     if (!budgetState.exceeded && (mergeAiTool || includeTool)) {

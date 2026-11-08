@@ -22,15 +22,19 @@ export const GUIDE_TEXT = `# MCP Memory Store v${VERSION} 使用指南
 
 Codex、Claude Code、Windsurf/Devin、Antigravity、DeepSeek Harness 共用正文组合搜索和范围准备入口。新请求必须显式选择具体 dataChain：codex、claude-code、windsurf、antigravity 或 dsh；多端正文搜索使用 dataChains。查询当前端时也由调用者填写当前端的具体值，不省略来源或使用 auto 猜测。
 
-这些新入口的conversationId是当前调用者的稳定ID，conversationIds是目标对话ID数组；旧fetch/read/search/export的conversationId按其schema指定目标。单次新范围读取或命中展开只选择一个端、一个目标。不同端的相同ID分别保留，桌面ID与词对ID只在来源核验后关联。WSF和DSH只提供对话数据，不能作为modelChain。
+conversationId是当前调用者的稳定ID，conversationIds是目标对话ID数组；fetch/read/search/recall/单条export同样接受一个目标数组项，省略时兼容把conversationId作为目标。批量导出显式使用exportBatch=true。单次范围读取或命中展开只选择一个端、一个目标。已有任务的状态、取消和恢复沿用原来源，显式传入来源时仍检查一致性。不同端的相同ID分别保留，桌面ID与词对ID只在来源核验后关联。WSF和DSH只提供对话数据，不能作为modelChain。
 
 - 按标题或ID找对话：list；按正文词语跨对话搜索：search_all，使用 allTerms/anyTerms/excludeTerms 组合交集、并集、排除，workspaces/conversationIds/messageRoles 限定范围。intersectionScope 可选同一对话、同轮或同消息。结果带来源、次数、命中轮次、原文片段和 sourceRevision。
 - 动态搜索：沿原调用者和 taskId 使用 search_all_status；afterRevision 消费增量，search_all_cancel/search_all_resume 取消或继续原任务。read_hit 同时传当前调用者conversationId、命中的dataChain、目标conversationIds、sourceRevision及startRound/endRound。pending修订尚未核验时，先用read_fast获取当前范围。
-- 已知目标先准备所需范围：prepare或默认read_fast(lastRounds=N)返回分段准备taskId，buildOrder="latest|oldest"选择近期或早期优先，prepareCache=false只准备所需范围；默认同一任务继续完整构建。沿原taskId使用prepare_status/prepare_cancel/prepare_resume；prepare_status用afterProgressRevision等待新增内容，不把准备任务交给search_all_status。
+- search_all可用threadMode="children"与准确parentConversationId限定子线程，main只查主线程；maxFiles/maxBytes/maxHits/deadlineMs限制每次执行，达到预算保留已核结果为partial，原taskId恢复后重新计量。limit只控制结果页大小。大响应给出首段、SHA256和read_result的next，原调用者沿同一结果ID续读全文。
+- 已知目标先准备所需范围：prepare、五端默认fetch或read_fast(lastRounds=N)返回分段准备taskId，buildOrder="latest|oldest"选择近期或早期优先，prepareCache=false只准备所需范围；默认同一任务继续完整构建。沿原taskId使用prepare_status/prepare_cancel/prepare_resume；恢复初始期限可传新的deadlineMs，prepare_status用afterProgressRevision等待新增内容。完整fetch缓存路线显式progressive=false，大来源配background=true；非Codex完整后台fetch沿同一分段任务查询，完整缓存发布后fullFetchCache给出cacheKey/cacheGeneration与sourcePartial，就绪范围始终可读。
+- 就绪范围导出：export使用原progressiveTaskId、原调用者conversationId、具体dataChain，再选rangeRef、lastRounds或明确轮次；固定引用导出单轮，保留原覆盖和未知总数。normal准备的范围需要思考或工具详情时，先按depth=full及所需messageRoles准备。
 - read_fast指定startRound/endRound或显式progressive=false时直接返回正文；响应若带cachePreparation.taskId，使用其中原任务的search_all_status/cancel/resume。read_fast的source省略或填写auto/local，不使用forceRefresh=true；强刷仅用于新建search_all，旧完整缓存使用旧search/read(source="cache")，LS来源通过支持它的旧入口读取。优先使用响应给出的next调用，不混用两类任务。
 - 范围就绪后，read_ready读取末N轮用原taskId与lastRounds，省略rangeRef；read_ready/extract_ready固定引用重读或提取用原taskId与rangeRef，返回该引用的一轮。locate_ready必须同时传这两项；search_ready的rangeRef选择缓存版本，范围由blockId/startRound/endRound限定。其它历史继续准备。messageRoles默认正文，可按需要选择工具或子代理内容。相对轮号只属于该块，身份或总轮次未核实时保留partial和缺口，不当作绝对轮次；已发布旧引用在完整构建和进程重开后保持对应原内容。
 
 完整fetch继续用于完整规范化缓存、recall及Record等需要完整来源的任务；日常快读和关键词找对话直接选择对应新入口。requestedRangeComplete表示本次所需范围可确认完整，fullSourceComplete表示整个来源完成，未查范围不能计作零命中。来源改变后核修订，失败保留已发布缓存，不跳过内容认证。
+
+初始范围与完整构建分开调度，完整构建最多占一个默认后台位置。deadlineMs包含初始排队和读取，后续完整构建有独立运行期限。未就绪返回原状态及查询next；后台失败已有范围时返回partial/preparationError。search_ready的hits[].next直接读取固定引用，cacheRevision只标识缓存投影，存在原始版本时另给originRevision及命中sourceRevision。
 
 单端搜索示例：{"action":"search_all","conversationId":"caller-id","dataChain":"claude-code","allTerms":["缓存","轮次"]}。多端搜索将dataChain替换为dataChains:["codex","windsurf"]。快读示例：{"action":"read_fast","conversationId":"caller-id","dataChain":"dsh","conversationIds":["target-id"],"lastRounds":3}。完整参数与来源差异见随包docs/five-host-search.md；详细搜索教程见docs/local-corpus-search.md。
 

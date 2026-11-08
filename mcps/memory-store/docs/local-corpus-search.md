@@ -4,7 +4,17 @@
 
 ## 先搜索，再展开命中轮次
 
+五端默认 `fetch` 与 `read_fast` 采用分段准备：先返回原任务及读取已就绪范围的 `next`，其余历史继续准备。需要完整持久 fetch 缓存供完整整理使用时，显式设置 `progressive=false`，大来源同时使用 `background=true`。非Codex来源的完整后台fetch仍使用原分段任务，沿返回的 `prepare_status` 查询；就绪范围继续可读，完整缓存发布后状态中的 `fullFetchCache` 给出 `cacheKey`、`cacheGeneration`、目标与实际完整性，供旧缓存读取入口使用。普通正文与 `full` 的思考、工具详情分别准备；按 normal 准备的原任务需要详情时，工具会给出按 full 准备的入口。
+
+已就绪范围可以直接导出：`action="export"`、原调用者 `conversationId`、具体 `dataChain`、原 `progressiveTaskId`，再选择一个 `rangeRef`、`lastRounds` 或明确轮次。固定引用导出单轮，范围相对轮号需带原块；导出保留已核覆盖、身份警告和未知总数，读取与导出使用同一范围。
+
 启动时用 `conversationId` 指定当前调用者的稳定 ID，单端必须显式填写具体 `dataChain`，多端用 `dataChains`，当前端也填写具体值，不省略或用 `auto`。`conversationIds` 用于限定目标对话，省略时搜索所选端的全部本地候选；`workspaces` 可限定一个或多个工作区。
+
+子线程正文搜索可传`threadMode="children"`和准确的`parentConversationId`，只扫描来源中已核实属于该父线程的候选；未显式指定`messageRoles`时读取子代理正文，full或工具详情视图另包含工具内容。`parentDataChain`填写与单一`dataChain`相同的来源。`threadMode="main"`只查主线程，默认保留全部类型。按父标题定位时先用`list`取得准确ID。
+
+`search_all`的`limit`只控制状态响应的页大小。`maxFiles`、`maxBytes`、`maxHits`和`deadlineMs`限制每次执行或恢复的扫描；`maxHits`按新增命中对话计数，字节预算在来源提供进度的读取边界检查。达到预算后状态为`partial`，已校验结果和未查范围保留，使用原`taskId`的`search_all_resume`继续，预算重新计时和计数。
+
+大结果首段返回`delivery="paged"`、结果`taskId`、SHA256及`next`。直接执行该`read_result`参数可续读同一结果的UTF-8文本，直到`complete=true`；原文件也保留。结果绑定原调用者，续读不重新扫描来源或启动模型。文件指针和首段各自说明实际交付范围。
 
 ```json
 {

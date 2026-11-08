@@ -15,20 +15,25 @@ let cancelled = false;
 let started = false;
 let active: { cache: ProgressiveCache; writer: ProgressiveWriter } | undefined;
 const hash = (value: unknown): string => createHash("sha256").update(JSON.stringify(value)).digest("hex");
-const check = (): void => { if (cancelled) throw new Error("Progressive preparation cancelled"); };
+let initialDeadlineAt: number | undefined;
+const check = (): void => {
+    if (cancelled) throw new Error("Progressive preparation cancelled");
+    if (initialDeadlineAt !== undefined && Date.now() >= initialDeadlineAt) throw new Error("Initial progressive range deadline exceeded; published ranges remain readable");
+};
 const send = (message: unknown): Promise<void> => new Promise((resolve, reject) => {
     if (!process.connected || !process.send) { reject(new Error("Progressive worker IPC disconnected")); return; }
     process.send(message, error => error ? reject(error) : resolve());
 });
 
 async function execute(payload: ProgressiveTaskPayload): Promise<string> {
+    initialDeadlineAt = payload.phase === "full" ? undefined : payload.initialDeadlineAt;
     if (payload.request.dataChain !== "codex") {
         const { executeHostProgressivePreparation } = await import("./conversation-progressive-worker-hosts.js");
         return executeHostProgressivePreparation(payload, { isCancelled: () => cancelled, onProgress: send,
             onActive: value => { active = value; } });
     }
     const { request, directory } = payload;
-    const projection = normalizeProgressiveProjection(request.messageRoles, request.depth);
+    let projection = normalizeProgressiveProjection(request.messageRoles, request.depth);
     let ready: ProgressiveReadyState = { version: 1, phase: "source", previous: [], requestedRangeComplete: false,
         updatedAt: new Date().toISOString(), warnings: [] };
     try { ready = JSON.parse(await fs.readFile(path.join(directory, "ready.json"), "utf8")); }
@@ -76,7 +81,7 @@ async function execute(payload: ProgressiveTaskPayload): Promise<string> {
                 order: order + offset,
                 rounds: batch,
                 messages: range.messages.filter(message => selectedIndices.has(message.round)),
-            }, request), check);
+            }, request, source.conversation?.isChildThread), check);
             blockIds.push(...blocks.map(block => block.blockId));
         }
         ready.phase = "range-ready";
@@ -105,39 +110,46 @@ async function execute(payload: ProgressiveTaskPayload): Promise<string> {
     };
     const thread = await getCodexThreadAsync(request.conversationId);
     if (!thread?.rolloutPath) throw new Error("Codex conversation source is unavailable");
+    if (thread.isChildThread && request.messageRolesExplicit === false) {
+        request.messageRoles = ["subagent"];
+        projection = normalizeProgressiveProjection(request.messageRoles, request.depth);
+    }
     let lastProgress = 0;
-    try { await readCodexHistoryWindow({
-        conversationId: request.conversationId, sourcePath: thread.rolloutPath,
-        direction: request.direction, maxRounds: request.initialRounds,
-        continueHistory: request.buildFull && request.direction !== "latest",
-        fillRequestedRange: !request.buildFull,
-        rangeRounds: Math.min(25, request.initialRounds), messageRoles: projection.messageRoles,
-        isCancelled: () => cancelled,
-        onRange: publishRaw,
-        onProgress: async progress => {
-            if (Date.now() - lastProgress < 250) return;
-            lastProgress = Date.now();
-            await send({ type: "progress", stage: "range:" + progress.phase, current: progress.roundsReady,
-                detail: "已读取 " + progress.bytesRead + " 字节、" + progress.segmentsRead + " 个来源片段" });
-        },
-    }); } catch (error) {
-        if (!request.buildFull || !(error instanceof Error) || !error.message.includes("window replica verification required")) throw error;
-        ready.warnings.push("Replicated source requires full canonical verification before ranges become available");
+    if (payload.phase !== "full") {
+        try { await readCodexHistoryWindow({
+            conversationId: request.conversationId, sourcePath: thread.rolloutPath,
+            direction: request.direction, maxRounds: request.initialRounds,
+            continueHistory: false,
+            fillRequestedRange: true,
+            rangeRounds: Math.min(25, request.initialRounds), messageRoles: projection.messageRoles,
+            isCancelled: () => { check(); return false; },
+            onRange: publishRaw,
+            onProgress: async progress => {
+                if (Date.now() - lastProgress < 250) return;
+                lastProgress = Date.now();
+                await send({ type: "progress", stage: "range:" + progress.phase, current: progress.roundsReady,
+                    detail: "已读取 " + progress.bytesRead + " 字节、" + progress.segmentsRead + " 个来源片段" });
+            },
+        }); } catch (error) {
+            if (!request.buildFull || !(error instanceof Error) || !error.message.includes("window replica verification required")) throw error;
+            ready.warnings.push("Replicated source requires full canonical verification before ranges become available");
+            await writeReady();
+        }
+        check();
+        if (!request.buildFull) {
+            if (!ready.requestedRangeComplete) ready.warnings.push("CODEX_WINDOW_RECOVERY: 当前局部范围或祖先认证尚未完成，可用以下请求继续完整准备；仍保留原资源上限：" + JSON.stringify({
+                action: "prepare", conversationId: request.ownerId, conversationIds: [request.conversationId], dataChain: "codex",
+                lastRounds: request.initialRounds, prepareCache: true, buildOrder: request.direction, waitSeconds: 0,
+                messageRoles: request.messageRoles, depth: request.depth,
+            }));
+            ready.phase = "requested-range-ready";
+            await writeReady();
+            return JSON.stringify({ taskId: payload.taskId, ready });
+        }
+        ready.phase = "full-cache";
         await writeReady();
+        return JSON.stringify({ taskId: payload.taskId, ready, continueFull: true });
     }
-    check();
-    if (!request.buildFull) {
-        if (!ready.requestedRangeComplete) ready.warnings.push("CODEX_WINDOW_RECOVERY: 当前局部范围或祖先认证尚未完成，可用以下请求继续完整准备；仍保留原资源上限：" + JSON.stringify({
-            action: "prepare", conversationId: request.ownerId, conversationIds: [request.conversationId], dataChain: "codex",
-            lastRounds: request.initialRounds, prepareCache: true, buildOrder: request.direction, waitSeconds: 0,
-            messageRoles: request.messageRoles, depth: request.depth,
-        }));
-        ready.phase = "requested-range-ready";
-        await writeReady();
-        return JSON.stringify({ taskId: payload.taskId, ready });
-    }
-    ready.phase = "full-cache";
-    await writeReady();
     await send({ type: "progress", stage: ready.phase, detail: "所需范围可继续使用，后台正在准备完整历史" });
     const { loadConversationData, getConversationRoundIndexBounds } = await import("./conversation-bridge.js");
     const { iterateCachedConversationSourceCacheRounds } = await import("./conversation-source-cache.js");
@@ -161,7 +173,9 @@ async function execute(payload: ProgressiveTaskPayload): Promise<string> {
         conversationId: request.conversationId, host: "codex", revision: hash([loaded.cacheGeneration, loaded.cacheFingerprint]),
         snapshot: { cacheKey: loaded.cacheKey, generation: loaded.cacheGeneration, fingerprint: loaded.cacheFingerprint },
         totalRounds: total,
-        conversation: { id: request.conversationId, title: thread.title || "", workspace: thread.cwd || "", source: "codex" },
+        conversation: { id: request.conversationId, title: thread.title || "", workspace: thread.cwd || "", source: "codex",
+            isChildThread: thread.isChildThread, parentConversationId: thread.parentConversationId || undefined,
+            agentNickname: thread.agentNickname || undefined, agentRole: thread.agentRole || undefined },
     }, request);
     const cacheDirectory = path.join(directory, "ranges", hash(source.revision));
     const cache = await openProgressiveCache({ root: cacheDirectory, source });
@@ -179,7 +193,7 @@ async function execute(payload: ProgressiveTaskPayload): Promise<string> {
             key: loaded.cacheKey, generation: loaded.cacheGeneration, startRound, endRound,
         });
         if (!selected) throw new Error("Full-cache range is unavailable");
-        const rounds = Array.from(selected.rounds, round => projectProgressiveRound(round, projection));
+        const rounds = Array.from(selected.rounds, round => projectProgressiveRound(round, projection, thread.isChildThread));
         if (!rounds.length) continue;
         await publishProgressiveBlocks(cache, writer, {
             coverage: { kind: "absolute", startRound, endRound },

@@ -4,7 +4,7 @@
 
 ## 选择来源和目标
 
-本页新入口的`conversationId`填写当前调用者的稳定ID，`conversationIds`选择目标；旧`fetch/read/search/export`的`conversationId`按对应schema指定目标。新查询必须显式填写具体 `dataChain`；查询当前端时，调用者也填写当前端的具体值。多个端同时查找用 `dataChains`。`auto`无法指定本次搜索范围，省略来源会返回修正参数的提示。
+`conversationId`填写当前调用者的稳定ID，`conversationIds`选择目标；`fetch/read/search/recall/单条export`同样接受一个目标数组项，省略时兼容把`conversationId`作为目标。批量导出显式填写`exportBatch=true`。新查询必须显式填写具体 `dataChain`；查询当前端时，调用者也填写当前端的具体值。多个端同时查找用 `dataChains`。已有任务的状态、取消与恢复可仅传原调用者和任务ID，沿用绑定来源；显式传入来源时仍检查一致性。
 
 | 参数 | 作用 | 示例 |
 |---|---|---|
@@ -25,17 +25,29 @@
 
 创建查询返回 `taskId`。沿同一调用者、原任务和来源执行 `search_all_status`，可用 `afterRevision`和 `waitSeconds`等待新增结果。命中给出次数、轮次、有限原文、`sourceRevision`及覆盖状态；分页游标绑定查询、来源与结果快照。`search_all_cancel`保留已提交结果，`search_all_resume`沿原任务继续。
 
+`search_all`支持`threadMode="main|children|all"`，子线程范围同时给准确`parentConversationId`。`maxFiles/maxBytes/maxHits/deadlineMs`按每次执行限制扫描，到达预算保留已校验结果并返回`partial`；沿原任务恢复。`limit`只决定返回页大小。来源没有提供可核实父子关系的候选时，保留该来源的覆盖诊断。
+
+正文或状态结果过大时，响应直接提供首段文本、SHA256和`read_result`的`next`；原调用者沿同一结果ID取得余下文本，保持来源版本，不重新读取历史。`read_hit`必须携带命中返回的`sourceRevision`。
+
 ```json
 {"action":"read_hit","conversationId":"caller-id","dataChain":"windsurf","conversationIds":["target-session-id"],"sourceRevision":"revision-from-hit","startRound":8,"endRound":9,"messageRoles":["user","assistant"]}
 ```
 
-`pending`修订仍在核验，暂时不能作为固定命中展开。来源发生变化后旧修订会被拒绝，应重新搜索或使用 `read_fast`读取当前范围。部分来源的命中保留 `provisional`、警告和已查范围；没有覆盖的部分不计作零命中。
+`pending`修订仍在核验，暂时不能作为固定命中展开。非Codex来源会有界保存已取得的原文快照，`read_hit`优先按来源、目标、版本、角色与轮次从该快照展开，响应包含`snapshotCapturedAt`及`sourceRevalidatedThisCall=false`；它返回那次搜索取得的原文。快照缺失或范围不足时重新读取来源并校验版本，来源变化则给出重新搜索或`read_fast`入口。部分来源的命中保留`provisional`、警告和已查范围，没有覆盖的部分保留为未查。
+
+默认`depth=normal`只返回完整可见消息及轻量轮次信息，按`messageRoles`筛角色；`brief`缩短每条摘录并标记截断，`full`按所选角色展开详细轮对象，`extraTypes`可单独选择思考、工具结果、代码或文件详情。内部规范化缓存继续保留原始完整轮对象。
 
 ## 先用已就绪内容
 
 `read_fast(lastRounds=N)`默认优先准备最新N轮，`prepare`还可用 `buildOrder="oldest"`优先早期内容。`prepareCache=false`只准备所需窗口；默认后台继续完整构建。状态、取消与恢复分别使用 `prepare_status`、`prepare_cancel`、`prepare_resume`，始终沿原任务操作。
 
+绝对轮次范围使用`read_fast(startRound/endRound)`；`prepare`使用`lastRounds`与构建方向，误传绝对范围会在开始前返回正确入口。
+
 范围就绪后，读取末N轮用原`taskId`与`lastRounds`并省略`rangeRef`；固定引用重读或提取用原`taskId`与`rangeRef`，返回该引用的一轮，`locate_ready`也必须同时传两项。`search_ready`的`rangeRef`只选择缓存版本，查询范围由`blockId/startRound/endRound`限定，无需等待其它历史。`rangeRef`绑定原来源、版本和块，完整历史构建后旧引用仍可读。相对轮号仅用于该块，确认总轮次后再使用绝对轮号。
+
+`search_ready`为每个`hits`项提供可直接调用的`next`，沿原任务读取已发布引用。`cacheRevision`表示缓存投影视图，存在原始来源版本时另给`originRevision`，并在命中`sourceRevision`中返回这一来源版本；没有可独立展开的来源版本时，使用引用的`next`。
+
+初始范围与完整构建分开排队，完整构建最多占一个默认后台位置。`deadlineMs`覆盖初始范围排队与读取，到期时保留已发布内容；完整构建继续使用自己的运行期限。准备未就绪时返回状态与可执行的查询参数，后台失败但有范围可用时返回`partial`和`preparationError`。
 
 默认末N轮快读使用上述分段任务，`prepare_status`通过`afterProgressRevision`等待新增内容。指定`startRound/endRound`或显式`progressive=false`时直接返回正文；若响应附带`cachePreparation.taskId`，该搜索缓存任务使用`search_all_status/cancel/resume`。`read_fast`的`source`省略或填写`auto/local`，不使用`forceRefresh=true`；旧缓存和LS来源使用支持它们的旧入口。以实际响应给出的`next`与任务种类继续，不混用状态入口，详见[完整参数示例](local-corpus-search.md)。
 
@@ -61,3 +73,5 @@ Devin先发现元数据，再核目标身份和主链，按需要的轮次读取
 任务级`warnings`保留构建过程中各个版本的诊断，当前范围是否已核验以`sourceRangeVerified`、`requestedRangeComplete`和返回的`source`为准。查看旧`rangeRef`时仍返回该引用原版本的覆盖状态。
 
 PB目录元数据缺少工作区时，按工作区筛选会列出 `pb_workspace_metadata_unavailable`及来源覆盖缺口；指定明确对话ID仍可读取。DSH未完成帧、PB未知变体等保留partial，工具不将它们计入完整来源。首次扫描、内容哈希、解密及完整构建仍有成本，接口持续报告实际进度与已就绪范围。
+
+Antigravity未映射的PB字段保留为未分类来源事件。`depth="full"`并选择`messageRoles=["tool"]`可在规范轮次的`semanticEvents`查看；`extraTypes=["tool_results"]`也提供`sourceEvents`。这些事件保留字段名与原始线索，不编造工具名称或调用成功状态，来源仍为`partial`。

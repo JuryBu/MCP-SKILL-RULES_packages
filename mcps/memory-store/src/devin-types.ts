@@ -12,6 +12,8 @@ export interface DevinReadOptions {
     identityMode?: "verified" | "physical";
     physicalSourceKind?: "devin-cli" | "devin-desktop";
     childDiscoveryOnly?: boolean;
+    childAgentId?: string;
+    messageRoles?: string[];
 }
 
 export type DevinRoundRange = { tailRounds: number } | { startRound: number; endRound?: number };
@@ -25,6 +27,16 @@ export interface DevinRoundCoverage {
     endStepExclusive: number;
     totalSteps: number;
     complete: boolean;
+    sourceRevision?: string;
+}
+
+export interface DevinRelativeCoverage {
+    unit: "round";
+    startRound: number;
+    endRound: number;
+    startStep: number;
+    endStepExclusive: number;
+    requestedRangeComplete: boolean;
     sourceRevision?: string;
 }
 
@@ -119,6 +131,7 @@ export interface DevinRawConversation {
     partial: boolean;
     warnings: string[];
     coverage?: DevinRoundCoverage;
+    relativeCoverage?: DevinRelativeCoverage;
     sourceEvidence?: { method: "content-digest" | "sqlite-data-version"; revision: string; validationRevision?: string; sources?: DevinSqliteValidation[] };
     readMetrics?: { identityMs: number; bodyReadMs: number; totalMs: number; bytesRead: number; recordsRead: number; identityCacheHit: boolean };
 }

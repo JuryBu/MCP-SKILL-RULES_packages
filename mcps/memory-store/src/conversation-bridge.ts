@@ -18,6 +18,7 @@ import {
 } from "./codex-client.js";
 import { assertCodexHistorySourceAsync, CodexHistorySourceMismatchError, type CodexHistorySource } from "./codex-history-source.js";
 import {
+    CLAUDE_CODE_NORMALIZATION_VERSION,
     getClaudeCodeThread,
     loadClaudeCodeConversationAsync,
     readClaudeCodeRoundTail,
@@ -76,6 +77,7 @@ import {
 } from "./conversation-source-cache.js";
 import {
     compareConversationRoundCompleteness,
+    ANTIGRAVITY_PB_NORMALIZATION_VERSION,
     discoverLocalPbCandidates,
     fingerprintLocalPbCandidates,
     loadLocalPbConversation,
@@ -129,6 +131,7 @@ export interface ConversationLoadResult {
     sourceMode?: ConversationRawSource;
     sourceDiagnostics?: string[];
     sourcePartial?: boolean;
+    antigravityNormalizationVersion?: number;
     sourceCoverage?: {
         unit: "step";
         startStep: number;
@@ -151,6 +154,15 @@ export function conversationSourceIsPartial(loaded: Pick<ConversationLoadResult,
     return Boolean(loaded.sourcePartial || loaded.windsurfData?.partial || loaded.sourceDiagnostics?.some(diagnostic =>
         /部分候选解码失败|本地 PB (?:active|implicit): failed\//u.test(diagnostic)
     ));
+}
+
+function conversationCacheNormalizationNeedsRefresh(snapshot: ConversationLoadResult): boolean {
+    return Boolean(
+        (snapshot.chainUsed === "antigravity" && snapshot.localPbActivities?.sourceFlavor === "antigravity"
+            && snapshot.antigravityNormalizationVersion !== ANTIGRAVITY_PB_NORMALIZATION_VERSION)
+        || (snapshot.chainUsed === "claude-code" && snapshot.claudeCodeData?.normalizationVersion !== CLAUDE_CODE_NORMALIZATION_VERSION)
+        || (snapshot.windsurfData?.thread.sourceKind && snapshot.windsurfData.normalizationVersion !== DEVIN_NORMALIZATION_VERSION)
+    );
 }
 
 export function getConversationRoundIndexBounds(loaded: Pick<ConversationLoadResult, "rounds" | "roundCount" | "roundIndexBounds">): ConversationSourceCacheRoundBounds {
@@ -399,7 +411,7 @@ export async function loadConversationData(
     }
 
     const resolved = source === "cache" || source === "local" || options.publishedCacheOnly
-        || (chain === "antigravity" && conversationId && (options.locateWindow || options.sourceReadBudget))
+        || (chain === "antigravity" && conversationId && (source === "auto" || options.locateWindow || options.sourceReadBudget))
         ? chain as ResolvedConversationChain
         : await resolveConversationChain(chain);
     if (!resolved) return null;
@@ -486,7 +498,7 @@ async function loadFromResolvedChain(
             || previous.snapshot.aiResponseCount === undefined
             || previous.snapshot.toolCallCount === undefined
             || (resolved === "codex" && (!previous.snapshot.codexData?.historySource?.segments.length || previous.snapshot.codexData.historySource.segments.some(segment => !segment.prefixSha256 || !segment.ordinalMode)))
-            || (previous.snapshot.windsurfData?.thread.sourceKind && previous.snapshot.windsurfData.normalizationVersion !== DEVIN_NORMALIZATION_VERSION)
+            || conversationCacheNormalizationNeedsRefresh(previous.snapshot)
         ),
     );
     const freshness = resolved === "codex" && options.expectedCodexSource
@@ -967,6 +979,7 @@ async function tryBuildIncrementalConversation(
     }
 
     const oldData = previous.snapshot.claudeCodeData;
+    if (oldData?.normalizationVersion !== CLAUDE_CODE_NORMALIZATION_VERSION) return null;
     const checkpoint = oldData?.sourceCheckpoint;
     const jsonlPath = oldData?.thread.jsonlPath;
     if (!checkpoint || !jsonlPath || oldData.logicalChain?.merged) return null;
@@ -1280,6 +1293,12 @@ function loadConversationCacheOnly(
 ): ConversationLoadResult | null {
     const cached = readConversationSourceCacheOnly<ConversationLoadResult>({ key, generation: options.cacheGeneration });
     if (!cached) return null;
+    if (conversationCacheNormalizationNeedsRefresh(cached.snapshot)) {
+        if (!options.cacheGeneration) {
+            throw Object.assign(new Error("已发布缓存使用旧的正文/角色分类。请先用fetch、相同dataChain与目标conversationIds、source=local建立新版缓存；原generation仍可显式读取。"), { code: "CONVERSATION_CACHE_NORMALIZATION_STALE" });
+        }
+        cached.snapshot = { ...cached.snapshot, sourceDiagnostics: [...(cached.snapshot.sourceDiagnostics || []), "本次显式读取固定旧generation，保留该generation生成时的正文/角色分类"] };
+    }
     return hydrateConversationCache(cached.snapshot, cached.generation, cached.cacheState, cached.fingerprint, key, sourceMode, options, cached.roundCount, cached.buildFailure, cached.createdAt);
 }
 
@@ -1349,6 +1368,7 @@ function localPbToConversationResult(
             totalSteps: local.totalSteps,
             cacheAuthority: "local",
             sourcePartial: local.partial,
+            antigravityNormalizationVersion: ANTIGRAVITY_PB_NORMALIZATION_VERSION,
             cacheFingerprint: local.fingerprint,
             sourceRevision: { revision: local.fingerprint.revision || "", contentCursor: String(local.coverage?.endStepExclusive ?? local.totalSteps), eventWatermark: null },
             ...(local.coverage ? { sourceCoverage: { ...local.coverage, source: "local" as const,

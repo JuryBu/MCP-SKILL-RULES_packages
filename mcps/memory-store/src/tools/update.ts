@@ -1,6 +1,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { touchActivity, appendTiming } from "../lifecycle.js";
+import { describeUnavailableMemory } from "../memory-availability.js";
 import {
     findMemoryById,
     writeMemoryFile,
@@ -69,11 +70,11 @@ export function registerUpdate(server: McpServer): void {
                 }
                 const { hash, entry } = currentFound;
                 const fileContent = readMemoryFile(hash, id);
-                if (!fileContent) {
+                if (fileContent === null) {
                     return appendTiming({
                         content: [{
                             type: "text" as const,
-                            text: `❌ 记忆文件已丢失: ${id}`,
+                            text: describeUnavailableMemory(hash, id),
                         }],
                     }, startTime);
                 }

@@ -4,6 +4,8 @@ import os from "os";
 import path from "path";
 import { StringDecoder } from "string_decoder";
 import { matchContextProbeText } from "./context-probe-text.js";
+import { renderConversationAutomationEvent } from "./conversation-automation-event.js";
+import { projectConversationTaskNotification } from "./conversation-task-notification.js";
 import type { CompactionSummaryInfo, ConversationRound } from "./trajectory.js";
 import type { ConversationAttachment } from "./conversation-attachments.js";
 import type { ConversationLogicalChainMode } from "./chain.js";
@@ -22,6 +24,8 @@ import {
     type SourceConversationIdentity,
     type SourceEvidenceIssue,
 } from "./source-evidence-contracts.js";
+
+export const CLAUDE_CODE_NORMALIZATION_VERSION = 3;
 
 export interface ClaudeCodeThreadInfo {
     id: string;
@@ -46,6 +50,7 @@ export interface ClaudeCodeThreadInfo {
 }
 
 export interface ClaudeCodeConversationData {
+    normalizationVersion?: number;
     thread: ClaudeCodeThreadInfo;
     rounds: ConversationRound[];
     totalSteps: number;
@@ -475,6 +480,15 @@ function claudeCodeMessageAnnotations(value: unknown): Array<{ selectedText: str
         .map(item => ({ selectedText: item.selectedText, comment: item.comment }));
 }
 
+function projectClaudeCodeTaskNotification(event: any, text: string) {
+    if (claudeCodeMessageAnnotations(event.message?.annotations ?? event.annotations).length) return null;
+    return projectConversationTaskNotification(text, {
+        channel: "claude-code",
+        kind: typeof event.origin?.kind === "string" ? event.origin.kind : undefined,
+        rawRole: `claude_code.user.origin.${event.origin?.kind || "unknown"}`,
+    });
+}
+
 function readJsonlLines(
     filePath: string,
     onLine: JsonlLineCallback,
@@ -768,6 +782,12 @@ function isLikelyPath(input: string): boolean {
 interface ExtractMessageContentOptions {
     includeEncryptedThinkingPlaceholders?: boolean;
     stepIndex?: number;
+    inlineImageSource?: {
+        jsonlPath: string;
+        byteOffset: number;
+        byteLength: number;
+        messageUuid?: string;
+    };
 }
 
 function encryptedThinkingPlaceholder(stepIndex?: number): string {
@@ -807,7 +827,7 @@ function extractMessageContent(content: any, cwd?: string, options: ExtractMessa
         };
     }
 
-    for (const item of content) {
+    for (const [contentIndex, item] of content.entries()) {
         if (!item || typeof item !== "object") {
             parts.push(unknownContentBlockPlaceholder("invalid"));
             continue;
@@ -829,19 +849,26 @@ function extractMessageContent(content: any, cwd?: string, options: ExtractMessa
             if (source.type === "base64" && typeof source.data === "string") {
                 const mimeType = source.media_type || source.mimeType || "image/png";
                 const sizeBytes = estimateBase64Bytes(source.data);
+                const encodedSha256 = createHash("sha256").update(source.data).digest("hex");
                 const attachment = {
                     kind: "image",
                     source: "claude-code-data-url",
                     mimeType,
                     sizeBytes,
-                    sha256: `sha256:${createHash("sha256").update(source.data).digest("hex")}`,
+                    sha256: `sha256:${encodedSha256}`,
                     stepIndex: options.stepIndex,
+                    claudeCodeInlineImage: options.inlineImageSource ? {
+                        version: 1 as const,
+                        ...options.inlineImageSource,
+                        contentIndex,
+                        encodedSha256,
+                    } : undefined,
                 } as const;
                 attachments.push({
                     ...attachment,
                     warning: sizeBytes > CLAUDE_ATTACHMENT_MAX_BYTES
                         ? `Claude Code base64 image estimated at ${sizeBytes} bytes exceeds configured ${CLAUDE_ATTACHMENT_MAX_BYTES}-byte limit; data URL was not materialized`
-                        : "Claude Code attachment data URL omitted from cache; hash retained",
+                        : options.inlineImageSource ? undefined : "Claude Code attachment data URL omitted from cache; hash retained",
                 });
             } else if (typeof source.path === "string" || typeof item.path === "string") {
                 const rawPath = source.path || item.path;
@@ -1775,6 +1802,12 @@ function createClaudeCodeRoundsBuilder(jsonlPath: string, cwd?: string): ClaudeC
         const extracted = extractMessageContent(message.content, event.cwd || cwd, {
             includeEncryptedThinkingPlaceholders: true,
             stepIndex,
+            inlineImageSource: {
+                jsonlPath: path.resolve(jsonlPath),
+                byteOffset,
+                byteLength: Buffer.byteLength(line, "utf8"),
+                messageUuid: typeof event.uuid === "string" ? event.uuid : undefined,
+            },
         });
 
         if (type === "user") {
@@ -1782,6 +1815,32 @@ function createClaudeCodeRoundsBuilder(jsonlPath: string, cwd?: string): ClaudeC
                 for (const toolResult of extracted.toolResults) applyToolResult(event, toolResult, byteOffset, lineNo);
                 if (currentRound) recordSourceCheckpoint("tool_result", currentRound, byteOffset, lineNo);
                 return;
+            }
+            const annotations = claudeCodeMessageAnnotations(message.annotations ?? event.annotations);
+            const notification = projectClaudeCodeTaskNotification(event, extracted.text);
+            if (notification) {
+                const round = ensureRound(byteOffset, lineNo);
+                if (round.userMessage === "(无显式用户消息)") {
+                    round.userMessage = "";
+                    round.userMessages = [];
+                }
+                round.semanticEvents ||= [];
+                for (const item of notification.events) {
+                    round.semanticEvents.push({ stepIndex, rawRole: `claude_code.${type}.origin.${event.origin.kind}`,
+                        semanticRole: "system", kind: "automation_event", text: renderConversationAutomationEvent(item.automation),
+                        resultFull: item.rawText, automation: item.automation, attachments: extracted.attachments });
+                    if (item.subagent) {
+                        round.subagentSummaries.push(item.subagent);
+                        round.semanticEvents.push({ stepIndex, rawRole: item.subagent.rawRole, semanticRole: "subagent",
+                            kind: "subagent_notification", text: item.subagent.summary, subagent: item.subagent, attachments: extracted.attachments });
+                    }
+                }
+                extracted.text = notification.userText || "";
+                if (!extracted.text) {
+                    for (const toolResult of extracted.toolResults) applyToolResult(event, toolResult, byteOffset, lineNo);
+                    if (extracted.toolResults.length > 0) recordSourceCheckpoint("tool_result", round, byteOffset, lineNo);
+                    return;
+                }
             }
             pushCurrent();
             roundIndex += 1;
@@ -1806,7 +1865,6 @@ function createClaudeCodeRoundsBuilder(jsonlPath: string, cwd?: string): ClaudeC
                 fileViews: [],
                 compactionSummaries: compactionInfo ? [compactionInfo] : undefined,
             };
-            const annotations = claudeCodeMessageAnnotations(message.annotations ?? event.annotations);
             if (!compactionInfo && annotations.length) currentRound.userMessages = [{ text: currentRound.userMessage, stepIndex, annotations, attachments: extracted.attachments }];
             currentRoundReplayByte = isCompactSummary && Number.isSafeInteger(pendingCompactBoundary?.byteOffset)
                 ? pendingCompactBoundary!.byteOffset!
@@ -2371,6 +2429,7 @@ export function loadClaudeCodeConversation(
         ? undefined
         : claudeCodeRoundTailCheckpointFromBuildSync(thread.jsonlPath, built);
     return {
+        normalizationVersion: CLAUDE_CODE_NORMALIZATION_VERSION,
         thread,
         rounds: built.rounds,
         totalSteps: built.totalSteps,
@@ -2397,6 +2456,7 @@ export async function loadClaudeCodeConversationAsync(
         ? undefined
         : await claudeCodeRoundTailCheckpointFromBuild(thread.jsonlPath, built);
     return {
+        normalizationVersion: CLAUDE_CODE_NORMALIZATION_VERSION,
         thread,
         rounds: built.rounds,
         totalSteps: built.totalSteps,
@@ -2413,7 +2473,13 @@ function searchableTextsFromEvent(event: any): Array<{ role: ClaudeCodeContextPr
     const message = event?.message || {};
     const extracted = extractMessageContent(message.content, event.cwd);
     const result: Array<{ role: ClaudeCodeContextProbeHit["role"]; text: string }> = [];
-    if (event.type === "user" && extracted.text) result.push({ role: "user", text: extracted.text });
+    if (event.type === "user" && extracted.text) {
+        const notification = projectClaudeCodeTaskNotification(event, extracted.text);
+        if (notification) {
+            for (const item of notification.events) result.push({ role: "item", text: item.subagent?.summary || renderConversationAutomationEvent(item.automation) });
+            if (notification.userText) result.push({ role: "user", text: notification.userText });
+        } else result.push({ role: "user", text: extracted.text });
+    }
     if (event.type === "assistant") {
         if (extracted.text) result.push({ role: "assistant", text: extracted.text });
         if (extracted.thinking) result.push({ role: "reasoning", text: extracted.thinking });
@@ -2460,7 +2526,8 @@ export function matchClaudeCodeContextProbeInJsonl(
         if (!event) return;
         if (event.type === "user") {
             const extracted = extractMessageContent(event.message?.content, event.cwd);
-            if (extracted.toolResults.length === 0 || extracted.text) roundIndex += 1;
+            const notification = projectClaudeCodeTaskNotification(event, extracted.text);
+            if ((extracted.toolResults.length === 0 || extracted.text) && (!notification || notification.userText)) roundIndex += 1;
         }
         for (const item of searchableTextsFromEvent(event)) {
             const snippet = matchContextProbeText(item.text, probe);
@@ -2511,7 +2578,8 @@ export async function matchClaudeCodeContextProbeInJsonlAsync(
             if (!event) return;
             if (event.type === "user") {
                 const extracted = extractMessageContent(event.message?.content, event.cwd);
-                if (extracted.toolResults.length === 0 || extracted.text) roundIndex += 1;
+                const notification = projectClaudeCodeTaskNotification(event, extracted.text);
+                if ((extracted.toolResults.length === 0 || extracted.text) && (!notification || notification.userText)) roundIndex += 1;
             }
             for (const item of searchableTextsFromEvent(event)) {
                 check();
@@ -2609,7 +2677,8 @@ export function deepLocateClaudeCodeConversations(
             if (!event) return;
             if (event.type === "user") {
                 const extracted = extractMessageContent(event.message?.content, event.cwd);
-                if (extracted.toolResults.length === 0 || extracted.text) roundIndex += 1;
+                const notification = projectClaudeCodeTaskNotification(event, extracted.text);
+                if ((extracted.toolResults.length === 0 || extracted.text) && (!notification || notification.userText)) roundIndex += 1;
             }
             for (const item of searchableTextsFromEvent(event)) {
                 const matched = mode === "exact"

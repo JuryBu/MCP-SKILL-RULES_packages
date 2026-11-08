@@ -1,6 +1,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { touchActivity, appendTiming } from "../lifecycle.js";
+import { describeUnavailableMemory } from "../memory-availability.js";
 import {
     ensureWorkspace,
     generateMemoryId,
@@ -147,7 +148,7 @@ export function registerBatch(server: McpServer): void {
                             const found = findMemoryById(op.id);
                             if (!found) { result = `❌ read: 记忆不存在 ${op.id}`; failCount++; break; }
                             const content = readMemoryFile(found.hash, op.id);
-                            if (!content) { result = `❌ read: 文件丢失 ${op.id}`; failCount++; break; }
+                            if (content === null) { result = describeUnavailableMemory(found.hash, op.id); failCount++; break; }
 
                             if (op.startLine || op.endLine) {
                                 const lines = content.split(/\r?\n/);
@@ -247,7 +248,7 @@ export function registerBatch(server: McpServer): void {
                             if (!found) { result = `❌ update: 不存在 ${op.id}`; failCount++; break; }
 
                             const content = readMemoryFile(found.hash, op.id);
-                            if (!content) { result = `❌ update: 文件丢失 ${op.id}`; failCount++; break; }
+                            if (content === null) { result = describeUnavailableMemory(found.hash, op.id); failCount++; break; }
 
                             const parsed = parseMemoryFile(content);
                             if (!parsed) { result = `❌ update: 格式异常 ${op.id}`; failCount++; break; }

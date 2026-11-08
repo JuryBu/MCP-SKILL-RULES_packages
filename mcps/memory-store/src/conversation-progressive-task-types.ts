@@ -2,6 +2,7 @@ import type { ProgressiveSource } from "./conversation-progressive-types.js";
 import type { ConversationLinkMode } from "./chain.js";
 import type { CorpusMessageRole } from "./conversation-corpus-types.js";
 import type { Depth } from "./trajectory.js";
+import type { ConversationSourceCacheKey } from "./conversation-source-cache.js";
 import { CORPUS_SOURCES, type CorpusSource } from "./conversation-corpus-sources.js";
 
 export const PROGRESSIVE_MESSAGE_ROLES: readonly CorpusMessageRole[] = ["user", "assistant", "tool", "subagent"];
@@ -25,7 +26,11 @@ export interface ProgressiveRequest {
     dataChain: CorpusSource;
     link?: ConversationLinkMode;
     messageRoles?: CorpusMessageRole[];
+    messageRolesExplicit?: boolean;
     depth?: Depth;
+    deadlineMs?: number;
+    fullFetchCache?: boolean;
+    forceRawCacheRebuild?: boolean;
 }
 
 export interface ProgressiveTaskPayload {
@@ -33,6 +38,8 @@ export interface ProgressiveTaskPayload {
     taskId: string;
     directory: string;
     request: ProgressiveRequest;
+    phase?: "initial" | "full";
+    initialDeadlineAt?: number;
 }
 
 export interface ProgressiveReadyGeneration {
@@ -48,8 +55,10 @@ export interface ProgressiveReadyState {
     previous: ProgressiveReadyGeneration[];
     requestedRangeComplete: boolean;
     fullCacheGeneration?: string;
+    fullFetchCache?: { cacheKey: ConversationSourceCacheKey; cacheGeneration: string; conversationId: string; sourcePartial: boolean; roundCount: number };
     updatedAt: string;
     warnings: string[];
+    initialWindow?: { revision: string; kind: string; endRound: number };
 }
 
 export function isProgressiveRequest(value: unknown): value is ProgressiveRequest {
@@ -60,6 +69,10 @@ export function isProgressiveRequest(value: unknown): value is ProgressiveReques
         && CORPUS_SOURCES.includes(request.dataChain)
         && (request.link === undefined || ["reference", "summary", "expand_children"].includes(request.link))
         && (request.depth === undefined || ["brief", "normal", "full"].includes(request.depth))
+        && (request.messageRolesExplicit === undefined || typeof request.messageRolesExplicit === "boolean")
+        && (request.fullFetchCache === undefined || typeof request.fullFetchCache === "boolean")
+        && (request.forceRawCacheRebuild === undefined || typeof request.forceRawCacheRebuild === "boolean")
+        && (request.deadlineMs === undefined || (Number.isSafeInteger(request.deadlineMs) && request.deadlineMs > 0))
         && (request.messageRoles === undefined || (Array.isArray(request.messageRoles)
             && request.messageRoles.length > 0 && request.messageRoles.length <= PROGRESSIVE_MESSAGE_ROLES.length
             && new Set(request.messageRoles).size === request.messageRoles.length
@@ -75,6 +88,8 @@ export function isProgressiveTaskPayload(value: unknown): value is ProgressiveTa
     const payload = value as ProgressiveTaskPayload;
     return payload.version === 1 && /^progressive-[a-f0-9-]{36}$/.test(payload.taskId)
         && typeof payload.directory === "string" && Boolean(payload.directory)
-        && isProgressiveRequest(payload.request);
+        && isProgressiveRequest(payload.request)
+        && (payload.phase === undefined || ["initial", "full"].includes(payload.phase))
+        && (payload.initialDeadlineAt === undefined || (Number.isSafeInteger(payload.initialDeadlineAt) && payload.initialDeadlineAt > 0));
 }
 

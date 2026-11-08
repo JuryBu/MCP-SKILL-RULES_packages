@@ -3,6 +3,7 @@ import fs from "fs";
 import path from "path";
 import { readFiniteIntegerEnv } from "./conversation-source-cache.js";
 import { TEMP_DIR } from "./temp-store.js";
+import { materializeClaudeCodeInlineImage, type ClaudeCodeInlineImageSource } from "./claude-code-attachments.js";
 import type { ConversationRound } from "./trajectory.js";
 
 export type ConversationAttachmentKind = "image" | "file";
@@ -38,6 +39,7 @@ export interface ConversationAttachment {
     tempPath?: string;
     warning?: string;
     stepIndex?: number;   // 新增：附件在 trajectory 中的原始 step；export 时定位时序，缺失回退旧行为
+    claudeCodeInlineImage?: ClaudeCodeInlineImageSource;
 }
 
 export interface AttachmentSummary {
@@ -144,13 +146,24 @@ function isMaterializableDataUrlSource(source: ConversationAttachmentSource): bo
         || source === "antigravity-tool-image";
 }
 
+function attachmentMaterializationKey(attachment: ConversationAttachment): string | undefined {
+    if (attachment.dataUrl) return attachment.dataUrl;
+    const source = attachment.claudeCodeInlineImage;
+    if (attachment.source === "claude-code-data-url" && source) {
+        return `claude-code:${JSON.stringify(source)}`;
+    }
+    return undefined;
+}
+
 function dedupeAttachments(attachments: ConversationAttachment[]): ConversationAttachment[] {
     const seen = new Set<string>();
     const result: ConversationAttachment[] = [];
     for (const attachment of attachments) {
+        const materializationKey = attachmentMaterializationKey(attachment);
         const key = attachment.dataUrl
             ? `${attachment.kind}:data:${attachment.dataUrl.slice(0, 160)}:${attachment.dataUrl.length}`
-            : `${attachment.kind}:path:${normalizePathKey(attachment.originalPath || attachment.name || "")}`;
+            : materializationKey ? `${attachment.kind}:data:${materializationKey}`
+                : `${attachment.kind}:path:${normalizePathKey(attachment.originalPath || attachment.name || "")}`;
         if (seen.has(key)) continue;
         seen.add(key);
         result.push(attachment);
@@ -345,7 +358,9 @@ async function mapLimit<T, R>(
             results[index] = await worker(items[index], index);
         }
     });
-    await Promise.all(runners);
+    const settled = await Promise.allSettled(runners);
+    const failed = settled.find((result): result is PromiseRejectedResult => result.status === "rejected");
+    if (failed) throw failed.reason;
     return results;
 }
 
@@ -452,6 +467,7 @@ export async function materializeRoundAttachments(
         ? readFiniteIntegerEnv("MEMORY_STORE_CODEX_ATTACHMENT_MATERIALIZE_CONCURRENCY", DEFAULT_MATERIALIZE_CONCURRENCY)
         : readFinitePositiveInteger(options.concurrency, DEFAULT_MATERIALIZE_CONCURRENCY);
     const cache = new Map<string, ConversationAttachment>();
+    const claudeSourceBudget = { remainingBytes: Math.min(maxTotalBytes * 2, 100 * 1024 * 1024) };
     let remainingTotalBytes = maxTotalBytes;
     let budgetExceeded = false;
 
@@ -500,7 +516,7 @@ export async function materializeRoundAttachments(
             if (
                 attachment.kind !== "image" ||
                 !isMaterializableDataUrlSource(attachment.source) ||
-                !attachment.dataUrl
+                !attachmentMaterializationKey(attachment)
             ) continue;
             if (budgetExceeded || hasBudgetExpired()) {
                 markBudgetExceeded();
@@ -518,7 +534,7 @@ export async function materializeRoundAttachments(
                 attachments[index] = { ...attachment, warning: "已有同一张本地图片（sha256 命中），未生成临时文件" };
                 continue;
             }
-            const parsed = parseDataUrl(attachment.dataUrl);
+            const parsed = attachment.dataUrl ? parseDataUrl(attachment.dataUrl) : null;
             const estimatedBytes = parsed?.sizeBytes || attachment.sizeBytes || 0;
             if (remaining <= 0) {
                 attachments[index] = { ...attachment, warning: `超过单次 materialize 数量上限 ${limit}，未生成临时文件` };
@@ -542,6 +558,14 @@ export async function materializeRoundAttachments(
             markBudgetExceeded();
             return applyBudgetWarning(job.attachment);
         }
+        if (job.attachment.source === "claude-code-data-url" && job.attachment.claudeCodeInlineImage) {
+            return materializeClaudeCodeInlineImage(job.attachment, {
+                maxBytes,
+                sourceBudget: claudeSourceBudget,
+                deadlineAt: options.deadlineAt,
+                shouldAbort: options.shouldAbort,
+            });
+        }
         return materializeAttachment(job.attachment, conversationId, job.round.roundIndex, {
             maxBytes,
             cache,
@@ -557,12 +581,14 @@ export async function materializeRoundAttachments(
     for (const round of cloned) {
         const materializedByDataUrl = new Map<string, ConversationAttachment>();
         for (const attachment of round.attachments || []) {
-            if (attachment.dataUrl) materializedByDataUrl.set(attachment.dataUrl, attachment);
+            const key = attachmentMaterializationKey(attachment);
+            if (key) materializedByDataUrl.set(key, attachment);
         }
         for (const message of round.userMessages || []) {
             if (!message.attachments) continue;
             message.attachments = message.attachments.map(attachment => {
-                const resolved = attachment.dataUrl ? materializedByDataUrl.get(attachment.dataUrl) : undefined;
+                const key = attachmentMaterializationKey(attachment);
+                const resolved = key ? materializedByDataUrl.get(key) : undefined;
                 return resolved ? { ...attachment, ...resolved } : attachment;
             });
         }

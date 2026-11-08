@@ -365,7 +365,7 @@ async function readPhysicalIdentityCatalog(id: string, budget: ReadBudget, optio
     const paths = devinPaths();
     const sources = catalogSources(budget, id, options);
     const cli = options.physicalSourceKind !== "devin-desktop" && isFile(paths.cli)
-        ? (await readCliConversations(paths.cli, budget, { identityOnly: true, metadataOnly: options.childDiscoveryOnly, sessionId: id }))[0] : undefined;
+        ? (await readCliConversations(paths.cli, budget, { identityOnly: true, metadataOnly: true, sessionId: id }))[0] : undefined;
     if (cli && sources.desktops.length) throw new DevinReadError("DEVIN_PHYSICAL_ID_AMBIGUOUS", "The ID exists in both physical stores; specify physicalSourceKind as devin-cli or devin-desktop.");
     const metadata = options.childDiscoveryOnly && sources.desktops[0] ? await readDesktopMetadata(sources.desktops[0], budget) : undefined;
     const desktop = metadata ? { ...metadata, messages: [], messageIds: new Set<string>(), toolCallIds: new Set<string>(), revision: digest(metadata.summary) }
@@ -410,6 +410,7 @@ function toRaw(entry: CatalogEntry): DevinRawConversation {
         desktopMessages: [...enrichedDesktop, ...supplements.filter(message => message.kind !== "subagent" || !representedAgents.has(message.payload.agentId))], compactions: entry.cli?.compactions ?? [],
         fingerprint, partial: entry.summary.partial, warnings: [...entry.summary.warnings],
         ...(entry.cli?.coverage ? { coverage: entry.cli.coverage } : {}),
+        ...(entry.cli?.relativeCoverage ? { relativeCoverage: entry.cli.relativeCoverage } : {}),
     };
 }
 
@@ -604,7 +605,7 @@ export async function readDevinRawConversation(id: string, options: DevinReadOpt
     if (!id.trim()) throw new DevinReadError("DEVIN_INVALID_ID", "A non-empty Devin conversation ID is required.");
     if (options.roundRange) validateDevinRoundRange(options.roundRange);
     const budget = new ReadBudget(options);
-    const ownedCache = (options.roundRange || options.childDiscoveryOnly) && !options.identityCache ? new DevinIdentityCache() : undefined;
+    const ownedCache = (options.roundRange || options.childDiscoveryOnly || options.childAgentId) && !options.identityCache ? new DevinIdentityCache() : undefined;
     const effectiveOptions = ownedCache ? { ...options, identityCache: ownedCache } : options;
     try {
     const catalog = await readIdentityCatalog(id, budget, effectiveOptions);
@@ -614,10 +615,10 @@ export async function readDevinRawConversation(id: string, options: DevinReadOpt
         if (options.roundRange && !entry.cli) throw new DevinReadError("DEVIN_RANGE_UNAVAILABLE", "Desktop-only Devin sources do not yet have verified absolute round boundaries; omit roundRange for a full read.");
         const sameIds = (left: Set<string>, right: Set<string>) => left.size === right.size && [...left].every(value => right.has(value));
         if (entry.cli) {
-            const loaded = (await readCliConversations(entry.cli.summary.sourcePath, budget, { sessionId: entry.cli.summary.canonicalId, roundRange: options.roundRange, childDiscoveryOnly: options.childDiscoveryOnly,
-                ...(options.roundRange && catalog.version ? { validatedChain: { nodes: entry.cli.nodes, compactions: entry.cli.compactions,
+            const loaded = (await readCliConversations(entry.cli.summary.sourcePath, budget, { sessionId: entry.cli.summary.canonicalId, roundRange: options.roundRange, childDiscoveryOnly: options.childDiscoveryOnly, childAgentId: options.childAgentId, messageRoles: options.messageRoles,
+                ...(options.roundRange && catalog.version && entry.cli.nodes.length ? { validatedChain: { nodes: entry.cli.nodes, compactions: entry.cli.compactions,
                     warnings: entry.cli.summary.warnings, mainChainId: entry.cli.summary.mainChainId } } : {}) }))[0];
-            if (!loaded || (!options.childDiscoveryOnly && !options.roundRange && (!sameIds(entry.cli.messageIds, loaded.messageIds) || !sameIds(entry.cli.toolCallIds, loaded.toolCallIds)))) {
+            if (!loaded || (options.identityMode !== "physical" && !options.childDiscoveryOnly && !options.childAgentId && !options.roundRange && (!sameIds(entry.cli.messageIds, loaded.messageIds) || !sameIds(entry.cli.toolCallIds, loaded.toolCallIds)))) {
                 throw new DevinReadError("DEVIN_IDENTITY_CHANGED", "Devin identity changed during source reading; retry with a fresh snapshot.");
             }
             entry.cli = loaded;
@@ -632,8 +633,8 @@ export async function readDevinRawConversation(id: string, options: DevinReadOpt
             entry.desktops = [];
         }
         for (const [index, desktop] of entry.desktops.entries()) {
-            const loaded = await readDesktop(desktop.summary.sourcePath, budget, false, options.childDiscoveryOnly);
-            if (!options.childDiscoveryOnly && (!sameIds(desktop.messageIds, loaded.messageIds) || !sameIds(desktop.toolCallIds, loaded.toolCallIds))) {
+            const loaded = await readDesktop(desktop.summary.sourcePath, budget, false, options.childDiscoveryOnly || Boolean(options.childAgentId));
+            if (!options.childDiscoveryOnly && !options.childAgentId && (!sameIds(desktop.messageIds, loaded.messageIds) || !sameIds(desktop.toolCallIds, loaded.toolCallIds))) {
                 throw new DevinReadError("DEVIN_IDENTITY_CHANGED", "Devin Desktop identity changed during source reading; retry with a fresh snapshot.");
             }
             entry.desktops[index] = loaded;
@@ -651,13 +652,14 @@ export async function readDevinRawConversation(id: string, options: DevinReadOpt
     if (effectiveOptions.identityCache && catalog.version) {
         const after = await effectiveOptions.identityCache.version(catalogSources(budget, id, effectiveOptions).filenames, budget);
         if (after !== catalog.version) throw new DevinReadError("DEVIN_IDENTITY_CHANGED", "Devin sources changed while reading selected bodies; retry with a fresh snapshot.");
-        if (result?.coverage) result.fingerprint.revision = `devin-sqlite/range-v1:${digest([after, result.summary.canonicalId])}`;
+        if (result?.coverage || result?.relativeCoverage) result!.fingerprint.revision = `devin-sqlite/range-v1:${digest([after, result!.summary.canonicalId])}`;
     }
     if (result) {
         rememberVerifiedAliases(result.summary);
-        result.sourceEvidence = { method: result.coverage ? "sqlite-data-version" : "content-digest", revision: result.fingerprint.revision!,
+        result.sourceEvidence = { method: result.coverage || result.relativeCoverage ? "sqlite-data-version" : "content-digest", revision: result.fingerprint.revision!,
             ...(catalog.version ? { validationRevision: catalog.version, sources: effectiveOptions.identityCache!.evidence() } : {}) };
         if (result.coverage) result.coverage.sourceRevision = result.fingerprint.revision;
+        if (result.relativeCoverage) result.relativeCoverage.sourceRevision = result.fingerprint.revision;
         const totalMs = performance.now() - startedAt;
         result.readMetrics = { identityMs, bodyReadMs: totalMs - identityMs, totalMs, bytesRead: budget.bytes,
             recordsRead: budget.nodes, identityCacheHit: catalog.cacheHit === true };

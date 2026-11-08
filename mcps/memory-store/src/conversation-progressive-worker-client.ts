@@ -24,10 +24,14 @@ async function terminateProgressiveWorkerTree(child: ChildProcess): Promise<void
 export interface ProgressiveWorkerRunOptions {
     target?: { file: string; execArgv?: string[] };
     cancelGraceMs?: number;
+    deadlineAt?: number;
 }
 
 export async function runProgressiveWorker(payload: ProgressiveTaskPayload, context: BackgroundTaskContext, options: ProgressiveWorkerRunOptions = {}): Promise<string> {
     if (context.isCancelled() || context.isSettled()) throw new Error("Progressive task cancelled before start");
+    if (options.deadlineAt !== undefined && Date.now() >= options.deadlineAt) {
+        throw new Error("Initial progressive range deadline exceeded; published ranges remain readable");
+    }
     const javascript = fileURLToPath(new URL("./conversation-progressive-worker.js", import.meta.url));
     const target = options.target?.file || (fs.existsSync(javascript) ? javascript : fileURLToPath(new URL("./conversation-progressive-worker.ts", import.meta.url)));
     return new Promise((resolve, reject) => {
@@ -38,6 +42,7 @@ export async function runProgressiveWorker(payload: ProgressiveTaskPayload, cont
             stdio: ["ignore", "ignore", "pipe", "ipc"],
         });
         let cancelled = false;
+        let deadlineExceeded = false;
         let result: string | undefined;
         let failure: Error | undefined;
         let stderr = "";
@@ -65,7 +70,11 @@ export async function runProgressiveWorker(payload: ProgressiveTaskPayload, cont
             forceStop();
         };
         const poll = setInterval(() => {
-            if (cancelled || (!context.isCancelled() && !context.isSettled())) return;
+            if (cancelled) return;
+            deadlineExceeded = result === undefined && failure === undefined
+                && options.deadlineAt !== undefined && Date.now() >= options.deadlineAt;
+            if (!deadlineExceeded && !context.isCancelled() && !context.isSettled()) return;
+            if (deadlineExceeded) failure = new Error("Initial progressive range deadline exceeded; published ranges remain readable");
             cancelled = true;
             try { if (child.connected) child.send({ type: "cancel" }, error => { if (error) fail(error); }); }
             catch (error) { fail(error instanceof Error ? error : new Error(String(error))); }
@@ -81,13 +90,14 @@ export async function runProgressiveWorker(payload: ProgressiveTaskPayload, cont
             const event = message as { type?: string; stage?: string; detail?: string; current?: number; result?: string; error?: string };
             if (event.type === "progress") context.updateProgress({ stage: event.stage, detail: event.detail, current: event.current, unit: "轮" });
             if (event.type === "result") result = event.result;
-            if (event.type === "error") failure = new Error(event.error || "Progressive worker failed");
+            if (event.type === "error" && !deadlineExceeded) failure = new Error(event.error || "Progressive worker failed");
         });
         child.on("error", fail);
         child.on("close", async (code, signal) => {
             const stopped = cancelled || context.isCancelled() || context.isSettled();
             await termination;
             if (cleanupFailure) finish(cleanupFailure);
+            else if (deadlineExceeded) finish(failure);
             else if (stopped) {
                 finish(new Error("Progressive task cancelled; published ranges remain readable"));
             } else if (failure) finish(failure);

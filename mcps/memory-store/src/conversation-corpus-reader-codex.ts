@@ -3,7 +3,9 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { getCodexThreadAsync, listCodexThreadsForMetadataAsync, type CodexThreadInfo } from "./codex-client.js";
-import { assertCodexHistoryManifest, assertCodexStreamingRangeSource, codexHistoryPhysicalIdentity, indexCodexHistorySourcePaths, parseCodexRolloutFilename, readCodexStreamingSessionMeta, resolveCodexStreamingHistorySource, scanCodexStreamingHistory, type CodexHistorySource, type CodexStreamingHistoryVerification, type CodexStreamingPrefixProof } from "./codex-history-source.js";
+import { assertCodexHistoryManifest, assertCodexStreamingHistoryVerification, assertCodexStreamingRangeSource, codexHistoryPhysicalIdentity, indexCodexHistorySourcePaths, parseCodexRolloutFilename, readCodexStreamingSessionMeta, resolveCodexStreamingHistorySource, scanCodexStreamingHistory, type CodexHistorySource, type CodexStreamingHistoryVerification, type CodexStreamingPrefixProof } from "./codex-history-source.js";
+import { readCodexHistoryWindow } from "./codex-history-window.js";
+import { readHostCorpusSnapshot, rememberHostCorpusProjection } from "./conversation-corpus-host-snapshot.js";
 import { throwIfCodexReadCancelled, CodexHistorySourceMismatchError } from "./codex-history-integrity.js";
 import type { CodexHistoryArchiveOptions } from "./codex-history-archive.js";
 import { iterateCachedConversationSourceCacheRounds, readConversationSourceCacheMetadata, readConversationSourceCacheRecordProjection } from "./conversation-source-cache.js";
@@ -11,9 +13,10 @@ import type { ConversationRecordProjectionRound } from "./conversation-record-pr
 import type { ConversationRound } from "./trajectory.js";
 import { DATA_ROOT } from "./store.js";
 import { codexCorpusAttachmentReferences, codexCorpusThreadOrigin, createCodexCorpusCollector, projectCodexCorpusRound, type CodexCorpusThreadOrigin } from "./conversation-corpus-reader-projection.js";
-import { CODEX_CORPUS_CACHE_FORMAT, CODEX_ROLE_PROOF_CACHE_FORMAT, CodexCorpusCacheSizeLimitError, codexCorpusSourceIdentitiesMatch, publishCodexCorpusCache, readCodexCorpusCache, type CodexCorpusCacheEntry } from "./conversation-corpus-reader-cache.js";
+import { CODEX_CORPUS_CACHE_FORMAT, CODEX_ROLE_PROOF_CACHE_FORMAT, CODEX_READABLE_RANGE_CACHE_FORMAT, CodexCorpusCacheSizeLimitError, codexCorpusSourceIdentitiesMatch, publishCodexCorpusCache, readCodexCorpusCache, type CodexCorpusCacheEntry } from "./conversation-corpus-reader-cache.js";
 import { readLegacyCodexCorpus } from "./conversation-corpus-reader-legacy.js";
 import { readRoleExcludedCodexProjection, type CodexRoleExcludedProjection } from "./conversation-corpus-reader-role-proof.js";
+import { isCodexReadableSourceFallback, readCodexReadableCache, readCodexReadableProjection } from "./conversation-corpus-reader-readable.js";
 import type { CorpusConversation, CorpusMessageRole, CorpusProjection, CorpusProvider, CorpusReadControl, CorpusSearchRequest } from "./conversation-corpus-types.js";
 import { normalizeCodexCorpusConversationId } from "./conversation-corpus-search.js";
 
@@ -37,9 +40,10 @@ export type CodexCorpusFastReadRequest = Omit<CodexCorpusRoundRequest, "revision
 
 const bodyRoles: CorpusMessageRole[] = ["user", "assistant"];
 const storedRoles: CorpusMessageRole[] = ["user", "assistant", "subagent"];
-const SEMANTIC_VERSION = "codex-corpus-reader/v5";
+const SEMANTIC_VERSION = "codex-corpus-reader/v7";
 const digest = (value: unknown) => createHash("sha256").update(JSON.stringify(value)).digest("hex");
-const projectionRevision = (revision: string) => digest({ format: CODEX_CORPUS_CACHE_FORMAT, source: revision });
+const projectionRevision = (revision: string) => digest({ format: CODEX_CORPUS_CACHE_FORMAT, reader: SEMANTIC_VERSION, source: revision });
+const needsSubagentRefresh = (entry: CodexCorpusCacheEntry, roles?: CorpusMessageRole[]) => roles?.includes("subagent") && (entry.projection.cacheGeneration || entry.readerSemanticVersion !== SEMANTIC_VERSION);
 const comparablePath = (value: string) => path.resolve(value).replace(/\\/gu, "/").replace(/\/$/u, "").toLowerCase();
 
 function inWorkspace(conversation: CorpusConversation, request: CorpusSearchRequest): boolean {
@@ -58,8 +62,32 @@ function selectRoles(projection: CorpusProjection, control: CorpusReadControl): 
 }
 
 function fromThread(thread: CodexThreadInfo): CorpusConversation {
-    const origin = codexCorpusThreadOrigin({ source: thread.source }, thread.id);
-    return { id: thread.id, title: thread.title || thread.id, workspace: thread.cwd || "", rolloutPath: thread.rolloutPath, updatedAt: typeof thread.updatedAtMs === "number" ? new Date(thread.updatedAtMs).toISOString() : undefined, archived: /(?:^|[\\/])archived_sessions[\\/]/u.test(thread.rolloutPath), source: "codex", parentConversationId: thread.parentConversationId || origin.parentConversationId, rootConversationId: thread.rootConversationId || undefined, isChildThread: origin.isChildThread, agentNickname: thread.agentNickname || origin.agentNickname, agentRole: thread.agentRole || origin.agentRole };
+    const origin = codexCorpusThreadOrigin({ source: thread.source, parent_thread_id: thread.parentConversationId, agent_nickname: thread.agentNickname, agent_role: thread.agentRole }, thread.id);
+    return { id: thread.id, title: thread.title || thread.id, workspace: thread.cwd || "", rolloutPath: thread.rolloutPath, updatedAt: typeof thread.updatedAtMs === "number" ? new Date(thread.updatedAtMs).toISOString() : undefined, archived: /(?:^|[\\/])archived_sessions[\\/]/u.test(thread.rolloutPath), source: "codex", parentConversationId: thread.parentConversationId || origin.parentConversationId, rootConversationId: thread.rootConversationId || undefined, isChildThread: Boolean(thread.isChildThread || origin.isChildThread), agentNickname: thread.agentNickname || origin.agentNickname, agentRole: thread.agentRole || origin.agentRole };
+}
+
+async function readPinnedCodexCorpusEntry(root: string, conversationId: string, revision: string, control: CorpusReadControl, format: CodexCorpusCacheEntry["format"] = CODEX_CORPUS_CACHE_FORMAT): Promise<CodexCorpusCacheEntry | null> {
+    const current = await readCodexCorpusCache(root, conversationId, control, format);
+    if (current?.projection.revision === revision) return current;
+    const directory = path.join(root, createHash("sha256").update(conversationId).digest("hex"));
+    let filenames: string[];
+    try { filenames = await fs.readdir(directory); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return null; throw error; }
+    for (const filename of filenames.filter(candidate => /^[a-f0-9]{64}\.json$/u.test(candidate)).sort()) {
+        throwIfCodexReadCancelled(control.isCancelled);
+        const candidate = path.join(directory, filename);
+        const physical = await fs.lstat(candidate);
+        if (!physical.isFile() || physical.size > 128 * 1024 ** 2) continue;
+        const bytes = await fs.readFile(candidate);
+        throwIfCodexReadCancelled(control.isCancelled);
+        if (bytes.length !== physical.size || createHash("sha256").update(bytes).digest("hex") !== filename.slice(0, -5)) continue;
+        const entry = JSON.parse(bytes.toString("utf8")) as CodexCorpusCacheEntry;
+        if (entry.format === format && entry.projection?.conversation.id === conversationId && entry.projection.conversation.source === "codex"
+            && entry.projection.revision === revision && Array.isArray(entry.projection.messages) && Array.isArray(entry.sourceIdentities)
+            && (entry.projection.complete || format === CODEX_READABLE_RANGE_CACHE_FORMAT && entry.projection.partial === true
+                && entry.projection.readableRangeVerified === true && entry.projection.fullSourceComplete === false && entry.projection.readableRange?.kind === "relative")) return entry;
+    }
+    return null;
 }
 
 async function sourceIdentities(verification: CodexStreamingHistoryVerification): Promise<CodexCorpusCacheEntry["sourceIdentities"]> {
@@ -144,6 +172,9 @@ export function createCodexCorpusProvider(options: CodexCorpusReaderOptions = {}
         const explicit = request.conversationIds?.map(normalizeCodexCorpusConversationId);
         const threads = options.listThreads ? await options.listThreads() : explicit?.length ? (await Promise.all(explicit.map(id => getCodexThreadAsync(id)))).filter((thread): thread is CodexThreadInfo => thread !== null) : await listCodexThreadsForMetadataAsync(Number.MAX_SAFE_INTEGER, true);
         const conversations = new Map(threads.map(thread => [thread.id.toLowerCase(), fromThread(thread)]));
+        if (explicit?.length && explicit.every(id => conversations.has(id)) || request.parentConversationId && threads.length) {
+            return [...conversations.values()].filter(conversation => (!explicit?.length || explicit.includes(conversation.id.toLowerCase())) && inWorkspace(conversation, request));
+        }
         const paths = await enumerate(control);
         for (const [id, rollouts] of paths) {
             if ((explicit?.length && !explicit.includes(id)) || conversations.has(id)) continue;
@@ -247,7 +278,7 @@ export function createCodexCorpusProvider(options: CodexCorpusReaderOptions = {}
         const completion = flushChunk();
         if (completion && typeof completion.then === "function") await completion;
         const messages = [...retained, ...(control.onChunk ? projectedMessages : projected.messages)];
-        return { format: CODEX_CORPUS_CACHE_FORMAT, projection: { conversation, revision: projectionRevision(verification.revision), messages, complete: true, warnings: messages.some(message => !message.timestamp) ? ["source_message_timestamps_unavailable"] : [], sourceBytes: verification.sourceBytes, timings: { discoveryMs: discoverMs, scanMs: performance.now() - started - discoverMs, incrementalReplay: replay ? 1 : 0 } }, verification, replay: projected.lastRoundStart ? { round: projected.roundCount, position: projected.lastRoundStart } : undefined, sourceIdentities: await sourceIdentities(verification) };
+        return { format: CODEX_CORPUS_CACHE_FORMAT, readerSemanticVersion: SEMANTIC_VERSION, projection: { conversation, revision: projectionRevision(verification.revision), messages, complete: true, warnings: messages.some(message => !message.timestamp) ? ["source_message_timestamps_unavailable"] : [], sourceBytes: verification.sourceBytes, timings: { discoveryMs: discoverMs, scanMs: performance.now() - started - discoverMs, incrementalReplay: replay ? 1 : 0 } }, verification, replay: projected.lastRoundStart ? { round: projected.roundCount, position: projected.lastRoundStart } : undefined, sourceIdentities: await sourceIdentities(verification) };
     };
 
     const readEntry = async (conversation: CorpusConversation, control: CorpusReadControl, allowMissingTimestamps = false): Promise<CodexCorpusCacheEntry> => {
@@ -257,8 +288,8 @@ export function createCodexCorpusProvider(options: CodexCorpusReaderOptions = {}
         if (!control.forceRefresh) {
             const cached = await readCodexCorpusCache(cacheRoot, conversation.id, control);
             const browsingOnly = cached?.projection.warnings.includes("legacy_cache_body_browsing_only") || cached?.projection.warnings.includes("message_timestamps_unavailable_in_legacy_projection");
-            if (cached && !((cached.projection.cacheGeneration && control.messageRoles?.includes("subagent")) || (!allowMissingTimestamps && browsingOnly)) && cached.projection.conversation.rolloutPath && conversation.rolloutPath && comparablePath(cached.projection.conversation.rolloutPath).replace(/\.zst$/u, "") === comparablePath(conversation.rolloutPath).replace(/\.zst$/u, "") && await codexCorpusSourceIdentitiesMatch(cached, pathsByRolloutId)) return { ...cached, projection: { ...cached.projection, conversation, timings: { cacheHit: 1 } } };
-            previous = browsingOnly ? null : cached;
+            if (cached && !(needsSubagentRefresh(cached, control.messageRoles) || (!allowMissingTimestamps && browsingOnly)) && cached.projection.conversation.rolloutPath && conversation.rolloutPath && comparablePath(cached.projection.conversation.rolloutPath).replace(/\.zst$/u, "") === comparablePath(conversation.rolloutPath).replace(/\.zst$/u, "") && await codexCorpusSourceIdentitiesMatch(cached, pathsByRolloutId)) return { ...cached, projection: { ...cached.projection, conversation, timings: { cacheHit: 1 } } };
+            previous = browsingOnly || cached && needsSubagentRefresh(cached, control.messageRoles) ? null : cached;
             const published = await reusePublished(conversation, control, allowMissingTimestamps);
             if (published) {
                 return persist(published, control);
@@ -281,14 +312,29 @@ export function createCodexCorpusProvider(options: CodexCorpusReaderOptions = {}
 
     const readRounds = async (conversation: CorpusConversation, request: CodexCorpusRoundRequest, control: CorpusReadControl = {}, requireRequestedRange = false): Promise<CorpusProjection> => {
         if (!request.revision) throw new Error("Codex round expansion requires its projection revision");
-        const requestedRoles = request.messageRoles || control.messageRoles;
-        const entry = await readEntry(conversation, requestedRoles?.includes("tool") ? { ...control, messageRoles: bodyRoles, onChunk: undefined } : { ...control, messageRoles: requestedRoles }, true);
-        if (entry.projection.revision !== request.revision) throw new CodexHistorySourceMismatchError("Codex corpus revision changed; repeat the search before expanding rounds");
+        throwIfCodexReadCancelled(control.isCancelled);
+        if (request.revision.startsWith("window:")) {
+            const snapshot = await readHostCorpusSnapshot(conversation, request, control, { cacheRoot, cacheMaxBytes: options.cacheMaxBytes });
+            if (snapshot) return snapshot;
+            throw new CodexHistorySourceMismatchError("Codex requested window snapshot is unavailable; its revision was not replaced with current source text");
+        }
+        await ensureSourceInventory(control, conversation);
+        const readable = request.revision.startsWith("readable:");
+        const entry = await readPinnedCodexCorpusEntry(readable ? path.join(cacheRoot, "readable-ranges") : cacheRoot, conversation.id, request.revision, control, readable ? CODEX_READABLE_RANGE_CACHE_FORMAT : CODEX_CORPUS_CACHE_FORMAT);
+        if (!entry || !conversation.rolloutPath || !entry.projection.conversation.rolloutPath
+            || comparablePath(conversation.rolloutPath).replace(/\.zst$/u, "") !== comparablePath(entry.projection.conversation.rolloutPath).replace(/\.zst$/u, "")) throw new CodexHistorySourceMismatchError("Codex corpus revision changed: requested snapshot is unavailable; no current-source rebuild was attempted");
         const last = entry.projection.messages.reduce((latest, message) => Math.max(latest, message.round), 0);
         const start = request.lastRounds === undefined ? request.startRound ?? 1 : Math.max(1, last - request.lastRounds + 1);
         const end = request.endRound ?? last;
         if (!Number.isSafeInteger(start) || start < 1 || !Number.isSafeInteger(end) || end < start || (request.lastRounds !== undefined && (!Number.isSafeInteger(request.lastRounds) || request.lastRounds < 1))) throw new Error("Codex corpus round range is invalid");
-        if (requireRequestedRange && request.lastRounds === undefined && end > last) throw new Error("Codex requested round range exceeds the available canonical rounds");
+        if ((requireRequestedRange || readable) && request.lastRounds === undefined && end > last) throw new Error("Codex requested round range exceeds the available canonical rounds");
+        try {
+            if (entry.verification) await assertCodexStreamingHistoryVerification(entry.verification, conversation.id, control.isCancelled, options.archive, readable ? entry.projection.readableRange!.missingHistoryBase?.endOrdinalExclusive ?? entry.verification.segments[0]!.startOrdinal : 0);
+            else if (!await codexCorpusSourceIdentitiesMatch(entry, pathsByRolloutId)) throw new CodexHistorySourceMismatchError("Codex requested corpus revision has no valid pinned source proof");
+        } catch (error) {
+            if (!(error instanceof CodexHistorySourceMismatchError)) throw error;
+            throw new CodexHistorySourceMismatchError(`Codex corpus revision changed: ${error.message}`);
+        }
         const roles = request.messageRoles || control.messageRoles || bodyRoles;
         if (roles.some(role => role === "tool" || role === "subagent") && entry.projection.cacheGeneration) {
             const key = { source: "codex:link=summary", conversationId: conversation.id };
@@ -299,17 +345,17 @@ export function createCodexCorpusProvider(options: CodexCorpusReaderOptions = {}
             return { ...entry.projection, messages: [...entry.projection.messages.filter(message => message.round >= start && message.round <= end && bodyRoles.includes(message.role) && roles.includes(message.role)), ...extra].sort((left, right) => left.round - right.round) };
         }
         if (roles.includes("tool")) {
-            const source = await resolveCodexStreamingHistorySource(conversation.rolloutPath!, { roots, pathsByRolloutId, archive: options.archive, isCancelled: control.isCancelled });
+            const source = entry.verification ? { leafPath: entry.verification.segments.at(-1)!.path, segments: entry.verification.segments } : await resolveCodexStreamingHistorySource(conversation.rolloutPath!, { roots, pathsByRolloutId, archive: options.archive, isCancelled: control.isCancelled });
             const selected: CorpusProjection["messages"] = [];
             const collector = createCodexCorpusCollector({ conversationId: conversation.id, cwd: conversation.workspace, roles, originsByPath: await sourceOrigins(source, conversation.id, control), onRound: (round, messages) => { if (round >= start && round <= end) selected.push(...messages); } });
             const verification = await scanCodexStreamingHistory(source, (event, position) => collector.addEvent(event, position), { archive: options.archive, isCancelled: control.isCancelled });
             collector.finish();
             const browseVerification = entry.projection.warnings.includes("legacy_cache_body_browsing_only") ? entry.verification : undefined;
             const comparableVerification = (value: CodexStreamingHistoryVerification) => value.segments.map(segment => ({ path: segment.path, physical: segment.physical, header: segment.headerSha256, start: segment.startOrdinal, end: segment.endOrdinalExclusive, bytes: segment.endByte, hash: segment.prefixSha256, next: segment.nextOrdinal }));
-            if (browseVerification ? JSON.stringify(comparableVerification(browseVerification)) !== JSON.stringify(comparableVerification(verification)) : projectionRevision(verification.revision) !== request.revision) throw new CodexHistorySourceMismatchError("Codex corpus revision changed during round expansion");
+            if (browseVerification ? JSON.stringify(comparableVerification(browseVerification)) !== JSON.stringify(comparableVerification(verification)) : entry.verification ? entry.verification.revision !== verification.revision : projectionRevision(verification.revision) !== request.revision) throw new CodexHistorySourceMismatchError("Codex corpus revision changed during round expansion");
             return { ...entry.projection, messages: selected };
         }
-        return { ...entry.projection, messages: entry.projection.messages.filter(message => message.round >= start && message.round <= end && roles.includes(message.role)) };
+        return { ...entry.projection, messages: entry.projection.messages.filter(message => message.round >= start && message.round <= end && roles.includes(message.role)), timings: { ...entry.projection.timings, cacheHit: 1, pinnedRevision: 1 } };
     };
 
     const readFast = async (conversation: CorpusConversation, request: CodexCorpusFastReadRequest, control: CorpusReadControl = {}): Promise<CorpusProjection> => {
@@ -320,9 +366,32 @@ export function createCodexCorpusProvider(options: CodexCorpusReaderOptions = {}
         const end = request.endRound ?? (request.lastRounds === undefined ? start : Number.POSITIVE_INFINITY);
         if (!Number.isSafeInteger(start) || start < 1 || (Number.isFinite(end) && (!Number.isSafeInteger(end) || end < start)) || (request.lastRounds !== undefined && (!Number.isSafeInteger(request.lastRounds) || request.lastRounds < 1))) throw new Error("Codex corpus fast round range is invalid");
         const range = { ...request, ...(request.lastRounds === undefined ? { endRound: end } : {}) };
+        if (request.lastRounds !== undefined && request.startRound === undefined && request.endRound === undefined) {
+            const started = performance.now();
+            let window;
+            try {
+                window = await readCodexHistoryWindow({ conversationId: conversation.id, sourcePath: conversation.rolloutPath, roots, pathsByRolloutId,
+                    cwd: conversation.workspace, direction: "latest", maxRounds: request.lastRounds, messageRoles: roles, archive: options.archive,
+                    fillRequestedRange: false, isCancelled: control.isCancelled, onProgress: progress => control.onProgress?.({ phase: "codex_recent_window", bytes: progress.bytesRead }) });
+            } catch (error) {
+                if (!(error instanceof Error) || !/Codex window replica verification required/u.test(error.message)) throw error;
+            }
+            if (window) {
+            const absoluteEndRound = window.coverage.absoluteEndRound;
+            const complete = absoluteEndRound !== undefined && window.coverage.snapshotEndReached && !window.source.snapshot.unverifiedHistoryBase;
+            const offset = absoluteEndRound === undefined ? 0 : absoluteEndRound - window.rounds.length;
+            const projection: CorpusProjection = { conversation, revision: `window:${digest({ source: window.source.revision, canonical: window.canonicalSha256, roles })}`,
+                messages: window.messages.map(message => ({ ...message, round: message.round + offset })), rounds: window.rounds.map(round => ({ ...round, roundIndex: round.roundIndex + offset })), complete, partial: !complete, fullSourceComplete: complete, readableRangeVerified: true,
+                requestedRangeComplete: window.coverage.requestedRangeComplete || complete, roundNumbering: complete ? "absolute" : "relative", totalRounds: complete ? absoluteEndRound : undefined,
+                warnings: complete ? [] : ["verified_recent_window_only", "relative_round_numbering", "full_source_projection_not_built", ...(window.source.snapshot.unverifiedHistoryBase ? ["CODEX_HISTORY_ANCESTRY_PENDING"] : [])],
+                sourceBytes: window.progress.bytesRead, timings: { rangeReadMs: performance.now() - started, recentWindow: 1 } };
+            await rememberHostCorpusProjection(projection, { ...control, messageRoles: roles }, { cacheRoot, cacheMaxBytes: options.cacheMaxBytes });
+            return projection;
+            }
+        }
         if (!control.forceRefresh) {
             const cached = await readCodexCorpusCache(cacheRoot, conversation.id, control);
-            if (cached && !(cached.projection.cacheGeneration && roles.includes("subagent")) && conversation.rolloutPath && cached.projection.conversation.rolloutPath && comparablePath(conversation.rolloutPath).replace(/\.zst$/u, "") === comparablePath(cached.projection.conversation.rolloutPath).replace(/\.zst$/u, "") && await codexCorpusSourceIdentitiesMatch(cached, pathsByRolloutId)) return readRounds(conversation, { ...range, revision: cached.projection.revision }, control, true);
+            if (cached && !needsSubagentRefresh(cached, roles) && conversation.rolloutPath && cached.projection.conversation.rolloutPath && comparablePath(conversation.rolloutPath).replace(/\.zst$/u, "") === comparablePath(cached.projection.conversation.rolloutPath).replace(/\.zst$/u, "") && await codexCorpusSourceIdentitiesMatch(cached, pathsByRolloutId)) return readRounds(conversation, { ...range, revision: cached.projection.revision }, control, true);
             const published = await reusePublished(conversation, { ...control, messageRoles: roles }, true);
             if (published) {
                 await persist(published, control);
@@ -374,14 +443,14 @@ export function createCodexCorpusProvider(options: CodexCorpusReaderOptions = {}
         await ensureSourceInventory(control, conversation);
         const cached = await readCodexCorpusCache(cacheRoot, conversation.id, control);
         const browsingOnly = cached?.projection.warnings.includes("legacy_cache_body_browsing_only") || cached?.projection.warnings.includes("message_timestamps_unavailable_in_legacy_projection");
-        if (cached && !browsingOnly && !(cached.projection.cacheGeneration && control.messageRoles?.includes("subagent")) && conversation.rolloutPath && cached.projection.conversation.rolloutPath
+        if (cached && !browsingOnly && !needsSubagentRefresh(cached, control.messageRoles) && conversation.rolloutPath && cached.projection.conversation.rolloutPath
             && comparablePath(conversation.rolloutPath).replace(/\.zst$/u, "") === comparablePath(cached.projection.conversation.rolloutPath).replace(/\.zst$/u, "")
             && await codexCorpusSourceIdentitiesMatch(cached, pathsByRolloutId)) return selectRoles({ ...cached.projection, conversation, timings: { cacheHit: 1 } }, control);
         const proof = await readCodexCorpusCache(proofCacheRoot, conversation.id, control, CODEX_ROLE_PROOF_CACHE_FORMAT);
         if (proof && roleProof(proof) && supportsCachedRoles(proof, control) && conversation.rolloutPath && proof.projection.conversation.rolloutPath
             && comparablePath(conversation.rolloutPath) === comparablePath(proof.projection.conversation.rolloutPath)
             && await codexCorpusSourceIdentitiesMatch(proof, pathsByRolloutId)) return selectRoles({ ...proof.projection, conversation, timings: { cacheHit: 1 } }, control);
-        return null;
+        return control.allowPartialSource ? readCodexReadableCache(conversation, control, { roots, pathsByRolloutId, archive: options.archive, cacheRoot, cacheMaxBytes: options.cacheMaxBytes }) : null;
     };
 
     return {
@@ -389,6 +458,7 @@ export function createCodexCorpusProvider(options: CodexCorpusReaderOptions = {}
         list,
         readCached,
         async read(conversation, control = {}) {
+            try {
             await ensureSourceInventory(control, conversation);
             if (control.messageRoles?.includes("tool")) {
                 if (!conversation.rolloutPath) throw new Error("Codex corpus conversation has no rollout path");
@@ -428,6 +498,11 @@ export function createCodexCorpusProvider(options: CodexCorpusReaderOptions = {}
             }
             const entry = await readEntry(conversation, control);
             return selectRoles(entry.projection, control);
+            } catch (error) {
+                throwIfCodexReadCancelled(control.isCancelled);
+                if (!control.allowPartialSource || !isCodexReadableSourceFallback(error)) throw error;
+                return readCodexReadableProjection(conversation, control, { roots, pathsByRolloutId, archive: options.archive, cacheRoot, cacheMaxBytes: options.cacheMaxBytes });
+            }
         },
         readRounds,
         readFast,

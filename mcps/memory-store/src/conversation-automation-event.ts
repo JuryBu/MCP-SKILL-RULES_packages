@@ -26,6 +26,7 @@ interface AutomationChannelRenderer {
 }
 
 const CHANNEL_RENDERERS: AutomationChannelRenderer[] = [
+    { channel: "claude-code", label: "Claude Code任务", matches: marker => marker.startsWith("CLAUDE_CODE_") },
     { channel: "codex-automation", label: "定时任务", matches: marker => marker === "CODEX_AUTOMATION_HEARTBEAT" },
     { channel: "napcat-qq", label: "QQ消息", matches: marker => marker.startsWith("NAPCAT_") },
     { channel: "wechat", label: "微信消息", matches: marker => marker.startsWith("WECHAT_") },

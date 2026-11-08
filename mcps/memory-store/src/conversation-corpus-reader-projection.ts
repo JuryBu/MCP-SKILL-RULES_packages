@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { createCodexRoundCollector } from "./codex-client.js";
-import { createConsecutiveHumanRoundMerger, getRoundUserMessages, type ConversationRound } from "./trajectory.js";
+import { createConsecutiveHumanRoundMerger, getRoundUserMessages, type ConversationRound, type SubagentSummary } from "./trajectory.js";
 import type { CorpusMessage, CorpusMessageRole, CorpusSourcePosition } from "./conversation-corpus-types.js";
 import type { CodexStreamingHistoryPosition } from "./codex-history-source.js";
 import type { ConversationAttachment } from "./conversation-attachments.js";
@@ -11,10 +11,10 @@ export function codexCorpusThreadOrigin(metadata: Record<string, unknown>, fallb
     let source: any = metadata.source;
     if (typeof source === "string") { try { source = JSON.parse(source); } catch {} }
     const spawn = source?.subagent?.thread_spawn;
-    const parent = metadata.parent_thread_id || spawn?.parent_thread_id;
+    const parent = metadata.parent_thread_id || metadata.parent_conversation_id || spawn?.parent_thread_id;
     const nickname = metadata.agent_nickname || spawn?.agent_nickname;
     const role = metadata.agent_role || spawn?.agent_role;
-    return { sourceThreadId: typeof metadata.id === "string" ? metadata.id : fallbackId, isChildThread: Boolean(source?.subagent || source === "subagent"), parentConversationId: typeof parent === "string" ? parent : undefined, agentNickname: typeof nickname === "string" ? nickname : undefined, agentRole: typeof role === "string" ? role : undefined };
+    return { sourceThreadId: typeof metadata.id === "string" ? metadata.id : fallbackId, isChildThread: Boolean(source?.subagent || source === "subagent" || typeof parent === "string" && parent), parentConversationId: typeof parent === "string" ? parent : undefined, agentNickname: typeof nickname === "string" ? nickname : undefined, agentRole: typeof role === "string" ? role : undefined };
 }
 
 function attachmentReference(attachment: ConversationAttachment): Omit<ConversationAttachment, "dataUrl"> {
@@ -51,16 +51,20 @@ export function projectCodexCorpusRound(
     fallbackPath?: string,
     originsByPath?: ReadonlyMap<string, CodexCorpusThreadOrigin>,
 ): CorpusMessage[] {
-    const messages: Array<CorpusMessage & { step: number; sequence: number }> = [];
+    const messages: Array<CorpusMessage & { step: number; sequence: number; agentId?: string; agentNickname?: string; agentRole?: string; parentConversationId?: string }> = [];
     let sequence = 0;
-    const append = (role: CorpusMessageRole, text: string, step: number, timestamp?: string, details: Pick<CorpusMessage, "attachments" | "mediaAttachments" | "annotations"> & { attachments?: ConversationAttachment[] } = {}): void => {
+    const append = (role: CorpusMessageRole, text: string, step: number, timestamp?: string, details: Pick<CorpusMessage, "attachments" | "mediaAttachments" | "annotations"> & { attachments?: ConversationAttachment[] } = {}, child?: SubagentSummary): void => {
         const metadata = positions.get(step);
         const position = metadata?.position || { path: fallbackPath, ordinal: step };
         const origin = position.path ? originsByPath?.get(position.path) : undefined;
         if (origin?.isChildThread && (role === "user" || role === "assistant")) role = "subagent";
         if (!roles.includes(role)) return;
+        const childId = typeof child?.threadId === "string" && child.threadId.trim() ? child.threadId : undefined;
+        const agentNickname = child?.nickname && child.nickname !== "subagent" ? child.nickname : origin?.isChildThread ? origin.agentNickname : undefined;
+        const agentRole = child?.role || (origin?.isChildThread ? origin.agentRole : undefined);
+        const parentConversationId = childId ? origin?.sourceThreadId || conversationId : origin?.parentConversationId;
         const identity = JSON.stringify([conversationId, position.path, position.startByte ?? position.ordinal, position.messageId, role, sequence]);
-        messages.push({ id: createHash("sha256").update(identity).digest("hex"), round: round.roundIndex, role, authorKind: role, sourceThreadId: origin?.sourceThreadId || conversationId, text, timestamp: metadata?.timestamp || timestamp, position: { ...position }, ...codexCorpusAttachmentReferences(details, step), ...(details.annotations?.length ? { annotations: details.annotations.map(annotation => ({ ...annotation })) } : {}), step, sequence: sequence++ });
+        messages.push({ id: createHash("sha256").update(identity).digest("hex"), round: round.roundIndex, role, authorKind: role, sourceThreadId: childId || origin?.sourceThreadId || conversationId, ...(childId ? { agentId: childId } : {}), ...(agentNickname ? { agentNickname } : {}), ...(agentRole ? { agentRole } : {}), ...(parentConversationId ? { parentConversationId } : {}), text, timestamp: metadata?.timestamp || timestamp, position: { ...position }, ...codexCorpusAttachmentReferences(details, step), ...(details.annotations?.length ? { annotations: details.annotations.map(annotation => ({ ...annotation })) } : {}), step, sequence: sequence++ });
     };
     for (const message of getRoundUserMessages(round)) append("user", message.text, message.stepIndex ?? round.startStep, message.createdAt, message);
     for (const response of round.aiResponses) {
@@ -68,10 +72,10 @@ export function projectCodexCorpusRound(
         if (response.response.trim() || attachments.length) append("assistant", response.response, response.stepIndex, undefined, { attachments });
     }
     for (const event of round.semanticEvents || []) {
-        if (event.semanticRole === "subagent" && (event.text || event.attachments?.length)) append("subagent", event.text || "", event.stepIndex ?? round.endStep, event.createdAt, { attachments: event.attachments || event.subagent?.attachments });
+        if (event.semanticRole === "subagent" && (event.text || event.attachments?.length)) append("subagent", event.text || "", event.stepIndex ?? round.endStep, event.createdAt, { attachments: event.attachments || event.subagent?.attachments }, event.subagent);
     }
     if (roles.includes("subagent") && !(round.semanticEvents || []).some(event => event.semanticRole === "subagent")) {
-        for (const child of round.subagentSummaries) append("subagent", [child.nickname, child.summary || child.status || ""].filter(Boolean).join("\n"), round.endStep, undefined, { attachments: child.attachments });
+        for (const child of round.subagentSummaries) append("subagent", [child.nickname, child.summary || child.status || ""].filter(Boolean).join("\n"), round.endStep, undefined, { attachments: child.attachments }, child);
     }
     for (const tool of round.toolCalls) append("tool", [tool.name, tool.argsFull || tool.argsSummary, tool.resultFull || tool.resultSummary].filter(Boolean).join("\n"), tool.stepIndex);
     return messages.sort((left, right) => left.step - right.step || left.sequence - right.sequence).map(({ step: _step, sequence: _sequence, ...message }) => message);

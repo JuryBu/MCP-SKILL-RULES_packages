@@ -1,12 +1,16 @@
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import type { CorpusMessageRole, CorpusProjection, CorpusProvider, CorpusReadControl, CorpusSearchExpression, CorpusSearchRequest } from "../conversation-corpus-types.js";
 import { normalizeCodexCorpusConversationId } from "../conversation-corpus-search.js";
 import { resolveCorpusSources, type CorpusSource } from "../conversation-corpus-sources.js";
+import { formatCorpusReadProjection } from "../conversation-corpus-output.js";
+import type { ExtraType } from "../trajectory.js";
+import { runIsolatedSource } from "../conversation-isolated-source.js";
+import { DATA_ROOT } from "../store.js";
 
-const actions = new Set(["search_all", "search_all_status", "search_all_cancel", "search_all_resume", "read_hit", "read_fast"]);
+const actions = new Set(["search_all", "search_all_status", "search_all_cancel", "search_all_resume", "read_hit", "read_fast", "read_result"]);
 
 export function isCorpusAction(action: string): boolean {
     return actions.has(action);
@@ -17,6 +21,13 @@ export interface CorpusToolParams {
     action: string;
     conversationId?: string;
     conversationIds?: string[];
+    parentConversationId?: string;
+    parentQuery?: string;
+    parentDataChain?: string;
+    threadMode?: "main" | "children" | "all";
+    maxFiles?: number;
+    maxBytes?: number;
+    maxHits?: number;
     query?: string;
     allTerms?: string[];
     anyTerms?: string[];
@@ -28,6 +39,8 @@ export interface CorpusToolParams {
     workspaces?: string[];
     workspaceMode?: CorpusSearchRequest["workspaceMode"];
     messageRoles?: string[];
+    depth?: "brief" | "normal" | "full";
+    extraTypes?: ExtraType[];
     forceRefresh?: boolean;
     taskId?: string;
     limit?: number;
@@ -81,23 +94,41 @@ function selectedRoles(input?: string[]): CorpusMessageRole[] | undefined {
     return [...new Set(roles)] as CorpusMessageRole[];
 }
 
-export async function runCorpusAction(params: CorpusToolParams, supplied?: CorpusToolImplementation): Promise<unknown> {
+export async function runCorpusAction(params: CorpusToolParams, supplied?: CorpusToolImplementation, internalIsolated = false): Promise<unknown> {
     const ownerId = params.conversationId?.trim();
     if (!ownerId) throw new Error("全库检索和读取需要conversationId指定当前调用者，目标范围使用conversationIds");
+    if (params.action === "read_result") return readCorpusResultPage(params);
     const createsRequest = ["search_all", "read_hit", "read_fast"].includes(params.action);
-    const sources = createsRequest || params.dataChain !== undefined || params.dataChains !== undefined || params.chain !== undefined
+    const sources = createsRequest || params.dataChain !== undefined || params.dataChains !== undefined || (params.chain !== undefined && params.chain !== "auto")
         ? resolveCorpusSources(params) : undefined;
     if (params.source === "ls" || params.source === "cache") throw Object.assign(new Error("search_all/read_hit/read_fast使用来源校验后的正文投影，请移除source或设置source=auto/local；固定旧fetch缓存generation请使用旧search/read(source=cache)"), { code: "CORPUS_SOURCE_INVALID" });
     if (params.forceRefresh && params.action !== "search_all") throw new Error("forceRefresh仅用于新建search_all，既有任务和命中展开保持原来源版本");
+    if (!supplied && !internalIsolated && ["read_hit", "read_fast"].includes(params.action)) {
+        const result = await runIsolatedSource<Record<string, unknown>>("corpus-action", { params: { ...params, prepareCache: false } }, { deadlineAt: Date.now() + (params.deadlineMs ?? 30_000) });
+        if (params.action === "read_fast" && params.prepareCache !== false) {
+            const conversation = result.conversation as { id: string; source: CorpusSource };
+            const preparation = await implementation();
+            result.cachePreparation = await preparation.prepareCache({ ownerId, conversationId: conversation.id, dataChain: conversation.source, provider: preparation.provider });
+        }
+        return result;
+    }
     const api = supplied || await implementation();
-    const roles = selectedRoles(params.messageRoles);
+    const defaultRoles = params.action === "search_all" && params.threadMode === "children" ? ["subagent", ...(params.depth === "full" || params.extraTypes?.some(type => type !== "thinking") ? ["tool"] : [])]
+        : params.depth === "full" ? ["user", "assistant", "tool", "subagent"]
+        : params.extraTypes?.some(type => type !== "thinking") ? ["user", "assistant", "tool"] : undefined;
+    const roles = selectedRoles(params.messageRoles ?? defaultRoles);
     if (params.action === "search_all") {
+        if (params.parentQuery !== undefined) throw new Error("search_all的子线程范围需要明确parentConversationId；先用list按parentQuery定位父对话");
+        const parentDataChain = params.parentDataChain === undefined ? undefined : resolveCorpusSources({ dataChain: params.parentDataChain })[0];
+        if (parentDataChain && (sources!.length !== 1 || sources![0] !== parentDataChain)) throw new Error("search_all的parentDataChain须与唯一dataChain一致");
         return api.start({ ownerId, provider: api.provider, request: {
             query: params.query, allTerms: params.allTerms, anyTerms: params.anyTerms, excludeTerms: params.excludeTerms,
             expression: params.searchExpression, conversationIds: params.conversationIds, workspaces: params.workspaces,
             workspaceMode: params.workspaceMode, messageRoles: roles, intersectionScope: params.intersectionScope,
             sort: params.searchSort, caseSensitive: params.caseSensitive, forceRefresh: params.forceRefresh,
             dataChains: sources!, sourceFailureMode: params.sourceFailureMode,
+            parentConversationId: params.parentConversationId, parentDataChain, threadMode: params.threadMode,
+            maxFiles: params.maxFiles, maxBytes: params.maxBytes, maxHits: params.maxHits, deadlineMs: params.deadlineMs,
         } });
     }
     if (params.action === "read_hit" || params.action === "read_fast") {
@@ -121,16 +152,20 @@ export async function runCorpusAction(params: CorpusToolParams, supplied?: Corpu
         const conversation = conversations.find(candidate => candidate.source === source
             && (candidate.id === targetId || candidate.canonicalId === targetId || candidate.aliases?.includes(targetId)));
         if (!conversation) throw new Error(`${params.action}目标对话在本机来源中不存在`);
+        const readRoles = params.messageRoles === undefined && conversation.isChildThread
+            ? selectedRoles(["subagent", ...(roles?.includes("tool") ? ["tool"] : [])]) : roles;
         if (params.action === "read_fast") {
             const projection = await api.readFast(conversation, { startRound: params.startRound, endRound: params.endRound,
-                    lastRounds: params.lastRounds, messageRoles: roles }, control);
+                    lastRounds: params.lastRounds, messageRoles: readRoles }, control);
             const cachePreparation = params.prepareCache === false ? undefined : await api.prepareCache({ ownerId, conversationId: conversation.id, dataChain: source, provider: api.provider });
-                return { ...projection, requestedRangeComplete: projection.partial !== true
-                    && projection.requestedRangeComplete !== false && (projection.requestedRangeComplete === true || projection.complete),
+            const result = { ...projection, requestedRangeComplete: projection.readableRangeVerified !== false
+                    && (projection.requestedRangeComplete === true || projection.requestedRangeComplete !== false && projection.complete),
                     fullSourceProjectionComplete: projection.complete, cachePreparation };
+            return formatCorpusReadProjection(result, { depth: params.depth, messageRoles: readRoles, extraTypes: params.extraTypes });
         }
-        return api.readRounds(conversation, { revision: params.sourceRevision!, startRound: params.startRound,
-            endRound: params.endRound, lastRounds: params.lastRounds, messageRoles: roles }, control);
+        const projection = await api.readRounds(conversation, { revision: params.sourceRevision!, startRound: params.startRound,
+            endRound: params.endRound, lastRounds: params.lastRounds, messageRoles: readRoles }, control);
+        return formatCorpusReadProjection(projection, { depth: params.depth, messageRoles: readRoles, extraTypes: params.extraTypes });
     }
     if (!params.taskId?.trim()) throw new Error(`${params.action}需要原taskId`);
     const identity = { ownerId, taskId: params.taskId.trim() };
@@ -156,10 +191,50 @@ export async function runCorpusAction(params: CorpusToolParams, supplied?: Corpu
     throw new Error("未知全库检索动作");
 }
 
-export async function corpusToolResult(result: unknown): Promise<{ content: Array<{ type: "text"; text: string }> }> {
+async function readCorpusResultPage(params: CorpusToolParams): Promise<unknown> {
+    const taskId = params.taskId || "";
+    if (!/^result-[a-f0-9-]{36}$/u.test(taskId)) throw new Error("read_result需要大结果响应返回的原taskId");
+    const ownerId = params.conversationId?.trim();
+    if (!ownerId) throw new Error("read_result需要原调用者conversationId");
+    const directory = path.join(DATA_ROOT, "corpus-results", createHash("sha256").update(ownerId).digest("hex"), taskId);
+    const metadata = JSON.parse(await fs.readFile(path.join(directory, "manifest.json"), "utf8")) as { ownerId: string; bytes: number; sha256: string; createdAt: string };
+    if (metadata.ownerId !== ownerId || !Number.isSafeInteger(metadata.bytes) || metadata.bytes < 0 || !/^[a-f0-9]{64}$/u.test(metadata.sha256)) throw new Error("read_result来源记录无效");
+    const cursor = params.continuationCursor?.split(":");
+    const offset = cursor ? Number(cursor[1]) : 0;
+    if (cursor && (cursor.length !== 2 || cursor[0] !== metadata.sha256) || !Number.isSafeInteger(offset) || offset < 0 || offset > metadata.bytes) throw new Error("read_result续读位置或来源版本无效");
+    const artifactPath = path.join(directory, "result.json");
+    const descriptor = await fs.open(artifactPath, "r");
+    let end = 0;
+    let text: string;
+    try {
+        if ((await descriptor.stat()).size !== metadata.bytes) throw new Error("read_result保存的结果大小已改变");
+        const buffer = Buffer.allocUnsafe(Math.min(24_004, metadata.bytes - offset));
+        const { bytesRead } = await descriptor.read(buffer, 0, buffer.length, offset);
+        end = Math.min(24_000, bytesRead);
+        if (offset + end < metadata.bytes) while (end > 0 && (buffer[end] & 0xc0) === 0x80) end--;
+        text = new TextDecoder("utf-8", { fatal: true }).decode(buffer.subarray(0, end));
+    } finally { await descriptor.close(); }
+    const nextOffset = offset + end;
+    const hasMore = nextOffset < metadata.bytes;
+    return { delivery: "paged", complete: !hasMore, artifactComplete: true, artifactPath, taskId,
+        bytes: metadata.bytes, sha256: metadata.sha256, startByte: offset, endByte: nextOffset, text,
+        description: "text为同一不可变JSON结果的UTF-8分段，顺次续读可取得全文",
+        ...(hasMore ? { next: { action: "read_result", conversationId: ownerId, taskId, continuationCursor: `${metadata.sha256}:${nextOffset}` } } : {}) };
+}
+
+export async function corpusToolResult(result: unknown, params?: CorpusToolParams): Promise<{ content: Array<{ type: "text"; text: string }> }> {
     const serialized = JSON.stringify(result, null, 2);
     const bytes = Buffer.byteLength(serialized, "utf8");
     if (bytes <= 100000) return { content: [{ type: "text", text: serialized }] };
+    if (params?.conversationId?.trim()) {
+        const ownerId = params.conversationId.trim();
+        const taskId = `result-${randomUUID()}`;
+        const directory = path.join(DATA_ROOT, "corpus-results", createHash("sha256").update(ownerId).digest("hex"), taskId);
+        await fs.mkdir(directory, { recursive: true });
+        await fs.writeFile(path.join(directory, "result.json"), serialized, { encoding: "utf8", flag: "wx" });
+        await fs.writeFile(path.join(directory, "manifest.json"), JSON.stringify({ ownerId, bytes, sha256: createHash("sha256").update(serialized).digest("hex"), createdAt: new Date().toISOString() }), { encoding: "utf8", flag: "wx" });
+        return { content: [{ type: "text", text: JSON.stringify(await readCorpusResultPage({ action: "read_result", conversationId: ownerId, taskId })) }] };
+    }
     const directory = await fs.mkdtemp(path.join(os.tmpdir(), "memory-store-corpus-"));
     const artifactPath = path.join(directory, "result.json");
     await fs.writeFile(artifactPath, serialized, "utf8");

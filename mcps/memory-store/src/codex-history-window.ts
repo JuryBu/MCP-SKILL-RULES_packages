@@ -2,7 +2,8 @@ import fs from "node:fs";
 import { createHash } from "node:crypto";
 import { setImmediate } from "node:timers/promises";
 import { streamCodexHistoryArchive, type CodexHistoryArchiveOptions } from "./codex-history-archive.js";
-import { codexHistoryPhysicalIdentity, readCodexStreamingSessionMeta, resolveCodexStreamingHistorySource, type CodexStreamingHistorySource, type CodexStreamingHistorySegment, type CodexStreamingHistoryPosition } from "./codex-history-source.js";
+import { readCodexStreamingSessionMeta, resolveCodexStreamingHistorySource, type CodexStreamingHistorySource, type CodexStreamingHistorySegment, type CodexStreamingHistoryPosition } from "./codex-history-source.js";
+import { createCodexHistoryWindowSourceGuard } from "./codex-history-stream-proof.js";
 import { createCodexCorpusCollector, codexCorpusThreadOrigin, type CodexCorpusThreadOrigin } from "./conversation-corpus-reader-projection.js";
 import type { CorpusMessage, CorpusMessageRole } from "./conversation-corpus-types.js";
 import type { ConversationRound } from "./trajectory.js";
@@ -20,7 +21,7 @@ export interface CodexHistoryWindowRange {
     rows: CodexHistoryWindowRow[];
     messages: CorpusMessage[];
     anchor: { first?: CodexStreamingHistoryPosition; last?: CodexStreamingHistoryPosition };
-    coverage: { kind: "chunk-local"; startRound: number; endRound: number; requestedRounds: number; requestedRangeComplete: boolean; historyStartReached: boolean; snapshotEndReached: boolean; openAtSnapshot: boolean };
+    coverage: { kind: "chunk-local"; startRound: number; endRound: number; requestedRounds: number; requestedRangeComplete: boolean; historyStartReached: boolean; snapshotEndReached: boolean; openAtSnapshot: boolean; absoluteEndRound?: number };
     canonicalSha256: string;
     progress: CodexHistoryWindowProgress;
 }
@@ -61,13 +62,6 @@ export function hashCodexHistoryWindowCanonical(messages: readonly CorpusMessage
 
 function cancelled(options: CodexHistoryWindowOptions): void {
     if (options.isCancelled?.() || options.archive?.isCancelled?.()) throw new Error("Codex window read cancelled");
-}
-
-function assertSource(source: CodexStreamingHistorySource): void {
-    for (const segment of source.segments) {
-        const current = codexHistoryPhysicalIdentity(fs.statSync(segment.path));
-        if (JSON.stringify(current) !== JSON.stringify(segment.physical)) throw new Error(`Codex window source changed: ${segment.path}`);
-    }
 }
 
 function parse(record: RecordSlice): any {
@@ -210,7 +204,8 @@ export async function readCodexHistoryWindow(options: CodexHistoryWindowOptions)
     }
     for (const segment of snapshot.segments) { Object.freeze(segment.physical); Object.freeze(segment.replicas); Object.freeze(segment); }
     Object.freeze(snapshot.segments); Object.freeze(snapshot);
-    assertSource(snapshot);
+    const assertSource = await createCodexHistoryWindowSourceGuard(snapshot, () => Boolean(options.isCancelled?.() || options.archive?.isCancelled?.()));
+    await assertSource();
     const revision = sha256(canonicalJson(snapshot));
     const source = { conversationId: options.conversationId, host: "codex" as const, revision, snapshot };
     const progress: CodexHistoryWindowProgress = { phase: "reading", bytesRead: 0, recordsRead: 0, segmentsRead: 0, roundsReady: 0 };
@@ -243,11 +238,11 @@ export async function readCodexHistoryWindow(options: CodexHistoryWindowOptions)
         const rangeEndsSnapshot = snapshotEndReached && selected.at(-1) === all.at(-1) && (!options.continueHistory || direction === "oldest" || totalPublished === 0);
         const openAtSnapshot = rangeEndsSnapshot && (!terminal || Boolean(human && activeEntries.indexOf(terminal) < activeEntries.indexOf(human)));
         const anchor = (message?: CorpusMessage): CodexStreamingHistoryPosition | undefined => message?.position.path && message.position.startByte !== undefined && message.position.endByte !== undefined && message.position.ordinal !== undefined ? message.position as CodexStreamingHistoryPosition : undefined;
-        assertSource(snapshot);
+        await assertSource();
         cancelled(options);
-        result = { source, rangeId: sha256(`${revision}:${direction}:${options.continueHistory ? canonicalJson([messages[0]?.position, messages.at(-1)?.position]) : "cumulative"}`), publication: options.continueHistory ? "append" : "replace", deduplicateBy: "message.id", direction, rounds, rows, messages, anchor: { first: anchor(messages[0]), last: anchor(messages.at(-1)) }, coverage: { kind: "chunk-local", startRound: count ? 1 : 0, endRound: count, requestedRounds: maximum, requestedRangeComplete: count >= maximum, historyStartReached: rangeStartsHistory, snapshotEndReached: rangeEndsSnapshot, openAtSnapshot }, canonicalSha256: hashCodexHistoryWindowCanonical(messages), progress: { ...progress, phase: "ready" } };
+        result = { source, rangeId: sha256(`${revision}:${direction}:${options.continueHistory ? canonicalJson([messages[0]?.position, messages.at(-1)?.position]) : "cumulative"}`), publication: options.continueHistory ? "append" : "replace", deduplicateBy: "message.id", direction, rounds, rows, messages, anchor: { first: anchor(messages[0]), last: anchor(messages.at(-1)) }, coverage: { kind: "chunk-local", startRound: count ? 1 : 0, endRound: count, requestedRounds: maximum, requestedRangeComplete: count >= maximum, historyStartReached: rangeStartsHistory, snapshotEndReached: rangeEndsSnapshot, openAtSnapshot, ...(!options.continueHistory && direction === "latest" && historyStartReached && snapshotEndReached ? { absoluteEndRound: all.length } : {}) }, canonicalSha256: hashCodexHistoryWindowCanonical(messages), progress: { ...progress, phase: "ready" } };
         if (options.continueHistory && count > 0 || !options.continueHistory && (count > published || final && !published)) {
-            await options.onRange?.(result); assertSource(snapshot); published = count;
+            await options.onRange?.(result); await assertSource(); published = count;
             if (options.continueHistory) {
                 for (const message of messages) publishedIds.add(message.id);
                 totalPublished += count;
@@ -263,7 +258,7 @@ export async function readCodexHistoryWindow(options: CodexHistoryWindowOptions)
             }
         }
         await options.onProgress?.({ ...progress });
-        assertSource(snapshot);
+        await assertSource();
         cancelled(options);
         return count >= maximum;
     };
@@ -349,7 +344,7 @@ export async function readCodexHistoryWindow(options: CodexHistoryWindowOptions)
     const selected = priorityResult ?? result!;
     if (!options.source && direction === "latest" && !options.continueHistory && options.fillRequestedRange !== false
         && snapshot.unverifiedHistoryBase && !selected.coverage.requestedRangeComplete && !selected.coverage.historyStartReached) {
-        assertSource(snapshot);
+        await assertSource();
         cancelled(options);
         const remainingBytes = (options.maxReadBytes ?? 8 * 1024 ** 3) - progress.bytesRead;
         if (remainingBytes <= 0) throw new Error("Codex window read byte limit");
@@ -368,7 +363,7 @@ export async function readCodexHistoryWindow(options: CodexHistoryWindowOptions)
         return { ...completed, progress: cumulative(completed.progress) };
     }
     await options.onProgress?.({ ...progress, phase: "complete", roundsReady: options.continueHistory ? totalPublished : result?.rounds.length ?? 0 });
-    assertSource(snapshot);
+    await assertSource();
     cancelled(options);
     return selected;
 }

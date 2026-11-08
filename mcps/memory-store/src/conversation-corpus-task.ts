@@ -87,6 +87,12 @@ interface CorpusRuntime {
     pendingCommitBytes: number;
     commitTimer?: ReturnType<typeof setTimeout>;
     commitError?: unknown;
+    deadlineAt?: number;
+    processedConversations: number;
+    processedSourceBytes: number;
+    currentSourceBytes: number;
+    initialMatchingConversations: number;
+    budgetReason?: string;
 }
 
 const runtimes = new Map<string, CorpusRuntime>();
@@ -105,6 +111,30 @@ function cancelled(runtime: CorpusRuntime): boolean {
         runtime.cancelled = fs.existsSync(path.join(runtime.task.directory, "cancel.json"));
     }
     return runtime.cancelled;
+}
+
+function budgetExceeded(runtime: CorpusRuntime): boolean {
+    if (runtime.budgetReason) return true;
+    const request = runtime.task.request;
+    if (runtime.deadlineAt !== undefined && Date.now() >= runtime.deadlineAt) runtime.budgetReason = `deadlineMs=${request.deadlineMs}`;
+    else if (request.maxBytes !== undefined && runtime.processedSourceBytes + runtime.currentSourceBytes >= request.maxBytes) runtime.budgetReason = `maxBytes=${request.maxBytes}`;
+    return Boolean(runtime.budgetReason);
+}
+
+function stopped(runtime: CorpusRuntime): boolean {
+    return cancelled(runtime) || budgetExceeded(runtime);
+}
+
+function canStartCandidate(runtime: CorpusRuntime): boolean {
+    if (stopped(runtime)) return false;
+    const request = runtime.task.request;
+    if (request.maxFiles !== undefined && runtime.processedConversations >= request.maxFiles) runtime.budgetReason = `maxFiles=${request.maxFiles}`;
+    else if (request.maxHits !== undefined && [...runtime.task.records.values()].filter(record => record.result).length - runtime.initialMatchingConversations >= request.maxHits) runtime.budgetReason = `maxHits=${request.maxHits}`;
+    return !runtime.budgetReason;
+}
+
+function recordBudgetStop(runtime: CorpusRuntime): void {
+    if (runtime.budgetReason) runtime.task.state.error = `Search paused at ${runtime.budgetReason}; verified results are retained. Continue with search_all_resume using the same taskId.`;
 }
 
 async function saveState(task: CorpusTaskLoaded): Promise<void> {
@@ -264,6 +294,11 @@ async function scanProjection(runtime: CorpusRuntime, projection: CorpusProjecti
     };
     for (let offset = 0; offset < projection.messages.length;) {
         if (cancelled(runtime)) return;
+        if (runtime.deadlineAt !== undefined && Date.now() >= runtime.deadlineAt) {
+            budgetExceeded(runtime);
+            await commit(false);
+            return;
+        }
         const end = Math.min(projection.messages.length, offset + task.state.checkpointEveryMessages);
         const computeStart = performance.now();
         for (; offset < end; offset++) accumulator.append(projection.messages[offset]);
@@ -313,9 +348,12 @@ async function readProjection(runtime: CorpusRuntime, provider: CorpusProvider, 
     try {
         const projection = await provider.read(candidate, {
             messageRoles: [...task.request.messageRoles!], forceRefresh: task.request.forceRefresh,
-            isCancelled: () => cancelled(runtime),
+            allowPartialSource: task.request.purpose !== "prepare",
+            deadlineAt: runtime.deadlineAt,
+            isCancelled: () => stopped(runtime),
             onProgress: progress => {
                 if (!accepting || cancelled(runtime)) return;
+                if (Number.isFinite(progress.bytes) && progress.bytes! >= 0) runtime.currentSourceBytes = Math.max(runtime.currentSourceBytes, progress.bytes!);
                 runtime.progress = { ...progress, source: candidate.source, conversationId: candidate.id };
                 notify(runtime);
             },
@@ -325,6 +363,7 @@ async function readProjection(runtime: CorpusRuntime, provider: CorpusProvider, 
                     if (streamError || cancelled(runtime)) return;
                     validateProjection({ ...chunk, complete: false }, candidate);
                     if (Number.isFinite(chunk.sourceBytes) && chunk.sourceBytes! >= 0) sourceBytes = chunk.sourceBytes!;
+                    runtime.currentSourceBytes = Math.max(runtime.currentSourceBytes, sourceBytes);
                     runtime.progress = { ...runtime.progress, phase: task.request.purpose === "prepare" ? "preparing" : "query_stream",
                         source: candidate.source, conversationId: candidate.id, bytes: sourceBytes };
                     if (task.request.purpose === "prepare") { notify(runtime); return; }
@@ -394,7 +433,7 @@ async function executeSearch(runtime: CorpusRuntime, provider: CorpusProvider): 
         if (!task.state.discoveryComplete || task.state.sourceStatuses?.some(status => status.status !== "ok")) {
             runtime.progress = { phase: "listing" };
             let candidates: CorpusConversation[];
-            try { candidates = await provider.list(JSON.parse(JSON.stringify(task.request)), { isCancelled: () => cancelled(runtime) }); }
+            try { candidates = await provider.list(JSON.parse(JSON.stringify(task.request)), { deadlineAt: runtime.deadlineAt, isCancelled: () => stopped(runtime) }); }
             catch (error) {
                 captureSourceStatuses(task, provider);
                 if (!provider.sourceStatuses) task.state.sourceStatuses = task.state.sourceStatuses!.map(status => ({ ...status, status: "error", error: messageOf(error) }));
@@ -426,15 +465,18 @@ async function executeSearch(runtime: CorpusRuntime, provider: CorpusProvider): 
         const pending = task.candidates.filter(candidate => {
             const committed = task.records.get(corpusConversationKey(candidate));
             return !(committed?.complete && corpusSemanticVersionsEqual(committed.semanticVersion, task.state.semanticVersion));
-        });
+        }).sort((left, right) => (task.records.get(corpusConversationKey(left))?.revision ?? 0)
+            - (task.records.get(corpusConversationKey(right))?.revision ?? 0));
         let nextPrefetch = 0;
-        const useCached = Boolean(provider.readCached) && task.request.purpose !== "prepare" && !task.request.forceRefresh;
+        const bounded = [task.request.maxFiles, task.request.maxBytes, task.request.maxHits, task.request.deadlineMs].some(value => value !== undefined);
+        const useCached = !bounded && Boolean(provider.readCached) && task.request.purpose !== "prepare" && !task.request.forceRefresh;
         const fillPrefetch = (): void => {
             if (!useCached) return;
             while (!stopPrefetch && !cancelled(runtime) && prefetched.size < 4 && nextPrefetch < pending.length) {
                 const candidate = pending[nextPrefetch++]!;
                 const cached = Promise.resolve().then(() => provider.readCached!(candidate, {
                     messageRoles: [...task.request.messageRoles!], isCancelled: () => stopPrefetch || cancelled(runtime),
+                    allowPartialSource: task.request.purpose !== "prepare",
                 })).then(projection => { publishPrefetch(corpusConversationKey(candidate), { projection }); },
                     error => { publishPrefetch(corpusConversationKey(candidate), { error }); });
                 prefetched.set(corpusConversationKey(candidate), cached);
@@ -443,6 +485,9 @@ async function executeSearch(runtime: CorpusRuntime, provider: CorpusProvider): 
         const deferred = new Set<string>();
         const pendingById = new Map(pending.map(candidate => [corpusConversationKey(candidate), candidate]));
         const processCandidate = async (candidate: CorpusConversation, cached?: CachedRead): Promise<boolean> => {
+            if (!canStartCandidate(runtime)) return false;
+            runtime.processedConversations++;
+            runtime.currentSourceBytes = 0;
             runtime.progress = { phase: "reading", source: candidate.source, conversationId: candidate.id };
             notify(runtime);
             try {
@@ -457,8 +502,14 @@ async function executeSearch(runtime: CorpusRuntime, provider: CorpusProvider): 
                 projection.warnings = [...new Set([...(projection.conversation.sourceWarnings ?? []), ...projection.warnings])];
                 runtime.progress = { phase: task.request.purpose === "prepare" ? "preparing" : "query", source: candidate.source, conversationId: candidate.id };
                 await scanProjection(runtime, projection, candidate, verifiedIdentity);
+                runtime.processedSourceBytes += Math.max(runtime.currentSourceBytes, projection.sourceBytes ?? 0);
+                runtime.currentSourceBytes = 0;
+                if (task.request.maxHits !== undefined) await flushCommits(runtime);
             } catch (error) {
                 if (cancelled(runtime)) { await retractUnverified(runtime, candidate); return false; }
+                if (budgetExceeded(runtime)) { await retractUnverified(runtime, candidate); return false; }
+                runtime.processedSourceBytes += runtime.currentSourceBytes;
+                runtime.currentSourceBytes = 0;
                 await commitConversation(runtime, {
                     source: candidate.source, conversationId: candidate.id, complete: false,
                     result: null, scannedMessages: 0, mirrorMessagesSkipped: 0,
@@ -489,12 +540,18 @@ async function executeSearch(runtime: CorpusRuntime, provider: CorpusProvider): 
         }
         await settlePrefetch();
         await flushCommits(runtime);
-        await finishTask(task, cancelled(runtime) ? "cancelled" : corpusCoverage(task).complete ? "completed" : "partial");
+        budgetExceeded(runtime);
+        recordBudgetStop(runtime);
+        const complete = corpusCoverage(task).complete;
+        if (complete) task.state.error = undefined;
+        await finishTask(task, cancelled(runtime) ? "cancelled" : complete ? "completed" : "partial");
     } catch (error) {
         await settlePrefetch();
         try { await flushCommits(runtime); } catch (commitError) { error = commitError; }
         task.state.error = messageOf(error);
-        await finishTask(task, cancelled(runtime) ? "cancelled" : "failed");
+        budgetExceeded(runtime);
+        recordBudgetStop(runtime);
+        await finishTask(task, cancelled(runtime) ? "cancelled" : budgetExceeded(runtime) ? "partial" : "failed");
     } finally {
         await settlePrefetch();
         if (runtime.commitTimer) clearTimeout(runtime.commitTimer);
@@ -509,7 +566,9 @@ async function executeSearch(runtime: CorpusRuntime, provider: CorpusProvider): 
 
 function run(task: CorpusTaskLoaded, provider: CorpusProvider, release: () => Promise<void>): void {
     const runtime: CorpusRuntime = { task, cancelled: false, lastCancelCheck: 0, lastStateSave: Date.now(), waiters: new Set(), release,
-        pendingCommits: [], pendingCommitBytes: 0 };
+        pendingCommits: [], pendingCommitBytes: 0, processedConversations: 0, processedSourceBytes: 0, currentSourceBytes: 0,
+        initialMatchingConversations: [...task.records.values()].filter(record => record.result).length,
+        deadlineAt: task.request.deadlineMs === undefined ? undefined : Date.now() + task.request.deadlineMs };
     runtimes.set(task.directory, runtime);
     runtime.promise = executeSearch(runtime, provider).catch(error => {
         task.state.status = "failed";

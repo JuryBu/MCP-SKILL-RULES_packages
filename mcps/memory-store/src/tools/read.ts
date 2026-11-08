@@ -2,6 +2,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { touchActivity, appendTiming } from "../lifecycle.js";
 import { readMemoryFile, findMemoryById } from "../store.js";
+import { describeUnavailableMemory } from "../memory-availability.js";
 import { saveTempFile } from "../temp-store.js";
 import { formatToolError } from "../error-format.js";
 
@@ -12,7 +13,7 @@ import { formatToolError } from "../error-format.js";
 export function registerRead(server: McpServer): void {
     server.tool(
         "memory_read",
-        "读取一条记忆的完整内容。支持行范围读取（startLine/endLine）。无范围时写临时文件返回路径。",
+        "读取一条记忆的完整内容。支持行范围读取（startLine/endLine）。无范围时写临时文件返回路径。已归档工作区返回归档状态与恢复入口。",
         {
             id: z.string().describe("记忆 ID"),
             startLine: z.number().optional().describe("起始行（1-indexed）"),
@@ -36,11 +37,11 @@ export function registerRead(server: McpServer): void {
 
                 const { hash, entry } = found;
                 const content = readMemoryFile(hash, id);
-                if (!content) {
+                if (content === null) {
                     return appendTiming({
                         content: [{
                             type: "text" as const,
-                            text: `❌ 记忆文件已丢失: ${id}（索引存在但文件不存在）`,
+                            text: describeUnavailableMemory(hash, id),
                         }],
                     }, startTime);
                 }

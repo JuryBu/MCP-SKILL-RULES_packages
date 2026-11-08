@@ -56,8 +56,12 @@ export function hostProjectionRounds(projection: CorpusProjection): Conversation
 export async function executeHostProgressivePreparation(payload: ProgressiveTaskPayload, control: HostProgressiveControl): Promise<string> {
     const { request, directory } = payload;
     const provider = control.provider ?? createMultiCorpusProvider();
-    const projection = normalizeProgressiveProjection(request.messageRoles, request.depth);
-    const check = (): void => { if (control.isCancelled()) throw new Error("Progressive preparation cancelled"); };
+    let projection = normalizeProgressiveProjection(request.messageRoles, request.depth);
+    const deadlineAt = payload.phase === "full" ? undefined : payload.initialDeadlineAt;
+    const check = (): void => {
+        if (control.isCancelled()) throw new Error("Progressive preparation cancelled");
+        if (deadlineAt !== undefined && Date.now() >= deadlineAt) throw new Error("Initial progressive range deadline exceeded; published ranges remain readable");
+    };
     let ready: ProgressiveReadyState = { version: 1, phase: "source", previous: [], requestedRangeComplete: false,
         updatedAt: new Date().toISOString(), warnings: [] };
     try { ready = JSON.parse(await fs.readFile(path.join(directory, "ready.json"), "utf8")); }
@@ -67,6 +71,28 @@ export async function executeHostProgressivePreparation(payload: ProgressiveTask
         ready.updatedAt = new Date().toISOString();
         await writeProgressiveState(path.join(directory, "ready.json"), ready);
     };
+    const prepareFullFetchCache = async (): Promise<void> => {
+        if (!request.fullFetchCache) return;
+        check();
+        ready.phase = "full-fetch-cache";
+        await writeReady();
+        await control.onProgress({ type: "progress", stage: ready.phase, detail: "已就绪范围继续可用，正在发布完整fetch缓存" });
+        const { loadConversationData, conversationSourceIsPartial } = await import("./conversation-bridge.js");
+        const physicalSourceKind = conversation?.sourceKind;
+        const loaded = await loadConversationData(request.dataChain, request.conversationId, {
+            source: "local", refresh: true, includeRounds: false, link: request.link,
+            forceRawCacheRebuild: request.forceRawCacheRebuild, requestClass: "background", isCancelled: control.isCancelled,
+            ...(request.dataChain === "windsurf" && (physicalSourceKind === "devin-cli" || physicalSourceKind === "devin-desktop")
+                ? { sourceReadBudget: { identityMode: "physical" as const, physicalSourceKind, isCancelled: control.isCancelled } } : {}),
+        });
+        check();
+        if (!loaded?.cacheKey || !loaded.cacheGeneration || loaded.cacheBuildFailure) throw new Error("完整fetch缓存未发布，已就绪范围继续保留");
+        ready.fullCacheGeneration = loaded.cacheGeneration;
+        ready.fullFetchCache = { cacheKey: loaded.cacheKey, cacheGeneration: loaded.cacheGeneration,
+            conversationId: loaded.conversationId, sourcePartial: conversationSourceIsPartial(loaded), roundCount: loaded.roundCount ?? loaded.rounds.length };
+        ready.phase = "complete";
+        await writeReady();
+    };
     const select = async (cacheDirectory: string, source: ProgressiveSource): Promise<void> => {
         if (ready.current?.directory !== cacheDirectory) {
             if (ready.current && !ready.previous.some(item => item.directory === ready.current!.directory)) ready.previous.push(ready.current);
@@ -75,11 +101,15 @@ export async function executeHostProgressivePreparation(payload: ProgressiveTask
         await writeReady();
     };
     const candidates = await provider.list({ conversationIds: [request.conversationId], dataChains: [request.dataChain],
-        sourceFailureMode: "fail" }, { isCancelled: control.isCancelled });
+        sourceFailureMode: "fail" }, { isCancelled: () => { check(); return false; }, deadlineAt });
     const conversation = candidates.find(candidate => candidate.source === request.dataChain
         && (candidate.id === request.conversationId || candidate.canonicalId === request.conversationId || candidate.aliases?.includes(request.conversationId)));
     if (!conversation) throw new Error("Conversation is unavailable in the explicitly selected source");
-    let initialWindow: { revision: string; kind: string; endRound: number } | undefined;
+    if (conversation.isChildThread && request.messageRolesExplicit === false) {
+        request.messageRoles = ["subagent"];
+        projection = normalizeProgressiveProjection(request.messageRoles, request.depth);
+    }
+    let initialWindow = ready.initialWindow;
     const publish = async (input: CorpusProjection, initial: boolean, final: boolean): Promise<void> => {
         check();
         if (!corpusProjectionIdentityMatches(input.conversation, conversation)) {
@@ -91,6 +121,7 @@ export async function executeHostProgressivePreparation(payload: ProgressiveTask
         const kind = input.roundNumbering ?? "absolute";
         if (initial) initialWindow = { revision: input.revision, kind,
             endRound: rounds.reduce((maximum, round) => Math.max(maximum, round.roundIndex), 0) };
+        if (initial) ready.initialWindow = initialWindow;
         const totalRounds = input.totalRounds ?? (input.complete && kind === "absolute"
             ? rounds.reduce((maximum, round) => Math.max(maximum, round.roundIndex), 0) : undefined);
         const sourceRangeVerified = input.partial !== true && input.requestedRangeComplete !== false;
@@ -122,7 +153,7 @@ export async function executeHostProgressivePreparation(payload: ProgressiveTask
                     coverage: { kind, startRound: batch[0]!.roundIndex, endRound: batch.at(-1)!.roundIndex },
                     anchor: { source: request.dataChain, revision: input.revision, first: batch[0]!.roundIndex, last: batch.at(-1)!.roundIndex },
                     rounds: batch, messages: input.messages.filter(message => indices.has(message.round)),
-                }, request), check);
+                }, request, input.conversation.isChildThread), check);
                 const status = await cache.status();
                 const count = kind === "relative" ? status.relativeReadyRounds : status.coveredAbsoluteRounds;
                 ready.warnings = [...new Set([...ready.warnings, ...input.warnings, ...(conversation.sourceWarnings ?? [])])];
@@ -177,7 +208,7 @@ export async function executeHostProgressivePreparation(payload: ProgressiveTask
         try {
             window = await provider.readFast(conversation, request.direction === "latest"
                 ? { lastRounds: request.initialRounds } : { startRound: 1, endRound: request.initialRounds }, {
-                messageRoles: projection.messageRoles, isCancelled: control.isCancelled,
+                messageRoles: projection.messageRoles, isCancelled: control.isCancelled, deadlineAt,
                 onProgress: progress => {
                     if (!acceptingProgress || progressPending || progressFailed || control.isCancelled()) return;
                     if (Date.now() - lastProgress < 250) return;
@@ -196,19 +227,22 @@ export async function executeHostProgressivePreparation(payload: ProgressiveTask
         if (!window) throw new Error("Conversation source did not return an initial projection");
         return window;
     };
-    const window = await readInitialWindow();
-    const windowRounds = hostProjectionRounds(window);
-    const windowContainsFull = window.complete && window.partial !== true && window.requestedRangeComplete !== false
-        && window.roundNumbering !== "relative" && window.totalRounds !== undefined
-        && windowRounds.length === window.totalRounds
-        && (window.totalRounds === 0 || (windowRounds[0]?.roundIndex === 1 && windowRounds.at(-1)?.roundIndex === window.totalRounds));
-    await publish(window, true, windowContainsFull);
-    if (!request.buildFull || windowContainsFull) {
-        if (!windowContainsFull) { ready.phase = "requested-range-ready"; await writeReady(); }
-        return JSON.stringify({ taskId: payload.taskId, ready });
+    if (payload.phase !== "full") {
+        const window = await readInitialWindow();
+        const windowRounds = hostProjectionRounds(window);
+        const windowContainsFull = window.complete && window.partial !== true && window.requestedRangeComplete !== false
+            && window.roundNumbering !== "relative" && window.totalRounds !== undefined
+            && windowRounds.length === window.totalRounds
+            && (window.totalRounds === 0 || (windowRounds[0]?.roundIndex === 1 && windowRounds.at(-1)?.roundIndex === window.totalRounds));
+        await publish(window, true, windowContainsFull);
+        if (!request.buildFull || (windowContainsFull && !request.fullFetchCache)) {
+            if (!windowContainsFull) { ready.phase = "requested-range-ready"; await writeReady(); }
+            return JSON.stringify({ taskId: payload.taskId, ready });
+        }
+        ready.phase = "full-cache";
+        await writeReady();
+        return JSON.stringify({ taskId: payload.taskId, ready, continueFull: true });
     }
-    ready.phase = "full-cache";
-    await writeReady();
     await control.onProgress({ type: "progress", stage: ready.phase, detail: "已就绪范围继续可用，其余历史正在后台准备" });
     let publication = Promise.resolve();
     let publicationError: unknown;
@@ -248,5 +282,6 @@ export async function executeHostProgressivePreparation(payload: ProgressiveTask
         ready.warnings = [...new Set([...ready.warnings, "Source coverage remains partial; only the published verified ranges are available"] )];
         await writeReady();
     }
+    await prepareFullFetchCache();
     return JSON.stringify({ taskId: payload.taskId, ready });
 }

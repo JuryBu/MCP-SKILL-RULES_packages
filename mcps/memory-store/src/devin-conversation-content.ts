@@ -33,6 +33,27 @@ export function devinBlockText(block: any): string {
     return "";
 }
 
+export function devinAssistantContent(value: unknown): { content: string; thinking: string; toolCalls: any[] } {
+    let parsed = value;
+    if (typeof value === "string" && /^[\s]*[\[{]/u.test(value)) {
+        try { parsed = JSON.parse(value); } catch {}
+    }
+    const blocks = Array.isArray(parsed) ? parsed : [parsed];
+    const recognized = blocks.every(block => block && typeof block === "object" && (
+        ["text", "thinking", "redacted_thinking", "tool_use"].includes(block.type)
+        || (typeof block.thinking === "string" && Object.keys(block).every(key => ["thinking", "signature", "type"].includes(key)))));
+    if (!recognized) return { content: redactDevinBinary(value), thinking: "", toolCalls: [] };
+    const content: string[] = [];
+    const thinking: string[] = [];
+    const toolCalls: any[] = [];
+    for (const block of blocks) {
+        if (block.type === "text") content.push(redactDevinBinary(block.text));
+        else if (typeof block.thinking === "string") thinking.push(block.thinking);
+        else if (block.type === "tool_use") toolCalls.push({ id: block.id, function: { name: block.name, arguments: block.input ?? {} } });
+    }
+    return { content: content.filter(Boolean).join("\n"), thinking: thinking.join("\n"), toolCalls };
+}
+
 export function devinDesktopText(record: Record<string, any>): string {
     const blocks = Array.isArray(record.content) ? record.content : [record.content];
     const groups: string[] = [];

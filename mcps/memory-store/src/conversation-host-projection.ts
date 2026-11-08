@@ -4,7 +4,7 @@ import { projectCodexCorpusRound, codexCorpusAttachmentReferences } from "./conv
 import type { CorpusConversation, CorpusFastReadRequest, CorpusMessageRole, CorpusProjection, CorpusReadControl, CorpusSearchRequest } from "./conversation-corpus-types.js";
 import type { ConversationRound } from "./trajectory.js";
 
-export const HOST_CORPUS_VERSION = "host-corpus/v2";
+export const HOST_CORPUS_VERSION = "host-corpus/v4";
 
 export interface HostCorpusSnapshot {
     conversation?: CorpusConversation;

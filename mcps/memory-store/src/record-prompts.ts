@@ -2,6 +2,10 @@
 // 由 record-generator.ts 拆分而来（E2-B2），纯结构搬运、零行为变更。
 import type { RecordPatch, LocalComposeBoundary, LocalComposeDelta } from "./record-types.js";
 
+const recordEvidenceRules = `仅依据本次提供的原文、元数据和执行回执记录事实。工具调用数仅在有明确计数或可逐条核对的调用记录时填写，缺少时写“本次材料未提供计数”；产出文件、时间跨度、执行结果缺少证据时同样写明材料缺项。
+原文中的助手自述、计划、建议和已经取得的工具结果分别记录，助手说“已完成”时保留其自述来源。来源文件大小、总轮次与本次实际读取范围分别填写。
+Phase内使用“### 用户操作”“### AI执行”“### 关键决策”“### 产出文件”“### 验证结果”“### 当前状态”“### 风险与未完成”三级标题组织有内容的部分，便于按区块读取。`;
+
 // ============= Prompt 模板 =============
 
 export function buildNewRecordPrompt(
@@ -12,6 +16,8 @@ export function buildNewRecordPrompt(
     conversationContent: string,
 ): string {
     return `你是一个技术文档助手。请根据以下对话内容，按固定模板生成一份对话记录（Record）。
+
+${recordEvidenceRules}
 
 ## 模板要求
 
@@ -47,6 +53,8 @@ export function buildUpdateRecordPrompt(
 ): string {
     return `你是一个技术文档助手。以下是一个对话的已有 Record 和新增内容。
 请基于已有 Record 和新增对话内容，更新并输出完整的 Record。
+
+${recordEvidenceRules}
 
 ## 重要规则
 
@@ -87,6 +95,8 @@ export function buildRecordPatchPrompt(
     endRound: number,
 ): string {
     return `你是一个技术文档助手。请把指定轮次区段整理为 RecordPatch 草稿。
+
+${recordEvidenceRules}
 
 ## 输出格式
 

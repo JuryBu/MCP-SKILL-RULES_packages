@@ -1186,14 +1186,44 @@ export async function getConversationExecutionRecord(
         try {
             const { isIsolatedSourceWorker, runIsolatedSource } = await import("./conversation-isolated-source.js");
             if (!isIsolatedSourceWorker()) return await runIsolatedSource("guard-record", { conversationId, startRound, charBudget, dataChain, allowUnavailable: control.allowUnavailable }, control, { timeoutMs: 30_000 });
+            if (dataChain !== "auto") {
+                const { normalizeCorpusSource } = await import("./conversation-corpus-sources.js");
+                const { createMultiCorpusProvider } = await import("./conversation-corpus-reader-multi.js");
+                const source = normalizeCorpusSource(dataChain);
+                const provider = createMultiCorpusProvider();
+                const sourceControl = { ...control, messageRoles: ["user", "assistant", "tool", "subagent"] as import("./conversation-corpus-types.js").CorpusMessageRole[] };
+                const candidates = await provider.list({ dataChains: [source], conversationIds: [conversationId], sourceFailureMode: "fail" }, sourceControl);
+                const target = candidates.find(candidate => [candidate.id, candidate.canonicalId, ...(candidate.aliases || [])].includes(conversationId));
+                if (!target) return unavailable("conversation source unavailable");
+                const windowRounds = Math.max(8, Math.min(128, Math.ceil(charBudget / 8_000)));
+                const projection = await provider.readFast(target, { lastRounds: windowRounds, messageRoles: sourceControl.messageRoles }, sourceControl);
+                const relative = projection.roundNumbering === "relative";
+                const effectiveStart = relative ? 1 : startRound;
+                let evidence: GuardExecutionEvidence;
+                if (projection.rounds?.length) evidence = collectGuardExecutionEvidence(projection.rounds, effectiveStart, charBudget, source);
+                else {
+                    const messages = projection.messages.filter(message => message.round >= Math.max(1, effectiveStart));
+                    const rendered = messages.map(message => `### Round ${message.round} / ${message.role}\n${message.text}`).join("\n\n");
+                    const text = sliceUnicodeSafe(rendered, 0, charBudget);
+                    evidence = { text, startRound, firstIncludedRound: messages[0]?.round, lastIncludedRound: messages.at(-1)?.round,
+                        includedRounds: new Set(messages.map(message => message.round)).size, sourceChars: rendered.length,
+                        includedChars: text.length, sourceCharsKnown: true,
+                        coverageGaps: text.length < rendered.length ? ["executionRecord: selected message text exceeds character budget"] : [] };
+                }
+                const firstRound = projection.rounds?.[0]?.roundIndex ?? projection.messages[0]?.round;
+                if (relative || firstRound === undefined || firstRound > Math.max(1, startRound)) evidence.coverageGaps.push(`executionRecord: recent ${windowRounds}-round window does not verify the absolute stage start`);
+                if (relative || projection.readableRangeVerified === false || projection.partial === true || projection.requestedRangeComplete === false) evidence.coverageGaps.push(...projection.warnings.map(warning => `executionRecord: ${warning}`));
+                if (relative) evidence.text = "[Relative round numbers; absolute stage coverage remains unverified]\n" + evidence.text;
+                evidence.startRound = startRound;
+                evidence.includedChars = evidence.text.length;
+                return evidence;
+            }
             const loaded = await loadConversationData(dataChain || "auto", conversationId, {
                 link: "summary",
                 includeRounds: false,
                 isCancelled: control.isCancelled,
                 sourceReadBudget: { deadlineMs: control.deadlineAt, isCancelled: control.isCancelled },
-                ...(dataChain === "dsh" ? { source: "cache" as const } : {}),
             });
-            if (dataChain === "windsurf" && !loaded) throw new Error("Guard refuses missing WSF conversation execution evidence");
             if (loaded) {
                 if (loaded.chainUsed === "windsurf") assertConversationConsumerSourceComplete(loaded);
                 const cachedRounds = loaded.cacheKey && loaded.cacheGeneration

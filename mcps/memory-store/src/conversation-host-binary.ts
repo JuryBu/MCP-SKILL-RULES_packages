@@ -4,6 +4,7 @@ import { discoverLocalPbCandidates, localPbResultToRounds } from "./conversation
 import { prepareLocalPbFileCandidates, type LocalPbFileCandidate, type LocalPbReadResult, type PreparedLocalPbCandidates } from "./local-pb-reader.js";
 import { readDevinConversation, DEVIN_NORMALIZATION_VERSION, splitDevinSubagentId } from "./devin-conversation.js";
 import { resolveDevinConversation, discoverDevinConversations, DevinIdentityCache } from "./devin-sqlite.js";
+import { ReadBudget } from "./devin-sqlite-store.js";
 import { assertHostFileUnchanged, captureHostFile, type HostFileRevision } from "./conversation-host-files.js";
 import { assertHostReadActive, hostCorpusDigest, type HostCorpusSnapshot } from "./conversation-host-projection.js";
 import type { HostCorpusReaderOptions } from "./conversation-corpus-reader-hosts.js";
@@ -41,7 +42,11 @@ export async function listBinaryHostConversations(source: "windsurf" | "antigrav
     const conversations: CorpusConversation[] = [];
     let partial = false;
     if (source === "windsurf") {
-        const discovered = await discoverDevinConversations({ ...options.devinOptions, conversationIds: request.conversationIds,
+        const childTargets = request.conversationIds?.filter(id => Boolean(splitDevinSubagentId(id)));
+        const parentTargets = request.conversationIds?.map(id => splitDevinSubagentId(id)?.parentId || id)
+            ?? (request.threadMode === "children" && request.parentConversationId ? [request.parentConversationId] : undefined);
+        const discovered = await discoverDevinConversations({ ...options.devinOptions,
+            conversationIds: parentTargets,
             limit: options.listLimit || 10_000, verifyAliases: false, isCancelled: control.isCancelled });
         partial ||= discovered.partial;
         warnings.push(...discovered.diagnostics.map(item => `${item.code}: ${item.message}`));
@@ -50,6 +55,29 @@ export async function listBinaryHostConversations(source: "windsurf" | "antigrav
             rolloutPath: summary.sourcePath, sourceKind: summary.sourceKind, sourceWarnings: summary.warnings,
             parentConversationId: summary.parentConversationId, isChildThread: summary.isChildThread,
         })));
+        if (childTargets?.length || request.threadMode === "children") {
+            const { discoverDevinChildCandidates } = await import("./devin-child-discovery.js");
+            const { readDevinRawConversation } = await import("./devin-sqlite.js");
+            const children = await discoverDevinChildCandidates(discovered.conversations.map(summary => ({
+                id: summary.canonicalId, dataChain: "windsurf" as const, title: summary.title, workspace: summary.cwd || "",
+                updatedAt: summary.updatedAt || "", aliases: summary.aliases, sourceKind: summary.sourceKind,
+                sourcePath: summary.sourcePath, sessionId: summary.sessionId, uuid: summary.uuid, detail: "explicit child lookup",
+            })), { conversationIds: childTargets, parentConversationId: request.parentConversationId,
+                deadlineAt: control.deadlineAt, isCancelled: control.isCancelled,
+                maxBytes: options.devinOptions?.maxBytes, candidateLimit: options.listLimit,
+                readRaw: (id, readOptions) => {
+                    const parent = discovered.conversations.find(summary => summary.canonicalId === id || summary.aliases.includes(id));
+                    return readDevinRawConversation(id, { ...readOptions,
+                        ...(parent ? { identityMode: "physical", physicalSourceKind: parent.sourceKind } as const : {}) });
+                } });
+            warnings.push(...children.warnings);
+            partial ||= children.warnings.length > 0;
+            conversations.push(...children.candidates.map(candidate => ({ source, id: candidate.id, canonicalId: candidate.id,
+                aliases: candidate.aliases, title: candidate.title, workspace: candidate.workspace, updatedAt: candidate.updatedAt,
+                rolloutPath: candidate.sourcePath, sourceKind: candidate.sourceKind, sourceWarnings: candidate.discoveryWarnings,
+                parentConversationId: candidate.parentConversationId || undefined, isChildThread: true, agentRole: candidate.agentRole || undefined,
+            })));
+        }
     }
     const local = listLocalPbConversationCandidates(source, { conversationIds: request.conversationIds, limit: options.listLimit || 10_000,
         isCancelled: control.isCancelled, onDiagnostic: diagnostic => { partial = true; warnings.push(`${diagnostic.code}: ${diagnostic.message}`); } });
@@ -180,46 +208,58 @@ export function createBinaryHostReader(source: "windsurf" | "antigravity", optio
         const ownedIdentityCache = options.devinOptions?.identityCache ? undefined : new DevinIdentityCache();
         const physicalWindow = Boolean(request?.lastRounds && conversation.sourceKind === "devin-desktop"
             && /^[\da-f]{8}-[\da-f]{4}-[\da-f]{4}-[\da-f]{4}-[\da-f]{12}$/iu.test(conversation.canonicalId || conversation.id));
+        const child = splitDevinSubagentId(conversation.canonicalId || conversation.id);
+        const physicalCliWindow = Boolean(conversation.sourceKind === "devin-cli");
         const devinOptions = { ...options.devinOptions, identityCache: options.devinOptions?.identityCache || ownedIdentityCache,
             deadlineMs: options.devinOptions?.deadlineMs ?? Date.now() + (request ? 30000 : 120000),
-            ...(physicalWindow ? { identityMode: "physical" as const, physicalSourceKind: "devin-desktop" as const } : {}),
+            ...(physicalWindow || physicalCliWindow ? { identityMode: "physical" as const,
+                physicalSourceKind: physicalWindow ? "devin-desktop" as const : "devin-cli" as const } : {}),
             isCancelled: control.isCancelled };
         try {
-        const child = splitDevinSubagentId(conversation.canonicalId || conversation.id);
         const summary = await resolveDevinConversation(child?.parentId || conversation.canonicalId || conversation.id, devinOptions);
         if (!summary) return readPb(conversation, request, control);
         const identityResolvedAt = performance.now();
         const paths = [summary.sourcePath, ...summary.desktopPaths];
-        const before = await sqliteSources(paths, control);
+        const before = physicalCliWindow ? [] : await sqliteSources(paths, control);
         const sourceVerifiedAt = performance.now();
         let devin;
         try {
             devin = await readDevinConversation(conversation.canonicalId || conversation.id, {
-                ...devinOptions, link: "reference", materializeAttachments: false,
+                ...devinOptions, link: "reference", materializeAttachments: true,
+                ...(child ? { childDiscoveryOnly: true } : {}),
+                ...(!child ? { messageRoles: request?.messageRoles ?? control.messageRoles ?? ["user", "assistant"] } : {}),
                 roundRange: request && !child && !physicalWindow ? request.lastRounds ? { tailRounds: request.lastRounds } : { startRound: request.startRound || 1, endRound: request.endRound } : undefined,
             });
         } catch (error) {
             if (!request || (error as { code?: string }).code !== "DEVIN_RANGE_UNAVAILABLE") throw error;
-            devin = await readDevinConversation(conversation.canonicalId || conversation.id, { ...devinOptions, link: "reference", materializeAttachments: false });
+            devin = await readDevinConversation(conversation.canonicalId || conversation.id, { ...devinOptions, link: "reference", materializeAttachments: true });
         }
         if (!devin) throw new Error("Devin source changed during range lookup");
         for (const item of before) await assertHostFileUnchanged(item, control.isCancelled);
-        for (const filename of paths) {
+        for (const filename of physicalCliWindow ? [] : paths) {
             const walPath = await fs.realpath(`${filename}-wal`).catch(error => { if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined; throw error; });
             if (Boolean(walPath) !== before.some(item => item.path === walPath)) throw new Error("Devin WAL source set changed during projection");
         }
         const raw = devin.raw;
+        if (physicalCliWindow && await devinOptions.identityCache!.version(paths, new ReadBudget(devinOptions)) !== raw.sourceEvidence?.validationRevision) {
+            throw new Error("Devin SQLite source changed during window projection");
+        }
         const expectedPaths = [...new Set(await Promise.all(paths.map(filename => fs.realpath(filename))))].sort();
         const actualPaths = [...new Set(await Promise.all([raw.summary.sourcePath, ...raw.summary.desktopPaths].map(filename => fs.realpath(filename))))].sort();
-        if (raw.summary.canonicalId !== summary.canonicalId || JSON.stringify(expectedPaths) !== JSON.stringify(actualPaths)) {
+        if ((child ? raw.summary.parentConversationId : raw.summary.canonicalId) !== summary.canonicalId
+            || JSON.stringify(expectedPaths) !== JSON.stringify(actualPaths)) {
             throw new Error("Devin identity source set changed during projection");
         }
-        const coverage = raw.coverage;
-        const partial = raw.partial && raw.warnings.some(warning => warning !== "DEVIN_RANGE_MAIN_CHAIN_ONLY");
+        const coverage = child ? undefined : raw.coverage;
+        const nonBodyWarnings = new Set(["DEVIN_RANGE_MAIN_CHAIN_ONLY", ...(physicalCliWindow ? ["DEVIN_ALIAS_VERIFICATION_PENDING"] : [])]);
+        const partial = raw.partial && raw.warnings.some(warning => !nonBodyWarnings.has(warning));
         const origin: CorpusConversation = { ...conversation, id: raw.summary.canonicalId, canonicalId: raw.summary.canonicalId, aliases: raw.summary.aliases,
             title: raw.summary.title, workspace: raw.summary.cwd || conversation.workspace, sourceKind: raw.summary.sourceKind, sourceWarnings: raw.summary.warnings, rolloutPath: raw.summary.sourcePath,
             parentConversationId: raw.summary.parentConversationId, isChildThread: raw.summary.isChildThread };
-        const revision = hostCorpusDigest(["host-devin/v1", DEVIN_NORMALIZATION_VERSION, raw.summary.canonicalId, physicalKey(before)]);
+        const revision = physicalCliWindow
+            ? hostCorpusDigest(["host-devin-window/v1", DEVIN_NORMALIZATION_VERSION, raw.summary.canonicalId,
+                raw.sourceEvidence?.sources?.map(item => [item.sourcePath, item.identity]), raw.nodes, raw.compactions])
+            : hostCorpusDigest(["host-devin/v1", DEVIN_NORMALIZATION_VERSION, raw.summary.canonicalId, physicalKey(before)]);
         if (!child && raw.summary.sourceKind === "devin-cli" && raw.summary.sessionId === raw.summary.canonicalId
             && raw.summary.identityStatus !== "pending" && raw.summary.desktopPaths.length
             && ((raw.summary.identityEvidence === "client-message-id" && raw.summary.matchedMessageIds > 0)
@@ -229,11 +269,12 @@ export function createBinaryHostReader(source: "windsurf" | "antigravity", optio
                 evidence: hostCorpusDigest([raw.summary.identityEvidence, raw.summary.matchedMessageIds, raw.summary.matchedToolCallIds,
                     [...raw.summary.aliases].sort(), physicalKey(before)]) });
         }
-        const totalRounds = physicalWindow ? undefined : coverage?.totalRounds ?? devin.rounds.at(-1)?.roundIndex ?? 0;
+        const relativeWindow = physicalWindow || Boolean(raw.relativeCoverage);
+        const totalRounds = relativeWindow ? undefined : coverage?.totalRounds ?? devin.rounds.at(-1)?.roundIndex ?? 0;
         return { conversation: origin, revision,
-            rounds: devin.rounds, roundNumbering: physicalWindow ? "relative" : "absolute", totalRounds, sourceComplete: !physicalWindow && (!coverage || coverage.complete),
-            rangeComplete: !physicalWindow && !partial && (!coverage || (coverage.startRound === (request?.lastRounds ? Math.max(1, totalRounds! - request.lastRounds + 1) : request?.startRound || 1) && coverage.endRound >= Math.min(request?.endRound || totalRounds!, totalRounds!))),
-            partial, warnings: raw.warnings, sourceBytes: before.reduce((sum, item) => sum + item.size, 0),
+            rounds: devin.rounds, roundNumbering: relativeWindow ? "relative" : "absolute", totalRounds, sourceComplete: !relativeWindow && (!coverage || coverage.complete),
+            rangeComplete: raw.relativeCoverage?.requestedRangeComplete ?? (!physicalWindow && !partial && (!coverage || (coverage.startRound === (request?.lastRounds ? Math.max(1, totalRounds! - request.lastRounds + 1) : request?.startRound || 1) && coverage.endRound >= Math.min(request?.endRound || totalRounds!, totalRounds!)))),
+            partial, warnings: raw.warnings, sourceBytes: physicalCliWindow ? raw.readMetrics?.bytesRead ?? 0 : before.reduce((sum, item) => sum + item.size, 0),
             timings: { ...(raw.readMetrics || {}), identityCacheHit: Number(raw.readMetrics?.identityCacheHit),
                 bodyTotalMs: raw.readMetrics?.totalMs || 0, identityResolutionMs: identityResolvedAt - started,
                 sourceVerificationMs: sourceVerifiedAt - identityResolvedAt, sourceVerificationBytes: before.reduce((sum, item) => sum + item.size, 0),

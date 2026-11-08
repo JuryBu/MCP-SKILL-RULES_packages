@@ -33,6 +33,17 @@ async function publish(value: any, location: (string | number)[] = [], channel: 
 
 async function execute(operation: IsolatedSourceOperation, payload: any, deadlineAt: number): Promise<unknown> {
     const isCancelled = () => !process.connected;
+    if (operation === "corpus-action") {
+        const params = payload?.params;
+        if (params?.action !== "read_hit" && params?.action !== "read_fast") throw new Error("Isolated corpus-action only supports read_hit/read_fast");
+        const { runCorpusAction } = await import("./tools/conversation-corpus-tool.js");
+        return runCorpusAction(params, undefined, true);
+    }
+    if (operation === "conversation-export") {
+        const { executeConversationSourceExport } = await import("./conversation-scoped-export.js");
+        return executeConversationSourceExport(payload, { deadlineAt, isCancelled,
+            onProgress: progress => { void send({ type: "progress", progress }).catch(() => undefined); } });
+    }
     if (operation === "guard-record") {
         const { getConversationExecutionRecord } = await import("./guard-engine.js");
         return getConversationExecutionRecord(payload.conversationId, payload.startRound, payload.charBudget, payload.dataChain, { deadlineAt, isCancelled, allowUnavailable: payload.allowUnavailable });

@@ -29,6 +29,8 @@ export interface CorpusMatchSnippet {
     revision: string;
     sourceRevision: string;
     cacheGeneration?: string;
+    roundNumbering?: CorpusProjection["roundNumbering"];
+    readableRangeVerified?: boolean;
 }
 
 export interface CorpusConversationMatch {
@@ -47,6 +49,10 @@ export interface CorpusConversationMatch {
     latestMatchTimeSource: "message_timestamp" | "unknown";
     snippets: CorpusMatchSnippet[];
     warnings: string[];
+    roundNumbering?: CorpusProjection["roundNumbering"];
+    readableRangeVerified?: boolean;
+    fullSourceComplete?: boolean;
+    readableRange?: CorpusProjection["readableRange"];
 }
 
 interface CompiledTerm {
@@ -110,6 +116,16 @@ export function compileCorpusSearch(request: CorpusSearchRequest): CompiledCorpu
     const copy = JSON.parse(JSON.stringify(request)) as CorpusSearchRequest;
     if (copy.dataChains !== undefined) copy.dataChains = resolveCorpusSources({ dataChains: copy.dataChains });
     if (copy.sourceFailureMode !== undefined && !["warn", "fail"].includes(copy.sourceFailureMode)) throw new Error("Invalid sourceFailureMode");
+    for (const field of ["maxFiles", "maxBytes", "maxHits", "deadlineMs"] as const) {
+        if (copy[field] !== undefined && (!Number.isSafeInteger(copy[field]) || copy[field]! < 1)) throw new Error(`${field} must be a positive integer`);
+    }
+    if (copy.threadMode !== undefined && !["main", "children", "all"].includes(copy.threadMode)) throw new Error("Invalid threadMode");
+    if (copy.threadMode === "children" && !copy.parentConversationId?.trim()) throw new Error("threadMode=children requires parentConversationId");
+    if (copy.parentConversationId !== undefined) {
+        if (copy.threadMode !== "children") throw new Error("parentConversationId requires threadMode=children");
+        if (!copy.parentConversationId.trim()) throw new Error("parentConversationId must be nonempty");
+        copy.parentConversationId = copy.dataChains?.length === 1 && copy.dataChains[0] === "codex" ? normalizeCodexCorpusConversationId(copy.parentConversationId) : copy.parentConversationId.trim();
+    }
     if (copy.purpose !== undefined && copy.purpose !== "prepare") throw new Error("Invalid corpus purpose");
     if (copy.purpose === "prepare" && (!Array.isArray(copy.conversationIds) || copy.conversationIds.length !== 1)) {
         throw new Error("Corpus preparation requires exactly one target conversation");
@@ -179,6 +195,9 @@ export function corpusConversationMatchesScope(conversation: CorpusConversation,
     const identifiers = [conversation.id, conversation.canonicalId, ...conversation.aliases ?? []].filter((value): value is string => typeof value === "string");
     const normalize = conversation.source === "codex" ? normalizeCodexCorpusConversationId : (value: string): string => value.trim();
     return (!request.dataChains || request.dataChains.includes(conversation.source))
+        && (request.threadMode !== "main" || !(conversation.isChildThread || conversation.parentConversationId))
+        && (request.threadMode !== "children" || Boolean(conversation.parentConversationId && normalize(conversation.parentConversationId) === normalize(request.parentConversationId!)))
+        && (!request.parentDataChain || request.parentDataChain === conversation.source)
         && (!request.conversationIds?.length || request.conversationIds.some(value => identifiers.some(identifier => normalize(identifier) === normalize(value))))
         && workspaceMatches(conversation.workspace, request.workspaces, request.workspaceMode ?? "contains");
 }
@@ -208,7 +227,7 @@ export class CorpusSearchAccumulator {
     constructor(
         readonly conversation: CorpusConversation,
         request: CorpusSearchRequest | CompiledCorpusSearch,
-        readonly source: { revision: string; cacheGeneration?: string; warnings?: string[]; partial?: boolean },
+        readonly source: Pick<CorpusProjection, "revision"> & Partial<Pick<CorpusProjection, "cacheGeneration" | "warnings" | "partial" | "roundNumbering" | "readableRangeVerified" | "fullSourceComplete" | "readableRange">>,
         options: { maxSnippets?: number; snippetChars?: number } = {},
     ) {
         this.compiled = "terms" in request ? request as CompiledCorpusSearch : compileCorpusSearch(request);
@@ -322,6 +341,7 @@ export class CorpusSearchAccumulator {
             if (group.matchedMessages || !hasPositive) rounds.push(round);
             if (snippets.length < this.maxSnippets) snippets.push(...group.snippets.slice(0, this.maxSnippets - snippets.length).map(snippet => ({
                 ...snippet, revision: this.source.revision, sourceRevision: this.source.revision, cacheGeneration: this.source.cacheGeneration,
+                ...(this.source.readableRangeVerified ? { roundNumbering: this.source.roundNumbering, readableRangeVerified: true } : {}),
             })));
         }
         if (scope === "conversation" ? !this.matches(counts) : !matchingScopes) return null;
@@ -334,6 +354,8 @@ export class CorpusSearchAccumulator {
             matchedMessages, matchingScopes: scope === "conversation" ? 1 : matchingScopes, rounds,
             latestMatchAt, latestMatchTimeSource: latestMatchAt ? "message_timestamp" : "unknown", snippets,
             warnings: [...this.warnings],
+            ...(this.source.readableRangeVerified ? { roundNumbering: this.source.roundNumbering, readableRangeVerified: true,
+                fullSourceComplete: this.source.fullSourceComplete, readableRange: this.source.readableRange } : {}),
         };
     }
 }

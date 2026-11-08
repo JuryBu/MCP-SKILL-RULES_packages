@@ -1,7 +1,7 @@
 import path from "node:path";
 import fs from "node:fs/promises";
 import { performance } from "node:perf_hooks";
-import { discoverClaudeCodeThreads, readClaudeCodeRoundTail, readClaudeCodeWindowText, type ClaudeCodeRoundTailCheckpoint, type ClaudeCodeThreadInfo } from "./claude-code-client.js";
+import { CLAUDE_CODE_NORMALIZATION_VERSION, discoverClaudeCodeThreads, readClaudeCodeRoundTail, readClaudeCodeWindowText, type ClaudeCodeRoundTailCheckpoint, type ClaudeCodeThreadInfo } from "./claude-code-client.js";
 import { discoverDshSessionSources, readDshSessionIncremental, readDshSessionColdWindow, type DshReaderOptions, type DshSessionCheckpoint, type DshSessionEvent, type DshSessionSource } from "./dsh-session-reader.js";
 import { normalizeDshSessionEvents, DSH_NORMALIZATION_VERSION } from "./dsh-client.js";
 import { mergeConsecutiveHumanRounds, type ConversationRound } from "./trajectory.js";
@@ -19,6 +19,7 @@ export interface HostLogReaderOptions extends HostCorpusReaderOptions {
 
 interface LogCache {
     version: "host-log/v2";
+    normalizationVersion?: number;
     source: "claude-code" | "dsh";
     id: string;
     revision: HostFileRevision;
@@ -44,12 +45,14 @@ function claudeConversation(thread: ClaudeCodeThreadInfo): CorpusConversation {
 function dshConversation(source: DshSessionSource): CorpusConversation {
     const header = source.header;
     const parent = typeof header.parentSession === "string" ? header.parentSession : undefined;
+    const isChildThread = Boolean(parent) || header.origin === "subagent";
+    const agentNickname = typeof header.agentPreset === "string" ? header.agentPreset : undefined;
     return {
-        source: "dsh", id: source.id, canonicalId: source.id, title: typeof header.title === "string" ? header.title : source.id,
+        source: "dsh", id: source.id, canonicalId: source.id, title: typeof header.title === "string" ? header.title : agentNickname || source.id,
         workspace: typeof header.cwd === "string" ? header.cwd : typeof header.workspace === "string" ? header.workspace : source.provenance.projectDirectory,
         rolloutPath: source.provenance.sourcePath, sourceKind: `dsh-${source.provenance.format}`,
         updatedAt: new Date(source.provenance.sourceMtimeMs).toISOString(), parentConversationId: parent,
-        isChildThread: Boolean(parent), agentRole: typeof header.origin === "string" ? header.origin : undefined,
+        isChildThread, agentRole: typeof header.origin === "string" ? header.origin : undefined, agentNickname,
     };
 }
 
@@ -63,7 +66,9 @@ export function createLogHostBackend(source: "claude-code" | "dsh", options: Hos
     const cacheFile = (id: string) => path.join(root, `${hostCorpusDigest([source, id])}.json`);
     const loadCache = async (id: string) => {
         const cached = await readHostCache<LogCache>(cacheFile(id), maxCacheBytes);
-        return cached?.version === "host-log/v2" && cached.source === source && cached.id === id && Array.isArray(cached.rounds) && Array.isArray(cached.warnings) ? cached : null;
+        return cached?.version === "host-log/v2" && cached.source === source && cached.id === id
+            && cached.normalizationVersion === (source === "dsh" ? DSH_NORMALIZATION_VERSION : CLAUDE_CODE_NORMALIZATION_VERSION)
+            && Array.isArray(cached.rounds) && Array.isArray(cached.warnings) ? cached : null;
     };
     const windowBytes = 4 * 1024 * 1024;
     const readWindow = async (conversation: CorpusConversation, request: CorpusFastReadRequest, control: CorpusReadControl, filePath: string, dshSource?: DshSessionSource): Promise<HostCorpusSnapshot | null> => {
@@ -75,11 +80,11 @@ export function createLogHostBackend(source: "claude-code" | "dsh", options: Hos
         if (dshSource && (revision.size !== dshSource.provenance.sourceSizeBytes || revision.mtimeMs !== dshSource.provenance.sourceMtimeMs)) throw new Error("DSH source changed after metadata discovery");
         if (revision.size > maxSourceBytes) throw new Error(`${source} source exceeds maxSourceBytes; use a larger explicit reader budget`);
         const verifiedAt = performance.now();
-        const windowFile = path.join(root, `${hostCorpusDigest([source, id, request, "cold-window/v1"])}.window.json`);
+        const windowFile = path.join(root, `${hostCorpusDigest([source, id, request, "cold-window/v2", source === "dsh" ? DSH_NORMALIZATION_VERSION : CLAUDE_CODE_NORMALIZATION_VERSION])}.window.json`);
         const cached = control.forceRefresh ? null : await readHostCache<{ sha256: string; path: string; snapshot: HostCorpusSnapshot }>(windowFile, maxCacheBytes);
         if (cached?.sha256 === revision.sha256 && cached.path === revision.path) {
             await assertHostFileUnchanged(revision, control.isCancelled);
-            return { ...cached.snapshot, timings: { ...cached.snapshot.timings, totalMs: performance.now() - started, verificationMs: verifiedAt - started,
+            return { ...cached.snapshot, conversation: { ...conversation, rolloutPath: revision.path, canonicalId: id }, timings: { ...cached.snapshot.timings, totalMs: performance.now() - started, verificationMs: verifiedAt - started,
                 verificationBytes: revision.size, knownSourceReadBytes: revision.size, parsedBytes: 0, decodedBytes: 0, cacheHit: 1 } };
         }
         let rounds: ConversationRound[];
@@ -126,8 +131,8 @@ export function createLogHostBackend(source: "claude-code" | "dsh", options: Hos
         await assertHostFileUnchanged(revision, control.isCancelled);
         const snapshot: HostCorpusSnapshot = {
             conversation: { ...conversation, rolloutPath: revision.path, canonicalId: id }, rounds,
-            revision: hostCorpusDigest(["host-log/v2", source === "dsh" ? DSH_NORMALIZATION_VERSION : 1, source, id, revision.path, revision.sha256]),
-            cacheGeneration: hostCorpusDigest([source, id, revision.sha256]), sourceComplete: false, partial: direction === "tail" || unresolvedTool || warnings.some(item => item.includes("incomplete_trailing") || item.startsWith("dsh_unknown") || item.startsWith("dsh_malformed")),
+            revision: hostCorpusDigest(["host-log/v2", source === "dsh" ? DSH_NORMALIZATION_VERSION : CLAUDE_CODE_NORMALIZATION_VERSION, source, id, revision.path, revision.sha256]),
+            cacheGeneration: hostCorpusDigest(source === "claude-code" ? [source, id, revision.sha256, CLAUDE_CODE_NORMALIZATION_VERSION] : [source, id, revision.sha256]), sourceComplete: false, partial: direction === "tail" || unresolvedTool || warnings.some(item => item.includes("incomplete_trailing") || item.startsWith("dsh_unknown") || item.startsWith("dsh_malformed")),
             roundNumbering: direction === "tail" ? "relative" : "absolute", rangeComplete: rounds.length > 0 && (request.endRound === undefined || rounds.at(-1)!.roundIndex >= request.endRound),
             warnings, sourceBytes: revision.size, timings: { totalMs: performance.now() - started, verificationMs: verifiedAt - started, verificationBytes: revision.size,
                 knownSourceReadBytes: revision.size + readBytes, parsedBytes, decodedBytes, windowBytes, cacheHit: 0, append: 0 },
@@ -202,7 +207,7 @@ export function createLogHostBackend(source: "claude-code" | "dsh", options: Hos
                     if (revision.size) { const byte = Buffer.allocUnsafe(1); await handle.read(byte, 0, 1, revision.size - 1); completeLine = byte[0] === 10; }
                 } finally { await handle.close(); }
                 await assertHostFileUnchanged(revision, control.isCancelled);
-                entry = { version: "host-log/v2", source, id, revision, rounds, rawRounds, claudeCheckpoint: tail.checkpoint,
+                entry = { version: "host-log/v2", normalizationVersion: CLAUDE_CODE_NORMALIZATION_VERSION, source, id, revision, rounds, rawRounds, claudeCheckpoint: tail.checkpoint,
                     warnings: completeLine ? [] : ["claude_incomplete_trailing_record"], partial: !completeLine };
             }
         } else {
@@ -224,6 +229,7 @@ export function createLogHostBackend(source: "claude-code" | "dsh", options: Hos
                 selected = dshSources.find(item => item.id === id);
             }
             if (!selected) throw new Error(`DSH source not found: ${id}`);
+            conversation = { ...conversation, ...dshConversation(selected) };
             if (selected.provenance.sourceSizeBytes > maxSourceBytes) throw new Error("DSH source exceeds maxSourceBytes; use a larger explicit reader budget");
             if (request && !previous && (selected.provenance.sourceSizeBytes > windowBytes || selected.provenance.format === "jsonl.zstd")) {
                 const window = await readWindow(conversation, request, control, selected.provenance.sourcePath, selected);
@@ -247,7 +253,7 @@ export function createLogHostBackend(source: "claude-code" | "dsh", options: Hos
                 const warnings = converted.diagnostics.map(item => `dsh_${item.code}@${item.eventIndex}/${item.eventType}`);
                 if (result.provenance.ignoredTrailingTextRecord) warnings.push("dsh_incomplete_trailing_record");
                 if (result.provenance.ignoredTrailingZstdFrame) warnings.push("dsh_incomplete_trailing_frame");
-                entry = { version: "host-log/v2", source, id, revision: result.checkpoint.source, rounds: converted.rounds,
+                entry = { version: "host-log/v2", normalizationVersion: DSH_NORMALIZATION_VERSION, source, id, revision: result.checkpoint.source, rounds: converted.rounds,
                     dshCheckpoint: result.checkpoint, events, warnings, partial: warnings.length > 0 };
             }
         }
@@ -257,8 +263,8 @@ export function createLogHostBackend(source: "claude-code" | "dsh", options: Hos
         const finished = performance.now();
         const origin = { ...conversation, rolloutPath: entry.revision.path, canonicalId: id };
         return {
-            conversation: origin, rounds: entry.rounds, revision: hostCorpusDigest(["host-log/v2", source === "dsh" ? DSH_NORMALIZATION_VERSION : 1, source, id, entry.revision.path, entry.revision.sha256]),
-            cacheGeneration: hostCorpusDigest([source, id, entry.revision.sha256]), partial: entry.partial, warnings: entry.warnings,
+            conversation: origin, rounds: entry.rounds, revision: hostCorpusDigest(["host-log/v2", source === "dsh" ? DSH_NORMALIZATION_VERSION : CLAUDE_CODE_NORMALIZATION_VERSION, source, id, entry.revision.path, entry.revision.sha256]),
+            cacheGeneration: hostCorpusDigest(source === "claude-code" ? [source, id, entry.revision.sha256, CLAUDE_CODE_NORMALIZATION_VERSION] : [source, id, entry.revision.sha256]), partial: entry.partial, warnings: entry.warnings,
             sourceBytes: entry.revision.size, totalRounds: entry.rounds.at(-1)?.roundIndex || 0, roundNumbering: "absolute",
             timings: { totalMs: finished - started, verificationMs: verifiedAt - started, normalizationMs: normalizedMs, cacheWriteMs: finished - publishAt,
                 verificationBytes: entry.revision.size, knownSourceReadBytes: entry.revision.size + parseBytes, parsedBytes: parseBytes, decodedBytes, cacheHit: Number(cacheHit), append: Number(append) },

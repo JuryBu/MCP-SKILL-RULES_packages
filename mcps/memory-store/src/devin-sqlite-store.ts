@@ -20,6 +20,7 @@ export class ReadBudget {
     readonly deadline: number;
     nodes = 0;
     bytes = 0;
+    private operations = 0;
 
     constructor(private readonly options: DevinReadOptions = {}) {
         this.maxNodes = this.limit(options.maxNodes, 100_000, "maxNodes");
@@ -49,16 +50,16 @@ export class ReadBudget {
         }
     }
 
-    async take(bytes = 0): Promise<void> {
+    async take(bytes = 0, countNode = true): Promise<void> {
         this.check();
         if (!Number.isSafeInteger(bytes) || bytes < 0 || this.bytes + bytes > this.maxBytes) {
             throw new DevinReadError("DEVIN_BYTE_BUDGET", "Devin SQLite reading exceeded maxBytes; no complete result was returned.");
         }
-        if (++this.nodes > this.maxNodes) {
+        if (countNode && ++this.nodes > this.maxNodes) {
             throw new DevinReadError("DEVIN_NODE_BUDGET", "Devin SQLite reading exceeded maxNodes; no complete result was returned.");
         }
         this.bytes += bytes;
-        if (this.nodes % 64 === 0) {
+        if (++this.operations % 64 === 0) {
             await yieldImmediate();
             this.check();
         }

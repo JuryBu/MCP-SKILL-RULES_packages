@@ -4,7 +4,7 @@ import type { ConversationLinkMode } from "./chain.js";
 import { materializeRoundAttachments, type ConversationAttachment } from "./conversation-attachments.js";
 import type { DevinDesktopMessage, DevinMessageNode, DevinRawConversation, DevinReadOptions } from "./devin-types.js";
 import type { ConversationRound, SubagentSummary } from "./trajectory.js";
-import { devinText as text, redactDevinBinary, devinDesktopText as desktopText, devinUserContent, addDevinToolDetails } from "./devin-conversation-content.js";
+import { devinText as text, redactDevinBinary, devinDesktopText as desktopText, devinUserContent, devinAssistantContent, addDevinToolDetails } from "./devin-conversation-content.js";
 import { attachDevinToolImages } from "./devin-tool-attachments.js";
 import { DevinReadError } from "./devin-sqlite-store.js";
 export { redactDevinBinary } from "./devin-conversation-content.js";
@@ -14,7 +14,7 @@ export interface DevinConversationOptions extends DevinReadOptions {
     materializeAttachments?: boolean;
 }
 
-export const DEVIN_NORMALIZATION_VERSION = 2;
+export const DEVIN_NORMALIZATION_VERSION = 4;
 
 function originalTime(node: DevinMessageNode): string | undefined {
     const original = node.message.metadata?.created_at;
@@ -152,12 +152,16 @@ export function devinRawToRounds(raw: DevinRawConversation, options: DevinConver
             current.userMessages = [{ text: userContent, stepIndex: step, rawRole: "devin-user", semanticRole: "user", attachments, createdAt: originalTime(node) }];
             current.semanticEvents!.push({ stepIndex: step, semanticRole: "user", rawRole: "user", text: userContent, attachments, createdAt: originalTime(node) });
         } else if (message.role === "assistant") {
-            const toolCalls = (Array.isArray(message.tool_calls) ? message.tool_calls : []).map((call: any) => ({ name: text(call.function?.name || call.name), args: redactDevinBinary(call.function?.arguments ?? call.arguments ?? {}) }));
-            if (content || message.thinking || toolCalls.length) current.aiResponses.push({ stepIndex: step, response: content, thinking: redactDevinBinary(message.thinking), toolCalls });
-            if (content) current.semanticEvents!.push({ stepIndex: step, semanticRole: "assistant", rawRole: "assistant", text: content, createdAt: originalTime(node) });
+            const assistant = devinAssistantContent(message.content);
+            const rawCalls = [...(Array.isArray(message.tool_calls) ? message.tool_calls : []), ...assistant.toolCalls];
+            const uniqueCalls = rawCalls.filter((call, index) => !call.id || rawCalls.findIndex(candidate => candidate.id === call.id) === index);
+            const toolCalls = uniqueCalls.map((call: any) => ({ name: text(call.function?.name || call.name), args: redactDevinBinary(call.function?.arguments ?? call.arguments ?? {}) }));
+            const thinking = [...new Set([redactDevinBinary(message.thinking), assistant.thinking].filter(Boolean))].join("\n");
+            if (assistant.content || thinking || toolCalls.length) current.aiResponses.push({ stepIndex: step, response: assistant.content, thinking, toolCalls });
+            if (assistant.content) current.semanticEvents!.push({ stepIndex: step, semanticRole: "assistant", rawRole: "assistant", text: assistant.content, createdAt: originalTime(node) });
             for (let index = 0; index < toolCalls.length; index++) {
                 const call = toolCalls[index];
-                calls.set(text(message.tool_calls[index].id), { round: current, index: current.toolCalls.length });
+                calls.set(text(uniqueCalls[index].id), { round: current, index: current.toolCalls.length });
                 current.toolCalls.push({ stepIndex: step, name: call.name, argsSummary: call.args.slice(0, 120), argsFull: call.args, resultSummary: "", resultFull: "" });
                 addDevinToolDetails(current, call.name, call.args, step);
             }
@@ -230,7 +234,7 @@ export async function readDevinConversation(id: string, options: DevinConversati
     const { readDevinRawConversation } = await import("./devin-sqlite.js");
     const child = splitDevinSubagentId(id);
     if (child && options.roundRange) throw new DevinReadError("DEVIN_RANGE_UNAVAILABLE", "Devin child round ranges require a full child read; omit roundRange.");
-    let raw = await readDevinRawConversation(child?.parentId || id, options);
+    let raw = await readDevinRawConversation(child?.parentId || id, child ? { ...options, childDiscoveryOnly: false, childAgentId: child.agentId } : options);
     if (!raw) return null;
     if (child) {
         const payload = selectDevinSubagents(raw).get(child.agentId)?.payload;

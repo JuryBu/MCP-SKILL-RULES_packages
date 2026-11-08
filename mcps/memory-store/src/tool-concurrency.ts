@@ -1,4 +1,6 @@
 import { AsyncLocalStorage } from "node:async_hooks";
+import { randomUUID } from "node:crypto";
+import { performance } from "node:perf_hooks";
 
 export type ToolQueueClass = "light" | "mixed";
 export type ToolRequestClass = ToolQueueClass | "auto-background" | "control";
@@ -21,6 +23,10 @@ export class AsyncSemaphore {
 
     get pendingCount(): number {
         return this.waiters.length;
+    }
+
+    get capacity(): number {
+        return this.limit;
     }
 
     async acquire(timeoutMs: number): Promise<ReleaseFn | null> {
@@ -66,6 +72,7 @@ export interface ToolConcurrencyOptions<T> {
     timeoutMs?: number;
     bypass?: boolean;
     onBusy?: (message: string) => T | Promise<T>;
+    onQuota?: (state: { waitMs: number; limit: number; activeBefore: number; pendingBefore: number; acquired: boolean }) => void;
 }
 
 const bypassStorage = new AsyncLocalStorage<boolean>();
@@ -132,7 +139,12 @@ export async function withToolConcurrency<T>(
 ): Promise<T> {
     if (options.bypass || isToolConcurrencyBypassed()) return fn();
     const timeoutMs = options.timeoutMs ?? defaultToolQueueTimeoutMs();
-    const release = await semaphoreFor(queueClass).acquire(timeoutMs);
+    const semaphore = semaphoreFor(queueClass);
+    const activeBefore = semaphore.activeCount;
+    const pendingBefore = semaphore.pendingCount;
+    const acquireStarted = performance.now();
+    const release = await semaphore.acquire(timeoutMs);
+    options.onQuota?.({ waitMs: performance.now() - acquireStarted, limit: semaphore.capacity, activeBefore, pendingBefore, acquired: release !== null });
     if (!release) {
         const message = formatBusyMessage(queueClass, label, timeoutMs);
         if (options.onBusy) return options.onBusy(message);
@@ -156,12 +168,13 @@ export function classifyToolRequest(name: string, args: Record<string, unknown> 
     }
     if (name === "record_manage") {
         const action = typeof args.action === "string" ? args.action : "";
+        if (action === "task_status" || action === "cancel") return "control";
         if (action === "update" || action === "batch_update" || action === "bulk_update") return "auto-background";
         if (action === "search" || action === "guide") return "mixed";
         return "light";
     }
-    if (name === "conversation_golden_extract") return args.taskId ? "light" : "auto-background";
-    if (name === "stage_guard") return args.action === "status" || args.action === "cancel" ? "control" : args.action === "check" && !args.taskId ? "mixed" : "light";
+    if (name === "conversation_golden_extract") return args.taskId ? "control" : "auto-background";
+    if (name === "stage_guard") return args.action === "status" || args.action === "cancel" || (args.action === "check" && args.taskId) ? "control" : args.action === "check" ? "mixed" : "light";
     if (name === "conversation_read_original") {
         if (["prepare_status", "prepare_cancel", "search_all_status", "search_all_cancel", "deep_locate_status", "deep_locate_cancel"].includes(String(args.action))) return "control";
         if (args.action === "deep_locate") return "auto-background";
@@ -187,21 +200,58 @@ export function installToolConcurrency(server: { tool: (...args: any[]) => unkno
     const originalTool = server.tool.bind(server);
     server.tool = (name: string, description: string, schema: unknown, handler: (args: any, extra?: unknown) => unknown) => {
         const wrapped = async (args: Record<string, unknown> = {}, extra?: unknown) => {
+            const receivedAt = new Date().toISOString();
+            const started = performance.now();
+            const requestId = randomUUID();
             const queueClass = classifyToolRequest(name, args);
             const action = typeof args.action === "string" ? `.${args.action}` : "";
+            let quota: Parameters<NonNullable<ToolConcurrencyOptions<unknown>["onQuota"]>>[0] | null = null;
+            let handlerMs = 0;
+            let handlerStarted = false;
+            const invoke = async () => {
+                handlerStarted = true;
+                const handlerStart = performance.now();
+                try {
+                    return await handler(args, extra);
+                } finally {
+                    handlerMs = performance.now() - handlerStart;
+                }
+            };
+            const inheritedBypass = isToolConcurrencyBypassed();
+            let result: unknown;
             if (queueClass === "auto-background" || queueClass === "control") {
-                return handler(args, extra);
+                result = await invoke();
+            } else {
+                const requested = Number(args.deadlineMs);
+                const fallback = name === "conversation_read_original" ? args.action === "list" ? 12_000 : args.action === "read_fast" ? 30_000 : 120_000 : undefined;
+                const timeoutMs = Number.isFinite(requested) && requested > 0 ? requested : fallback;
+                const signal = (extra as { signal?: AbortSignal } | undefined)?.signal;
+                result = await requestStorage.run({ deadlineAt: timeoutMs === undefined ? undefined : Date.now() + timeoutMs, signal }, () => withToolConcurrency(
+                    queueClass,
+                    `${name}${action}`,
+                    invoke,
+                    {
+                        onBusy: toolConcurrencyBusyResponse,
+                        timeoutMs: Math.min(timeoutMs ?? Infinity, defaultToolQueueTimeoutMs()),
+                        onQuota: state => { quota = state; },
+                    },
+                ));
             }
-            const requested = Number(args.deadlineMs);
-            const fallback = name === "conversation_read_original" ? args.action === "list" ? 12_000 : args.action === "read_fast" ? 30_000 : 120_000 : undefined;
-            const timeoutMs = Number.isFinite(requested) && requested > 0 ? requested : fallback;
-            const signal = (extra as { signal?: AbortSignal } | undefined)?.signal;
-            return requestStorage.run({ deadlineAt: timeoutMs === undefined ? undefined : Date.now() + timeoutMs, signal }, () => withToolConcurrency(
-                queueClass,
-                `${name}${action}`,
-                () => handler(args, extra),
-                { onBusy: toolConcurrencyBusyResponse, timeoutMs: Math.min(timeoutMs ?? Infinity, defaultToolQueueTimeoutMs()) },
-            ));
+            if (!result || typeof result !== "object" || Array.isArray(result)) return result;
+            const response = result as Record<string, unknown>;
+            const metadata = response._meta && typeof response._meta === "object" && !Array.isArray(response._meta) ? response._meta as Record<string, unknown> : {};
+            return {
+                ...response,
+                _meta: {
+                    ...metadata,
+                    "memory-store/toolTiming": {
+                        version: 1, requestId, tool: name, requestClass: queueClass, processId: process.pid,
+                        receivedAt, completedAt: new Date().toISOString(), quota, handlerStarted, handlerMs,
+                        bypass: queueClass === "control" || queueClass === "auto-background" ? queueClass : inheritedBypass ? "inherited" : null,
+                        totalMs: performance.now() - started,
+                    },
+                },
+            };
         };
         return originalTool(name, description, schema, wrapped);
     };

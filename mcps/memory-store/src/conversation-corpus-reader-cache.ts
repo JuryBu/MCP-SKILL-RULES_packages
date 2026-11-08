@@ -7,11 +7,13 @@ import type { CorpusProjection, CorpusReadControl } from "./conversation-corpus-
 
 export const CODEX_CORPUS_CACHE_FORMAT = "codex-corpus-body/v4";
 export const CODEX_ROLE_PROOF_CACHE_FORMAT = "codex-role-exclusion-cache/v1";
+export const CODEX_READABLE_RANGE_CACHE_FORMAT = "codex-readable-range-cache/v1";
 
 export interface CodexCorpusCacheEntry {
-    format: typeof CODEX_CORPUS_CACHE_FORMAT | typeof CODEX_ROLE_PROOF_CACHE_FORMAT;
+    format: typeof CODEX_CORPUS_CACHE_FORMAT | typeof CODEX_ROLE_PROOF_CACHE_FORMAT | typeof CODEX_READABLE_RANGE_CACHE_FORMAT;
     projection: CorpusProjection;
     publishedProjectionVersion?: 2;
+    readerSemanticVersion?: string;
     verification?: CodexStreamingHistoryVerification;
     replay?: { round: number; position: CodexStreamingHistoryPosition };
     sourceIdentities: Array<{ path: string; physical: CodexHistoryPhysicalIdentity }>;
@@ -53,6 +55,7 @@ function rememberReusedEntry(key: string, value: ReusedCorpusEntry): void {
 function invalidateReusedEntries(root: string, conversationId: string): void {
     forgetReusedEntry(reuseKey(root, conversationId, CODEX_CORPUS_CACHE_FORMAT));
     forgetReusedEntry(reuseKey(root, conversationId, CODEX_ROLE_PROOF_CACHE_FORMAT));
+    forgetReusedEntry(reuseKey(root, conversationId, CODEX_READABLE_RANGE_CACHE_FORMAT));
 }
 
 async function cacheFileIdentity(filename: string): Promise<string> {
@@ -149,7 +152,8 @@ export async function readCodexCorpusCache(root: string, conversationId: string,
         throwIfCodexReadCancelled(control.isCancelled);
         if (bytes.length !== manifest.bytes || digest(bytes) !== manifest.sha256) return null;
         const entry = JSON.parse(bytes.toString("utf8")) as CodexCorpusCacheEntry;
-        if (entry.format !== format || entry.projection.conversation.id !== conversationId || !entry.projection.complete || !Array.isArray(entry.sourceIdentities)) return null;
+        const readableRange = format === CODEX_READABLE_RANGE_CACHE_FORMAT && entry.projection.partial === true && entry.projection.readableRangeVerified === true && entry.projection.fullSourceComplete === false && entry.projection.readableRange?.kind === "relative";
+        if (entry.format !== format || entry.projection.conversation.id !== conversationId || (!entry.projection.complete && !readableRange) || !Array.isArray(entry.sourceIdentities)) return null;
         throwIfCodexReadCancelled(control.isCancelled);
         rememberReusedEntry(key, { entry, manifestPath, contentPath, manifestPhysical, contentPhysical, bytes: bytes.length });
         return entry;

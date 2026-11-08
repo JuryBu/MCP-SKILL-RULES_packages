@@ -7,7 +7,7 @@ import { AsyncSemaphore, currentToolRequestControl } from "./tool-concurrency.js
 import type { DevinConversationSummary } from "./devin-types.js";
 import { DevinReadError } from "./devin-sqlite-store.js";
 
-export type IsolatedSourceOperation = "candidates" | "devin-discover" | "devin-list" | "devin-identities" | "devin-resolve" | "devin-raw" | "devin-read" | "devin-fingerprint" | "host-list" | "host-read" | "host-cached" | "guard-record";
+export type IsolatedSourceOperation = "candidates" | "devin-discover" | "devin-list" | "devin-identities" | "devin-resolve" | "devin-raw" | "devin-read" | "devin-fingerprint" | "host-list" | "host-read" | "host-cached" | "guard-record" | "conversation-export" | "corpus-action";
 export interface IsolatedSourceControl {
     deadlineAt?: number;
     signal?: AbortSignal;

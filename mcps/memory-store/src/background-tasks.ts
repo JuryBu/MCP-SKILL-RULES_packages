@@ -203,6 +203,8 @@ interface BackgroundTaskQueueLaneStats {
 interface QueuedBackgroundTask {
     lane: BackgroundTaskLaneName;
     run: QueuedBackgroundRun;
+    task?: BackgroundTask;
+    deadlineTimer?: ReturnType<typeof setTimeout>;
 }
 
 interface BackgroundTaskExecution {
@@ -231,6 +233,7 @@ function normalizeRecordSchedulerLaneConcurrency(value: number): number {
 
 class BackgroundTaskQueue {
     private active = 0;
+    private activeFullPreparations = 0;
     private readonly pending: QueuedBackgroundTask[] = [];
     private readonly activeByLane = new Map<BackgroundTaskLaneName, number>();
     private readonly pendingByLane = new Map<BackgroundTaskLaneName, number>();
@@ -267,14 +270,47 @@ class BackgroundTaskQueue {
         };
     }
 
-    enqueue(lane: BackgroundTaskLaneName, run: QueuedBackgroundRun): void {
-        this.pending.push({ lane, run });
+    enqueue(lane: BackgroundTaskLaneName, run: QueuedBackgroundRun, task?: BackgroundTask): void {
+        const entry: QueuedBackgroundTask = { lane, run, task };
+        this.pending.push(entry);
         this.pendingByLane.set(lane, (this.pendingByLane.get(lane) || 0) + 1);
+        const payload = task?.resumePayload as { phase?: string; initialDeadlineAt?: number } | undefined;
+        const deadlineAt = task?.kind === "conversation-progressive" && payload?.phase !== "full"
+            ? payload?.initialDeadlineAt : undefined;
+        if (deadlineAt !== undefined && Number.isFinite(deadlineAt)) {
+            const expire = (): void => {
+                const remaining = deadlineAt - Date.now();
+                if (remaining > 0) {
+                    entry.deadlineTimer = setTimeout(expire, Math.min(remaining, 2_147_483_647));
+                    entry.deadlineTimer.unref();
+                    return;
+                }
+                const index = this.pending.indexOf(entry);
+                if (index < 0 || !task) return;
+                try {
+                    const current = getBackgroundTask(task.id);
+                    if (current?.status === "running" && current.ownerPid === process.pid) {
+                        const failed = settleTaskAsError(current, "Initial progressive range deadline exceeded while queued; published ranges remain readable", { timedOut: true });
+                        Object.assign(task, failed);
+                    }
+                    this.pending.splice(index, 1);
+                    this.pendingByLane.set(lane, Math.max(0, (this.pendingByLane.get(lane) || 0) - 1));
+                    discardBackgroundTaskExecution(task.id, task);
+                    this.drain();
+                } catch (error) {
+                    console.error("Progressive queue deadline could not be persisted:", error instanceof Error ? error.message : String(error));
+                }
+            };
+            entry.deadlineTimer = setTimeout(expire, Math.min(Math.max(0, deadlineAt - Date.now()), 2_147_483_647));
+            entry.deadlineTimer.unref();
+        }
         this.drain();
     }
 
     resetForTest(): void {
         this.active = 0;
+        this.activeFullPreparations = 0;
+        for (const item of this.pending) if (item.deadlineTimer) clearTimeout(item.deadlineTimer);
         this.pending.length = 0;
         for (const lane of this.activeByLane.keys()) {
             this.activeByLane.set(lane, 0);
@@ -284,25 +320,41 @@ class BackgroundTaskQueue {
 
     private drain(): void {
         while (this.pending.length > 0) {
-            const nextIndex = this.pending.findIndex(item => this.canRunLane(item.lane));
+            let nextIndex = this.pending.findIndex(item => this.isInitialPreparation(item) && this.canRun(item));
+            if (nextIndex < 0) nextIndex = this.pending.findIndex(item => this.canRun(item));
             if (nextIndex < 0) return;
-            const [{ lane, run }] = this.pending.splice(nextIndex, 1);
+            const [next] = this.pending.splice(nextIndex, 1);
+            if (next?.deadlineTimer) clearTimeout(next.deadlineTimer);
+            const { lane, run } = next!;
+            const fullPreparation = this.isFullPreparation(next!);
             this.active++;
+            if (fullPreparation) this.activeFullPreparations++;
             this.pendingByLane.set(lane, Math.max(0, (this.pendingByLane.get(lane) || 0) - 1));
             this.activeByLane.set(lane, (this.activeByLane.get(lane) || 0) + 1);
             void run().catch(error => {
                 console.error("后台任务队列执行失败：", error instanceof Error ? error.message : String(error));
             }).finally(() => {
                 this.active = Math.max(0, this.active - 1);
+                if (fullPreparation) this.activeFullPreparations = Math.max(0, this.activeFullPreparations - 1);
                 this.activeByLane.set(lane, Math.max(0, (this.activeByLane.get(lane) || 0) - 1));
                 this.drain();
             });
         }
     }
 
-    private canRunLane(lane: BackgroundTaskLaneName): boolean {
-        const limit = normalizeConcurrencyLimit(this.limits[lane], 1);
-        return (this.activeByLane.get(lane) || 0) < limit;
+    private isFullPreparation(item: QueuedBackgroundTask): boolean {
+        return item.task?.kind === "conversation-progressive"
+            && (item.task.resumePayload as { phase?: string } | undefined)?.phase === "full";
+    }
+
+    private isInitialPreparation(item: QueuedBackgroundTask): boolean {
+        return item.task?.kind === "conversation-progressive" && !this.isFullPreparation(item);
+    }
+
+    private canRun(item: QueuedBackgroundTask): boolean {
+        const limit = normalizeConcurrencyLimit(this.limits[item.lane], 1);
+        return (this.activeByLane.get(item.lane) || 0) < limit
+            && (!this.isFullPreparation(item) || this.activeFullPreparations < 1);
     }
 }
 
@@ -1367,7 +1419,7 @@ function scheduleBackgroundTask(
                 if (timeout) clearTimeout(timeout);
                 onSettled?.();
             }
-        });
+        }, task);
     };
 
     clearSuspensionTimer(task.id);
@@ -1481,6 +1533,17 @@ function resumeBackgroundTaskWithSameId(
         resumeVersion: resumedTask.resumeVersion,
         resumeHash: resumedTask.resumeHash,
     }, releaseClaim);
+}
+
+export function checkpointBackgroundTaskResumePayload(taskId: string, resumePayload: unknown): void {
+    const task = tasks.get(taskId);
+    if (!task || task.status !== "running" || task.ownerPid !== process.pid) {
+        throw new Error("Background task cannot checkpoint after cancellation or settlement");
+    }
+    const previous = { ...task };
+    Object.assign(task, prepareResumeMetadata({ resumePayload }));
+    try { persistTask(task, "progress"); }
+    catch (error) { Object.assign(task, previous); throw error; }
 }
 
 export function startBackgroundTask(

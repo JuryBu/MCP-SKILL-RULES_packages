@@ -68,6 +68,15 @@ export interface CorpusProjection {
     rounds?: ConversationRound[];
     roundNumbering?: "absolute" | "relative";
     totalRounds?: number;
+    readableRangeVerified?: boolean;
+    fullSourceComplete?: boolean;
+    readableRange?: {
+        kind: "relative";
+        startRound: number;
+        endRound: number;
+        segments: Array<{ path: string; startOrdinal: number; endOrdinalExclusive: number; endByte: number; prefixSha256: string }>;
+        missingHistoryBase?: { rolloutId: string; endOrdinalExclusive: number; endByte: number };
+    };
 }
 
 export interface CorpusSearchExpression {
@@ -87,6 +96,13 @@ export interface CorpusSearchRequest {
     excludeTerms?: string[];
     expression?: CorpusSearchExpression;
     conversationIds?: string[];
+    parentConversationId?: string;
+    parentDataChain?: CorpusSource;
+    threadMode?: "main" | "children" | "all";
+    maxFiles?: number;
+    maxBytes?: number;
+    maxHits?: number;
+    deadlineMs?: number;
     workspaces?: string[];
     workspaceMode?: "contains" | "exact" | "under" | "any" | "all";
     messageRoles?: CorpusMessageRole[];
@@ -97,6 +113,7 @@ export interface CorpusSearchRequest {
 }
 
 export interface CorpusReadControl {
+    allowPartialSource?: boolean;
     deadlineAt?: number;
     messageRoles?: CorpusMessageRole[];
     forceRefresh?: boolean;

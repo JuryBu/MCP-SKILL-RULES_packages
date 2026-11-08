@@ -62,7 +62,8 @@ import {
 } from "../background-tasks.js";
 import type { BackgroundTaskContext, BackgroundTaskProgress } from "../background-tasks.js";
 import type { BackgroundTask } from "../background-tasks.js";
-import { exportConversation, formatConversationExportResult } from "../conversation-exporter.js";
+import { exportConversation, formatConversationExportResult, conversationExportSourceMetadata } from "../conversation-exporter.js";
+import { runConversationSourceExport } from "../conversation-scoped-export.js";
 import { formatLocalPbActivities } from "../conversation-source-adapters.js";
 import {
     listConversationCandidates,
@@ -1965,12 +1966,12 @@ export function registerConversation(server: McpServer, dependencies: {
   read_ready/search_ready/locate_ready/extract_ready — 在完整历史尚未构建完时使用已就绪范围，返回覆盖、暂计状态和稳定引用
 fetch/search/read/recall/export 必须传 conversationId（共享 broker 后端拦截所有无 ID 调用，含 antigravity——跨 session 共享后端无法安全推断「当前对话」）。先用 action="list" 定位 ID。`,
         {
-            action: z.enum(["list", "fetch", "search", "read", "recall", "export", "deep_locate", "deep_locate_status", "deep_locate_cancel", "search_all", "search_all_status", "search_all_cancel", "search_all_resume", "read_hit", "read_fast", "prepare", "prepare_status", "prepare_cancel", "prepare_resume", "read_ready", "search_ready", "locate_ready", "extract_ready"]).default("search")
+            action: z.enum(["list", "fetch", "search", "read", "recall", "export", "deep_locate", "deep_locate_status", "deep_locate_cancel", "search_all", "search_all_status", "search_all_cancel", "search_all_resume", "read_hit", "read_fast", "read_result", "prepare", "prepare_status", "prepare_cancel", "prepare_resume", "read_ready", "search_ready", "locate_ready", "extract_ready"]).default("search")
                 .describe("list/fetch/search/read/recall/export=已有原文功能；deep_locate=有预算定位；search_all及status/cancel/resume=显式单端或多端正文组合搜索和动态任务；read_hit=按命中来源版本/轮次展开；read_fast=无需先完整fetch的指定轮次/近期正文"),
             conversationId: z.string().optional()
-                .describe("稳定对话ID。search_all、read_fast、read_hit与deep_locate系列填当前调用者ID，目标筛选使用conversationIds；read_hit兼容旧目标ID用法；fetch/search/read/export填目标ID；WSF接受已验证的UUID/文字别名"),
+                .describe("当前调用者的稳定对话ID，目标使用conversationIds。fetch/search/read/recall/单条export兼容省略conversationIds时把本字段作为目标；WSF接受UUID或词对ID，身份核实状态随结果返回"),
             conversationIds: z.array(z.string()).optional()
-                .describe("[list/deep_locate/search_all/read_fast/read_hit] 可选目标范围；read_fast/read_hit最多一个，省略时兼容读取conversationId；list/deep_locate/search_all的单数conversationId指定调用者"),
+                .describe("目标对话ID数组；fetch/search/read/recall/单条export/read_fast/prepare/read_hit最多一个，省略时兼容读取conversationId；list/deep_locate/search_all/批量export可限定多个目标。conversationId保持调用者身份"),
             allTerms: z.array(z.string().min(1).max(4096)).max(100).optional()
                 .describe("[search_all] 全部包含的词；默认在同一对话满足，intersectionScope可改同轮/同消息"),
             anyTerms: z.array(z.string().min(1).max(4096)).max(100).optional()
@@ -1994,9 +1995,9 @@ fetch/search/read/recall/export 必须传 conversationId（共享 broker 后端�
             prepareCache: z.boolean().optional()
                 .describe("[read_fast] 默认true，并行准备完整正文缓存，返回可查询/取消/恢复的原taskId；false仅取得所需原文"),
             progressive: z.boolean().optional()
-                .describe("[fetch/read_fast] 默认true，适用的Codex巨型fetch或末N轮先返回分段准备任务；false沿用完整原文路径"),
+                .describe("[fetch/read_fast] 默认true，五端fetch先返回分段准备任务并给可读范围的next；false沿用完整fetch缓存路径，完整来源整理建议background=true"),
             progressiveTaskId: z.string().optional()
-                .describe("[read/search] 读取已就绪范围时指定原prepare任务；conversationId填任务调用者"),
+                .describe("[read/search/export] 使用已就绪范围的原prepare任务；export配rangeRef、lastRounds或明确轮次，仅导出该范围，conversationId填任务调用者"),
             afterProgressRevision: z.string().regex(/^[a-f0-9]{64}$/).optional()
                 .describe("[prepare_status] 原样回传上次revision并设置waitSeconds，等待新增就绪内容、状态变化或到期"),
             buildOrder: z.enum(["latest", "oldest"]).optional()
@@ -2004,7 +2005,7 @@ fetch/search/read/recall/export 必须传 conversationId（共享 broker 后端�
             blockId: z.string().optional()
                 .describe("[read_ready/search_ready] 可选固定已发布块，局部轮号须随blockId使用"),
             rangeRef: z.string().optional()
-                .describe("[locate_ready/read_ready/extract_ready] 已返回的稳定范围引用，旧历史加入后仍指向相同正文"),
+                .describe("[locate_ready/read_ready/extract_ready/export] 稳定单轮引用；export同时填原progressiveTaskId。locate_ready必填，先search_ready取得hits[].ref与next，旧历史加入后仍指向同一正文"),
             query: z.string().optional()
                 .describe("[list/search] 搜索关键词"),
             contextProbe: z.string().optional()
@@ -2026,13 +2027,13 @@ fetch/search/read/recall/export 必须传 conversationId（共享 broker 后端�
             waitSeconds: z.number().optional()
                 .describe("[deep_locate_status] 等待秒数，建议 30-45"),
             maxFiles: z.number().optional()
-                .describe("[deep_locate] 最大扫描文件数"),
+                .describe("[deep_locate/search_all] 每次执行或恢复的最大扫描对话/文件数；search_all到期保留已核结果并返回partial，可沿原taskId恢复"),
             maxBytes: z.number().optional()
-                .describe("[deep_locate] 最大扫描字节数；[read] 单段交付字节上限，会覆盖默认约 100K 字符预算"),
+                .describe("[deep_locate/search_all] 每次执行的来源扫描字节预算；[read] 单段交付字节上限，会覆盖默认约100K字符预算"),
             maxHits: z.number().optional()
-                .describe("[deep_locate/search] 最大命中数；search 的 limit 别名，与 limit 不同值时报错"),
+                .describe("[deep_locate/search] 最大命中数；search的limit别名；[search_all] 每次执行新增命中对话数，limit只控制返回页大小"),
             deadlineMs: z.number().int().min(1).max(600000).optional()
-                .describe("[list contextProbe/deep_locate] 候选发现和正文定位的总时间预算（毫秒）；到期返回已取得的部分证据，不冒充完整扫描"),
+                .describe("[list contextProbe/deep_locate/search_all/read_hit/read_fast] 本次执行总时间预算（毫秒）；search_all到期保留已确认结果并暂停为partial，沿原taskId恢复"),
             startRound: z.number().optional()
                 .describe("[read/recall manual] 起始轮次（1-indexed）"),
             endRound: z.number().optional()
@@ -2040,7 +2041,7 @@ fetch/search/read/recall/export 必须传 conversationId（共享 broker 后端�
             recallMode: z.enum(["auto", "manual", "full"]).optional()
                 .describe("[recall] auto=按宿主压缩信号恢复 / manual=按 startRound/endRound / full=全部 context-only 内容写临时文件"),
             continuationCursor: z.string().optional()
-                .describe("[read] 上一段返回的续读光标；来源或参数变化时会拒绝，避免重复或串读"),
+                .describe("[read/read_result/search_all_status] 原响应返回的续读光标；read_result配合同一调用者及结果taskId分页取得大结果全文"),
             cacheGeneration: z.string().min(1).optional()
                 .describe("[search/read] 固定已发布缓存的同一 generation；可用 search 返回值继续 read，旧代缺失时报恢复建议"),
             forceRefresh: z.boolean().optional()
@@ -2067,7 +2068,7 @@ fetch/search/read/recall/export 必须传 conversationId（共享 broker 后端�
             source: z.enum(["auto", "local", "ls", "cache"]).optional()
                 .describe("原文来源：Codex search/read 未传时只读已发布缓存；显式 auto/local 与 fetch 保持原文校验；ls=旧 Windsurf/Antigravity；cache=固定已发布缓存"),
             dataChains: z.array(conversationDataChainValueSchema("dataChains")).optional()
-                .describe("[list/deep_locate/export] 批量模式：查询限定的多个数据源；例如 [\"codex\",\"windsurf\",\"dsh\"]。未传时保持单 dataChain 行为"),
+                .describe("[list/deep_locate/search_all/批量export] 显式限定多个数据源，例如 [\"codex\",\"windsurf\",\"dsh\"]；单目标范围操作使用一个具体dataChain，已有taskId的状态/取消/恢复沿用原来源"),
             workspaces: z.array(z.string()).optional()
                 .describe("[list/export] 批量模式：按工作区路径过滤，可传一个或多个目录"),
             workspaceMode: z.enum(["contains", "exact", "under", "any", "all"]).optional()
@@ -2085,9 +2086,9 @@ fetch/search/read/recall/export 必须传 conversationId（共享 broker 后端�
             idResolutionMode: z.enum(["unique", "priority"]).optional()
                 .describe("dataChain=auto 且传 conversationId 时：unique=并行全源唯一匹配，priority=保留旧优先级顺序；默认 unique"),
             threadMode: z.enum(["main", "children", "all"]).optional()
-                .describe("[list/deep_locate/export] 线程过滤：main=只返回主线程，children=只列某个父线程的子线程，all=主线程和子线程；具体关联以来源可验证结构为准"),
+                .describe("[list/deep_locate/search_all/export] 线程过滤：main=主线程，children=parentConversationId的子线程，all=全部；按来源可验证关联过滤"),
             parentConversationId: z.string().optional()
-                .describe("[list/export] threadMode=children 时指定父线程 conversationId"),
+                .describe("[list/search_all/export] threadMode=children时指定父线程conversationId；search_all需要准确ID"),
             parentQuery: z.string().optional()
                 .describe("[list/export] threadMode=children 时用标题/ID/工作区唯一定位父线程；不唯一会返回诊断"),
             parentDataChain: conversationDataChainInputSchema("parentDataChain", "预留：父线程定位的数据源；当前主要用于 Codex 子线程过滤。DSH（DeepSeek Harness，含 deepseek-harness 别名）与 Windsurf 只支持 dataChain；agy 与 Grok 只支持 modelChain"),
@@ -2103,17 +2104,21 @@ fetch/search/read/recall/export 必须传 conversationId（共享 broker 后端�
 
             try {
                 if (isProgressiveAction(params) || (params.action === "read_fast" && params.lastRounds !== undefined && params.progressive !== false && !dependencies.corpus && !params.forceRefresh && params.source !== "cache" && params.source !== "ls")) {
-                    return corpusToolResult(await runProgressiveAction(params));
+                    return corpusToolResult(await runProgressiveAction(params), params);
                 }
                 if (isCorpusAction(params.action)) {
                     if (params.action === "search_all" && params.background === false) throw new Error("search_all使用可查询的后台任务，请省略background或设为true");
                     const result = await runCorpusAction(params, dependencies.corpus);
                     if (!result || typeof result !== "object" || Array.isArray(result)) throw new Error("全库检索未返回有效状态对象");
-                    return corpusToolResult({ ...result, requestElapsedMs: Date.now() - startTime });
+                    return corpusToolResult({ ...result, requestElapsedMs: Date.now() - startTime }, params);
+                }
+                if (params.action === "export" && params.progressiveTaskId) {
+                    const result = await runConversationSourceExport({ kind: "progressive", params });
+                    return appendTiming({ content: [{ type: "text" as const, text: formatConversationExportResult(result) }] }, startTime);
                 }
                 const {
                     action,
-                    conversationId,
+                    conversationId: callerConversationId,
                     query,
                     contextProbe,
                     depth = "normal",
@@ -2163,6 +2168,14 @@ fetch/search/read/recall/export 必须传 conversationId（共享 broker 后端�
                     link = DEFAULT_LINK_MODE,
                     logicalChain,
                 } = params;
+                const readsSingleTarget = ["fetch", "search", "read", "recall"].includes(action)
+                    || (action === "export" && !exportBatch);
+                if (readsSingleTarget && conversationIds !== undefined
+                    && (conversationIds.length !== 1 || !conversationIds[0]?.trim())) {
+                    throw new Error("This action reads one target conversation; provide one non-empty conversationIds entry, or use exportBatch for multiple exports.");
+                }
+                const conversationId = readsSingleTarget && conversationIds !== undefined
+                    ? conversationIds[0]!.trim() : callerConversationId;
                 const sourceExplicit = params.source !== undefined;
                 const limit = action === "search" ? resolveConversationSearchLimit(requestedLimit, maxHits) : requestedLimit ?? 8;
                 const contextRounds = requestedContextRounds ?? (action === "search" ? 0 : action === "read" ? 1 : 2);
@@ -2175,7 +2188,8 @@ fetch/search/read/recall/export 必须传 conversationId（共享 broker 后端�
                 const cacheRequest = { source, sourceExplicit, link, cacheGeneration, logicalChain: logicalChain as ConversationLogicalChainMode | undefined };
                 const publishedCacheOnly = shouldUsePublishedConversationCache(action, chains.dataChain, sourceExplicit);
                 const effectiveCompactionMode: CompactionMode = compactionMode || (depth === "full" ? "full" : "folded");
-                const isBatchConversationExport = action === "export" && !conversationId?.trim() && Boolean(exportBatch || dataChains?.length || workspaces?.length);
+                const isBatchConversationExport = action === "export" && Boolean(exportBatch
+                    || (!conversationId?.trim() && (dataChains?.length || workspaces?.length)));
 
                 if (!isBatchConversationExport && shouldRequireExplicitConversationId(action, chains.dataChain, conversationId)) {
                     return appendTiming({
@@ -2257,7 +2271,7 @@ fetch/search/read/recall/export 必须传 conversationId（共享 broker 后端�
                 }
 
                 if (action === "list") {
-                    if ((!query?.trim() && chains.dataChain !== "auto" && source !== "ls") || conversationIds?.length || contextProbe?.trim() || source === "local" || source === "cache" || chains.dataChain === "dsh" || dataChains?.length || workspaces?.length || threadMode || parentConversationId || parentQuery) {
+                    if ((!query?.trim() && chains.dataChain !== "auto" && source !== "ls") || (chains.dataChain === "antigravity" && source !== "ls") || conversationIds?.length || contextProbe?.trim() || source === "local" || source === "cache" || chains.dataChain === "dsh" || dataChains?.length || workspaces?.length || threadMode || parentConversationId || parentQuery) {
                         const result = await (dependencies.listCandidates || listConversationCandidates)({
                             dataChains: dataChains?.length ? dataChains : [chains.dataChain],
                             source, contextProbe, maxBytes, maxHits, candidateLimit: maxFiles, deadlineMs,
@@ -2832,7 +2846,17 @@ fetch/search/read/recall/export 必须传 conversationId（共享 broker 后端�
                 }
 
                 if (action === "fetch" && conversationId && source !== "ls" && source !== "cache") {
-                    const resolvedFetchChain = await (dependencies.resolveFetchChain || resolveConversationChain)(chains.dataChain);
+                    const resolvedFetchChain = chains.dataChain === "antigravity" ? "antigravity"
+                        : await (dependencies.resolveFetchChain || resolveConversationChain)(chains.dataChain);
+                    if (resolvedFetchChain && resolvedFetchChain !== "codex" && params.progressive !== false && !forceRefresh && background !== false) {
+                        return corpusToolResult(await runProgressiveAction({ ...params, action: "prepare", dataChain: resolvedFetchChain,
+                            conversationIds: [conversationId], prepareCache: true, link }), params);
+                    }
+                    if (resolvedFetchChain && resolvedFetchChain !== "codex" && background === true) {
+                        return corpusToolResult(await runProgressiveAction({ ...params, action: "prepare", dataChain: resolvedFetchChain,
+                            conversationIds: [conversationId], prepareCache: true, link,
+                            fullFetchCache: true, forceRawCacheRebuild: forceRefresh === true }), params);
+                    }
                     const estimate = resolvedFetchChain === "codex"
                         ? await (dependencies.estimateCodexFetchWork || estimateCodexFetchWorkAsync)(conversationId)
                         : null;
@@ -2852,7 +2876,7 @@ fetch/search/read/recall/export 必须传 conversationId（共享 broker 后端�
                     if (estimate && (background === true || estimate.shouldBackground)) {
                         if (params.progressive !== false && !forceRefresh) {
                             return corpusToolResult(await runProgressiveAction({ ...params, action: "prepare", dataChain: "codex",
-                                conversationIds: [conversationId], prepareCache: true, link }));
+                                conversationIds: [conversationId], prepareCache: true, link }), params);
                         }
                         const payload = createCodexFetchWorkerPayload({
                             conversationId,
@@ -2913,6 +2937,18 @@ fetch/search/read/recall/export 必须传 conversationId（共享 broker 后端�
                             && (exportScope === "search" || (!exportScope && Boolean(query))),
                     requireCompactionMetadata: action === "recall",
                 };
+                if (action === "export" && !dependencies.loadConversation) {
+                    const result = await runConversationSourceExport({
+                        kind: "source", dataChain: chains.dataChain, conversationId: conversationId!, loadOptions, cacheRequest,
+                        selection: { scope: exportScope || (query ? "search" : (startRound || endRound ? "rounds" : "full")),
+                            query, startRound, endRound, contextRounds, limit, mode: mode as SearchMode,
+                            depth: depth as Depth, extraTypes: extraTypes as ExtraType[],
+                            messageRoles: messageRoles as ConversationMessageRole[] | undefined,
+                            compactionMode: effectiveCompactionMode, outputDir, overwrite, format: exportFormat || "markdown",
+                            includeAssets, pdfEmbedAttachments: pdfEmbedAttachments || "auto" },
+                    });
+                    return appendTiming({ content: [{ type: "text" as const, text: formatConversationExportResult(result) }] }, startTime);
+                }
                 const readConversation = dependencies.loadConversation || loadConversationData;
                 let loaded = await readConversation(chains.dataChain, conversationId, loadOptions);
                 if (publishedCacheOnly && loaded && loaded.chainUsed !== "codex") {
@@ -3058,6 +3094,7 @@ fetch/search/read/recall/export 必须传 conversationId（共享 broker 后端�
                         expandedChildren,
                         childDiagnostics,
                         partialWarning,
+                        sourceMetadata: conversationExportSourceMetadata(loaded),
                         scope: exportScope || (query ? "search" : (startRound || endRound ? "rounds" : "full")),
                         query,
                         startRound,

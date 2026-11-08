@@ -2,7 +2,7 @@ import fs from "fs";
 import os from "os";
 import path from "path";
 import { pathToFileURL } from "url";
-import { execFile, spawn } from "child_process";
+import { execFile, spawn, type ChildProcess } from "child_process";
 import { randomUUID } from "node:crypto";
 import { createRequire } from "module";
 import MarkdownIt from "markdown-it";
@@ -258,11 +258,30 @@ export function findPdfBrowser(): string | null {
     return null;
 }
 
-async function runBrowserPrintCli(browserPath: string, htmlPath: string, pdfPath: string, exportDir: string, timeoutMs: number): Promise<void> {
+async function closePdfBrowser(child: ChildProcess | undefined, profileDir: string): Promise<void> {
+    const root = path.resolve(os.tmpdir());
+    const target = path.resolve(profileDir);
+    if (path.dirname(target) !== root || !path.basename(target).startsWith("memory-store-pdf-")) throw new Error("PDF临时目录超出本次范围");
+    if (child && child.exitCode === null && child.signalCode === null) {
+        await new Promise<void>(resolve => {
+            const timer = setTimeout(resolve, 3000);
+            child.once("close", () => { clearTimeout(timer); resolve(); });
+            try { child.kill("SIGKILL"); } catch { clearTimeout(timer); resolve(); }
+        });
+    }
+    if (!child || child.exitCode !== null || child.signalCode !== null) {
+        await fs.promises.rm(target, { recursive: true, force: true, maxRetries: 2, retryDelay: 100 }).catch(error => {
+            process.stderr.write(`PDF临时浏览器目录待清理: ${target}: ${String(error)}\n`);
+        });
+    }
+}
+
+async function runBrowserPrintCli(browserPath: string, htmlPath: string, pdfPath: string, _exportDir: string, timeoutMs: number): Promise<void> {
+    const profileDir = fs.mkdtempSync(path.join(os.tmpdir(), "memory-store-pdf-"));
+    let child: ChildProcess | undefined;
+    try {
     await new Promise<void>((resolve, reject) => {
-        const profileDir = path.join(exportDir, ".pdf-browser-profile");
-        fs.mkdirSync(profileDir, { recursive: true });
-        const child = spawn(browserPath, [
+        child = spawn(browserPath, [
             "--headless=new",
             "--disable-gpu",
             "--no-sandbox",
@@ -272,7 +291,7 @@ async function runBrowserPrintCli(browserPath: string, htmlPath: string, pdfPath
             pathToFileURL(htmlPath).href,
         ], { windowsHide: true, stdio: "ignore" });
         const timer = setTimeout(() => {
-            child.kill("SIGKILL");
+            child?.kill("SIGKILL");
             reject(new Error(`PDF 渲染超时 ${timeoutMs}ms`));
         }, timeoutMs);
         child.on("error", error => {
@@ -288,6 +307,7 @@ async function runBrowserPrintCli(browserPath: string, htmlPath: string, pdfPath
             }
         });
     });
+    } finally { await closePdfBrowser(child, profileDir); }
 }
 
 /**
@@ -302,8 +322,7 @@ async function runBrowserPrintCdp(browserPath: string, htmlPath: string, pdfPath
     const WebSocketCtor = (globalThis as { WebSocket?: any }).WebSocket;
     if (!WebSocketCtor) throw new Error("当前 Node 运行时无内置 WebSocket（需 Node >=21），无法走 CDP 打印");
 
-    const profileDir = path.join(exportDir, ".pdf-browser-profile-cdp");
-    fs.mkdirSync(profileDir, { recursive: true });
+    const profileDir = fs.mkdtempSync(path.join(os.tmpdir(), "memory-store-pdf-"));
     const fileUrl = pathToFileURL(htmlPath).href;
     const child = spawn(browserPath, [
         "--headless=new",
@@ -316,9 +335,9 @@ async function runBrowserPrintCdp(browserPath: string, htmlPath: string, pdfPath
     ], { windowsHide: true, stdio: ["ignore", "pipe", "pipe"] });
 
     let ws: any = null;
-    const cleanup = () => {
+    const cleanup = async () => {
         try { if (ws) ws.close(); } catch { /* ignore */ }
-        try { child.kill("SIGKILL"); } catch { /* ignore */ }
+        await closePdfBrowser(child, profileDir);
     };
 
     try {
@@ -404,7 +423,7 @@ async function runBrowserPrintCdp(browserPath: string, htmlPath: string, pdfPath
         if (!(fs.existsSync(pdfPath) && fs.statSync(pdfPath).size > 0)) throw new Error("CDP 输出 PDF 为空");
         try { await send("Browser.close", {}, undefined, 5_000); } catch { /* ignore */ }
     } finally {
-        cleanup();
+        await cleanup();
     }
 }
 

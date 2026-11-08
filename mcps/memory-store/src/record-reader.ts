@@ -474,6 +474,36 @@ function typesForView(view?: RecordReaderView): RecordSectionType[] | null {
     return null;
 }
 
+export function describeRecordReaderSelection(index: RecordReaderIndex, options: SelectReaderBlocksOptions = {}) {
+    const requestedSectionTypes = options.sectionTypes || options.include || typesForView(options.view) || [];
+    const availableSectionTypes = [...new Set(index.blocks.map(block => block.sectionType))];
+    const availablePhaseIds = index.phases.map(phase => phase.id);
+    const warnings = index.warnings || [];
+    const missingSectionTypes = requestedSectionTypes.filter(sectionType => !availableSectionTypes.includes(sectionType));
+    const missingPhaseIds = (options.phaseIds || []).filter(phaseId => !availablePhaseIds.some(availableId => phaseIdMatches(availableId, [phaseId])));
+    const details = [
+        `所需区块类型：${requestedSectionTypes.join("、") || "不限"}`,
+        `当前索引区块类型：${availableSectionTypes.join("、") || "无"}`,
+    ];
+    if (missingSectionTypes.length) details.push(`当前索引缺少类型：${missingSectionTypes.join("、")}`);
+    if (options.phaseIds?.length) details.push(`所选阶段：${options.phaseIds.join("、")}；索引阶段：${availablePhaseIds.join("、") || "无"}`);
+    if (options.exclude?.length) details.push(`排除类型：${options.exclude.join("、")}`);
+    if (options.startBlockId) details.push(`继续读取区块：${options.startBlockId}`);
+    if (warnings.length) details.push(`索引提示：${warnings.join("；")}`);
+    return {
+        requestedSectionTypes,
+        availableSectionTypes,
+        missingSectionTypes,
+        requestedPhaseIds: options.phaseIds || [],
+        availablePhaseIds,
+        missingPhaseIds,
+        excludedSectionTypes: options.exclude || [],
+        startBlockId: options.startBlockId,
+        warnings,
+        explanation: details.join("\n"),
+    };
+}
+
 export function selectReaderBlocks(index: RecordReaderIndex, options: SelectReaderBlocksOptions = {}): ReaderBlock[] {
     let blocks = [...index.blocks];
     if (options.phaseIds && options.phaseIds.length > 0) {

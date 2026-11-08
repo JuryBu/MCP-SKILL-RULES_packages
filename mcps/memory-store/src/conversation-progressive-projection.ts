@@ -7,7 +7,7 @@ import type { CorpusMessageRole } from "./conversation-corpus-types.js";
 import type { ConversationRound } from "./trajectory.js";
 
 type Projection = ReturnType<typeof normalizeProgressiveProjection>;
-const format = "progressive-projection/v1";
+const format = "progressive-projection/v3";
 
 export function projectProgressiveSource(source: ProgressiveSource, request: Pick<ProgressiveRequest, "messageRoles" | "depth">): ProgressiveSource {
     const projection = { format, ...normalizeProgressiveProjection(request.messageRoles, request.depth) };
@@ -18,15 +18,15 @@ export function projectProgressiveSource(source: ProgressiveSource, request: Pic
 export function availableProgressiveRoles(source: ProgressiveSource): readonly CorpusMessageRole[] {
     const projection = (source.snapshot as { projection?: { format?: string; messageRoles?: string[]; depth?: string } })?.projection;
     if (!projection) return PROGRESSIVE_MESSAGE_ROLES;
-    if (projection.format !== format || !projection.messageRoles?.length) throw new Error("Invalid progressive projection metadata");
+    if (![format, "progressive-projection/v2", "progressive-projection/v1"].includes(projection.format || "") || !projection.messageRoles?.length) throw new Error("Invalid progressive projection metadata");
     return normalizeProgressiveProjection(projection.messageRoles, projection.depth).messageRoles;
 }
 
-export function projectProgressiveRound(round: ConversationRound, projection: Projection): ConversationRound {
+export function projectProgressiveRound(round: ConversationRound, projection: Projection, subagentSource = false): ConversationRound {
     const { messageRoles, depth } = projection;
     if (depth === "full" && PROGRESSIVE_MESSAGE_ROLES.every(role => messageRoles.includes(role))) return round;
-    const user = messageRoles.includes("user");
-    const assistant = messageRoles.includes("assistant");
+    const user = subagentSource ? messageRoles.includes("subagent") : messageRoles.includes("user");
+    const assistant = subagentSource ? messageRoles.includes("subagent") : messageRoles.includes("assistant");
     const tools = messageRoles.includes("tool");
     const subagent = messageRoles.includes("subagent");
     const references = codexCorpusAttachmentReferences(round);
@@ -47,15 +47,19 @@ export function projectProgressiveRound(round: ConversationRound, projection: Pr
         fileViews: tools ? round.fileViews : undefined,
         compactionSummaries: depth === "full" ? round.compactionSummaries : undefined,
         subagentSummaries: subagent ? round.subagentSummaries : [],
-        semanticEvents: round.semanticEvents?.filter(event => messageRoles.includes(event.semanticRole === "model" ? "assistant" : event.semanticRole as CorpusMessageRole))
+        semanticEvents: round.semanticEvents?.filter(event => {
+            if (tools && depth === "full" && ["pb_wire_variant", "local_pb_activity"].includes(event.kind || "")) return true;
+            const role = event.semanticRole === "model" ? "assistant" : event.semanticRole;
+            return messageRoles.includes(subagentSource && ["user", "assistant"].includes(role) ? "subagent" : role as CorpusMessageRole);
+        })
             .map(event => tools ? event : { ...event, argsFull: undefined, resultFull: undefined, resultSummary: undefined,
                 ...codexCorpusAttachmentReferences(event) }),
     };
 }
 
-export function projectProgressiveInput(input: ProgressivePublishInput, request: Pick<ProgressiveRequest, "messageRoles" | "depth">): ProgressivePublishInput {
+export function projectProgressiveInput(input: ProgressivePublishInput, request: Pick<ProgressiveRequest, "messageRoles" | "depth">, subagentSource = false): ProgressivePublishInput {
     const projection = normalizeProgressiveProjection(request.messageRoles, request.depth);
-    return { ...input, rounds: input.rounds.map(round => projectProgressiveRound(round, projection)),
+    return { ...input, rounds: input.rounds.map(round => projectProgressiveRound(round, projection, subagentSource)),
         messages: input.messages.filter(message => projection.messageRoles.includes(message.role)) };
 }
 

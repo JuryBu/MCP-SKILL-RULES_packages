@@ -20,7 +20,7 @@ const execAsync = promisify(exec);
 const CODEX_STATUS_TTL = 60_000;
 const CODEX_DEFAULT_MODEL = process.env.MEMORY_STORE_CODEX_MODEL || "gpt-6.1-sol";
 const CODEX_DEFAULT_REASONING_EFFORT = process.env.MEMORY_STORE_CODEX_REASONING || "max";
-const CODEX_DEFAULT_SPEED_TIER = process.env.MEMORY_STORE_CODEX_SPEED || "fast";
+const CODEX_DEFAULT_SPEED_TIER = process.env.MEMORY_STORE_CODEX_SPEED || "standard";
 const CODEX_SERVICE_TIER = CODEX_DEFAULT_SPEED_TIER === "fast" ? "priority"
     : CODEX_DEFAULT_SPEED_TIER === "standard" ? "default" : CODEX_DEFAULT_SPEED_TIER;
 const CODEX_FAST_MODE = CODEX_SERVICE_TIER === "priority";

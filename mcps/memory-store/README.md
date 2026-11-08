@@ -1,4 +1,6 @@
-# MCP Memory Store v1.27.4
+# MCP Memory Store v1.27.5
+
+原文各入口统一使用`conversationId`记录调用者、`conversationIds`选择目标。单条`fetch/search/read/recall/export`接受一个目标，旧调用省略目标数组时仍按`conversationId`读取；批量导出显式使用`exportBatch=true`。历史范围先准备所需内容，再把完整构建沿原任务排入后台，已发布引用继续可读。
 
 Codex采用明文追加段时，近期窗口可先返回局部正文，旧压缩祖先的核验单独保留状态。祖先未核实的窗口继续标为相对轮次和部分覆盖；完整缓存、Record与recall仍要求完整来源核验，详见[近期窗口与旧历史](docs/history-source-isolation.md#codex近期窗口与旧历史)。
 
@@ -10,13 +12,15 @@ Codex采用明文追加段时，近期窗口可先返回局部正文，旧压缩
 
 五端的末N轮 `read_fast` 和 `prepare` 支持先返回分段准备任务，Codex适用的大型 `fetch` 继续使用这一路线。`conversationId` 表示调用者，`conversationIds` 指定一个目标，并显式填写目标 `dataChain`；`buildOrder="latest"` 优先最新内容，`oldest` 优先最早内容，`lastRounds` 设置优先准备的轮数。`prepareCache=false` 只准备所需窗口；默认继续补齐完整缓存。
 
-有范围就绪后，即可用同一 `taskId` 执行 `read_ready`、`search_ready`、`locate_ready` 和 `extract_ready`，其余范围继续准备。`prepare_status` 返回真实覆盖、任务状态与不透明 `revision`；把它原样传入 `afterProgressRevision` 并设置 `waitSeconds=30`，可等待新结果。`prepare_cancel` 保留已发布范围，`prepare_resume` 在原worker退出后沿原task恢复。
+有范围就绪后，即可用同一 `taskId` 执行 `read_ready`、`search_ready`、`locate_ready` 和 `extract_ready`，其余范围继续准备。`search_ready`的`hits[].next`可直接展开固定引用，`cacheRevision`单独标识缓存视图，有原始来源版本时另给`originRevision`与命中的`sourceRevision`。`prepare_status` 返回真实覆盖、任务状态与不透明 `revision`；把它原样传入 `afterProgressRevision` 并设置 `waitSeconds=30`，可等待新结果。`prepare_cancel` 保留已发布范围，`prepare_resume` 在原worker退出后沿原task恢复。
+
+`deadlineMs`用于初始范围的接纳等待和读取；已发布内容在初始期限耗尽后仍保留，后续完整构建使用独立运行期限。未就绪时返回原任务状态和下一次查询，完整准备失败且已有可读范围时返回`partial`及`preparationError`。
 
 初期轮号属于各自块，配合 `blockId` 使用；稳定 `rangeRef` 可直接定位原轮，补齐旧历史或切换到完整轮号后仍有效。只有完整来源校验并发布结束，`fullSourceComplete` 才为true。搜索同时报告已查范围与暂计状态，调用者可逐次取得增长结果。常规Record、Guard和recall继续使用完整缓存。
 
 `publishedRangeComplete` 表示当前缓存覆盖了请求的范围，`sourceRangeVerified` 表示来源能确认该范围，`requestedRangeComplete` 同时考虑两项。来源带有未知字段、未完成尾部或其它partial诊断时，已读正文仍可使用，响应保留覆盖缺口与警告。后台发布早期历史时保持已就绪的最新窗口，旧引用继续绑定原来源和版本。
 
-`conversation_golden_extract` 可以显式提供 `progressiveTaskId` 与 `rangeRefs`，只分析已选择的完整轮对象，结果保留来源与范围说明。省略这两个参数时沿用完整历史提取。将 `progressive=false` 可选择旧的完整读取路线；压缩来源的完整性校验、资源限额和取消保护保持有效。
+`conversation_golden_extract` 可以显式提供 `progressiveTaskId` 与 `rangeRefs`，只分析已选择的完整轮对象，结果保留来源与范围说明。省略这两个参数时沿用完整历史提取。五端默认 `fetch` 先给分段准备任务及就绪读取入口；`export` 可以用原 `progressiveTaskId` 与 `rangeRef` 或明确范围直接导出。设置 `progressive=false` 选择完整 fetch 缓存路线，大来源配 `background=true`；压缩来源的完整性校验、显式资源预算和取消保护保持有效。
 
 跨对话搜索默认逐项持久提交，完成队列与已校验索引复用减少重复工作。有界批量发布保留为内部可选策略，采用前应对实际数据验证收益和恢复结果。
 
@@ -180,7 +184,7 @@ Devin 使用 Node.js 内置 SQLite，只读事务兼容正在写入的数据库�
 - 显式指定 `chain="antigravity"`、`chain="codex"`、`chain="claude-code"`、`chain="grok"` 或 `chain="agy"` 时，不做跨宿主静默回退；显式 `modelChain="agy"` 只走 agy 内部三模型 fallback
 - `modelChain` 只支持 `auto|antigravity|codex|claude-code|cc|grok|agy`；传入 `windsurf/wsf|dsh|deepseek-harness` 会明确报错，`dataChain="agy"` 也会明确报错
 - Grok/progrok 不会由 memory-store 自动启动，只会探测 `MEMORY_STORE_GROK_PROXY_URL`；真实 smoke 前需确保 proxy 已在本机运行
-- Codex 模型桥默认值：`gpt-6.1-sol` + `model_reasoning_effort=max`。每次以隔离配置的 CLI 请求显式传入 `service_tier=priority`、`features.fast_mode=true`，不修改 Desktop 或日常 CLI 配置；使用 `--strict-config` 检查请求配置。`MEMORY_STORE_CODEX_SPEED=fast|priority` 请求加速，`standard|default` 请求普通服务档；Fast 的实际服务档以服务端响应为准。
+- Codex 模型桥默认值：`gpt-6.1-sol` + `model_reasoning_effort=max` + 普通服务档。每次以隔离配置的 CLI 请求显式传入 `service_tier=default`、`features.fast_mode=false`，不修改 Desktop 或日常 CLI 配置；使用 `--strict-config` 检查请求配置。明确配置 `MEMORY_STORE_CODEX_SPEED=fast|priority` 才请求加速，`standard|default` 请求普通服务档；Fast 的实际服务档以服务端响应为准。
 - Codex 调用失败时优先提取 JSON stdout 中的 `turn.failed` / `error` 及匹配的 HTTP 状态和错误类型，再使用 stderr 摘要；模型桥结果报告实际映射后的模型名称。
 - Claude Code CLI 默认值：`MEMORY_STORE_CC_MODEL=sonnet`、`MEMORY_STORE_CC_EFFORT=medium`；普通 `modelChain="auto"` 不默认消耗 CC 额度，CC 相关非 Record 模型任务才允许按 `Antigravity > Codex > Claude Code CLI` fallback。
 - Grok 默认模型：轻量任务使用 `MEMORY_STORE_GROK_MODEL`（默认 `grok-4.20-0309-non-reasoning`），Record 使用 `MEMORY_STORE_GROK_RECORD_MODEL`（默认 `grok-4.3`），Stage Guard 使用 `MEMORY_STORE_GROK_GUARD_MODEL`（默认 `grok-4.5`）；输出 token 上限 default/Record/Guard 分别默认 800/8192/4096，可用 `MEMORY_STORE_GROK_MAX_TOKENS`、`MEMORY_STORE_GROK_RECORD_MAX_TOKENS`、`MEMORY_STORE_GROK_GUARD_MAX_TOKENS` 覆盖；Record 场景 Grok 失败后 Antigravity fallback 使用 M20。

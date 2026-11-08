@@ -19,12 +19,40 @@ import { materializeRoundAttachments, type ConversationAttachment } from "./conv
 import { iterateCachedConversationSourceCacheRounds, type ConversationSourceCacheKey } from "./conversation-source-cache.js";
 import { renderConversationPdf } from "./conversation-pdf.js";
 import type { BackgroundTaskContext } from "./background-tasks.js";
-import type { ResolvedConversationChain } from "./conversation-bridge.js";
+import { conversationSourceIsPartial, type ConversationLoadResult, type ResolvedConversationChain } from "./conversation-bridge.js";
 import type { SearchMode } from "./search-engine.js";
 
 export type ConversationExportFormat = "markdown" | "pdf" | "both";
 export type ConversationExportScope = "full" | "rounds" | "search";
 export type PdfEmbedAttachmentsMode = "off" | "auto" | "force";
+
+export interface ConversationExportSourceMetadata {
+    partial: boolean;
+    coverage?: ConversationLoadResult["sourceCoverage"];
+    revision?: ConversationLoadResult["sourceRevision"];
+    mode?: ConversationLoadResult["sourceMode"];
+    cacheReadPolicy?: ConversationLoadResult["cacheReadPolicy"];
+    diagnostics: string[];
+    isSubagent?: boolean;
+    progressive?: { taskId: string; fullSourceComplete: boolean; sourceRangeVerified: boolean; ranges: unknown };
+}
+
+export function conversationExportSourceMetadata(loaded: ConversationLoadResult): ConversationExportSourceMetadata {
+    const thread = (loaded.codexData?.thread || loaded.claudeCodeData?.thread || loaded.windsurfData?.thread) as
+        { isChildThread?: boolean; parentConversationId?: string | null; agentRole?: string | null; agentNickname?: string | null } | undefined;
+    const header = loaded.dshData?.header;
+    return {
+        partial: conversationSourceIsPartial(loaded) || loaded.sourceCoverage?.complete === false,
+        coverage: loaded.sourceCoverage,
+        revision: loaded.sourceRevision,
+        mode: loaded.sourceMode,
+        cacheReadPolicy: loaded.cacheReadPolicy,
+        diagnostics: loaded.sourceDiagnostics || [],
+        isSubagent: Boolean(thread?.isChildThread || thread?.parentConversationId || thread?.agentRole
+            || (loaded.chainUsed === "codex" && thread?.agentNickname)
+            || header?.parentSession || header?.origin === "subagent"),
+    };
+}
 
 export interface ConversationExportOptions {
     conversationId: string;
@@ -36,6 +64,10 @@ export interface ConversationExportOptions {
     expandedChildren?: Array<{ thread: { id: string; title: string }; rounds: ConversationRound[] }>;
     childDiagnostics?: Array<{ threadId: string; nickname?: string; reason: string; detail: string }>;
     partialWarning?: string;
+    sourceMetadata?: ConversationExportSourceMetadata;
+    totalRounds?: number;
+    totalRoundsKnown?: boolean;
+    totalStepsKnown?: boolean;
     scope?: ConversationExportScope;
     query?: string;
     startRound?: number;
@@ -84,7 +116,10 @@ export interface ConversationExportResult {
         roundsExported: number;
         totalRounds: number;
         totalSteps: number;
+        totalRoundsKnown?: boolean;
+        totalStepsKnown?: boolean;
         markdownChars: number;
+        markdownBytes?: number;
         assetsCopied: number;
         assetsSkipped: number;
         embeddedPdfAttachments: number;
@@ -179,12 +214,13 @@ function cloneRound(round: ConversationRound): ConversationRound {
 function buildSearchBlockContent(round: ConversationRound, options?: ConversationExportOptions): string {
     const roleFilter = normalizeMessageRoles(options?.messageRoles);
     if (roleFilter.size > 0 && options) {
-        return formatRoundForMessageRoles(
+        return formatRoundForExport(
             round,
             options.depth || "normal",
             options.extraTypes || [],
             roleFilter,
             options.compactionMode || ((options.depth || "normal") === "full" ? "full" : "folded"),
+            options.sourceMetadata?.isSubagent,
         );
     }
     return [
@@ -481,7 +517,20 @@ function formatRoundForExport(
     extraTypes: ExtraType[],
     roleFilter: Set<ConversationMessageRole>,
     compactionMode: CompactionMode,
+    subagentSource = false,
 ): string {
+    if (subagentSource) {
+        const selected = new Set(roleFilter);
+        selected.delete("user");
+        selected.delete("assistant");
+        selected.delete("model");
+        if (!roleFilter.size || roleFilter.has("subagent")) {
+            selected.add("user");
+            selected.add("assistant");
+        }
+        if (!selected.size) return "";
+        return formatRoundForMessageRoles(round, depth, extraTypes, selected, compactionMode, { subagentSource: true }).text;
+    }
     return roleFilter.size > 0
         ? formatRoundForMessageRoles(round, depth, extraTypes, roleFilter, compactionMode)
         : formatRound(round, depth, extraTypes, {
@@ -509,12 +558,17 @@ function buildMarkdownHeader(
     lines.push(`- dataChain: ${options.chainUsed}`);
     lines.push(`- exportedAt: ${new Date().toISOString()}`);
     lines.push(`- scope: ${options.scope || "full"}`);
-    lines.push(`- rounds: ${rangeLabel} / total ${totalRounds}`);
-    lines.push(`- totalSteps: ${options.totalSteps}`);
+    lines.push(`- rounds: ${rangeLabel} / total ${options.totalRoundsKnown === false ? "unknown" : totalRounds}`);
+    lines.push(`- totalSteps: ${options.totalStepsKnown === false ? "unknown" : options.totalSteps}`);
     lines.push(`- depth: ${depth}`);
     lines.push(`- extraTypes: ${extraTypes.join(", ") || "(none)"}`);
     lines.push(`- messageRoles: ${(options.messageRoles || []).join(", ") || "(all)"}`);
     lines.push(`- compactionMode: ${compactionMode}`);
+    if (options.sourceMetadata) {
+        lines.push(`- sourcePartial: ${options.sourceMetadata.partial}`);
+        if (options.sourceMetadata.revision) lines.push(`- sourceRevision: ${options.sourceMetadata.revision.revision}`);
+        if (options.sourceMetadata.coverage) lines.push(`- sourceCoverage: ${JSON.stringify(options.sourceMetadata.coverage)}`);
+    }
     lines.push("");
     if (warnings.length || options.partialWarning) {
         lines.push("## Warnings");
@@ -545,7 +599,7 @@ function buildMarkdownTail(options: ConversationExportOptions, assets: Conversat
         for (const child of options.expandedChildren) {
             lines.push(`## 子线程 ${child.thread.id.slice(0, 8)}... ${child.thread.title ? `| ${child.thread.title}` : ""}`);
             for (const round of child.rounds) {
-                const formatted = formatRoundForExport(round, depth, extraTypes, roleFilter, compactionMode);
+                const formatted = formatRoundForExport(round, depth, extraTypes, roleFilter, compactionMode, true);
                 if (!formatted) continue;
                 lines.push(formatted);
                 lines.push("");
@@ -579,7 +633,7 @@ function buildMarkdown(
     const roleFilter = normalizeMessageRoles(options.messageRoles);
     const lines = [buildMarkdownHeader({ ...options, rounds }, warnings, rangeLabel, totalRounds)];
     for (const round of rounds) {
-        const formatted = formatRoundForExport(round, depth, extraTypes, roleFilter, compactionMode);
+        const formatted = formatRoundForExport(round, depth, extraTypes, roleFilter, compactionMode, options.sourceMetadata?.isSubagent);
         if (!formatted) continue;
         lines.push(formatted, "");
     }
@@ -644,7 +698,7 @@ async function streamCachedFullMarkdown(
             assets.push(...rewritten.assets);
             const exportedRound = rewritten.rounds[0];
             if (exportedRound) {
-                const formatted = formatRoundForExport(exportedRound, depth, extraTypes, roleFilter, compactionMode);
+                const formatted = formatRoundForExport(exportedRound, depth, extraTypes, roleFilter, compactionMode, options.sourceMetadata?.isSubagent);
                 if (formatted) await write(`${formatted}\n\n`);
             }
             roundsExported += 1;
@@ -670,6 +724,7 @@ export async function exportConversation(options: ConversationExportOptions): Pr
     const format = options.format || "markdown";
     const includeAssets = options.includeAssets !== false;
     const warnings: string[] = [];
+    if (options.sourceMetadata?.partial) warnings.push("原文来源尚有未覆盖内容，具体来源范围与诊断保存在manifest.source中。");
     throwIfExportAborted(options, "export directory setup");
     const exportDir = resolveExportDirectory(options);
     const scope = options.scope || "full";
@@ -696,7 +751,7 @@ export async function exportConversation(options: ConversationExportOptions): Pr
         throwIfExportAborted(options, "round selection");
         let selected: Awaited<ReturnType<typeof selectRounds>>;
         let markdownOptions = options;
-        totalRounds = options.rounds.length;
+        totalRounds = options.totalRounds ?? options.rounds.length;
         if (scope === "rounds") {
             const startRound = Math.max(1, options.startRound || 1);
             const endRound = options.endRound || undefined;
@@ -792,11 +847,12 @@ export async function exportConversation(options: ConversationExportOptions): Pr
         compactionMode: options.compactionMode || ((options.depth || "normal") === "full" ? "full" : "folded"),
         startRound: exportedStartRound,
         endRound: exportedEndRound,
-        totalRounds,
-        totalSteps: options.totalSteps,
+        totalRounds: options.totalRoundsKnown === false ? null : totalRounds,
+        totalSteps: options.totalStepsKnown === false ? null : options.totalSteps,
         roundsExported,
-        partial: Boolean(options.partialWarning) || warnings.length > 0,
+        partial: Boolean(options.partialWarning) || options.sourceMetadata?.partial === true || warnings.length > 0,
         partialWarning: options.partialWarning || null,
+        source: options.sourceMetadata || null,
         warnings,
         files: {
             markdown: markdownPath,
@@ -806,6 +862,7 @@ export async function exportConversation(options: ConversationExportOptions): Pr
         assets,
         stats: {
             markdownChars,
+            markdownBytes: fs.statSync(markdownPath).size,
             assetsCopied: assets.filter(asset => asset.exportPath).length,
             assetsSkipped: assets.filter(asset => asset.warning && !asset.exportPath).length,
             embeddedPdfAttachments,
@@ -828,7 +885,10 @@ export async function exportConversation(options: ConversationExportOptions): Pr
             roundsExported,
             totalRounds,
             totalSteps: options.totalSteps,
+            totalRoundsKnown: options.totalRoundsKnown,
+            totalStepsKnown: options.totalStepsKnown,
             markdownChars,
+            markdownBytes: fs.statSync(markdownPath).size,
             assetsCopied: assets.filter(asset => asset.exportPath).length,
             assetsSkipped: assets.filter(asset => asset.warning && !asset.exportPath).length,
             embeddedPdfAttachments,
@@ -846,7 +906,7 @@ export function formatConversationExportResult(result: ConversationExportResult)
         result.pdfPath ? `📕 PDF: ${result.pdfPath}` : "📕 PDF: 未生成",
         result.htmlPath ? `🌐 HTML: ${result.htmlPath}` : "",
         `📋 Manifest: ${result.manifestPath}`,
-        `📊 轮次: ${result.stats.roundsExported}/${result.stats.totalRounds} | Markdown ${(result.stats.markdownChars / 1024).toFixed(1)}KB | assets ${result.stats.assetsCopied} copied / ${result.stats.assetsSkipped} skipped`,
+        `📊 轮次: ${result.stats.roundsExported}/${result.stats.totalRoundsKnown === false ? "总数未核实" : result.stats.totalRounds} | Markdown ${result.stats.markdownBytes === undefined ? result.stats.markdownChars + "字符" : (result.stats.markdownBytes / 1024).toFixed(1) + "KiB"} | assets ${result.stats.assetsCopied} copied / ${result.stats.assetsSkipped} skipped`,
         result.stats.embeddedPdfAttachments > 0 ? `🧷 PDF 原生附件嵌入: ${result.stats.embeddedPdfAttachments}` : "",
     ].filter(Boolean);
     if (result.warnings.length) {

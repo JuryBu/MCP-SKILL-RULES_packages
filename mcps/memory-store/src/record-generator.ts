@@ -1,6 +1,6 @@
 import fs from "fs";
 import { createHash } from "crypto";
-import { formatRound, type ConversationRound } from "./trajectory.js";
+import type { ConversationRound } from "./trajectory.js";
 import { sliceUnicodeSafe } from "./unicode-text.js";
 import { AGY_MODEL_SEQUENCE } from "./agy-client.js";
 import {
@@ -13,6 +13,7 @@ import { saveTempFile } from "./temp-store.js";
 import { mapGrokModel, type GrokExecDiagnostics } from "./grok-client.js";
 import { FifoConcurrencyGate, type ConcurrencyGatePermit } from "./concurrency-gate.js";
 import { isBackgroundTaskSuspension } from "./background-task-suspension.js";
+import { formatRoundForRecord } from "./record-tool-material.js";
 
 /**
  * Record 生成引擎
@@ -1061,7 +1062,7 @@ async function callFlashWithRetryChain(
 
 export function formatRoundsForRecord(rounds: ConversationRound[]): FormattedRecordRound[] {
     return rounds.map((round) => {
-        const rawText = formatRound(round, "normal");
+        const rawText = formatRoundForRecord(round);
         const text = capSingleRoundText(rawText, round.roundIndex);
         return { round, text, chars: charCount(text) };
     });
@@ -1126,7 +1127,7 @@ export async function formatRoundsForRecordAsync(
     const result: FormattedRecordRound[] = [];
     for (let i = 0; i < rounds.length; i++) {
         const round = rounds[i];
-        const rawText = formatRound(round, "normal");
+        const rawText = formatRoundForRecord(round);
         if (rawText.length <= RECORD_MAX_SINGLE_ROUND_CHARS) {
             result.push({ round, text: rawText, chars: charCount(rawText) });
         } else {
@@ -1158,7 +1159,7 @@ function splitOversizedRoundBySteps(round: ConversationRound): RoundSplitPart[] 
     // 退化保护：start>end（异常数据）时整轮作为单 part 处理。
     if (!Number.isFinite(stepStart) || !Number.isFinite(stepEnd) || stepEnd < stepStart) {
         const child = buildChildRound(round, stepStart, stepEnd, true);
-        const rawText = capSingleRoundText(formatRound(child, "normal"), round.roundIndex);
+        const rawText = capSingleRoundText(formatRoundForRecord(child), round.roundIndex);
         return [{ startStep: stepStart, endStep: stepEnd, rawText }];
     }
 
@@ -1172,7 +1173,7 @@ function splitOversizedRoundBySteps(round: ConversationRound): RoundSplitPart[] 
         if (curEnd < curStart) return; // 空区间不产出
         const includeRoundHead = isFirst;
         const child = buildChildRound(round, curStart, forceEnd ?? curEnd, includeRoundHead);
-        let partText = formatRound(child, "normal");
+        let partText = formatRoundForRecord(child);
         if (partText.length > RECORD_MAX_SINGLE_ROUND_CHARS) {
             partText = capSingleRoundText(partText, round.roundIndex);
         }
@@ -1183,7 +1184,7 @@ function splitOversizedRoundBySteps(round: ConversationRound): RoundSplitPart[] 
     for (let step = stepStart; step <= stepEnd; step++) {
         // 估算把 step 纳入当前 part 后的体量：用「仅含该 step 的合成子轮」文本长度近似单 step 增量。
         const stepChild = buildChildRound(round, step, step, false);
-        const stepChars = formatRound(stepChild, "normal").length;
+        const stepChars = formatRoundForRecord(stepChild).length;
         const wouldExceed = curEnd >= curStart && curChars + stepChars > RECORD_ROUND_SPLIT_PART_CHARS;
         if (wouldExceed) {
             flush();
@@ -1200,7 +1201,7 @@ function splitOversizedRoundBySteps(round: ConversationRound): RoundSplitPart[] 
     // 极端：所有 step 都没产生任何内容（理论上 stepStart..stepEnd 至少有一段），兜一个含 round head 的 part。
     if (parts.length === 0) {
         const child = buildChildRound(round, stepStart, stepEnd, true);
-        const rawText = capSingleRoundText(formatRound(child, "normal"), round.roundIndex);
+        const rawText = capSingleRoundText(formatRoundForRecord(child), round.roundIndex);
         parts.push({ startStep: stepStart, endStep: stepEnd, rawText });
     }
     return parts;

@@ -2,7 +2,7 @@ import fs from "fs";
 import path from "path";
 import { DATA_ROOT, writeJsonAtomic } from "./store.js";
 import { loadConversationData as defaultLoadConversationData } from "./conversation-bridge.js";
-import { exportConversation as defaultExportConversation, type ConversationExportOptions, type ConversationExportResult } from "./conversation-exporter.js";
+import { exportConversation as defaultExportConversation, conversationExportSourceMetadata, type ConversationExportOptions, type ConversationExportResult } from "./conversation-exporter.js";
 import type { UnifiedConversationCandidate, SourceStatus, WorkspaceMatchMode, WorkspaceMatchScope } from "./conversation-filter.js";
 import type { ConversationLinkMode } from "./chain.js";
 
@@ -290,6 +290,7 @@ export async function exportConversationBatch(
                 expandedChildren: loaded.codexData?.expandedChildren || [],
                 childDiagnostics: loaded.codexData?.childDiagnostics || [],
                 partialWarning: formatWindsurfPartialWarning(loaded),
+                sourceMetadata: conversationExportSourceMetadata(loaded),
                 outputDir: childDir,
                 overwrite: true,
             });

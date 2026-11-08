@@ -55,6 +55,7 @@ import {
     getConversationSourceCacheGenerationKind,
     readCached,
     readConversationSourceCacheRecordProjection,
+    iterateCachedConversationSourceCacheRounds,
     type ConversationSourceCacheGenerationRef,
 } from "./conversation-source-cache.js";
 import { rebuildConversationCacheForRecord } from "./conversation-bridge.js";
@@ -62,12 +63,15 @@ import { projectConversationRoundForRecord, type ConversationRecordProjectionRou
 import { getRoundUserMessages, type ConversationMessageRole, type ConversationRound } from "./trajectory.js";
 import { projectConversationAutomationInput } from "./conversation-automation-event.js";
 import { projectConversationSubagentInput } from "./conversation-subagent-event.js";
+import type { RecordRoundToolMaterial } from "./record-tool-material.js";
 
 export const PRODUCTION_SOURCE_CONTENT_SCHEMA_VERSION = "record-source-content/v1" as const;
 export const PRODUCTION_SOURCE_FORMATTER_VERSION_V1 = "canonical-json-nfc-lf/v1" as const;
-export const PRODUCTION_SOURCE_FORMATTER_VERSION = "canonical-json-nfc-lf/v2" as const;
+export const PRODUCTION_SOURCE_FORMATTER_VERSION_V2 = "canonical-json-nfc-lf/v2" as const;
+export const PRODUCTION_SOURCE_FORMATTER_VERSION = "canonical-json-nfc-lf/v3" as const;
 export const SUPPORTED_PRODUCTION_SOURCE_FORMATTER_VERSIONS = [
     PRODUCTION_SOURCE_FORMATTER_VERSION_V1,
+    PRODUCTION_SOURCE_FORMATTER_VERSION_V2,
     PRODUCTION_SOURCE_FORMATTER_VERSION,
 ] as const;
 export const DEFAULT_PRODUCTION_SOURCE_MAX_CONTENT_BYTES = 16 * 1024 * 1024;
@@ -77,7 +81,7 @@ export const MAX_PRODUCTION_SOURCE_ATTACHMENT_DECODE_BYTES = 4 * 1024 * 1024;
 export type ProductionSourceFormatterVersion = typeof SUPPORTED_PRODUCTION_SOURCE_FORMATTER_VERSIONS[number];
 
 export function isSupportedProductionSourceFormatterVersion(value: unknown): value is ProductionSourceFormatterVersion {
-    return value === PRODUCTION_SOURCE_FORMATTER_VERSION_V1 || value === PRODUCTION_SOURCE_FORMATTER_VERSION;
+    return value === PRODUCTION_SOURCE_FORMATTER_VERSION_V1 || value === PRODUCTION_SOURCE_FORMATTER_VERSION_V2 || value === PRODUCTION_SOURCE_FORMATTER_VERSION;
 }
 
 export interface ProductionSourceReaderWorkspace {
@@ -161,6 +165,8 @@ export interface ProductionSourceCanonicalMessage {
     roundIndex?: number;
     rawRole?: string;
     semanticRole?: ConversationMessageRole;
+    stepIndex?: number;
+    recordToolMaterial?: RecordRoundToolMaterial;
     attachments?: ProductionSourceCanonicalAttachment[];
 }
 
@@ -286,6 +292,8 @@ interface ProductionSourceMessage {
     roundIndex?: number;
     rawRole?: string;
     semanticRole?: ConversationMessageRole;
+    stepIndex?: number;
+    recordToolMaterial?: RecordRoundToolMaterial;
     attachments?: readonly ProductionSourceAttachmentInput[];
     mediaAttachments?: readonly string[];
 }
@@ -879,6 +887,8 @@ function canonicalProductionSourceMessages(messages: ProductionSourceMessage[]):
             ...(message.roundIndex !== undefined ? { roundIndex: message.roundIndex } : {}),
             ...(message.rawRole !== undefined ? { rawRole: message.rawRole } : {}),
             ...(message.semanticRole !== undefined ? { semanticRole: message.semanticRole } : {}),
+            ...(message.stepIndex !== undefined ? { stepIndex: message.stepIndex } : {}),
+            ...(message.recordToolMaterial !== undefined ? { recordToolMaterial: message.recordToolMaterial } : {}),
             ...(attachments.length > 0 ? { attachments } : {}),
         });
     }
@@ -1010,6 +1020,8 @@ function messagesFromRecordProjection(rounds: readonly ConversationRecordProject
         if (!round || !Number.isInteger(round.roundIndex) || round.roundIndex < 1 || !Array.isArray(round.messages)) {
             throw new Error(`fetch 缓存 Record 投影第 ${index + 1} 轮结构无效`);
         }
+        const firstMessageIndex = messages.length;
+        const toolMaterial = round.messages.find(message => message.recordToolMaterial)?.recordToolMaterial;
         for (const [messageIndex, message] of round.messages.entries()) {
             if (!message || (message.role !== "user" && message.role !== "assistant") || typeof message.text !== "string") {
                 throw new Error(`fetch 缓存 Record 投影第 ${index + 1} 轮第 ${messageIndex + 1} 条消息结构无效`);
@@ -1029,9 +1041,16 @@ function messagesFromRecordProjection(rounds: readonly ConversationRecordProject
                 roundIndex: round.roundIndex,
                 ...(projectedMessage.rawRole !== undefined ? { rawRole: projectedMessage.rawRole } : {}),
                 ...(projectedMessage.semanticRole !== undefined ? { semanticRole: projectedMessage.semanticRole } : {}),
+                ...(projectedMessage.stepIndex !== undefined ? { stepIndex: projectedMessage.stepIndex } : {}),
                 attachments: message.attachments,
                 mediaAttachments: message.mediaAttachments,
             });
+        }
+        if (toolMaterial) {
+            if (messages.length === firstMessageIndex) {
+                messages.push({ role: "assistant", text: "", roundIndex: round.roundIndex, stepIndex: toolMaterial.startStep });
+            }
+            messages[firstMessageIndex].recordToolMaterial = toolMaterial;
         }
     }
     return messages;
@@ -1157,12 +1176,29 @@ function verifiedCacheScan(
     const pagination = { cursor: null, pages: 1, limit: null, truncated: false };
     let materializedRoundCount = 0;
     materializedRoundCount = projection.projections.length;
-    const messages = messagesFromRecordProjection(projection.projections);
+    let recordProjections = projection.projections;
+    let materializedSource = { bytes: projection.bytes, sha256: projection.sha256 };
+    let toolMaterialSource = "recordProjection";
+    if (recordProjections.some(round => round.recordToolMaterialVersion !== 1)) {
+        const originalRounds = iterateCachedConversationSourceCacheRounds<ConversationRound>({
+            key: reference.key,
+            generation: reference.generation,
+            expectedFingerprint: reference.fingerprint,
+            startRound: requestedReadStartRound,
+        });
+        if (!originalRounds) throw new Error(`fetch 缓存 Record 工具材料补齐失败: ${reference.generation}`);
+        recordProjections = Array.from(originalRounds.rounds, projectConversationRoundForRecord);
+        if (recordProjections.length !== projection.projections.length) {
+            throw new Error(`fetch 缓存 Record 工具材料轮次不一致: ${reference.generation}`);
+        }
+        materializedSource = { bytes: originalRounds.roundsBytes, sha256: originalRounds.roundsSha256 };
+        toolMaterialSource = "verified-rounds";
+    }
+    const messages = messagesFromRecordProjection(recordProjections);
     const expectedMaterializedRoundCount = Math.max(0, cached.roundCount - requestedReadStartRound + 1);
     if (materializedRoundCount !== expectedMaterializedRoundCount) {
         throw new Error(`fetch 缓存 generation 增量轮次数量不一致: expected=${expectedMaterializedRoundCount}, actual=${materializedRoundCount}`);
     }
-    const materializedSource = projection;
     const observedAt = (sequence: number) => ({
         scanId,
         sequence,
@@ -1249,7 +1285,7 @@ function verifiedCacheScan(
                 && Number(request.sourceSnapshot?.totalSteps) >= 0
                 ? { totalSteps: Number(request.sourceSnapshot?.totalSteps) }
                 : {}),
-            materializedSource: "recordProjection",
+            materializedSource: toolMaterialSource,
             requestedReadStartRound,
             materializedReadStartRound: projection.materializedStartRound,
             materializedReadEndRound: projection.materializedEndRound,

@@ -3,7 +3,7 @@ import fs from "node:fs";
 import fsPromises from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { materializeCodexHistoryArchive, materializeCodexHistoryArchiveSync, streamCodexHistoryArchive, type CodexHistoryArchiveOptions, type CodexHistoryArchiveView, type CodexHistoryArchiveStreamIdentity } from "./codex-history-archive.js";
+import { materializeCodexHistoryArchive, materializeCodexHistoryArchiveSync, resolveCodexHistoryArchiveStreamLimits, streamCodexHistoryArchive, type CodexHistoryArchiveOptions, type CodexHistoryArchiveView, type CodexHistoryArchiveStreamIdentity } from "./codex-history-archive.js";
 import { CodexHistorySourceMismatchError, CodexOrdinalValidator, hashCodexPrefix, hashCodexPrefixSync, throwIfCodexReadCancelled, type CodexOrdinalMode } from "./codex-history-integrity.js";
 import { codexJsonlRecordByteLimit, codexJsonlRecordExceedsLimit } from "./codex-jsonl-record-limit.js";
 export { CodexHistorySourceMismatchError } from "./codex-history-integrity.js";
@@ -1069,6 +1069,8 @@ export async function assertCodexStreamingRangeSource(source: CodexStreamingHist
         if (JSON.stringify(current) !== JSON.stringify(segment.physical)) {
             if (/\.zst$/iu.test(segment.path) || !plainAppend(segment.physical, current) || sha256(await readFirstLine(segment.path)) !== segment.headerSha256) throw new CodexHistorySourceMismatchError("Codex history changed during fast range read");
             if (proof && await hashCodexPrefix(segment.path, proof.endByte, isCancelled) !== proof.sha256) throw new CodexHistorySourceMismatchError("Codex history prefix changed during fast range read");
+            const after = codexHistoryPhysicalIdentity(await fsPromises.stat(segment.path));
+            if (JSON.stringify(current) !== JSON.stringify(after) && !plainAppend(current, after)) throw new CodexHistorySourceMismatchError("Codex history changed during range prefix verification");
         }
         if (!proof || proof.replicasVerified) continue;
         for (const replica of segment.replicas) {
@@ -1084,6 +1086,26 @@ export async function assertCodexStreamingRangeSource(source: CodexStreamingHist
             if (bytes !== proof.endByte || hash.digest("hex") !== proof.sha256 || JSON.stringify(before) !== JSON.stringify(codexHistoryPhysicalIdentity(await fsPromises.stat(replica)))) throw new CodexHistorySourceMismatchError("Conflicting plaintext/compressed Codex history replicas in requested range");
         }
     }
+}
+
+export async function assertCodexStreamingHistoryVerification(verification: CodexStreamingHistoryVerification, conversationId: string, isCancelled?: () => boolean, archive: CodexHistoryArchiveOptions = {}, startingOrdinal = 0): Promise<void> {
+    if (!verification.segments.length || verification.segments.at(-1)!.threadId !== conversationId || verification.revision !== sha256(JSON.stringify(verification.segments))) throw new CodexHistorySourceMismatchError("Codex pinned history verification is invalid");
+    let nextOrdinal = startingOrdinal;
+    for (const segment of verification.segments) {
+        throwIfCodexReadCancelled(isCancelled);
+        const identity = parseCodexRolloutFilename(segment.path);
+        if (!identity || identity.threadId !== segment.threadId || identity.rolloutId !== segment.rolloutId
+            || segment.startOrdinal !== nextOrdinal || !Number.isSafeInteger(segment.nextOrdinal) || segment.nextOrdinal <= segment.startOrdinal
+            || segment.endOrdinalExclusive !== undefined && segment.endOrdinalExclusive !== segment.nextOrdinal
+            || !Number.isSafeInteger(segment.endByte) || segment.endByte < 1 || !/^[a-f0-9]{64}$/u.test(segment.prefixSha256)
+            || !/^[a-f0-9]{64}$/u.test(segment.headerSha256)) throw new CodexHistorySourceMismatchError("Codex pinned history identity or ordinal coverage is invalid");
+        nextOrdinal = segment.nextOrdinal;
+        for (const replica of segment.replicaIdentities) {
+            if (JSON.stringify(replica.physical) !== JSON.stringify(codexHistoryPhysicalIdentity(await fsPromises.stat(replica.path)))) throw new CodexHistorySourceMismatchError("Codex pinned history replica changed");
+        }
+    }
+    await assertCodexStreamingRangeSource({ leafPath: verification.segments.at(-1)!.path, segments: verification.segments },
+        verification.segments.map(segment => ({ path: segment.path, endByte: segment.endByte, sha256: segment.prefixSha256, replicasVerified: true })), isCancelled, archive);
 }
 
 export function codexHistoryPhysicalIdentity(stats: fs.Stats): CodexHistoryPhysicalIdentity {
@@ -1111,10 +1133,13 @@ async function streamingHeader(filePath: string, options: CodexHistoryArchiveOpt
     options = { ...options, streamChunkBytes: 64 * 1024 };
     throwIfCodexReadCancelled(options.isCancelled);
     const physical = codexHistoryPhysicalIdentity(await fsPromises.stat(filePath));
-    const previous = streamingHeaderCache.get(filePath);
+    const cacheKey = `${filePath}\0${JSON.stringify(resolveCodexHistoryArchiveStreamLimits(options))}\0${options.decoder ?? "auto"}`;
+    const previous = streamingHeaderCache.get(cacheKey);
     if (previous && JSON.stringify(previous.physical) === JSON.stringify(physical)) return previous;
-    if (previous) { streamingHeaderCacheBytes -= previous.header.header.length; streamingHeaderCache.delete(filePath); }
-    const remember = (header: RolloutHeader) => {
+    if (previous) { streamingHeaderCacheBytes -= previous.header.header.length; streamingHeaderCache.delete(cacheKey); }
+    const remember = async (header: RolloutHeader) => {
+        throwIfCodexReadCancelled(options.isCancelled);
+        if (JSON.stringify(physical) !== JSON.stringify(codexHistoryPhysicalIdentity(await fsPromises.stat(filePath)))) throw new CodexHistorySourceMismatchError("Codex history changed while reading its session header");
         const entry = { header, physical };
         if (header.header.length <= 1024 * 1024) {
             while (streamingHeaderCacheBytes + header.header.length > 8 * 1024 * 1024 || streamingHeaderCache.size >= 128) {
@@ -1123,7 +1148,7 @@ async function streamingHeader(filePath: string, options: CodexHistoryArchiveOpt
                 streamingHeaderCacheBytes -= oldest[1].header.header.length;
                 streamingHeaderCache.delete(oldest[0]);
             }
-            streamingHeaderCache.set(filePath, entry);
+            streamingHeaderCache.set(cacheKey, entry);
             streamingHeaderCacheBytes += header.header.length;
         }
         return entry;
@@ -1196,16 +1221,43 @@ export async function resolveCodexStreamingHistorySource(
     return { leafPath, segments: reverse.reverse() };
 }
 
+type CodexStreamingScanOptions = { archive?: CodexHistoryArchiveOptions; isCancelled?: () => boolean; onProgress?: (bytes: number) => void; replayFrom?: CodexStreamingHistoryPosition; previousVerification?: CodexStreamingHistoryVerification; onPrefixProof?: (proof: CodexStreamingPrefixProof) => void };
+
+export interface CodexStreamingReadableVerification extends CodexStreamingHistoryVerification {
+    readableRangeVerified: true;
+    fullSourceComplete: boolean;
+}
+
 export async function scanCodexStreamingHistory(
     source: CodexStreamingHistorySource,
     onEvent: (event: any, position: CodexStreamingHistoryPosition) => void | Promise<void>,
-    options: { archive?: CodexHistoryArchiveOptions; isCancelled?: () => boolean; onProgress?: (bytes: number) => void; replayFrom?: CodexStreamingHistoryPosition; previousVerification?: CodexStreamingHistoryVerification; onPrefixProof?: (proof: CodexStreamingPrefixProof) => void } = {},
+    options: CodexStreamingScanOptions = {},
 ): Promise<CodexStreamingHistoryVerification> {
     if (source.unverifiedHistoryBase !== undefined || source.sourceRangeVerified === false) throw new CodexHistorySourceMismatchError("Full Codex history scan requires verified ancestry");
+    return scanCodexStreamingSegments(source, onEvent, options);
+}
+
+export async function scanCodexStreamingReadableRange(
+    source: CodexStreamingHistorySource,
+    onEvent: (event: any, position: CodexStreamingHistoryPosition) => void | Promise<void>,
+    options: Pick<CodexStreamingScanOptions, "archive" | "isCancelled" | "onProgress" | "onPrefixProof"> = {},
+): Promise<CodexStreamingReadableVerification> {
+    if (!source.segments.length) throw new CodexHistorySourceMismatchError("Codex readable range requires a source segment");
+    if (source.unverifiedHistoryBase && (source.segments.length !== 1 || source.segments[0]!.ordinalMode !== "explicit")) throw new CodexHistorySourceMismatchError("Codex readable range requires an explicit local ordinal window");
+    const verification = await scanCodexStreamingSegments(source, onEvent, options, source.segments[0]!.startOrdinal);
+    return { ...verification, readableRangeVerified: true, fullSourceComplete: source.segments[0]!.startOrdinal === 0 && source.unverifiedHistoryBase === undefined && source.sourceRangeVerified !== false };
+}
+
+async function scanCodexStreamingSegments(
+    source: CodexStreamingHistorySource,
+    onEvent: (event: any, position: CodexStreamingHistoryPosition) => void | Promise<void>,
+    options: CodexStreamingScanOptions,
+    firstOrdinal = 0,
+): Promise<CodexStreamingHistoryVerification> {
     const verified: CodexStreamingHistoryVerification["segments"] = [];
     const archive = { ...options.archive, isCancelled: options.isCancelled ?? options.archive?.isCancelled };
     let previousMode: CodexOrdinalMode | undefined;
-    let nextOrdinal = 0;
+    let nextOrdinal = firstOrdinal;
     let sourceBytes = 0;
     const utf8 = new TextDecoder("utf-8", { fatal: true });
     for (const segment of source.segments) {

@@ -6,6 +6,7 @@ import type { ClaudeCodeThreadInfo } from "./claude-code-client.js";
 import type { DshReaderOptions } from "./dsh-session-reader.js";
 import type { LocalPbFileCandidate, LocalPbReaderOptions } from "./local-pb-reader.js";
 import type { DevinReadOptions } from "./devin-types.js";
+import { rememberHostCorpusProjection, readHostCorpusSnapshot } from "./conversation-corpus-host-snapshot.js";
 
 export type HostCorpusSource = Exclude<CorpusSource, "codex">;
 
@@ -57,10 +58,22 @@ export function createHostCorpusProvider(source: HostCorpusSource, options: Host
     if (!["claude-code", "windsurf", "antigravity", "dsh"].includes(source)) throw new Error("Host corpus provider requires an explicit non-Codex source");
     const backend = options.backend || defaultBackend(source, options);
     const isolated = !isIsolatedSourceWorker() && canIsolateSourceOptions(options);
+    const canonicalRounds = source === "dsh" || source === "claude-code";
     let statuses: CorpusSourceStatus[] = [];
-    const assertSource = (conversation: CorpusConversation, control: CorpusReadControl) => {
+    const assertActive = (control: CorpusReadControl) => {
         assertHostReadActive(control);
+        if (control.deadlineAt !== undefined && Date.now() >= control.deadlineAt) {
+            throw Object.assign(new Error("Host conversation source reading deadline exceeded"), { name: "TimeoutError" });
+        }
+    };
+    const assertSource = (conversation: CorpusConversation, control: CorpusReadControl) => {
+        assertActive(control);
         if (conversation.source !== source) throw new Error(`Provider ${source} cannot read ${conversation.source}`);
+    };
+    const remember = async (projection: CorpusProjection, control: CorpusReadControl): Promise<CorpusProjection> => {
+        await rememberHostCorpusProjection(projection, control, { ...options, canonicalRounds });
+        assertActive(control);
+        return projection;
     };
     const read = async (conversation: CorpusConversation, request: CorpusFastReadRequest | undefined, control: CorpusReadControl): Promise<CorpusProjection> => {
         assertSource(conversation, control);
@@ -72,25 +85,25 @@ export function createHostCorpusProvider(source: HostCorpusSource, options: Host
             const { restoreIsolatedCorpusIdentity } = await import("./conversation-host-binary.js");
             restoreIsolatedCorpusIdentity(result.projection.conversation, result.identity);
             if (!request && control.onChunk) await control.onChunk({ ...result.projection, verified: !result.projection.partial });
-            assertHostReadActive(control);
-            return result.projection;
+            assertActive(control);
+            return remember(result.projection, control);
         }
         const snapshot = await backend.read(conversation, request, control);
-        assertHostReadActive(control);
+        assertActive(control);
         const projection = projectHostCorpus(conversation, snapshot, request, control);
         if (!request && control.onChunk) await control.onChunk({
             conversation: projection.conversation, revision: projection.revision, messages: projection.messages,
             rounds: projection.rounds, roundNumbering: projection.roundNumbering, warnings: projection.warnings,
             sourceBytes: projection.sourceBytes, verified: !snapshot.partial,
         });
-        assertHostReadActive(control);
-        return projection;
+        assertActive(control);
+        return remember(projection, control);
     };
     return {
         semanticVersion: `${HOST_CORPUS_VERSION}/${source}`,
         sourceStatuses: () => { const current = backend.sourceStatuses?.(); return current?.length ? current : statuses; },
         async list(request, control) {
-            assertHostReadActive(control);
+            assertActive(control);
             try {
                 if (isolated) {
                     const result = await runIsolatedSource<{ candidates: CorpusConversation[]; statuses: CorpusSourceStatus[] }>("host-list", { source, options, request }, control, { timeoutMs: 12_000 });
@@ -101,7 +114,7 @@ export function createHostCorpusProvider(source: HostCorpusSource, options: Host
                     if (conversation.source !== source) throw new Error(`Unexpected ${conversation.source} candidate from ${source}`);
                     return hostConversationMatches(conversation, request);
                 });
-                assertHostReadActive(control);
+                assertActive(control);
                 statuses = [{ source, status: "ok", candidateCount: candidates.length, warnings: [] }];
                 return candidates;
             } catch (error) {
@@ -117,14 +130,18 @@ export function createHostCorpusProvider(source: HostCorpusSource, options: Host
                     const { restoreIsolatedCorpusIdentity } = await import("./conversation-host-binary.js");
                     restoreIsolatedCorpusIdentity(result.projection.conversation, result.identity);
                 }
-                return result.projection;
+                return result.projection ? remember(result.projection, control) : null;
             }
             const cached = await backend.readCached?.(conversation, control);
-            return cached ? projectHostCorpus(conversation, cached, undefined, control) : null;
+            return cached ? remember(projectHostCorpus(conversation, cached, undefined, control), control) : null;
         },
         read: (conversation, control) => read(conversation, undefined, control),
         readFast: (conversation, request, control = {}) => read(conversation, request, control),
         async readRounds(conversation, request, control = {}) {
+            assertSource(conversation, control);
+            const snapshot = await readHostCorpusSnapshot(conversation, request, control, { ...options, canonicalRounds });
+            assertActive(control);
+            if (snapshot) return snapshot;
             const { revision, messageRoles, ...range } = request;
             const projection = await read(conversation, range, { ...control, messageRoles: messageRoles ?? control.messageRoles });
             if (!revision || projection.revision !== revision) throw new Error(`${source} source revision changed; run a fresh search before expanding the hit`);

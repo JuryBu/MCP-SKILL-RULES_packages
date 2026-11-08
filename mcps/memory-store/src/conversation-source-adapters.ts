@@ -22,6 +22,7 @@ import { mergeConsecutiveHumanRounds, type ConversationRound } from "./trajector
 import { readFiniteIntegerEnv, type ConversationSourceFingerprint } from "./conversation-source-cache.js";
 
 export type ConversationRawSource = "auto" | "local" | "ls" | "cache";
+export const ANTIGRAVITY_PB_NORMALIZATION_VERSION = 2;
 
 export interface LocalPbCandidateDiagnostic {
     kind: LocalPbCandidateKind;
@@ -295,7 +296,7 @@ export function localPbResultToRounds(result: LocalPbReadResult): ConversationRo
             round.fileViews = [...(round.fileViews || []), { stepIndex, kind: "local_pb_activity", title: activity.kind, textSummary: text }];
         }
         if (step.planner) {
-            const projected = projectLocalPbPlanner(step.planner);
+            const projected = projectLocalPbPlanner(step.planner, result.sourceFlavor);
             round.aiResponses.push({ stepIndex, response: projected.response, thinking: projected.thinking, toolCalls: [] });
             if (projected.draftResponse) {
                 round.semanticEvents?.push({ stepIndex, rawRole: "local_pb.field_20", semanticRole: "model", kind: "draft_response", text: projected.draftResponse });
@@ -324,7 +325,7 @@ export function localPbResultToRounds(result: LocalPbReadResult): ConversationRo
     return mergeConsecutiveHumanRounds(rounds);
 }
 
-function projectLocalPbPlanner(planner: LocalPbPlannerResponse): {
+function projectLocalPbPlanner(planner: LocalPbPlannerResponse, sourceFlavor: LocalPbSourceFlavor): {
     response: string;
     thinking: string;
     draftResponse?: string;
@@ -332,6 +333,12 @@ function projectLocalPbPlanner(planner: LocalPbPlannerResponse): {
     const response = planner.response || "";
     const thinking = planner.thinking || "";
     const modified = planner.modifiedResponse || "";
+    if (sourceFlavor === "antigravity") {
+        return {
+            response,
+            thinking: [...new Set([thinking, modified].filter(Boolean))].join("\n\n"),
+        };
+    }
     const responseLooksLikeThinking = Boolean(response && looksLikeLocalPbReasoningOnly(response));
     const modifiedLooksLikeThinking = Boolean(modified && looksLikeLocalPbReasoningOnly(modified));
     const visibleResponse = response && !responseLooksLikeThinking

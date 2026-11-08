@@ -5,6 +5,7 @@ import crypto from "node:crypto";
 import os from "node:os";
 import { z } from "zod";
 import { touchActivity } from "../lifecycle.js";
+import { restoreRecordToolMaterials } from "../record-tool-material.js";
 import { listConversationsByMtime, detectWorkspaceFromSteps, fetchFirstPageSteps } from "../ls-client.js";
 import {
     readRecord, readRecordAsync, writeRecord, writeRecordWithCommitArtifactLockHeld, upsertRecordIndex,
@@ -102,6 +103,7 @@ import {
     RECORD_SECTION_TYPES,
     buildOutline,
     buildRecordReaderIndex,
+    describeRecordReaderSelection,
     formatReaderView,
     isRecordReaderIndexFresh,
     selectRecordReaderBlocks,
@@ -1530,7 +1532,7 @@ action:
             conversationId: z.string().optional()
                 .describe("对话 ID（update 不传则自动获取当前对话）；audit默认目标，显式recordIds/auditAll时仅保留调用来源身份"),
             workspace: z.string().optional()
-                .describe("工作区路径（不传则 general）"),
+                .describe("Record 存储工作区路径，显式指定时优先使用该工作区；audit 的来源工作区仍取原对话元数据"),
             scope: z.enum(["workspace", "global", "general"]).optional()
                 .describe("[search/list/audit/migrate_unknown_chain/stale_check] 范围，默认 workspace；workspace 严格只读指定工作区"),
             includeGeneral: z.boolean().optional()
@@ -2687,6 +2689,7 @@ export function conversationLoadFromFrozenSource(source: FrozenRuntimeSource): C
         });
     }
     publishCurrent();
+    restoreRecordToolMaterials(rounds, source.document.messages);
     const materializedReadEndRound = rounds.length > 0
         ? materializedReadStartRound + rounds.length - 1
         : materializedReadStartRound - 1;
@@ -3628,6 +3631,10 @@ async function handleRead(
             matchedBlockCount: selected.totalBlocks,
             returnedBlockCount: selected.blocks.length,
             blockCount: selected.blocks.length,
+            ...(selected.totalBlocks === 0 ? {
+                emptyReason: "no_matching_blocks",
+                selection: describeRecordReaderSelection(index, viewOptions),
+            } : {}),
             blocks: selected.blocks.map(block => ({
                 id: block.id,
                 phaseId: block.phaseId,
@@ -3644,7 +3651,8 @@ async function handleRead(
         if (result.truncated) {
             return rt(`⚠️ Record ${resolvedId.slice(0, 8)}... 结构化读取命中区块，但当前 maxChars 太小，未返回正文（index=${indexStatus}）${coverageWarning ? `\n${coverageWarning}` : ""}\n${result.nextReadHint}`, startMs);
         }
-        return rt(`📭 Record ${resolvedId.slice(0, 8)}... 结构化读取无匹配区块（index=${indexStatus}）${coverageWarning ? `\n${coverageWarning}` : ""}`, startMs);
+        const selection = describeRecordReaderSelection(index, viewOptions);
+        return rt(`📭 Record ${resolvedId.slice(0, 8)}... 已找到，结构化读取无匹配区块（index=${indexStatus}）\n${selection.explanation}\n可用 view="outline" 查看结构，或用 view="raw" 读取正文${coverageWarning ? `\n${coverageWarning}` : ""}`, startMs);
     }
     const suffix = result.truncated ? `\n\n⚠️ 已按 block 边界截断：${result.nextReadHint}` : "";
     if (result.text.length > 8000 && !options.maxChars) {
@@ -3689,18 +3697,28 @@ async function handleSearch(
         || options.indexMode
     );
 
-    const blocks = hasStructuredSearch
-        ? await buildStructuredRecordSearchBlocks(hash, scope, includeGeneral === true, options)
-        : await buildRecordSearchBlocksForScopeAsync(hash, scope, includeGeneral === true);
+    const selection = hasStructuredSearch
+        ? await buildStructuredRecordSearchSelection(hash, scope, includeGeneral === true, options)
+        : undefined;
+    const blocks = selection?.blocks || await buildRecordSearchBlocksForScopeAsync(hash, scope, includeGeneral === true);
 
-    if (blocks.length === 0) return rt("📭 当前工作区无 Record", startMs);
+    if (blocks.length === 0) {
+        const recordCount = selection?.records.length || 0;
+        const reason = recordCount > 0 ? "no_matching_blocks" : "no_records";
+        const records = selection?.records.slice(0, options.limit || 10) || [];
+        if (options.format === "json") {
+            return rt(JSON.stringify({ query, count: 0, results: [], reason, recordCount, records, recordsTruncated: recordCount > records.length }, null, 2), startMs);
+        }
+        if (recordCount === 0) return rt("📭 当前工作区无 Record", startMs);
+        return rt(`📭 已找到 ${recordCount} 份 Record，当前结构筛选无匹配区块\n${records.map(record => `${record.recordId}：\n${record.selection.explanation}`).join("\n")}\n可用 view="outline" 查看结构，或移除结构筛选后搜索正文`, startMs);
+    }
 
     let results = await search(blocks, query, { mode: mode || "auto", limit: options.limit || 10, chain });
     if ((mode || "auto") === "auto" && results.length === 0) {
         results = await search(blocks, query, { mode: "smart", limit: options.limit || 10, chain });
     }
 
-    if (results.length === 0) return rt(`🔍 搜索 "${query}" — 无匹配`, startMs);
+    if (results.length === 0 && !hasStructuredSearch) return rt(`🔍 搜索 "${query}" — 无匹配`, startMs);
 
     if (hasStructuredSearch) {
         const body = formatStructuredSearchResults(query, results, options.format || "text", options.maxChars);
@@ -3862,7 +3880,7 @@ async function dedupeSearchTargetsAsync(targets: RecordSearchTarget[]): Promise<
     return Array.from(map.values());
 }
 
-export async function buildStructuredRecordSearchBlocks(
+async function buildStructuredRecordSearchSelection(
     hash: string,
     scope: RecordManageScope | undefined,
     includeGeneral = false,
@@ -3874,14 +3892,23 @@ export async function buildStructuredRecordSearchBlocks(
         searchScope?: RecordSearchScope;
         indexMode?: RecordReaderIndexMode;
     } = {},
-): Promise<TextBlock[]> {
+) {
     const blocks: TextBlock[] = [];
+    const records: Array<{ recordId: string; hash: string; indexStatus: string; searchScope: RecordSearchScope; matchedBlockCount: number; selection: ReturnType<typeof describeRecordReaderSelection> }> = [];
     const targets = await collectRecordSearchTargetsAsync(hash, scope, includeGeneral, options.conversationId, options.recordIds);
     for (const target of targets) {
         const workspace = (await readRecordWorkspaceMetaAsync(target.hash))?.originalPath;
         const { index, indexStatus } = await readOrBuildReaderIndex(target.hash, target.conversationId, target.content, options.indexMode || "auto");
         const selected = blocksForSearchScope(index, options.searchScope || "section")
             .filter(block => matchesPhaseAndSection(block, options.phaseIds, options.sectionTypes));
+        records.push({
+            recordId: target.conversationId,
+            hash: target.hash,
+            indexStatus,
+            searchScope: options.searchScope || "section",
+            matchedBlockCount: selected.length,
+            selection: describeRecordReaderSelection(index, options),
+        });
         for (const block of selected) {
             const phaseLabel = block.phaseId || "tail";
             blocks.push({
@@ -3904,16 +3931,25 @@ export async function buildStructuredRecordSearchBlocks(
                         action: "read",
                         workspace,
                         conversationId: target.conversationId,
-                        view: block.phaseId ? "phase" : "custom",
+                        view: options.searchScope === "record" ? "raw" : block.phaseId ? "phase" : "custom",
                         phaseIds: block.phaseId ? [block.phaseId] : undefined,
-                        sectionTypes: [block.sectionType],
+                        sectionTypes: options.searchScope === "record" || options.searchScope === "phase" ? undefined : [block.sectionType],
                         withCitations: true,
                     },
                 },
             });
         }
     }
-    return blocks;
+    return { blocks, records };
+}
+
+export async function buildStructuredRecordSearchBlocks(
+    hash: string,
+    scope: RecordManageScope | undefined,
+    includeGeneral = false,
+    options: Parameters<typeof buildStructuredRecordSearchSelection>[3] = {},
+): Promise<TextBlock[]> {
+    return (await buildStructuredRecordSearchSelection(hash, scope, includeGeneral, options)).blocks;
 }
 
 function blocksForSearchScope(index: RecordReaderIndex, searchScope: RecordSearchScope): ReaderBlock[] {
@@ -3974,6 +4010,7 @@ function formatStructuredSearchResults(query: string, results: SearchResult[], f
     const payload = {
         query,
         count: results.length,
+        ...(results.length === 0 ? { reason: "no_text_match" } : {}),
         results: results.map(result => ({
             id: result.id,
             title: result.title,
@@ -3992,6 +4029,7 @@ function formatStructuredSearchResults(query: string, results: SearchResult[], f
         })),
     };
     if (format === "json") return JSON.stringify(payload, null, 2);
+    if (results.length === 0) return `🔍 结构化搜索 "${query}" — 所选区块中无匹配`;
 
     const lines = [`🔍 结构化搜索 "${query}" — ${results.length} 个区块命中 (${results[0].matchType} 模式):\n`];
     let used = lines.join("\n").length;
@@ -4502,6 +4540,8 @@ async function auditRecordLocations(
                     suggestedAction: !targetSibling || locIsBest ? "move" : "archiveDuplicate",
                 });
             } else {
+                const currentMeta = await readRecordWorkspaceMetaAsync(loc.hash);
+                const currentWorkspace = currentMeta?.originalPath || currentMeta?.canonicalPath;
                 items.push({
                     conversationId: loc.conversationId,
                     title: loc.title,
@@ -4510,7 +4550,7 @@ async function auditRecordLocations(
                     expectedWorkspace: detected.expectedWorkspace,
                     sourceType: detected.sourceType,
                     status: "conflict",
-                    reason: "当前位置与结构来源不一致，且不是 general 兜底副本",
+                    reason: `Record 存储工作区 ${currentWorkspace || loc.hash} 与 ${detected.sourceType} 来源工作区 ${detected.expectedWorkspace || detected.expectedHash} 不一致；显式指定 workspace 可以保存独立副本，归属审计仍以原对话元数据为依据，请确认该存储位置是否为有意指定`,
                     suggestedAction: "manualReview",
                 });
             }

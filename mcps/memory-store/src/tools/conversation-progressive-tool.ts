@@ -39,7 +39,11 @@ export interface ProgressiveToolParams {
     dataChains?: string[];
     chain?: string;
     depth?: string;
+    extraTypes?: string[];
     link?: ConversationLinkMode;
+    deadlineMs?: number;
+    fullFetchCache?: boolean;
+    forceRawCacheRebuild?: boolean;
 }
 
 export function isProgressiveAction(params: ProgressiveToolParams): boolean {
@@ -66,6 +70,7 @@ export async function runProgressiveAction(params: ProgressiveToolParams): Promi
     const ownerId = params.conversationId?.trim();
     if (!ownerId) throw new Error("Progressive operations require conversationId for the caller");
     if (params.action === "prepare" || params.action === "read_fast") {
+        if (params.action === "prepare" && (params.startRound !== undefined || params.endRound !== undefined)) throw new Error("prepare按lastRounds与buildOrder准备近期或早期范围；指定绝对startRound/endRound请用read_fast，同样可返回后续缓存准备入口");
         const sources = resolveCorpusSources(params);
         if (sources.length !== 1) throw new Error("prepare/read_fast一次准备一个来源的一个对话，请给具体dataChain");
         const dataChain = sources[0]!;
@@ -74,34 +79,45 @@ export async function runProgressiveAction(params: ProgressiveToolParams): Promi
         const request = {
             ownerId, conversationId: dataChain === "codex" ? normalizeCodexCorpusConversationId(target) : target.trim(),
             direction: params.buildOrder || "latest", initialRounds: params.lastRounds ?? 100,
-            buildFull: params.prepareCache !== false, dataChain, link: params.link || "reference",
+            buildFull: params.prepareCache !== false, dataChain, link: params.link || "reference", deadlineMs: params.deadlineMs,
+            messageRolesExplicit: params.messageRoles !== undefined,
+            ...(params.fullFetchCache ? { fullFetchCache: true, forceRawCacheRebuild: params.forceRawCacheRebuild === true } : {}),
             ...normalizeProgressiveProjection(params.messageRoles, params.depth),
         };
         const started = await startProgressivePreparation(request) as { taskId: string };
         const status = await getProgressiveTaskStatus({ ownerId, taskId: started.taskId,
             waitMs: Math.min(45000, Math.max(0, (params.waitSeconds ?? (params.action === "read_fast" ? 1 : 0)) * 1000)) });
-        return { ...(withAvailableRoles(status) as object), next: {
+        const effectiveRoles = params.messageRoles === undefined && (status as { ready?: { source?: ProgressiveSource } }).ready?.source?.conversation?.isChildThread
+            ? normalizeProgressiveProjection(["subagent"], request.depth).messageRoles : request.messageRoles;
+        return { ...(withAvailableRoles(status) as object), next: (status as { rangeAvailable?: boolean }).rangeAvailable ? {
             status: { action: "prepare_status", conversationId: ownerId, dataChain, taskId: started.taskId, waitSeconds: 30,
                 afterProgressRevision: (status as { revision?: string }).revision },
-            read: { action: "read_ready", conversationId: ownerId, dataChain, taskId: started.taskId, lastRounds: params.lastRounds ?? 5, messageRoles: request.messageRoles, depth: request.depth },
-            search: { action: "search_ready", conversationId: ownerId, dataChain, taskId: started.taskId, query: "<word>", messageRoles: request.messageRoles, depth: request.depth },
-        } };
+            read: { action: "read_ready", conversationId: ownerId, dataChain, taskId: started.taskId, lastRounds: params.lastRounds ?? 5, messageRoles: effectiveRoles, depth: request.depth },
+            search: { action: "search_ready", conversationId: ownerId, dataChain, taskId: started.taskId, query: "<word>", messageRoles: effectiveRoles, depth: request.depth },
+        } : (status as { next?: unknown }).next };
     }
     const taskId = params.progressiveTaskId || params.taskId;
     if (!taskId) throw new Error("Use the original progressive taskId");
     const identity = { ownerId, taskId };
-    if (params.dataChain !== undefined || params.dataChains !== undefined || params.chain !== undefined) {
+    let preparation: { request: ProgressiveRequest; rangeAvailable?: boolean } | undefined;
+    if (params.dataChain !== undefined || params.dataChains !== undefined || (params.chain !== undefined && params.chain !== "auto")) {
         const sources = resolveCorpusSources(params);
-        const original = await getProgressiveTaskStatus({ ...identity, waitMs: 0 }) as { request: ProgressiveRequest };
-        if (sources.length !== 1 || sources[0] !== original.request.dataChain) throw new Error("请求来源与原渐进taskId不同，请沿用原任务的dataChain");
+        preparation = await getProgressiveTaskStatus({ ...identity, waitMs: 0 }) as { request: ProgressiveRequest; rangeAvailable?: boolean };
+        if (sources.length !== 1 || sources[0] !== preparation.request.dataChain) throw new Error("请求来源与原渐进taskId不同，请沿用原任务的dataChain");
     }
     if (params.action === "prepare_status") return withAvailableRoles(await getProgressiveTaskStatus({ ...identity, afterRevision: params.afterProgressRevision,
         waitMs: Math.min(45000, Math.max(0, (params.waitSeconds || 0) * 1000)) }));
     if (params.action === "prepare_cancel") return cancelProgressivePreparation(identity);
-    if (params.action === "prepare_resume") return resumeProgressivePreparation(identity);
+    if (params.action === "prepare_resume") return resumeProgressivePreparation({ ...identity, deadlineMs: params.deadlineMs });
+    preparation ??= await getProgressiveTaskStatus({ ...identity, waitMs: 0 }) as { request: ProgressiveRequest; rangeAvailable?: boolean };
+    if (!preparation.rangeAvailable && !params.rangeRef) return withAvailableRoles(preparation);
     const { cache, ready, row } = await openProgressiveTaskCache(identity, params.rangeRef);
-    const selectedRoles = roles(params);
     const status = await cache.status();
+    const selectedRoles = params.messageRoles === undefined && status.source.conversation?.isChildThread
+        ? normalizeProgressiveProjection(["subagent"], params.depth).messageRoles : roles(params);
+    if ((params.depth === "full" || params.extraTypes?.length) && preparation.request.depth !== "full") {
+        throw new Error("此任务按normal准备，尚无完整思考和工具详情。请用prepare、depth=full及所需messageRoles准备对应范围，再沿返回的taskId读取");
+    }
     const availableMessageRoles = availableProgressiveRoles(status.source);
     const missingRoles = selectedRoles.filter(role => !availableMessageRoles.includes(role));
     if (missingRoles.length) throw new Error("Requested message roles were not prepared: " + missingRoles.join(", ") + ". Available message roles: " + availableMessageRoles.join(", ")
@@ -126,7 +142,16 @@ export async function runProgressiveAction(params: ProgressiveToolParams): Promi
             caseSensitive: params.caseSensitive, messageRoles: selectedRoles,
         }, selection);
         const sourceRangeVerified = verifiedSourceRange(result.status.source);
+        const originRevision = (result.status.source.snapshot as { source?: { revision?: string } })?.source?.revision;
+        const cacheRevision = result.status.source.revision;
+        const sourceRevision = originRevision;
+        const referenceCall = (rangeRef: string) => ({ action: "read_ready", conversationId: ownerId,
+            dataChain: preparation!.request.dataChain, taskId, rangeRef, messageRoles: selectedRoles, depth: params.depth || "normal" });
         return { taskId, phase: ready.phase, availableMessageRoles, ...result,
+            cacheRevision, originRevision,
+            match: result.match ? { ...result.match, sourceRevision,
+                snippets: result.match.snippets.map(snippet => ({ ...snippet, sourceRevision })) } : null,
+            hits: result.hits.map(hit => ({ ...hit, next: referenceCall(hit.ref) })),
             publishedRangeComplete: result.requestedRangeComplete, sourceRangeVerified,
             requestedRangeComplete: result.requestedRangeComplete && sourceRangeVerified,
             provisional: result.provisional || !sourceRangeVerified, warnings: ready.warnings };
