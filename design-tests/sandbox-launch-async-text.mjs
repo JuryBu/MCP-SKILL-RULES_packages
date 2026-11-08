@@ -17,7 +17,15 @@ fs.mkdirSync(taskDirectory);
 let trackChunkReads = false;
 let chunkReads = 0;
 const readBursts = [];
-const isolatedFs = { ...fs, readFileSync(filename, ...args) {
+const openDescriptors = new Set();
+const isolatedFs = { ...fs, openSync(...args) {
+    const descriptor = fs.openSync(...args);
+    openDescriptors.add(descriptor);
+    return descriptor;
+}, closeSync(descriptor) {
+    fs.closeSync(descriptor);
+    openDescriptors.delete(descriptor);
+}, readFileSync(filename, ...args) {
     if (trackChunkReads && path.dirname(String(filename)) === taskDirectory) chunkReads += 1;
     return fs.readFileSync(filename, ...args);
 } };
@@ -76,7 +84,7 @@ try {
     const tracked = [path.join(fixture, "registry.json"), ...fs.readdirSync(taskDirectory).map(name => path.join(taskDirectory, name))];
     const before = tracked.map(fingerprint);
     const launchFilename = path.join(sourceRoot, "tools/launch.ts");
-    const launch = loadSource(launchFilename, "\nexport { readAllTasks, readAllTasksAsync, decodeLaunchLog, tailFile, pendingTaskWrites, writeTaskIfUnchanged, formatLaunchTaskElapsed };\n");
+    const launch = loadSource(launchFilename, "\nexport { readAllTasks, readAllTasksAsync, readTaskFile, decodeLaunchLog, tailFile, pendingTaskWrites, writeTaskIfUnchanged, formatLaunchTaskElapsed };\n");
     launch.pendingTaskWrites.set("current", task("current", { command: "pending wins" }));
     const expected = JSON.stringify(launch.readAllTasks());
     const startedAt = performance.now();
@@ -92,6 +100,12 @@ try {
     assert.deepEqual(readBursts, [64, 64, 4]);
     assert.equal(chunkReads, 0);
     assert.deepEqual(tracked.map(fingerprint), before);
+    assert.equal((await launch.readTaskFile("current.json")).id, "current");
+    assert.equal((await launch.readTaskFile("gone.json")).deleted, true);
+    await assert.rejects(launch.readTaskFile("broken.json"));
+    fs.writeFileSync(path.join(taskDirectory, "current-zero.json"), Buffer.alloc(64));
+    await assert.rejects(launch.readTaskFile("current-zero.json", true));
+    assert.equal(openDescriptors.size, 0);
     assert.match(fs.readFileSync(launchFilename, "utf8"), /\(await readAllTasksAsync\(\)\)\.filter/u);
     const stale = task("stale", { status: "running", exitCode: null });
     const stalePath = path.join(taskDirectory, "stale.json");

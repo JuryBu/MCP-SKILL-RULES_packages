@@ -298,11 +298,11 @@ export function getLaunchRecoveryState(): { ready: boolean; ignoredHistoricalRec
 
 async function readTaskFile(fileName: string, allowHistoricalZeroRecords = false): Promise<LaunchTask | LaunchTombstone | null> {
     const filePath = path.join(TASK_REGISTRY_DIR, fileName);
-    const handle = await fs.promises.open(filePath, "r");
+    const handle = fs.openSync(filePath, "r");
     try {
-        const content = await handle.readFile();
+        const content = fs.readFileSync(handle);
         if (allowHistoricalZeroRecords && content[0] === 0
-            && isPreviousBootZeroRecord(content, await handle.stat(), bootStartedAtMs)) {
+            && isPreviousBootZeroRecord(content, fs.fstatSync(handle), bootStartedAtMs)) {
             ignoredHistoricalTaskFiles.add(fileName);
             return null;
         }
@@ -314,7 +314,7 @@ async function readTaskFile(fileName: string, allowHistoricalZeroRecords = false
         if (!task) throw new Error(`invalid launch task registry file: ${fileName}`);
         return task;
     } finally {
-        await handle.close();
+        fs.closeSync(handle);
     }
 }
 
@@ -1209,6 +1209,8 @@ export function registerLaunch(server: McpServer): void {
             // ── list ──
             if (action === "list") {
                 const visibleTasks = (await readAllTasksAsync()).filter(task => hasOwnerAccess(task.ownerId, ownerId));
+                const registryReadMs = Date.now() - startTime;
+                const initiallyRunning = visibleTasks.filter(task => task.status === "running").length;
                 for (const task of visibleTasks) {
                     const beforeRefresh = JSON.stringify(task);
                     if (await refreshTaskStatusAsync(task) || task.registryWriteError) writeTaskIfUnchanged(task, beforeRefresh);
@@ -1227,7 +1229,8 @@ export function registerLaunch(server: McpServer): void {
                 });
 
                 return appendTiming({
-                    content: [{ type: "text" as const, text: `📋 任务列表 (${visibleTasks.length}):\n${lines.join("\n")}\n` }],
+                    content: [{ type: "text" as const, text: `📋 任务列表 (${visibleTasks.length}):\n${lines.join("\n")}\n`
+                        + (Date.now() - startTime > 5000 ? `查询分段：登记读取 ${registryReadMs}ms；状态刷新 ${Date.now() - startTime - registryReadMs}ms；开始时运行中 ${initiallyRunning}\n` : "") }],
                 });
             }
 
