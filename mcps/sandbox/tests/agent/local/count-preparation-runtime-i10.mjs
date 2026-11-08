@@ -110,6 +110,20 @@ for (const scenario of ['recover', 'exhaust']) test(`formal same-CID image follo
                 input: { text: 'Must not reach the provider' } }, { ...client, principalId: 'other-principal' });
             assert.equal(rejected.ok, false);
             assert.equal(observed.count, 3);
+            const getRecord = store.getRecord.bind(store);
+            let conversationReads = 0;
+            store.getRecord = async key => {
+                if (key.kind === 'conversation' && ++conversationReads === 2) await delay(150);
+                return getRecord(key);
+            };
+            try {
+                const timedOut = await services.dispatch('conversations.countTokens', { conversationId: control.conversationId,
+                    input: { text: 'Preparation must share the same deadline' }, timeoutMs: 20 }, client);
+                assert.equal(timedOut.ok, false);
+                assert.equal(timedOut.error.code, 'E_COUNT_TOKENS_TIMEOUT');
+                await delay(180);
+                assert.equal(observed.count, 3);
+            } finally { store.getRecord = getRecord; }
         }
         console.log(JSON.stringify({ scenario, ...observed, realLocalHttp: true, sameConversation: true, modelCharges: 0 }));
     } finally {

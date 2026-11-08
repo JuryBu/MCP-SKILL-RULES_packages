@@ -56,9 +56,10 @@ export function createGeminiTokenCounter(options: GeminiTokenCounterOptions) {
         let deadline = Math.min(executionDeadline, startedAt + requestBudgetMs);
         const requestTimeline: JsonObject[] = [];
         const progress: JsonObject = { requestPurpose: 'input_token_count', generationDispatch: 'not_started', requestAttempts: 0, phase: 'preparing', requestTimeline };
+        let finished = false;
         const controller = new AbortController();
         const stop = (code: string, message: string) => controller.abort(new AgentFault(code, message,
-            { ...progress, executionDeadlineAt: deadlineAt, requestDeadlineAt: new Date(deadline).toISOString(), requestBudgetMs }));
+            { ...structuredClone(progress), executionDeadlineAt: deadlineAt, requestDeadlineAt: new Date(deadline).toISOString(), requestBudgetMs }));
         const stopTimeout = () => stop(deadline < executionDeadline ? 'E_COUNT_TOKENS_TIMEOUT' : 'E_COUNT_TOKENS_DEADLINE',
             deadline < executionDeadline ? '原生计数超过当前输入的等待期限' : '原生计数超过本次执行期限');
         const check = () => {
@@ -108,32 +109,42 @@ export function createGeminiTokenCounter(options: GeminiTokenCounterOptions) {
             const send = async (credential?: string) => {
                 check();
                 if (credential !== undefined && (!credential || /[\r\n]/.test(credential))) throw new AgentFault('E_AUTH', '凭据内容无效');
+                requestAttempts++;
+                const attempt = requestAttempts;
+                Object.assign(progress, { requestAttempts, phase: 'count_request' });
                 return decodeResponse(await options.transport.request({ method: 'POST', url: endpoint.href,
                     headers: { 'Content-Type': 'application/json', ...(credential ? { 'x-goog-api-key': credential } : {}) }, body,
                     timeoutMs: Math.max(1, deadline - now()), maxResponseBytes: 64 * 1024,
                     onPhase: (phase, detail) => {
+                        if (finished || controller.signal.aborted) return;
                         Object.assign(progress, { transportPhase: phase, ...detail });
-                        if (requestTimeline.length < 16) requestTimeline.push({ phase, elapsedMs: now() - startedAt, ...detail });
+                        if (requestTimeline.length < 16) requestTimeline.push({ attempt, phase, elapsedMs: now() - startedAt, ...detail });
                     } }, controller.signal), 'gemini', endpoint.href);
             };
             let raw: RawProviderResponse | undefined;
             let requestAttempts = 0;
+            let attemptCycles = 0;
             while (!raw) {
                 check();
-                requestAttempts++;
-                Object.assign(progress, { requestAttempts, phase: 'count_request' });
+                attemptCycles++;
+                for (const field of ['httpStatus', 'transportPhase', 'route', 'retryAfterMs']) delete progress[field];
+                Object.assign(progress, { attemptCycle: attemptCycles, phase: profile.credentialRef ? 'credential_preparation' : 'preparing_http' });
                 try {
                     raw = profile.credentialRef
                         ? await options.credentialAccess!.withCredential(profile.credentialRef, profile.credentialGeneration, send) : await send();
                 } catch (error) {
-                    check();
                     const cause = error instanceof ProviderFault ? error.transportCause : safeTransportCause(error);
+                    if (!controller.signal.aborted && !finished) progress.lastAttemptFailure = {
+                        code: error instanceof AgentFault ? error.code : 'E_COUNT_TOKENS_ERROR',
+                        httpStatus: error instanceof ProviderFault ? error.httpStatus ?? null : null,
+                        ...(cause ? { transportCause: { ...cause } } : {}) };
+                    check();
                     const transient = error instanceof ProviderFault && !['E_AUTH', 'E_QUOTA', 'E_MODEL_UNAVAILABLE', 'E_PARAMETER_INVALID', 'E_CANCELLED', 'E_RESPONSE_LIMIT'].includes(error.code)
                         && (['ECONNRESET', 'EPIPE', 'ETIMEDOUT', 'EAI_AGAIN', 'UND_ERR_SOCKET', 'UND_ERR_CONNECT_TIMEOUT'].includes(String(cause?.causeCode ?? cause?.code))
                             || [500, 502, 503, 504].includes(error.httpStatus ?? 0) || error.code === 'E_RATE_LIMIT' && error.retryable);
-                    const wait = Math.max(250 * 2 ** (requestAttempts - 1) + Math.floor(Math.random() * 250),
+                    const wait = Math.max(250 * 2 ** (attemptCycles - 1) + Math.floor(Math.random() * 250),
                         error instanceof ProviderFault ? error.retryAfterMs ?? 0 : 0);
-                    if (transient && requestAttempts < 3 && now() + wait < deadline) {
+                    if (transient && attemptCycles < 3 && now() + wait < deadline) {
                         Object.assign(progress, { phase: 'retry_backoff', retryAfterMs: wait, lastTransportCause: cause });
                         await delay(wait, undefined, { signal: controller.signal });
                         continue;
@@ -164,6 +175,7 @@ export function createGeminiTokenCounter(options: GeminiTokenCounterOptions) {
                 requestBodyBytes, requestBudgetMs, requestTimeline } });
         });
         const result = Promise.race([work, aborted]).finally(() => {
+            finished = true;
             clearTimeout(timer);
             signal?.removeEventListener('abort', cancel);
             active.delete(controller);

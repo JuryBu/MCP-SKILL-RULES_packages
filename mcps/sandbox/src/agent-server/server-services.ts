@@ -934,23 +934,43 @@ export async function createAgentServices(options: ServerServiceOptions) {
                 const conversationId = String(params.conversationId);
                 const allowed = await options.runtime.dispatch('conversations.get', { conversationId }, client);
                 if (!allowed.ok) return allowed;
-                const deadlineAt = new Date(Date.now() + Number(params.timeoutMs ?? 120_000)).toISOString();
+                const timeoutMs = Number(params.timeoutMs ?? 120_000);
+                const deadlineAt = new Date(Date.now() + timeoutMs).toISOString();
+                const controller = new AbortController();
+                const cancel = () => controller.abort(metadataAbort.signal.reason ?? new AgentFault('E_COUNT_TOKENS_CLOSED', '计数核心已关闭'));
+                metadataAbort.signal.addEventListener('abort', cancel, { once: true });
+                if (metadataAbort.signal.aborted) cancel();
+                const timer = setTimeout(() => controller.abort(new AgentFault('E_COUNT_TOKENS_TIMEOUT', '输入准备或原生计数超过本次等待期限',
+                    { requestPurpose: 'input_token_count', generationDispatch: 'not_started', executionDeadlineAt: deadlineAt })), timeoutMs);
+                const aborted = new Promise<never>((_resolve, reject) => {
+                    if (controller.signal.aborted) reject(controller.signal.reason);
+                    else controller.signal.addEventListener('abort', () => reject(controller.signal.reason), { once: true });
+                });
+                const work = async () => {
+                controller.signal.throwIfAborted();
                 const conversation = await options.store.getRecord<{ options: Record<string, unknown> }>({
                     conversationId, kind: 'conversation', id: conversationId });
+                controller.signal.throwIfAborted();
                 const selected = conversation?.value.options;
                 if (typeof selected?.profileId !== 'string') throw new AgentFault('E_PROFILE_REQUIRED', '先选择本次使用的API配置');
                 const profile = await provider.profiles.get(selected.profileId);
+                controller.signal.throwIfAborted();
                 if (!profile) throw new AgentFault('E_PROFILE_NOT_FOUND', 'API配置不存在或已停用');
                 if (profile.protocol !== 'gemini' || profile.routePolicy.kind !== 'direct') throw new AgentFault('E_COUNT_TOKENS_UNAVAILABLE', '当前原生计数仅支持Gemini协议直接路由');
                 const modelId = typeof selected.modelId === 'string' ? selected.modelId : profile.defaultModel;
                 if (!modelId) throw new AgentFault('E_MODEL_REQUIRED', '先选择本次计数使用的模型');
                 const { entry } = await provider.models.get(profile.profileId, modelId);
+                controller.signal.throwIfAborted();
                 const view = await inputAttachments.appendUser(conversationId, { protocol: 'gemini', contents: [] },
-                    params.input as JsonValue, { profile, entry }, metadataAbort.signal);
-                const counted = await provider.countRequestTokens(profile.profileId, modelId, view, metadataAbort.signal,
+                    params.input as JsonValue, { profile, entry }, controller.signal);
+                controller.signal.throwIfAborted();
+                const counted = await provider.countRequestTokens(profile.profileId, modelId, view, controller.signal,
                     deadlineAt, (selected.parameters ?? {}) as JsonObject);
-                return { ok: true, data: { ...counted, scope: 'provided_input_only', historyIncluded: false,
+                return { ok: true, data: { ...counted, scope: 'provided_input_only', automaticHistoryIncluded: false,
                     generationRequests: 0, historyWrites: 0, budgetMutations: 0 } as unknown as JsonValue };
+                };
+                try { return await Promise.race([work(), aborted]); }
+                finally { clearTimeout(timer); metadataAbort.signal.removeEventListener('abort', cancel); }
             }
             if (method === 'conversations.context') {
                 const allowed = await options.runtime.dispatch('conversations.get', { conversationId: params.conversationId }, client);

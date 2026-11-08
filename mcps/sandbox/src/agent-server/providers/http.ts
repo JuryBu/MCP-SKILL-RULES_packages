@@ -84,7 +84,11 @@ export class FetchTransport implements HttpTransport {
         try { maximum = validateHttpRequest(request); }
         catch (error) { throw transportFailure(error, { phase: 'preflight' }); }
         const controller = new AbortController();
-        const abort = (): void => controller.abort();
+        let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+        const abort = (): void => {
+            controller.abort();
+            void reader?.cancel().catch(() => {});
+        };
         signal?.addEventListener('abort', abort, { once: true });
         let timedOut = false;
         const timer = setTimeout(() => { timedOut = true; abort(); }, request.timeoutMs);
@@ -116,12 +120,13 @@ export class FetchTransport implements HttpTransport {
             }
             transportPhase = 'response_body';
             try { request.onPhase?.(transportPhase, { httpStatus: status }); } catch {}
-            const reader = response.body?.getReader();
+            reader = response.body?.getReader();
             let total = 0;
             if (reader) {
                 try {
                     while (true) {
                         const item = await reader.read();
+                        controller.signal.throwIfAborted();
                         if (item.done) break;
                         total += item.value.byteLength;
                         if (total > maximum) {

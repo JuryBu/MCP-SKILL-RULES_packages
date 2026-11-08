@@ -186,6 +186,7 @@ export function createProviderNetwork(options: ProviderNetworkOptions = {}): Pro
         return { route, address: route.route === 'proxy' ? proxy.address : undefined };
     };
     const dispatchers = new Map<string, Dispatcher>();
+    const pendingSignals = new Map<AbortSignal, AbortSignal[]>();
     const shutdown = new AbortController();
     const nativeFetch = globalThis.fetch as unknown as NativeFetchWithDispatcher;
     let closed = false;
@@ -198,6 +199,7 @@ export function createProviderNetwork(options: ProviderNetworkOptions = {}): Pro
         const callerSignal = init?.signal ?? (input instanceof Request ? input.signal : undefined);
         const totalTimeoutMs = timeoutMs ?? (callerSignal ? undefined : standaloneTimeoutMs);
         const signals = [request.signal, shutdown.signal];
+        if (callerSignal) signals.push(callerSignal);
         if (totalTimeoutMs !== undefined) signals.push(AbortSignal.timeout(totalTimeoutMs));
         const signal = AbortSignal.any(signals);
         signal.throwIfAborted();
@@ -214,7 +216,9 @@ export function createProviderNetwork(options: ProviderNetworkOptions = {}): Pro
         }
         const dispatched: NativeFetchInit = { signal, dispatcher, redirect: 'error' };
         try { options.onRoute?.(selected.route); } catch {}
-        return nativeFetch(request, dispatched);
+        pendingSignals.set(signal, signals);
+        try { return await nativeFetch(request, dispatched); }
+        finally { pendingSignals.delete(signal); }
     };
     return {
         fetch: fetchImpl,
