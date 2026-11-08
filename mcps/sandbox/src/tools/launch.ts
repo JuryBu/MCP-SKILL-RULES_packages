@@ -225,7 +225,7 @@ async function readAllTasksAsync(): Promise<LaunchTask[]> {
     const tombstones = new Set<string>();
     const authoritativeFiles = new Set<string>();
     try {
-        const entries = await fs.promises.readdir(TASK_REGISTRY_DIR, { withFileTypes: true });
+        const entries = fs.readdirSync(TASK_REGISTRY_DIR, { withFileTypes: true });
         const files = entries.filter(entry => entry.isFile() && entry.name.endsWith(".json"));
         for (let offset = 0; offset < files.length; offset += 64) {
             const parsedFiles = files.slice(offset, offset + 64).map(entry => {
@@ -249,7 +249,7 @@ async function readAllTasksAsync(): Promise<LaunchTask[]> {
     } catch {
     }
     try {
-        const parsed: unknown = JSON.parse(await fs.promises.readFile(REGISTRY_FILE, "utf-8"));
+        const parsed: unknown = JSON.parse(fs.readFileSync(REGISTRY_FILE, "utf-8"));
         if (Array.isArray(parsed)) {
             for (const value of parsed) {
                 const task = normalizeLaunchTask(value);
