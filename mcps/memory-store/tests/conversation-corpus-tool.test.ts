@@ -94,12 +94,12 @@ let schema: Record<string, any> = {};
 registerConversation({ tool: (_name: string, _description: string, definition: typeof schema, callback: typeof handler) => { schema = definition; handler = callback; } } as any, { corpus: api, loadConversation: async () => null });
 assert.equal(schema.action.parse("search_all"), "search_all");
 assert.equal(schema.searchExpression.parse({ all: [{ term: "缓存" }, { any: [{ term: "轮次" }, { term: "原文" }] }] }).all.length, 2);
-const started = await handler({ action: "search_all", conversationId: "caller-a", dataChain: "codex", allTerms: ["缓存"], intersectionScope: "round" });
+const started = await handler({ action: "search_all", format: "json", conversationId: "caller-a", dataChain: "codex", allTerms: ["缓存"], intersectionScope: "round" });
 assert.equal(JSON.parse(started.content[0].text).taskId, "task-a");
 assert.equal(calls.at(-1)?.args.request.intersectionScope, "round");
-const expanded = await handler({ action: "read_hit", conversationId: "target", dataChain: "codex", sourceRevision: "revision-a", startRound: 3, endRound: 3 });
+const expanded = await handler({ action: "read_hit", format: "json", conversationId: "target", dataChain: "codex", sourceRevision: "revision-a", startRound: 3, endRound: 3 });
 assert.equal(JSON.parse(expanded.content[0].text).revision, "revision-a");
-const recent = await handler({ action: "read_fast", conversationId: "target", dataChain: "codex", lastRounds: 2, background: false });
+const recent = await handler({ action: "read_fast", format: "json", conversationId: "target", dataChain: "codex", lastRounds: 2, background: false });
 assert.equal(JSON.parse(recent.content[0].text).requestedRangeComplete, true);
 const missingIdentity = await handler({ action: "search_all", query: "缓存" });
 assert.match(missingIdentity.content[0].text, /调用者/u);
@@ -108,7 +108,7 @@ const missingCache = await handler({ action: "read", conversationId: "10000000-0
 assert.equal(missingCache.isError, true);
 
 for (const action of ["search_all", "read_hit", "read_fast"] as const) {
-    const arguments_ = { action, conversationId: "caller-a", conversationIds: ["target"], dataChain: "codex", query: "缓存",
+    const arguments_ = { action, format: "json", conversationId: "caller-a", conversationIds: ["target"], dataChain: "codex", query: "缓存",
         sourceRevision: action === "read_hit" ? "revision-a" : undefined, lastRounds: 1, prepareCache: false };
     for (const source of ["cache", "ls"] as const) {
         const callsBeforeRejection = calls.length;

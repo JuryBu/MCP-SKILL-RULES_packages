@@ -1,4 +1,6 @@
-import type { CorpusMessageRole, CorpusSearchExpression } from "../conversation-corpus-types.js";
+import type { CorpusConversation, CorpusMessage, CorpusMessageRole, CorpusSearchExpression } from "../conversation-corpus-types.js";
+import { formatCorpusReadProjection } from "../conversation-corpus-output.js";
+import type { Depth, ExtraType } from "../trajectory.js";
 import type { ConversationLinkMode } from "../chain.js";
 import { normalizeProgressiveProjection, type ProgressiveRequest } from "../conversation-progressive-task-types.js";
 import { availableProgressiveRoles } from "../conversation-progressive-projection.js";
@@ -53,7 +55,39 @@ export function isProgressiveAction(params: ProgressiveToolParams): boolean {
 }
 
 function roles(params: ProgressiveToolParams): CorpusMessageRole[] {
-    return normalizeProgressiveProjection(params.messageRoles, params.depth).messageRoles;
+    const selection = normalizeProgressiveProjection(params.messageRoles, params.depth).messageRoles;
+    if (params.messageRoles === undefined && params.extraTypes?.some(type => type !== "thinking") && !selection.includes("tool")) selection.push("tool");
+    return selection;
+}
+
+export function formatProgressiveReadRows(result: Pick<ProgressiveReadResult, "rows" | "messages" | "status">, params: ProgressiveToolParams, selectedRoles = roles(params)) {
+    const source = result.status.source;
+    const userOnly = selectedRoles.length === 1 && selectedRoles[0] === "user";
+    const formatted = formatCorpusReadProjection({
+        conversation: source.conversation || { source: source.host as CorpusConversation["source"], id: source.conversationId, title: "", workspace: "" },
+        revision: source.revision, complete: result.status.complete, warnings: [],
+        messages: result.messages, rounds: result.rows.map(item => item.round),
+    }, {
+        depth: params.depth as Depth | undefined, messageRoles: selectedRoles,
+        extraTypes: userOnly ? [] : params.extraTypes as ExtraType[] | undefined,
+    }) as { messages: CorpusMessage[]; rounds: Array<Record<string, unknown>> };
+    const showToolSummary = params.depth !== "full" && selectedRoles.some(role => role === "assistant" || role === "tool" || role === "subagent");
+    const rounds = result.rows.map((item, index) => {
+        const counts = new Map<string, number>();
+        if (showToolSummary) {
+            if (!item.round.toolCalls.length && item.round.toolSummary) for (const tool of item.round.toolSummary) counts.set(tool.name, tool.count);
+            const names = item.round.toolCalls.length ? item.round.toolCalls.map(tool => tool.name)
+                : item.round.toolSummary ? []
+                : result.messages.filter(message => message.round === item.round.roundIndex && message.role === "tool").map(message => message.text.split("\n", 1)[0]!);
+            for (const name of names) if (name) counts.set(name, (counts.get(name) || 0) + 1);
+        }
+        const details = formatted.rounds[index];
+        return { ...details, ...(userOnly ? { compactionSummaries: undefined } : {}),
+            ref: item.ref, blockId: item.blockId, round: item.round.roundIndex, roundNumbering: item.kind,
+            ...(showToolSummary ? { toolSummary: [...counts].map(([name, count]) => ({ name, count })),
+                toolSummaryAvailable: item.round.toolSummary !== undefined || availableProgressiveRoles(source).includes("tool") || counts.size > 0 } : {}) };
+    });
+    return { rounds, messages: formatted.messages };
 }
 
 function verifiedSourceRange(source: ProgressiveSource): boolean {
@@ -98,7 +132,8 @@ export async function runProgressiveAction(params: ProgressiveToolParams): Promi
         return { ...(withAvailableRoles(status) as object), next: (status as { rangeAvailable?: boolean }).rangeAvailable ? {
             status: { action: "prepare_status", conversationId: ownerId, dataChain, taskId: started.taskId, waitSeconds: 30,
                 afterProgressRevision: (status as { revision?: string }).revision },
-            read: { action: "read_ready", conversationId: ownerId, dataChain, taskId: started.taskId, lastRounds: params.lastRounds ?? 5, messageRoles: effectiveRoles, depth: request.depth },
+            read: { ...(status as { next?: object }).next, action: "read_ready", conversationId: ownerId, dataChain, taskId: started.taskId, lastRounds: request.initialRounds,
+                ...(request.direction === "oldest" ? { buildOrder: "oldest" } : {}), messageRoles: effectiveRoles, depth: request.depth },
             search: { action: "search_ready", conversationId: ownerId, dataChain, taskId: started.taskId, query: "<word>", messageRoles: effectiveRoles, depth: request.depth },
         } : (status as { next?: unknown }).next };
     }
@@ -169,21 +204,34 @@ export async function runProgressiveAction(params: ProgressiveToolParams): Promi
     let result: ProgressiveReadResult;
     if (row) result = { rows: [row], rounds: [row.round], messages: row.messages, status, requestedRangeComplete: true };
     else if (params.lastRounds !== undefined || (params.startRound === undefined && params.endRound === undefined)) {
-        const amount = params.lastRounds ?? 5;
+        const amount = params.lastRounds ?? preparation.request.initialRounds;
         if (!Number.isSafeInteger(amount) || amount < 1 || amount > 100000) throw new Error("lastRounds must be a positive bounded integer");
-        const latest = await cache.readLatest({ ...selection, direction: "latest" }, amount);
-        const rows = latest.rows.slice().reverse();
-        result = { ...latest, rows, rounds: rows.map(item => item.round), messages: rows.flatMap(item => item.messages),
-            requestedRangeComplete: latest.requestedRangeComplete || latest.status.complete };
+        if ((params.buildOrder || preparation.request.direction) === "oldest") {
+            let initialBlocks = status.blocks.filter(block => selection.blockId ? block.blockId === selection.blockId
+                : !ready.preferredBlockIds?.length || ready.preferredBlockIds.includes(block.blockId));
+            if (!initialBlocks.length && !selection.blockId) initialBlocks = status.blocks.filter(block => block.coverage.kind === "absolute");
+            if (!initialBlocks.length) throw new Error("The initial oldest range is unavailable in this cache generation; use its original rangeRef");
+            const startRound = Math.min(...initialBlocks.map(block => block.coverage.startRound));
+            const earliest = await cache.read({ ...selection, blockIds: initialBlocks.map(block => block.blockId),
+                startRound, endRound: startRound + amount - 1, direction: "oldest" });
+            const expectedRounds = status.complete && status.source.totalRounds !== undefined
+                ? Math.min(amount, Math.max(0, status.source.totalRounds - startRound + 1)) : amount;
+            result = { ...earliest, requestedRangeComplete: earliest.rows.length === expectedRounds };
+        } else {
+            const latest = await cache.readLatest({ ...selection, direction: "latest" }, amount);
+            const rows = latest.rows.slice().reverse();
+            result = { ...latest, rows, rounds: rows.map(item => item.round), messages: rows.flatMap(item => item.messages),
+                requestedRangeComplete: latest.requestedRangeComplete || latest.status.complete };
+        }
     } else result = await cache.read(selection);
-    const messages = result.messages.filter(message => selectedRoles.includes(message.role));
+    const { messages, rounds } = formatProgressiveReadRows(result, params, selectedRoles);
     const sourceRangeVerified = verifiedSourceRange(result.status.source);
     return {
         taskId, phase: ready.phase, requestedRangeComplete: result.requestedRangeComplete && sourceRangeVerified,
         publishedRangeComplete: result.requestedRangeComplete, sourceRangeVerified,
         fullSourceComplete: result.status.complete, coverage: result.status.completeRanges,
         source: result.status.source, availableMessageRoles,
-        rounds: result.rows.map(item => ({ ref: item.ref, blockId: item.blockId, round: item.round.roundIndex, roundNumbering: item.kind })),
+        rounds,
         messages, ...(params.action === "extract_ready" ? { text: messages.map(message => "[" + message.role + "] " + message.text).join("\n\n") } : {}),
         warnings: ready.warnings,
     };

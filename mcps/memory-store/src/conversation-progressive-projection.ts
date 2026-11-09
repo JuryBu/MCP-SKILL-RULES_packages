@@ -7,7 +7,7 @@ import type { CorpusMessageRole } from "./conversation-corpus-types.js";
 import type { ConversationRound } from "./trajectory.js";
 
 type Projection = ReturnType<typeof normalizeProgressiveProjection>;
-const format = "progressive-projection/v3";
+const format = "progressive-projection/v4";
 
 export function projectProgressiveSource(source: ProgressiveSource, request: Pick<ProgressiveRequest, "messageRoles" | "depth">): ProgressiveSource {
     const projection = { format, ...normalizeProgressiveProjection(request.messageRoles, request.depth) };
@@ -18,7 +18,7 @@ export function projectProgressiveSource(source: ProgressiveSource, request: Pic
 export function availableProgressiveRoles(source: ProgressiveSource): readonly CorpusMessageRole[] {
     const projection = (source.snapshot as { projection?: { format?: string; messageRoles?: string[]; depth?: string } })?.projection;
     if (!projection) return PROGRESSIVE_MESSAGE_ROLES;
-    if (![format, "progressive-projection/v2", "progressive-projection/v1"].includes(projection.format || "") || !projection.messageRoles?.length) throw new Error("Invalid progressive projection metadata");
+    if (![format, "progressive-projection/v3", "progressive-projection/v2", "progressive-projection/v1"].includes(projection.format || "") || !projection.messageRoles?.length) throw new Error("Invalid progressive projection metadata");
     return normalizeProgressiveProjection(projection.messageRoles, projection.depth).messageRoles;
 }
 
@@ -30,6 +30,9 @@ export function projectProgressiveRound(round: ConversationRound, projection: Pr
     const tools = messageRoles.includes("tool");
     const subagent = messageRoles.includes("subagent");
     const references = codexCorpusAttachmentReferences(round);
+    const toolCounts = new Map<string, number>();
+    if (assistant || tools || subagent) for (const call of round.toolCalls) toolCounts.set(call.name, (toolCounts.get(call.name) || 0) + 1);
+    const toolSummary = assistant || tools || subagent ? toolCounts.size ? [...toolCounts].map(([name, count]) => ({ name, count })) : round.toolSummary || [] : undefined;
     return {
         ...round,
         userMessage: user ? round.userMessage : "",
@@ -42,6 +45,7 @@ export function projectProgressiveRound(round: ConversationRound, projection: Pr
         aiResponses: assistant ? round.aiResponses.map(response => ({ ...response,
             thinking: depth === "full" ? response.thinking : "", toolCalls: tools ? response.toolCalls : [] })) : [],
         toolCalls: tools ? round.toolCalls : [],
+        toolSummary,
         taskBoundaries: tools ? round.taskBoundaries : [],
         codeActions: tools ? round.codeActions : [],
         fileViews: tools ? round.fileViews : undefined,

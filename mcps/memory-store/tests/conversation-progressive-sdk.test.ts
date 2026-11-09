@@ -39,10 +39,22 @@ if (process.argv.includes("--stdio")) {
     await client.connect(clientTransport);
 }
 const call = async (args: Record<string, unknown>): Promise<any> => {
-    const result = await client.callTool({ name: "conversation_read_original", arguments: { conversationId: caller, dataChain: "codex", ...args } });
+    const result = await client.callTool({ name: "conversation_read_original", arguments: { conversationId: caller, dataChain: "codex", format: "json", ...args } });
     const text = (result.content as Array<{ type: string; text?: string }>).filter(item => item.type === "text").map(item => item.text).join("\n");
     if (result.isError) throw new Error(text);
-    return JSON.parse(text);
+    let value = JSON.parse(text);
+    if (value.delivery === "paged") {
+        let combined = value.text;
+        while (value.next) {
+            const page = await client.callTool({ name: "conversation_read_original", arguments: value.next });
+            const pageText = (page.content as Array<{ type: string; text?: string }>).filter(item => item.type === "text").map(item => item.text).join("\n");
+            if (page.isError) throw new Error(pageText);
+            value = JSON.parse(pageText);
+            combined += value.text;
+        }
+        return JSON.parse(combined);
+    }
+    return value;
 };
 let taskId: string | undefined;
 try {

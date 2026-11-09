@@ -2,6 +2,22 @@
 
 `conversation_read_original` 的 `search_all`、`read_hit`、`read_fast` 和分段准备接口支持 `codex`、`claude-code`、`windsurf`、`antigravity`、`dsh`。Windsurf来源也包含Devin桌面/CLI日志；DSH使用DeepSeek Harness本地会话日志。
 
+## 返回格式与详细度
+
+新读取入口和正文搜索默认使用`format="markdown"`，按对话标题、轮次与角色排列正文，图片附件、批注、来源版本、固定引用及未覆盖范围随相应内容展示。准备中的任务返回简短状态与实际下一步参数。
+
+程序需要解析字段时，首次调用显式设置`format="json"`，工具继续返回纯JSON文本。格式选择沿新入口返回的可执行`next`传递；旧完整缓存`read`继续采用其原有可读排版。格式选择只改变返回文本，内部缓存、搜索索引和来源引用保持原结构。
+
+| 选择 | 返回内容 |
+|---|---|
+| `depth="brief"` | 缩短每条可见消息，明确标记原文长度与截短 |
+| `depth="normal"` | 完整可见正文及轻量工具名称概要 |
+| `depth="full"` / `extraTypes` | 按所选角色展开已准备的思考、工具结果、代码或文件详情 |
+
+只有normal准备结果时，详情读取沿返回的明确提示准备对应full范围。`messageRoles=["user"]`只返回主人内容；子代理来源与相对轮号保持原标记。
+
+大返回结果保存为不可变文件，首次响应给首段及`read_result`的续读参数；按原调用者、结果ID和游标顺次读取。Markdown分页保留可读正文，JSON分页的`text`字段保留原JSON字节片段，完整拼接后解析。两种方式均保留完整文件位置、字节范围与来源哈希。
+
 ## 选择来源和目标
 
 `conversationId`填写当前调用者的稳定ID，`conversationIds`选择目标；`fetch/read/search/recall/单条export`同样接受一个目标数组项，省略时兼容把`conversationId`作为目标。批量导出显式填写`exportBatch=true`。新查询必须显式填写具体 `dataChain`；查询当前端时，调用者也填写当前端的具体值。多个端同时查找用 `dataChains`。已有任务的状态、取消与恢复可仅传原调用者和任务ID，沿用绑定来源；显式传入来源时仍检查一致性。

@@ -56,10 +56,21 @@ async function connect(input: ReturnType<typeof fixture>) {
     await client.connect(transport);
     const tasks = new Set<string>();
     const call = async (arguments_: Record<string, unknown>): Promise<any> => {
-        const reply = await client.callTool({ name: "conversation_read_original", arguments: { conversationId: caller, dataChain: "codex", ...arguments_ } });
+        const reply = await client.callTool({ name: "conversation_read_original", arguments: { conversationId: caller, dataChain: "codex", format: "json", ...arguments_ } });
         const text = (reply.content as Array<{ type: string; text?: string }>).filter(item => item.type === "text").map(item => item.text).join("\n");
         assert.ok(!reply.isError, text);
         let value = JSON.parse(text);
+        if (value.delivery === "paged") {
+            let combined = value.text;
+            while (value.next) {
+                const page = await client.callTool({ name: "conversation_read_original", arguments: value.next });
+                const pageText = (page.content as Array<{ type: string; text?: string }>).filter(item => item.type === "text").map(item => item.text).join("\n");
+                assert.ok(!page.isError, pageText);
+                value = JSON.parse(pageText);
+                combined += value.text;
+            }
+            value = JSON.parse(combined);
+        }
         if (value.delivery === "artifact") value = JSON.parse(fs.readFileSync(value.artifactPath, "utf8"));
         if (value.taskId) tasks.add(value.taskId);
         return value;

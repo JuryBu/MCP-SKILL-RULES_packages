@@ -2012,6 +2012,8 @@ fetch/search/read/recall/export 必须传 conversationId（共享 broker 后端�
                 .describe("[list] 在指定 dataChain(s)/workspaces 中以 50-120 字独特正文匹配五源候选；有时间/字节预算，多命中和 partial 均不自动选中"),
             depth: z.enum(["brief", "normal", "full"]).default("normal")
                 .describe("[fetch/search/read] 返回详细度：brief=截断100字 / normal=完整文本 / full=含思考+工具结果"),
+            format: z.enum(["markdown", "json"]).optional()
+                .describe("[read_fast/read_hit/read_ready/search_all/search_ready/read_result] 默认按轮次与角色返回可读Markdown；json保留完整结构化结果供程序解析。缓存、来源与引用不变"),
             compactionMode: z.enum(["folded", "full", "omit"]).optional()
                 .describe("[read] Claude Code 压缩续聊摘要读取方式：folded=默认折叠为临时文件 / full=展开但标记 / omit=仅保留省略标记；未传时 depth=full 自动 full，其余 folded"),
             mode: z.enum(["auto", "exact", "fuzzy", "smart"]).optional()

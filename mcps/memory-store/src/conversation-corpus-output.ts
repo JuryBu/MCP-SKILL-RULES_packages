@@ -76,6 +76,10 @@ export function formatCorpusReadProjection(
         ...(round.createdAt === undefined ? {} : { createdAt: round.createdAt }),
         ...(round.legacyRoundIndices ? { legacyRoundIndices: [...round.legacyRoundIndices] } : {}),
         messageIds: messageIdsByRound.get(round.roundIndex) || [],
+        ...(selection.messageRoles.some(role => role !== "user") ? {
+            toolSummary: round.toolCalls.length ? [...round.toolCalls.reduce((counts, call) => counts.set(call.name, (counts.get(call.name) || 0) + 1), new Map<string, number>())].map(([name, count]) => ({ name, count })) : round.toolSummary || [],
+            toolSummaryAvailable: true,
+        } : {}),
         ...(selection.messageRoles.includes("user") ? codexCorpusAttachmentReferences(round) : {}),
         ...(extraTypes.size ? requestedRoundDetails(round, detailRoles, extraTypes, subagentSource) : {}),
     }));

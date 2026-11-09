@@ -1,4 +1,4 @@
-# MCP Memory Store v1.27.8
+# MCP Memory Store v1.27.9
 
 原文各入口统一使用`conversationId`记录调用者、`conversationIds`选择目标。单条`fetch/search/read/recall/export`接受一个目标，旧调用省略目标数组时仍按`conversationId`读取；批量导出显式使用`exportBatch=true`。历史范围先准备所需内容，再把完整构建沿原任务排入后台，已发布引用继续可读。
 
@@ -9,6 +9,8 @@ Codex采用明文追加段时，近期窗口可先返回局部正文，旧压缩
 历史定位、来源重读取与控制请求的补修见[故障隔离说明](docs/history-source-isolation.md)：五端默认列表先枚举元数据，正文探针按预算核实，已确认候选在期限耗尽时随部分覆盖返回。WSF近期正文先于完整身份核查，Codex/CC/DSH定位避免隐式完整准备，Antigravity按目标步骤读取并传递取消。慢来源保留隔离执行及整树清理，普通查询、状态与取消有独立响应路径。
 
 ## 本地检索与分段就绪读取
+
+快读、命中展开、就绪读取和正文搜索默认返回按轮次、角色整理的Markdown，保留附件、批注、固定引用、覆盖范围与后续调用。程序需要解析原始结果时显式设置`format="json"`，并沿返回的`next`继续；大结果保持同一结果ID分页。`brief`缩短可见消息，`full`及`extraTypes`展开已准备的详情，普通读取保留轻量工具名称概要，具体见[返回格式与详细度](docs/five-host-search.md#返回格式与详细度)。
 
 `conversation_read_original(action="search_all")` 在Codex、Claude Code、Windsurf/Devin、Antigravity和DeepSeek Harness的本地对话正文中组合关键词，支持工作区、对话、角色范围，以及交集、并集和排除条件。单端显式传入具体 `dataChain`，多端显式使用 `dataChains`；调用者应填写当前端，工具按选择范围查找。返回持久任务，使用同一调用者 `conversationId` 与原 `taskId` 查询动态结果、取消或恢复；命中附带来源、次数、轮次和来源版本，可继续 `read_hit` 定点读取。[五端搜索与范围读取](docs/five-host-search.md)说明了参数、覆盖和来源差异。
 

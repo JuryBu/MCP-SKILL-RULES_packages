@@ -12,7 +12,7 @@ export async function readCliTailWindow(database: DatabaseSync, sessionId: strin
             json_object('summarized_from',json_extract(metadata,'$.summarized_from'),
                 'is_system_prefix',json_extract(metadata,'$.is_system_prefix')) ELSE metadata END AS metadata,
         CASE WHEN json_valid(chat_message) AND json_type(chat_message)='object' THEN
-            json_object('role',json_extract(chat_message,'$.role'),
+            json_object('role',json_extract(chat_message,'$.role'),'tool_call_id',json_extract(chat_message,'$.tool_call_id'),
                 'metadata',json_object('created_at',json_extract(chat_message,'$.metadata.created_at')))
             ELSE NULL END AS message
         FROM message_nodes WHERE session_id=? AND node_id=?`);

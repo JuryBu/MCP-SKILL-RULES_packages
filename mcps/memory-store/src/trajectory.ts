@@ -35,6 +35,7 @@ export interface ConversationRound {
     attachments?: import("./conversation-attachments.js").ConversationAttachment[]; // Codex/Antigravity 附件引用（不直接输出 data URL）
     aiResponses: AiResponse[];   // AI 回复（可能多条）
     toolCalls: ToolCallInfo[];   // 工具调用列表
+    toolSummary?: Array<{ name: string; count: number }>;
     taskBoundaries: TaskInfo[];  // 任务状态
     codeActions: CodeActionInfo[]; // 代码编辑
     subagentSummaries: SubagentSummary[]; // 子代理线程摘要（Codex 链路）

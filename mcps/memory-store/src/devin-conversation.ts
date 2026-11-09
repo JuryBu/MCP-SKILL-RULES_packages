@@ -14,7 +14,7 @@ export interface DevinConversationOptions extends DevinReadOptions {
     materializeAttachments?: boolean;
 }
 
-export const DEVIN_NORMALIZATION_VERSION = 4;
+export const DEVIN_NORMALIZATION_VERSION = 5;
 
 function originalTime(node: DevinMessageNode): string | undefined {
     const original = node.message.metadata?.created_at;

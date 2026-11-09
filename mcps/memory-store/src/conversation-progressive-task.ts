@@ -203,6 +203,12 @@ async function openReadyGeneration(generation: NonNullable<ProgressiveReadyState
     }
 }
 
+export function progressiveReadyReadNext(request: ProgressiveRequest, taskId: string, initialBlockIds?: string[]) {
+    return { action: "read_ready", conversationId: request.ownerId, dataChain: request.dataChain,
+        taskId, lastRounds: request.initialRounds,
+        ...(request.direction === "oldest" ? { buildOrder: "oldest", ...(initialBlockIds?.length === 1 ? { blockId: initialBlockIds[0] } : {}) } : {}) };
+}
+
 export async function getProgressiveTaskStatus(identity: ProgressiveTaskIdentity & { waitMs?: number; afterRevision?: string }): Promise<unknown> {
     if (identity.waitMs !== undefined && (!Number.isFinite(identity.waitMs) || identity.waitMs < 0)) throw new Error("Invalid progressive status waitMs");
     if (identity.afterRevision !== undefined && !/^[a-f0-9]{64}$/.test(identity.afterRevision)) throw new Error("Invalid progressive status afterRevision");
@@ -239,7 +245,8 @@ export async function getProgressiveTaskStatus(identity: ProgressiveTaskIdentity
             rangeAvailable, cancellationPending,
             warnings: [...(ready?.warnings || []), ...(partialFailure ? [`PREPARATION_FAILED_WITH_READABLE_RANGE: ${task?.error}`] : [])],
             next: rangeAvailable
-                ? { action: "read_ready", conversationId: identity.ownerId, dataChain: record.payload.request.dataChain, taskId: identity.taskId }
+                ? progressiveReadyReadNext(record.payload.request, identity.taskId,
+                    ready?.preferredBlockIds?.filter(blockId => status?.blocks.some(block => block.blockId === blockId)))
                 : task?.status === "running" || task?.status === "suspended"
                     ? { action: "prepare_status", conversationId: identity.ownerId, dataChain: record.payload.request.dataChain, taskId: identity.taskId, waitSeconds: 1, afterProgressRevision: revision }
                     : task?.status === "cancelled"

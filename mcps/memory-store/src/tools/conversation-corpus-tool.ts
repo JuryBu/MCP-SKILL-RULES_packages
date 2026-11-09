@@ -6,6 +6,7 @@ import type { CorpusMessageRole, CorpusProjection, CorpusProvider, CorpusReadCon
 import { normalizeCodexCorpusConversationId } from "../conversation-corpus-search.js";
 import { resolveCorpusSources, type CorpusSource } from "../conversation-corpus-sources.js";
 import { formatCorpusReadProjection } from "../conversation-corpus-output.js";
+import { formatCorpusReadableResult, withCorpusOutputFormat } from "../conversation-readable-output.js";
 import type { ExtraType } from "../trajectory.js";
 import { runIsolatedSource } from "../conversation-isolated-source.js";
 import { DATA_ROOT } from "../store.js";
@@ -17,6 +18,7 @@ export function isCorpusAction(action: string): boolean {
 }
 
 export interface CorpusToolParams {
+    format?: "markdown" | "json";
     deadlineMs?: number;
     action: string;
     conversationId?: string;
@@ -197,12 +199,12 @@ async function readCorpusResultPage(params: CorpusToolParams): Promise<unknown> 
     const ownerId = params.conversationId?.trim();
     if (!ownerId) throw new Error("read_result需要原调用者conversationId");
     const directory = path.join(DATA_ROOT, "corpus-results", createHash("sha256").update(ownerId).digest("hex"), taskId);
-    const metadata = JSON.parse(await fs.readFile(path.join(directory, "manifest.json"), "utf8")) as { ownerId: string; bytes: number; sha256: string; createdAt: string };
+    const metadata = JSON.parse(await fs.readFile(path.join(directory, "manifest.json"), "utf8")) as { ownerId: string; bytes: number; sha256: string; createdAt: string; format?: "markdown" | "json" };
     if (metadata.ownerId !== ownerId || !Number.isSafeInteger(metadata.bytes) || metadata.bytes < 0 || !/^[a-f0-9]{64}$/u.test(metadata.sha256)) throw new Error("read_result来源记录无效");
     const cursor = params.continuationCursor?.split(":");
     const offset = cursor ? Number(cursor[1]) : 0;
     if (cursor && (cursor.length !== 2 || cursor[0] !== metadata.sha256) || !Number.isSafeInteger(offset) || offset < 0 || offset > metadata.bytes) throw new Error("read_result续读位置或来源版本无效");
-    const artifactPath = path.join(directory, "result.json");
+    const artifactPath = path.join(directory, metadata.format === "markdown" ? "result.md" : "result.json");
     const descriptor = await fs.open(artifactPath, "r");
     let end = 0;
     let text: string;
@@ -218,12 +220,15 @@ async function readCorpusResultPage(params: CorpusToolParams): Promise<unknown> 
     const hasMore = nextOffset < metadata.bytes;
     return { delivery: "paged", complete: !hasMore, artifactComplete: true, artifactPath, taskId,
         bytes: metadata.bytes, sha256: metadata.sha256, startByte: offset, endByte: nextOffset, text,
-        description: "text为同一不可变JSON结果的UTF-8分段，顺次续读可取得全文",
+        description: `text为同一不可变${metadata.format === "markdown" ? "Markdown" : "JSON"}结果的UTF-8分段，顺次续读可取得全文`,
+        ...(metadata.format === "markdown" ? { format: "markdown" } : {}),
         ...(hasMore ? { next: { action: "read_result", conversationId: ownerId, taskId, continuationCursor: `${metadata.sha256}:${nextOffset}` } } : {}) };
 }
 
 export async function corpusToolResult(result: unknown, params?: CorpusToolParams): Promise<{ content: Array<{ type: "text"; text: string }> }> {
-    const serialized = JSON.stringify(result, null, 2);
+    const output = params?.format === "json" ? withCorpusOutputFormat(result, "json") : result;
+    const readable = formatCorpusReadableResult(output, params);
+    const serialized = readable ?? JSON.stringify(output, null, 2);
     const bytes = Buffer.byteLength(serialized, "utf8");
     if (bytes <= 100000) return { content: [{ type: "text", text: serialized }] };
     if (params?.conversationId?.trim()) {
@@ -231,9 +236,10 @@ export async function corpusToolResult(result: unknown, params?: CorpusToolParam
         const taskId = `result-${randomUUID()}`;
         const directory = path.join(DATA_ROOT, "corpus-results", createHash("sha256").update(ownerId).digest("hex"), taskId);
         await fs.mkdir(directory, { recursive: true });
-        await fs.writeFile(path.join(directory, "result.json"), serialized, { encoding: "utf8", flag: "wx" });
-        await fs.writeFile(path.join(directory, "manifest.json"), JSON.stringify({ ownerId, bytes, sha256: createHash("sha256").update(serialized).digest("hex"), createdAt: new Date().toISOString() }), { encoding: "utf8", flag: "wx" });
-        return { content: [{ type: "text", text: JSON.stringify(await readCorpusResultPage({ action: "read_result", conversationId: ownerId, taskId })) }] };
+        await fs.writeFile(path.join(directory, readable === undefined ? "result.json" : "result.md"), serialized, { encoding: "utf8", flag: "wx" });
+        await fs.writeFile(path.join(directory, "manifest.json"), JSON.stringify({ ownerId, bytes, sha256: createHash("sha256").update(serialized).digest("hex"), createdAt: new Date().toISOString(), ...(readable === undefined ? {} : { format: "markdown" }) }), { encoding: "utf8", flag: "wx" });
+        const page = await readCorpusResultPage({ action: "read_result", conversationId: ownerId, taskId });
+        return { content: [{ type: "text", text: formatCorpusReadableResult(page, { ...params, action: "read_result" }) ?? JSON.stringify(params.format === "json" ? withCorpusOutputFormat(page, "json") : page) }] };
     }
     const directory = await fs.mkdtemp(path.join(os.tmpdir(), "memory-store-corpus-"));
     const artifactPath = path.join(directory, "result.json");
