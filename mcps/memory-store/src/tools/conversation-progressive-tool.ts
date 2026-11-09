@@ -6,6 +6,7 @@ import { normalizeProgressiveProjection, type ProgressiveRequest } from "../conv
 import { availableProgressiveRoles } from "../conversation-progressive-projection.js";
 import type { ProgressiveSource } from "../conversation-progressive-types.js";
 import { normalizeCodexCorpusConversationId } from "../conversation-corpus-search.js";
+import { getCodexThreadMetadataByIdAsync } from "../codex-client.js";
 import { resolveCorpusSources } from "../conversation-corpus-sources.js";
 import type { ProgressiveSelection, ProgressiveReadResult } from "../conversation-progressive-types.js";
 import {
@@ -158,7 +159,26 @@ export async function runProgressiveAction(params: ProgressiveToolParams): Promi
     const selectedRoles = params.messageRoles === undefined && status.source.conversation?.isChildThread
         ? availableMessageRoles.filter(role => role === "subagent" || (params.depth === "full" && role === "tool")) : roles(params);
     if ((params.depth === "full" || params.extraTypes?.length) && preparation.request.depth !== "full") {
-        throw new Error("此任务按normal准备，尚无完整思考和工具详情。请用prepare、depth=full及所需messageRoles准备对应范围，再沿返回的taskId读取");
+        const selectedBlock = params.blockId ? status.blocks.find(block => block.blockId === params.blockId) : undefined;
+        const relativeSelection = row?.kind === "relative" || selectedBlock?.coverage.kind === "relative"
+            || (!params.blockId && (params.startRound !== undefined || params.endRound !== undefined)
+                && status.completeRanges.some(range => range.kind === "relative"));
+        const absoluteStart = relativeSelection ? undefined : row?.kind === "absolute" ? row.round.roundIndex : params.startRound;
+        const absoluteEnd = relativeSelection ? undefined : row?.kind === "absolute" ? row.round.roundIndex : params.endRound;
+        const next = absoluteStart !== undefined || absoluteEnd !== undefined
+            ? { action: "read_fast", conversationId: ownerId, conversationIds: [preparation.request.conversationId],
+                dataChain: preparation.request.dataChain, startRound: absoluteStart, endRound: absoluteEnd,
+                depth: "full", messageRoles: selectedRoles, extraTypes: params.extraTypes, prepareCache: false }
+            : { action: "prepare", conversationId: ownerId, conversationIds: [preparation.request.conversationId],
+                dataChain: preparation.request.dataChain, lastRounds: params.lastRounds ?? preparation.request.initialRounds,
+                buildOrder: params.buildOrder || preparation.request.direction, depth: "full", messageRoles: selectedRoles, prepareCache: false };
+        return { taskId, status: "needs_preparation", phase: "details-not-prepared", rangeAvailable: true,
+            preparedDepth: preparation.request.depth || "normal", requestedDepth: "full",
+            detail: "已有正文仍可读取；完整思考和工具详情需要补充准备，请按下一步参数继续。原任务和固定引用保留。",
+            ...(relativeSelection ? { requestedSelection: { originalRangeRef: params.rangeRef, blockId: params.blockId,
+                startRound: params.startRound, endRound: params.endRound, relativeRound: row?.round.roundIndex,
+                detail: "这是原窗口中的相对轮次；补充准备后按新窗口的覆盖信息选择详情，原引用继续指向原正文。" } } : {}),
+            next };
     }
     const missingRoles = selectedRoles.filter(role => !availableMessageRoles.includes(role));
     if (missingRoles.length) throw new Error("Requested message roles were not prepared: " + missingRoles.join(", ") + ". Available message roles: " + availableMessageRoles.join(", ")
@@ -226,11 +246,17 @@ export async function runProgressiveAction(params: ProgressiveToolParams): Promi
     } else result = await cache.read(selection);
     const { messages, rounds } = formatProgressiveReadRows(result, params, selectedRoles);
     const sourceRangeVerified = verifiedSourceRange(result.status.source);
+    let conversation = result.status.source.conversation;
+    if (result.status.source.host === "codex" && !conversation?.title) {
+        const thread = await getCodexThreadMetadataByIdAsync(result.status.source.conversationId).catch(() => null);
+        if (thread) conversation = { ...conversation, id: thread.id, source: "codex", title: thread.title || thread.id,
+            workspace: conversation?.workspace || thread.cwd || "" };
+    }
     return {
         taskId, phase: ready.phase, requestedRangeComplete: result.requestedRangeComplete && sourceRangeVerified,
         publishedRangeComplete: result.requestedRangeComplete, sourceRangeVerified,
         fullSourceComplete: result.status.complete, coverage: result.status.completeRanges,
-        source: result.status.source, availableMessageRoles,
+        source: result.status.source, ...(conversation ? { conversation } : {}), availableMessageRoles,
         rounds,
         messages, ...(params.action === "extract_ready" ? { text: messages.map(message => "[" + message.role + "] " + message.text).join("\n\n") } : {}),
         warnings: ready.warnings,

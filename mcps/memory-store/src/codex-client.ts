@@ -1077,6 +1077,11 @@ export function getCodexThread(conversationId: string): CodexThreadInfo | null {
     return rolloutMatches.length === 1 ? rolloutMatches[0] : null;
 }
 
+export async function getCodexThreadMetadataByIdAsync(conversationId: string): Promise<CodexThreadInfo | null> {
+    const exactId = conversationId.trim().toLowerCase();
+    return isLikelyCodexIdLookup(exactId) && exactId.length === 36 ? readThreadByIdAsync(exactId) : null;
+}
+
 export async function getCodexThreadAsync(conversationId: string): Promise<CodexThreadInfo | null> {
     const exactId = conversationId.trim().toLowerCase();
     if (isLikelyCodexIdLookup(exactId) && exactId.length === 36) {

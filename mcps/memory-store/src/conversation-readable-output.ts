@@ -1,4 +1,5 @@
 import type { CorpusToolParams } from "./tools/conversation-corpus-tool.js";
+import { compactProgressiveRef } from "./conversation-progressive-reference.js";
 import { formatRoundForMessageRoles, parseResponseAnnotations, type ConversationRound, type ConversationMessageRole } from "./trajectory.js";
 
 type ResultObject = Record<string, unknown>;
@@ -91,14 +92,41 @@ function attachmentLines(value: ResultObject): string[] {
     return lines;
 }
 
-function messageLines(message: ResultObject): string[] {
+function localDate(timestamp: string): string {
+    const date = new Date(timestamp);
+    return Number.isNaN(date.getTime()) ? "" : `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
+}
+
+function localTime(timestamp: string, pageDate: string): string {
+    const date = new Date(timestamp);
+    const day = localDate(timestamp);
+    if (!day) return timestamp;
+    const time = `${String(date.getHours()).padStart(2, "0")}:${String(date.getMinutes()).padStart(2, "0")}`;
+    return day === pageDate ? time : `${day} ${time}`;
+}
+
+function readableRef(reference: unknown): string {
+    return compactProgressiveRef(string(reference)) || string(reference);
+}
+
+function detailsPreparationLines(result: ResultObject): string[] {
+    if (result.phase !== "details-not-prepared") return [];
+    const depths = [result.preparedDepth && `已准备 ${result.preparedDepth}`, result.requestedDepth && `请求 ${result.requestedDepth}`].filter(Boolean);
+    return [`ℹ️ 已有正文可读，详情需要补充准备${depths.length ? `（${depths.join("，")}）` : ""}`, ...(result.detail ? [string(result.detail)] : []),
+        ...(result.requestedSelection ? [`原请求范围：${JSON.stringify(result.requestedSelection)}`] : [])];
+}
+
+function messageLines(message: ResultObject, context: { source: string; baseSource: string; pageDate: string; brief: boolean }): string[] {
     const roles: Record<string, string> = { user: "👤 用户", assistant: "🤖 AI", tool: "🔧 工具", subagent: "🧩 子代理" };
+    const briefRoles: Record<string, string> = { user: "👤", assistant: "🤖", tool: "🔧 工具", subagent: "🧩 子代理" };
     const role = string(message.role);
     const agent = role === "subagent" ? string(message.agentNickname) || string(message.nickname) || string(message.agentRole) : "";
-    const lines = [`### ${roles[role] || role}${agent ? ` · ${agent}` : ""}${message.timestamp ? ` · ${message.timestamp}` : ""}`];
-    if (message.sourceThreadId) lines.push(`来源对话：\`${message.sourceThreadId}\``);
+    const lines = [`### ${(context.brief ? briefRoles : roles)[role] || role}${agent ? ` · ${agent}` : ""}${message.timestamp ? ` · ${localTime(string(message.timestamp), context.pageDate)}` : ""}`];
+    const source = string(message.sourceThreadId) || context.baseSource;
+    if (source && source !== context.source) lines.push(`来源对话：\`${source}\``);
+    if (source) context.source = source;
     const parsed = role === "user" ? parseResponseAnnotations(string(message.text)) : { text: string(message.text), annotations: [], warnings: [] };
-    if (parsed.text) lines.push("", parsed.text);
+    if (parsed.text) lines.push("", `${parsed.text}${context.brief && message.truncated === true && !parsed.text.endsWith("…") ? "…" : ""}`);
     const annotations = [...parsed.annotations, ...objects(message.annotations)];
     const displayedAnnotations = new Set<string>();
     for (const annotation of annotations) {
@@ -111,27 +139,44 @@ function messageLines(message: ResultObject): string[] {
     }
     lines.push(...warningLines(parsed.warnings));
     lines.push(...attachmentLines(message));
-    if (message.truncated === true) lines.push(`⚠️ 当前为简略文本${message.originalTextChars ? `，原文${message.originalTextChars}字符` : ""}，用depth=normal读取完整正文`);
+    if (message.truncated === true && !context.brief) lines.push(`⚠️ 当前为简略文本${message.originalTextChars ? `，原文${message.originalTextChars}字符` : ""}，用depth=normal读取完整正文`);
     return lines;
 }
 
 function readLines(result: ResultObject, params: CorpusToolParams): string[] {
     const source = object(result.source);
     const conversation = object(result.conversation || source.conversation);
+    const messages = objects(result.messages);
+    const rounds = objects(result.rounds);
+    const brief = params.depth === "brief";
+    const baseSource = string(conversation.id) || string(source.conversationId) || params.conversationIds?.[0] || string(messages[0]?.sourceThreadId);
+    const pageDate = messages.map(message => localDate(string(message.timestamp))).find(Boolean) || "";
+    const context = { source: baseSource, baseSource, pageDate, brief };
     const lines = [`# 📖 ${string(conversation.title) || "对话原文"}`];
     const identity = [
         string(conversation.source) || string(source.host) || params.dataChain,
-        string(conversation.id) || string(source.conversationId) || params.conversationIds?.[0],
+        baseSource,
     ].filter(Boolean);
     if (identity.length) lines.push(identity.join(" · "));
     if (conversation.workspace) lines.push(`工作区：${conversation.workspace}`);
     if (result.totalRounds !== undefined || source.totalRounds !== undefined) lines.push(`总轮次：${result.totalRounds ?? source.totalRounds}`);
+    const relative = result.roundNumbering === "relative" || rounds.some(round => round.roundNumbering === "relative");
+    const numbers = [...rounds.map(round => Number(round.round ?? round.roundIndex)), ...messages.map(message => Number(message.round))].filter(Number.isFinite);
+    const firstRound = numbers.reduce((minimum, round) => Math.min(minimum, round), Infinity);
+    const lastRound = numbers.reduce((maximum, round) => Math.max(maximum, round), -Infinity);
+    const actualRange = numbers.length ? `${relative ? "相对" : ""}轮次${firstRound}–${lastRound}` : "";
+    const lastRounds = params.lastRounds ?? result.requestedRounds ?? object(result.request).lastRounds;
+    const selectedRange = lastRounds !== undefined ? `末${lastRounds}轮` : params.startRound !== undefined || params.endRound !== undefined
+        ? `所选轮次${params.startRound ?? "起始"}–${params.endRound ?? "末尾"}` : params.rangeRef ? "固定引用范围" : "";
+    if (selectedRange || actualRange) lines.push(`范围：${selectedRange}${selectedRange && actualRange ? " · 本页" : ""}${actualRange}`);
+    if (pageDate) lines.push(`时间：${pageDate}（本机时间）`);
     if (conversation.isChildThread) lines.push(`子代理：${conversation.agentNickname || conversation.agentRole || conversation.id}${conversation.parentConversationId ? ` · 主对话：${conversation.parentConversationId}` : ""}`);
     if (result.requestedRangeComplete === false || result.partial === true) lines.push("⚠️ 当前只返回可读范围，未覆盖内容与来源缺口见后续提示");
+    if (result.sourceRangeVerified === false) lines.push("⚠️ 来源范围仍待核验");
     if (result.fullSourceComplete === false || result.fullSourceProjectionComplete === false) lines.push("⏳ 其余历史尚未完整准备，已就绪内容可以继续使用");
-    if (result.roundNumbering === "relative" || objects(result.rounds).some(round => round.roundNumbering === "relative")) lines.push("相对轮号仅属于当前已准备范围，绝对轮号仍待核实");
-    const messages = objects(result.messages);
-    const rounds = objects(result.rounds);
+    if (relative) lines.push("相对轮号仅属于当前已准备范围，绝对轮号仍待核实");
+    lines.push(...detailsPreparationLines(result));
+    let briefTruncated = messages.some(message => message.truncated === true);
     const metadata = new Map(rounds.map(round => [Number(round.round ?? round.roundIndex), round]));
     const grouped = new Map<number, ResultObject[]>();
     for (const message of messages) {
@@ -150,10 +195,12 @@ function readLines(result: ResultObject, params: CorpusToolParams): string[] {
                 : params.depth === "full" ? ["user", "assistant", "tool", "subagent"] : ["user", "assistant"];
             const roles = new Set<ConversationMessageRole>((params.messageRoles || defaults) as ConversationMessageRole[]);
             if (roles.delete("model" as ConversationMessageRole)) roles.add("assistant");
-            lines.push(formatRoundForMessageRoles(round as unknown as ConversationRound, params.depth || "normal", params.extraTypes || [], roles, "full"));
+            let rendered = formatRoundForMessageRoles(round as unknown as ConversationRound, params.depth || "normal", params.extraTypes || [], roles, "full");
+            if (brief) rendered = rendered.replace(/\n\n⚠️ 本段过长已截断（\d+→\d+字），可用 depth="full" 展开/gu, () => { briefTruncated = true; return "…"; });
+            lines.push(rendered);
         } else {
             lines.push(`## ${round.roundNumbering === "relative" || result.roundNumbering === "relative" ? "相对轮次" : "轮次"} ${roundNumber}`);
-            for (const message of group) lines.push("", ...messageLines(message));
+            for (const message of group) lines.push("", ...messageLines(message, context));
             if (!group.some(message => message.role === "user")) lines.push(...attachmentLines(round));
             for (const detail of objects(round.thinking)) if (detail.thinking) lines.push("", "#### 💭 思考", string(detail.thinking));
             for (const detail of objects(round.aiResponses)) if (detail.thinking) lines.push("", "#### 💭 思考", string(detail.thinking));
@@ -167,11 +214,15 @@ function readLines(result: ResultObject, params: CorpusToolParams): string[] {
             else if (round.toolSummaryAvailable === false) lines.push("⚠️ 当前准备范围尚无工具名称概要");
         }
         if (params.extraTypes?.includes("tool_results")) for (const detail of objects(round.sourceEvents)) lines.push("", "#### 🔧 来源事件详情", JSON.stringify(detail, null, 2));
-        if (round.ref) lines.push("", `固定引用：\`${round.ref}\``);
-        if (round.blockId) lines.push(`已发布块：\`${round.blockId}\``);
+        if (round.ref) lines.push("", `固定引用：\`${readableRef(round.ref)}\``);
+        if (round.blockId && !(compactProgressiveRef(string(round.ref)) && string(round.ref).split(":")[3] === round.blockId)) lines.push(`已发布块：\`${round.blockId}\``);
     }
     if (!grouped.size) lines.push("", "当前所选范围与角色没有可见正文");
-    for (const key of ["taskId", "ref", "blockId", "revision", "sourceRevision", "cacheRevision", "originRevision"] as const) if (result[key]) lines.push("", `${key}：\`${result[key]}\``);
+    if (brief && briefTruncated) lines.push("", "ℹ️ 简读中…表示正文已截短，可用 depth=normal 继续，长段落用 depth=full 展开");
+    for (const key of ["taskId", "ref", "blockId", "revision", "sourceRevision", "cacheRevision", "originRevision"] as const) {
+        if (key === "blockId" && [result, ...rounds].some(round => compactProgressiveRef(string(round.ref)) && string(round.ref).split(":")[3] === result.blockId)) continue;
+        if (result[key]) lines.push("", `${key}：\`${key === "ref" ? readableRef(result[key]) : result[key]}\``);
+    }
     lines.push(...warningLines(result.warnings));
     const preparation = object(result.cachePreparation);
     if (preparation.taskId) lines.push(`⏳ 缓存准备任务：\`${preparation.taskId}\``);
@@ -227,7 +278,7 @@ function searchLines(result: ResultObject, params: CorpusToolParams): string[] {
     lines.push(...coverageLines(result));
     for (const hit of objects(result.hits)) {
         lines.push("", `### 命中轮次 ${hit.round ?? ""}`, string(hit.text || hit.snippet));
-        if (hit.ref) lines.push(`固定引用：\`${hit.ref}\``);
+        if (hit.ref) lines.push(`固定引用：\`${readableRef(hit.ref)}\``);
         nextCall(lines, hit.next);
     }
     const request = object(result.request);
@@ -250,7 +301,8 @@ function preparationLines(result: ResultObject): string[] {
     const request = object(result.request);
     const lines = ["# ⏳ 对话历史准备", `任务：\`${result.taskId || ""}\``, `状态：${result.status || result.phase || "准备中"}`];
     if (request.dataChain || request.conversationId) lines.push(`${request.dataChain || ""} · ${request.conversationId || ""}`);
-    lines.push(result.rangeAvailable ? result.requestedRangeComplete === false ? "⏳ 已有部分范围可读，所需范围仍在准备" : "✅ 所需范围已经就绪，可以读取、搜索和定位" : "⏳ 所需范围仍在准备，请沿原任务查询进度");
+    if (result.phase === "details-not-prepared") lines.push(...detailsPreparationLines(result));
+    else lines.push(result.rangeAvailable ? result.requestedRangeComplete === false ? "⏳ 已有部分范围可读，所需范围仍在准备" : "✅ 所需范围已经就绪，可以读取、搜索和定位" : "⏳ 所需范围仍在准备，请沿原任务查询进度");
     if (result.fullSourceComplete === false) lines.push("⏳ 完整历史尚未准备完成");
     const progress = object(result.progress);
     if (progress.detail) lines.push(string(progress.detail));
@@ -273,6 +325,6 @@ export function formatCorpusReadableResult(value: unknown, params?: CorpusToolPa
     }
     if (["read_fast", "read_hit", "read_ready", "locate_ready", "extract_ready"].includes(params.action) && Array.isArray(result.messages)) return readLines(result, params).join("\n");
     if (["search_all", "search_all_status", "search_ready"].includes(params.action) && (Array.isArray(result.results) || Array.isArray(result.hits))) return searchLines(result, params).join("\n");
-    if ((params.action.startsWith("prepare") || ["read_fast", "read_ready", "search_ready"].includes(params.action)) && result.taskId) return preparationLines(result).join("\n");
+    if ((params.action.startsWith("prepare") || ["read_fast", "read_ready", "search_ready"].includes(params.action)) && (result.taskId || result.phase === "details-not-prepared")) return preparationLines(result).join("\n");
     return undefined;
 }

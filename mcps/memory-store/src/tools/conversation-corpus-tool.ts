@@ -21,6 +21,7 @@ export interface CorpusToolParams {
     format?: "markdown" | "json";
     deadlineMs?: number;
     action: string;
+    rangeRef?: string;
     conversationId?: string;
     conversationIds?: string[];
     parentConversationId?: string;

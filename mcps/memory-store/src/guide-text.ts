@@ -20,6 +20,8 @@ export const GUIDE_TEXT = `# MCP Memory Store v${VERSION} 使用指南
 
 快读、命中展开、就绪读取与正文搜索默认返回按轮次和角色整理的可读Markdown，保留图片附件、批注、工具概要、固定引用及未覆盖范围。程序解析使用format="json"，沿返回next继续以保留格式；大结果使用同一结果ID和read_result续页。brief缩短可见消息，normal保留完整正文与轻量概要，full和extraTypes展开已经准备的详情。准备任务的next保留最初请求的末尾轮数。
 
+渐进正文使用可直接回传同一taskId的p2:短引用，保留完整块SHA256与覆盖校验，原pcache:v1:引用继续有效；JSON保留完整ref。同一来源集中显示，跨来源和子代理身份仍注明，简读不逐条重复长截短说明。未准备的full详情返回needs_preparation与可执行next，原正文和引用保留；按新准备任务的覆盖信息读取补充详情。
+
 未知目标可用list配合明确dataChain、workspaces与contextProbe定位，conversationId只标识当前调用者。contextProbe允许原句的标点、空白与段落变化，返回实际原文片段；文字增删或改写请提供真实原话或显式模糊深搜。各来源独立核验正文，到期返回已确认候选和partial、未查范围及源错误。取消仍停止原读取，sourceFailureMode="fail"保留严格失败策略。list是同步入口，只支持缩小范围或调整deadlineMs；后台深搜使用deep_locate及原taskId的deep_locate_status/cancel。prepare、search_all分别使用各自status/cancel/resume，不混用任务操作。
 
 Codex、Claude Code、Windsurf/Devin、Antigravity、DeepSeek Harness 共用正文组合搜索和范围准备入口。新请求必须显式选择具体 dataChain：codex、claude-code、windsurf、antigravity 或 dsh；多端正文搜索使用 dataChains。查询当前端时也由调用者填写当前端的具体值，不省略来源或使用 auto 猜测。

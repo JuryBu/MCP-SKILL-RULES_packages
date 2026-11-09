@@ -1,6 +1,7 @@
 import * as fs from "node:fs/promises";
 import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
+import { parseCompactProgressiveRef } from "./conversation-progressive-reference.js";
 import { setTimeout as delay } from "node:timers/promises";
 import { compileCorpusSearch, CorpusSearchAccumulator, CORPUS_QUERY_SEMANTIC_VERSION } from "./conversation-corpus-search.js";
 import type { CorpusMessage, CorpusSearchRequest } from "./conversation-corpus-types.js";
@@ -510,6 +511,14 @@ class DiskProgressiveCache implements ProgressiveCache {
     }
 
     async locate(ref: string): Promise<ProgressiveRow> {
+        const compact = parseCompactProgressiveRef(ref);
+        if (compact) {
+            const manifest = await this.manifest();
+            const block = manifest.blocks.find(item => item.blockId === compact.blockId && item.coverage.kind === compact.kind);
+            if (!block) return fail("unpublished_ref", "Reference does not name a published immutable block in this source");
+            for await (const row of this.rows(manifest, { blockId: block.blockId, startRound: compact.round, endRound: compact.round })) return row;
+            return fail("invalid_ref", "Reference round is outside published coverage");
+        }
         const parsed = /^pcache:v1:([a-f0-9]{64}):([a-f0-9]{64}):([a-f0-9]{64}):(absolute|relative):([1-9][0-9]*)$/.exec(ref);
         if (!parsed || parsed[1] !== this.sourceKey) return fail("invalid_ref", "Reference belongs to another source generation or has invalid syntax");
         const manifest = await this.manifest();

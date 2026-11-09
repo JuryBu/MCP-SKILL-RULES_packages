@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { formatCorpusReadableResult, withCorpusOutputFormat } from "../src/conversation-readable-output.js";
+import { compactProgressiveRef } from "../src/conversation-progressive-reference.js";
 
 const params = { action: "read_ready", conversationId: "reader", dataChain: "windsurf" };
 const result = {
@@ -69,6 +70,77 @@ const childFull = formatCorpusReadableResult({ conversation: { isChildThread: tr
 for (const expected of ["child-body", "child-thinking", "Plato", "相对轮次"]) assert.ok(childFull.includes(expected), expected);
 assert.equal(childFull.split("single-tool-payload").length - 1, 1);
 
+const blockId = "b".repeat(64);
+const longRef = `pcache:v1:${"a".repeat(64)}:${blockId}:${"c".repeat(64)}:relative:1`;
+const shortRef = compactProgressiveRef(longRef)!;
+const sameDay = new Date(2026, 10, 9, 14, 23).toISOString();
+const nextDay = new Date(2026, 10, 10, 0, 5).toISOString();
+const densityResult = {
+    conversation: { id: "same-source", title: "来源精简", source: "codex" }, roundNumbering: "relative",
+    rounds: [{ round: 1, ref: longRef, blockId, toolSummary: [{ name: "sandbox_exec", count: 2 }] }],
+    messages: [
+        { round: 1, role: "user", text: "简略正文", truncated: true, originalTextChars: 300, timestamp: sameDay, sourceThreadId: "same-source" },
+        { round: 1, role: "assistant", text: "AI正文", truncated: true, timestamp: sameDay, sourceThreadId: "same-source" },
+        { round: 1, role: "subagent", agentNickname: "Sol", text: "不同来源", sourceThreadId: "child-source" },
+        { round: 1, role: "assistant", text: "返回主对话", timestamp: nextDay, sourceThreadId: "same-source" },
+    ], next: { action: "read_ready", taskId: "task", rangeRef: longRef },
+};
+const densitySnapshot = JSON.stringify(densityResult);
+const densityNormal = formatCorpusReadableResult(densityResult, { action: "read_ready", depth: "normal", lastRounds: 4 })!;
+for (const expected of ["# 📖 来源精简", "范围：末4轮 · 本页相对轮次1–1", "时间：2026-11-09（本机时间）", "14:23", "2026-11-10 00:05", shortRef, "sandbox_exec × 2", "Sol", "不同来源"]) assert.ok(densityNormal.includes(expected), expected);
+assert.equal(densityNormal.split("same-source").length - 1, 2);
+assert.equal(densityNormal.split("child-source").length - 1, 1);
+assert.ok(!densityNormal.includes("已发布块"));
+assert.ok(!densityNormal.includes(sameDay));
+assert.ok(densityNormal.includes(JSON.stringify(densityResult.next)));
+const densityBrief = formatCorpusReadableResult(densityResult, { action: "read_ready", depth: "brief", startRound: 1, endRound: 1 })!;
+assert.ok(densityBrief.includes("范围：所选轮次1–1 · 本页相对轮次1–1"));
+assert.ok(densityBrief.includes("### 👤 · 14:23"));
+assert.ok(densityBrief.includes("简略正文…"));
+assert.equal(densityBrief.split("正文已截短").length - 1, 1);
+assert.ok(!densityBrief.includes("当前为简略文本"));
+const premarkedBrief = formatCorpusReadableResult({ messages: [{ round: 1, role: "user", text: "已有省略号…", truncated: true }] }, { action: "read_ready", depth: "brief" })!;
+assert.ok(premarkedBrief.includes("已有省略号…"));
+assert.ok(!premarkedBrief.includes("已有省略号……"));
+assert.equal(premarkedBrief.split("正文已截短").length - 1, 1);
+assert.equal(JSON.stringify(densityResult), densitySnapshot);
+assert.equal(formatCorpusReadableResult(densityResult, { action: "read_ready", format: "json" }), undefined);
+const homogeneous = formatCorpusReadableResult({ ...densityResult, messages: densityResult.messages.slice(0, 2) }, { action: "read_ready" })!;
+assert.equal(homogeneous.split("same-source").length - 1, 1);
+const mismatchedBlock = formatCorpusReadableResult({ messages: [], rounds: [{ round: 1, ref: longRef, blockId: "different-block" }] }, { action: "read_ready" })!;
+assert.ok(mismatchedBlock.includes("different-block"));
+const compactSearch = formatCorpusReadableResult({ taskId: "task", hits: [{ round: 1, ref: longRef, next: densityResult.next }] }, { action: "search_ready" })!;
+assert.ok(compactSearch.includes(`固定引用：\`${shortRef}\``));
+assert.ok(compactSearch.includes(JSON.stringify(densityResult.next)));
+const invalidTime = formatCorpusReadableResult({ messages: [{ round: 1, role: "user", text: "时间保留", timestamp: "unknown-time" }] }, { action: "read_ready" })!;
+assert.ok(invalidTime.includes("unknown-time"));
+const unverified = formatCorpusReadableResult({ sourceRangeVerified: false, partial: true, rounds: [{ round: 1, roundNumbering: "relative" }], messages: [{ round: 1, role: "user", text: "部分正文" }] }, { action: "read_ready" })!;
+for (const expected of ["来源范围仍待核验", "当前只返回可读范围", "相对轮号仅属于当前已准备范围"]) assert.ok(unverified.includes(expected), expected);
+const detailPendingResult = { taskId: "task", status: "needs_preparation", phase: "details-not-prepared", preparedDepth: "normal", requestedDepth: "full", detail: "原准备仅含正文，补充工具详情", next: { action: "prepare", depth: "full", lastRounds: 4 } };
+for (const detailResult of [detailPendingResult, { ...detailPendingResult, messages: [{ round: 1, role: "user", text: "已有正文" }] }]) {
+    const detailPending = formatCorpusReadableResult(detailResult, { action: "read_ready", depth: "full" })!;
+    for (const expected of ["已有正文可读，详情需要补充准备", "已准备 normal", "请求 full", "补充工具详情", JSON.stringify(detailPendingResult.next)]) assert.ok(detailPending.includes(expected), expected);
+    assert.ok(!detailPending.includes("失败"));
+    assert.ok(!detailPending.includes("所需范围已经就绪"));
+}
+const absoluteNext = { action: "read_fast", depth: "full", startRound: 8, endRound: 9, format: "markdown" };
+const relativeSelection = { rangeRef: longRef, roundNumbering: "relative" };
+const absoluteDetailPending = formatCorpusReadableResult({ ...detailPendingResult, requestedSelection: relativeSelection, next: absoluteNext }, { action: "read_ready", depth: "full" })!;
+assert.ok(absoluteDetailPending.includes(JSON.stringify(relativeSelection)));
+assert.ok(absoluteDetailPending.includes(JSON.stringify(absoluteNext)));
+assert.ok(!absoluteDetailPending.includes('"action":"prepare"'));
+const relativeBlockSelection = { blockId, startRound: 2, endRound: 3 };
+const relativeBlockNext = { action: "prepare", conversationId: "reader", conversationIds: ["same-source"], dataChain: "codex", lastRounds: 4, buildOrder: "latest", depth: "full", messageRoles: ["user", "assistant", "tool"], prepareCache: false };
+const relativeBlockResult = { ...detailPendingResult, requestedSelection: relativeBlockSelection, next: relativeBlockNext };
+const relativeBlockSnapshot = JSON.stringify(relativeBlockResult);
+const relativeBlockPending = formatCorpusReadableResult(relativeBlockResult, { action: "read_ready", depth: "full", ...relativeBlockSelection })!;
+for (const expected of ["已有正文可读，详情需要补充准备", `原请求范围：${JSON.stringify(relativeBlockSelection)}`, JSON.stringify(relativeBlockNext)]) assert.ok(relativeBlockPending.includes(expected), expected);
+assert.ok(!relativeBlockPending.includes('"action":"read_fast"'));
+assert.equal(JSON.stringify(relativeBlockResult), relativeBlockSnapshot);
+const legacyBrief = formatCorpusReadableResult({ rounds: [{ roundIndex: 1, startStep: 1, endStep: 2, userMessage: "原文".repeat(101), aiResponses: [{ stepIndex: 2, response: "答复".repeat(101) }], toolCalls: [], subagentSummaries: [], taskBoundaries: [], codeActions: [] }], messages: [] }, { action: "read_fast", depth: "brief" })!;
+assert.ok(!legacyBrief.includes("本段过长已截断"));
+assert.equal(legacyBrief.split("正文已截短").length - 1, 1);
+
 const fs = await import("node:fs/promises");
 const os = await import("node:os");
 const path = await import("node:path");
@@ -107,4 +179,4 @@ try {
     else process.env.MEMORY_STORE_DATA_ROOT = previousRoot;
     await fs.rm(temporary, { recursive: true, force: true });
 }
-console.log("PASS readable output: delta identity/cursors, coverage/errors, stable refs, pending fallback, source events, JSON next propagation and UTF-8 pagination");
+console.log("PASS readable output: compact refs, source transitions, brief density, local dates/ranges, detail preparation, delta cursors, coverage, attachments, JSON and UTF-8 pagination");
