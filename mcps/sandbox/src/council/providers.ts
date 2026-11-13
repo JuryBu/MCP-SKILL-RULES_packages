@@ -2,8 +2,9 @@ import fs from "fs";
 import os from "os";
 import path from "path";
 import { randomUUID } from "node:crypto";
-import { callGetModelResponseDetailed, resolveAntigravityCliModel } from "../ls-client.js";
-import { AntigravityCallError, readAntigravityCatalogFixture } from "../antigravity-model-catalog.js";
+import { callGetModelResponseDetailed, getAntigravityModelCatalog, resolveAntigravityCliModel } from "../ls-client.js";
+import { AntigravityCallError, antigravityCouncilCandidates, selectAntigravityModel, type AntigravityCatalog } from "../antigravity-model-catalog.js";
+import { resolveAntigravityLsCliCommand } from "../antigravity-cli-ls.js";
 import { runAntigravityAgentCli } from "../antigravity-agent-cli.js";
 import { callCodexText } from "../model-bridge.js";
 import { callClaudeCodeText, claudeCodeOptionsFromParams } from "../claude-code-bridge.js";
@@ -371,22 +372,16 @@ function getFallbackConfig(config: CouncilModelConfig, spec: unknown): CouncilMo
     };
 }
 
-function getDefaultFallbackConfigs(config: CouncilModelConfig): CouncilModelConfig[] {
+function getDefaultFallbackConfigs(config: CouncilModelConfig, catalog?: AntigravityCatalog | null): CouncilModelConfig[] {
     config = normalizeCouncilModelConfig(config);
     if (config.provider === "antigravityCli") {
         if (!DEFAULT_ANTIGRAVITY_CLI_FALLBACKS_ENABLED) return [];
-        if (readAntigravityCatalogFixture()) return [];
         const model = getDefaultModel(config);
         const baseParams = withoutFallbackParams(config.params) || {};
         const chain = getCompatibleAntigravityCliModelEnv(
             "SANDBOX_COUNCIL_ANTIGRAVITY_CLI_MODEL_CHAIN",
             "SANDBOX_COUNCIL_GEMINI_CLI_MODEL_CHAIN",
-            [
-                "Gemini 3.1 Pro (High)",
-                "Gemini 3.5 Flash (High)",
-                "Gemini 3.1 Pro (Low)",
-                "Gemini 3.5 Flash (Medium)",
-            ].join(","),
+            catalog ? antigravityCouncilCandidates(catalog).map(entry => entry.label).join(",") : "",
         ).split(",").map((item) => item.trim()).filter(Boolean);
         const currentIndex = chain.findIndex((item) => item === model);
         const candidates = currentIndex >= 0 ? chain.slice(currentIndex + 1) : chain.filter((item) => item !== model);
@@ -465,10 +460,10 @@ function getDefaultFallbackConfigs(config: CouncilModelConfig): CouncilModelConf
         }));
 }
 
-function getFallbackConfigs(config: CouncilModelConfig): CouncilModelConfig[] {
+function getFallbackConfigs(config: CouncilModelConfig, catalog?: AntigravityCatalog | null): CouncilModelConfig[] {
     config = normalizeCouncilModelConfig(config);
     const raw = config.params?.fallbackModels ?? config.params?.fallbacks ?? config.params?.fallbackModel;
-    if (raw === undefined) return getDefaultFallbackConfigs(config);
+    if (raw === undefined) return getDefaultFallbackConfigs(config, catalog);
     const specs = Array.isArray(raw) ? raw : [raw];
     return specs
         .filter((spec) => spec !== undefined && spec !== null && spec !== "")
@@ -845,11 +840,11 @@ async function callAntigravityCliText(
         { transport: "cli-agent", submitted: false, outcomeUnknown: false, safeToFallback: false, kind: "rejected" });
     loadImages(imagePaths, Boolean(config.supportsVision), config.provider);
     const model = await resolveAntigravityCliModel(getDefaultModel(config), signal, deadline);
-    const command = getStringParam(config.params, "command") || getStringParam(config.params, "cli") || getCompatibleEnv(
+    const command = resolveAntigravityLsCliCommand(getStringParam(config.params, "command") || getStringParam(config.params, "cli") || getCompatibleEnv(
         "SANDBOX_COUNCIL_ANTIGRAVITY_CLI_COMMAND",
         "SANDBOX_COUNCIL_GEMINI_CLI_COMMAND",
-        "agy",
-    );
+        "",
+    ));
     const cwd = path.resolve(getStringParam(config.params, "cwd") || process.cwd());
     const dir = config.provider === "antigravityCli"
         ? antigravityCliAccessibleTempDir(cwd, "council-model-calls", runId)
@@ -936,9 +931,23 @@ export async function callCouncilModel(
         const response = await apiSession.call(config, prompt, imagePaths, timeoutMs, signal, runId);
         return councilApiResult(config.provider, response.modelId ?? config.model ?? "profile-default", response, runId);
     }
-    const candidates = [config, ...getFallbackConfigs(config)].map(normalizeCouncilModelConfig);
     const antigravityDeadline = config.provider === "antigravity" || config.provider === "antigravityCli"
         ? Date.now() + (getNumberParam(config.params, "timeoutMs") ?? getNumberParam(config.params, "modelTimeoutMs") ?? timeoutMs) : undefined;
+    const catalog = config.provider === "antigravityCli" ? await getAntigravityModelCatalog(signal, antigravityDeadline) : undefined;
+    const explicitFallbacks = config.params?.fallbackModels ?? config.params?.fallbacks ?? config.params?.fallbackModel;
+    const seenModels = new Set<string>();
+    const candidates = [config, ...getFallbackConfigs(config, catalog)].map(normalizeCouncilModelConfig).filter((candidate, index) => {
+        if (!catalog) return true;
+        try {
+            const selected = selectAntigravityModel(catalog, getDefaultModel(candidate));
+            if (explicitFallbacks === undefined && seenModels.has(selected.model)) return false;
+            seenModels.add(selected.model);
+            return true;
+        } catch (error) {
+            if (!(error instanceof AntigravityCallError) || index === 0) throw error;
+            return false;
+        }
+    });
     const errors: string[] = [];
     for (let index = 0; index < candidates.length; index++) {
         const candidate = candidates[index];
@@ -958,6 +967,7 @@ export async function callCouncilModel(
             errors.push(`${describeModelConfig(candidate)} => ${message}`);
             const canFallback = isRetryableError(err) && index < candidates.length - 1;
             if (!canFallback) {
+                if (err instanceof AntigravityCallError) throw err;
                 if (index === 0 || candidates.length === 1) throw err;
                 throw new Error(`provider fallback 链失败: ${errors.join(" | ")}`);
             }

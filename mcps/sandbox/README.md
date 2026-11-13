@@ -176,7 +176,7 @@ MCP 进程与父 LS 进程绑定（ppid），容错管理：
 - 批量搜索时，顶层 `modelChain` 可作为默认值，`queries[i].modelChain` 可单独覆盖；未填时按 `chain` 兼容规则回退
 - `modelChain` 仅影响 `smart` 模式；`exact` / `fuzzy` 完全不受影响
 - `modelChain="grok"` 需要本机 progrok API 可用；`modelChain="antigravity"` 需要存在可连接的 Antigravity LS；`modelChain="codex"` 需要本机可调用 `codex` CLI；`modelChain="claude-code"` 需要本机可调用 `claude` CLI。显式链路均为硬约束，不可用时直接报错，不做跨 provider 降级
-- Antigravity LS 模型默认值：`SANDBOX_LS_MODEL` 未设置时使用 `MODEL_PLACEHOLDER_M132`（Gemini 3.5 Flash High）；默认 fallback 为 `MODEL_PLACEHOLDER_M132,MODEL_PLACEHOLDER_M20,MODEL_PLACEHOLDER_M18,MODEL_PLACEHOLDER_M16,MODEL_PLACEHOLDER_M36`，可用 `SANDBOX_LS_MODEL_FALLBACKS` 覆盖。`MODEL_PLACEHOLDER_M37` 会转到当前 Pro High `M16`，`MODEL_PLACEHOLDER_M47` 会转到 `M18`，旧 `MODEL_GOOGLE_GEMINI_2_5_FLASH*` 会转到新 Flash 占位符。
+- Antigravity 新版从当前 LS 的模型目录解析默认模型、简称和可用额度，默认选择目录中的 Flash High，`pro/strong` 优先 Carbon High。显式模型 ID、标签和 `MODEL_*` 以当前目录为准，旧版 LS 继续使用原有协议和旧别名；`SANDBOX_LS_MODEL` 与 `SANDBOX_LS_MODEL_FALLBACKS` 保留覆盖作用。
 - Codex 模型桥默认值：`gpt-5.5` + `model_reasoning_effort=low` + `model_speed_tier=fast`，用于 `smart_search(modelChain="codex")` 这类短同步模型桥；可用 `SANDBOX_CODEX_BRIDGE_REASONING` 覆盖
 - Codex 模型桥稳定性：默认 fallback 链为 `gpt-5.5:low → gpt-5.4:low → gpt-5.4-mini:low`，只在超时、429/5xx、连接中断、空输出等可重试错误时降级；可用 `SANDBOX_CODEX_BRIDGE_FALLBACKS`、`SANDBOX_CODEX_BRIDGE_FALLBACKS_ENABLED=0`、`SANDBOX_CODEX_BRIDGE_RETRIES` 调整。`sandbox_codex` 是可执行 agent 入口，可能有文件写入副作用，不默认自动重试，长任务仍建议 `background=true`
 - Grok/progrok 模型桥默认 `reasoning_effort=low`，`smart_search(modelChain="grok")` 的 index/broad/deep 三阶段共用该默认值；可用 `SANDBOX_PROGROK_REASONING_EFFORT` 或 `SANDBOX_SMART_GROK_REASONING_EFFORT` 覆盖。progrok 可重试错误（超时、截断、429、5xx）会在桥内尝试一次 fallback 模型，默认 `grok-4.20-non-reasoning`，可用 `SANDBOX_PROGROK_FALLBACK_MODEL` 或 `SANDBOX_SMART_GROK_FALLBACK_MODEL` 覆盖；`max_tokens` 保持 4096
@@ -186,6 +186,7 @@ MCP 进程与父 LS 进程绑定（ppid），容错管理：
 - 默认超时：文件定点 smart 120s、阶段一 90s、阶段二 120s；Grok smart 调用默认 30s；Codex broad/deep 前台与后台阶段默认 15s。Codex CLI 首次启动和 gpt-5.5 推理可能超过 60s，不应按短超时判定链路失败。
 - smart 自动定位默认最多分析 12 个 SearchUnit；候选很多时，broad 阶段会跳过完全没有本地 exact/fuzzy/function 证据的 unit，并保留少量探索名额；索引阶段先走模型 JSON 索引，失败后拆段 retry，再退化到本地 fuzzy；deep 阶段保留 yes+maybe 语义，但默认最多深挖 8 个 unit；显式 `files/range` 不参与无证据跳过。
 - 批量查询的每个 `queries[i]` 可单独覆盖 `mode/searchPath/modelChain`，smart 查询内部最多 2 并发，避免模型桥阻塞。
+- 单个不超过12000字符的文件定点查询直接进行一次语义分析，保留原文片段和行号；无匹配返回空结果，结构无法解析时明确标记本地替代结果。Antigravity 此路径最多等待30秒，已受理但结果未知、额度和明确不可重试错误会原样返回，停止额外模型尝试。
 - `smart_search(mode="smart")` 单查询默认后台执行，立即返回 `taskId`；显式 `background=false` 可强制前台。后台任务带 `ownerId`、deadline 与 timedOut，默认 15 分钟超时标记 error，可用 `SANDBOX_SMART_BACKGROUND_MAX_RUN_MS` 覆盖；任务状态会写入 `sandbox-data/bg-tasks`，后端重启后仍可查 done/error/interrupted。
 - Codex 侧大目录或长文件 smart 搜索建议使用后台模式，避免同步 MCP 调用超过宿主超时窗口：
 
@@ -198,18 +199,18 @@ smart_search(taskId="...", waitSeconds=30)
 
 ### Antigravity LS 模型别名
 
-`GetModelResponse` 内部仍使用 `MODEL_*` 编码，但 `smart_search` 和 `sandbox_council` 的 Antigravity 路径都支持下列易读别名：
+新版 LS 的 `MODEL_*` 编码随目录变化，以下简称均在调用时解析，精确 ID 和标签也可直接使用：
 
-| 别名 | 实际编码 | 说明 |
-|------|----------|------|
-| `M132`, `fast`, `default`, `ag-fast`, `flash` | `MODEL_PLACEHOLDER_M132` | Gemini 3.5 Flash High，当前 auto 默认快模型 |
-| `M20`, `flash-medium`, `flash-lite`, `gemini-3.5-flash-medium` | `MODEL_PLACEHOLDER_M20` | Gemini 3.5 Flash Medium |
-| `M18`, `gemini-3-flash` | `MODEL_PLACEHOLDER_M18` | Gemini 3 Flash，旧稳定兜底 |
-| `M16`, `M37`, `gemini-pro`, `gemini-3.1-pro`, `pro-high` | `MODEL_PLACEHOLDER_M16` | Gemini 3.1 Pro High；`M37` 是旧 Pro High 占位符，自动转到 M16 |
-| `M36`, `gemini-3.1-pro-low`, `pro-low` | `MODEL_PLACEHOLDER_M36` | Gemini 3.1 Pro Low |
-| `M35`, `sonnet`, `claude-sonnet`, `claude-4.6-sonnet` | `MODEL_PLACEHOLDER_M35` | Claude Sonnet |
-| `M26`, `opus`, `claude-opus`, `claude-4.6-opus` | `MODEL_PLACEHOLDER_M26` | Claude Opus |
-| `M47` | `MODEL_PLACEHOLDER_M18` | 旧编码已下线，自动转到 M18 |
+| 别名 | 选择规则 |
+|------|----------|
+| `default`, `auto`, `fast`, `ag-fast`, `flash` | 当前目录的 Flash High |
+| `pro`, `pro-high`, `gemini-pro`, `strong`, `reasoning` | 优先 Carbon High，其次目录中的 Pro、Argon High |
+| `carbon`, `hydrogen`, `argon`，以及 `-high` / `-xhigh` | 指定系列及对应详细档位，缺少显式档位时返回不可用 |
+| `sonnet`, `claude-sonnet`, `opus`, `claude-opus` | 当前目录中的对应 Claude 模型 |
+
+旧版 LS 保留已有固定编码和别名兼容；新版只接受当前目录实际存在的编码。Council 默认备用模型取自当前可用目录，显式备用链及新旧环境变量仍按原有优先级生效。结果是否受理未知时停止自动重发。
+
+Antigravity 回归入口为 `npm run test:antigravity`，只使用受控目录和本机只读进程检查。`test:antigravity:runner` 需显式设置 `SANDBOX_AGY_RUNNER_SMOKE_TEST=1`，`test:antigravity:lifecycle` 需显式设置 `SANDBOX_AGY_LIFECYCLE_TEST=1`，后者只启动并正常关闭本任务自己的 CLI LS。
 
 ## 生命周期与 owner 边界
 

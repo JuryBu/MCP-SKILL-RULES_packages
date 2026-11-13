@@ -1,6 +1,6 @@
 {
   "name": "sandbox-mcp-server",
-  "version": "1.20.0",
+  "version": "1.20.1",
   "description": "MCP Server - 代码执行沙箱，支持硬超时、内存限制、持久会话、并行执行、GPU/CUDA",
   "type": "module",
   "main": "dist/index.js",
@@ -29,7 +29,10 @@
     "test:session-codex": "node ../../design-tests/sandbox-session-codex-lifecycle.mjs",
     "test:cancellation": "node ../../design-tests/sandbox-cancellation-persistence.mjs",
     "test:memory-limits": "node ../../design-tests/sandbox-memory-limit-config.mjs",
-    "test:smart-search-isolation": "node ../../design-tests/sandbox-smart-search-isolation.mjs"
+    "test:smart-search-isolation": "node ../../design-tests/sandbox-smart-search-isolation.mjs",
+    "test:antigravity": "node --import tsx --test --test-concurrency=1 tests/antigravity/compat.test.ts tests/antigravity/search-compact-patch.test.ts && node --experimental-vm-modules --test --test-isolation=none tests/antigravity/model-routing-patch.test.mjs && node --test --test-concurrency=1 tests/antigravity/windows-runtime-patch.test.mjs",
+    "test:antigravity:runner": "node --import tsx tests/antigravity/agent-cli-runner-smoke.ts",
+    "test:antigravity:lifecycle": "node --import tsx tests/antigravity/cli-ls-lifecycle.ts"
   },
   "engines": {
     "node": ">=24.12.0"

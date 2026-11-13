@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * MCP Sandbox Server v1.20.0
+ * MCP Sandbox Server v1.20.1
  *
  * 代码执行沙箱，解决 Antigravity IDE 中 run_command 的痛点。
  *
@@ -423,7 +423,7 @@ Provider:
 - Antigravity CLI provider 未显式传 fallbackModels 时默认按 Gemini 3.1 Pro (High) → Gemini 3.5 Flash (High) → Gemini 3.1 Pro (Low) → Gemini 3.5 Flash (Medium) 降级；可用 SANDBOX_COUNCIL_ANTIGRAVITY_CLI_DEFAULT_FALLBACKS=0 关闭。命令默认是 agy，可用 params.command/params.cli 或 SANDBOX_COUNCIL_ANTIGRAVITY_CLI_COMMAND 覆盖。SANDBOX_COUNCIL_ANTIGRAVITY_CLI_MODEL、_MODEL_CHAIN、_DEFAULT_FALLBACKS、_COMMAND、_TEMP_DIR、_CONCURRENCY、_MAX_BYTES 和 SANDBOX_COUNCIL_ANTIGRAVITY_INDEX_MODELS 为新名称，旧 SANDBOX_COUNCIL_GEMINI_CLI_* 与 SANDBOX_COUNCIL_GEMINI_INDEX_MODELS 兼容一个版本周期且新名称优先。超时或中止会回收 PowerShell 与 agy 进程树
 - antigravityCli 的认证/命令缺失/路径拒绝等 terminal failure 会停止 agy 模型重试：PDF/Word/Excel/EPUB 进入本地 Python fallback，PPTX 也进入 Python fallback 且永远不进 Codex，视频与未知二进制可按既有链路尝试 Codex；capacity、timeout、瞬态错误和空产物只按既有同 provider/同 agy 链重试或降级，provider fallback 不跨 provider
 - moderator 调用失败时会先走 provider fallback；如果所有主持模型仍失败，会用规则兜底汇总已返回的参与者意见，并标明未经过主持模型二次综合
-- CLI 文件索引：Antigravity CLI (agy) 和 Codex CLI 都必须把完整索引写入临时 Markdown，stdout/stderr 只保留短状态；宿主会校验临时文件存在、大小上限和 <<<COUNCIL_INDEX>>> 标记。agy 索引模型链为多模态 Gemini 3.5 Flash (High) → Gemini 3.1 Pro (Low) → Gemini 3.5 Flash (Medium)，其他文件 Gemini 3.5 Flash (Low) → Gemini 3.5 Flash (Medium) → Gemini 3.1 Pro (Low)，可用 SANDBOX_COUNCIL_ANTIGRAVITY_INDEX_MODELS 覆盖。PPTX 始终禁止进入 Codex；PDF/Word/Excel/EPUB 默认也不进入，仅 SANDBOX_COUNCIL_STRUCTURED_CODEX_FALLBACK=1 才允许作为最后兜底
+- CLI 文件索引：Antigravity CLI (agy) 和 Codex CLI 都必须把完整索引写入临时 Markdown，stdout/stderr 只保留短状态；宿主校验临时文件存在、大小上限和 <<<COUNCIL_INDEX>>> 标记。agy 优先当前目录的默认模型，再按可用目录形成去重备用链，可用 SANDBOX_COUNCIL_ANTIGRAVITY_INDEX_MODELS 覆盖，旧环境变量继续兼容。PPTX 始终禁止进入 Codex；PDF/Word/Excel/EPUB 默认也不进入，仅 SANDBOX_COUNCIL_STRUCTURED_CODEX_FALLBACK=1 才允许作为最后兜底
 - 大输入处理：默认超过 60000 真实字符的 input、manualContext、纯文本文件或 CSV 文件会写入 sandbox-data/temp/council-large-inputs；source 原文、checkpoint JSON 和 LargeInputIndex Markdown 都落临时文件，注入模型的只是索引摘录和路径。默认 chunkSize=24000、overlap=1200，可用 largeInput 或 SANDBOX_COUNCIL_LARGE_INPUT_* 环境变量覆盖
 - 压力输入超时：当存在 large_input_index、agentic_index、structured_extract、promoted_image 或 images 时，正式模型调用默认从 120s 放宽到 600s；可用 pressureModelTimeoutMs / SANDBOX_COUNCIL_PRESSURE_MODEL_TIMEOUT_MS 覆盖，单模型可用 params.timeoutMs 覆盖；后台任务默认 deadline 为 45 分钟
 - 前台调用沿链路传递同一 AbortSignal；后台 worker 根据 deadline 创建本地取消控制器，先中止并写入 interrupted，等待清理宽限期后仍存活才由父进程或状态查询强制结束整个 worker 进程树。系统不检查桌面进程名，也不注册桌面自启
@@ -435,7 +435,7 @@ Provider:
   "input": "讨论这个方案的风险和下一步",
   "participants": [
     {"id":"red","role":"红队，找漏洞","provider":"codex","model":"gpt-5.4"},
-    {"id":"blue","role":"蓝队，给建设性方案","provider":"antigravity","model":"M132"}
+    {"id":"blue","role":"蓝队，给建设性方案","provider":"antigravity","model":"default"}
   ],
   "moderator": {"id":"moderator","role":"主持人","provider":"codex","model":"gpt-5.4"},
   "maxRounds": 4,
@@ -459,14 +459,12 @@ Provider:
 - ✅ "moderator": {"id":"moderator","role":"主持人","provider":"codex","model":"gpt-5.4"}
 
 Antigravity 常用别名:
-- M132/fast/default/ag-fast/flash -> MODEL_PLACEHOLDER_M132 (Gemini 3.5 Flash High)
-- M20/flash-medium/flash-lite/gemini-3.5-flash-medium -> MODEL_PLACEHOLDER_M20 (Gemini 3.5 Flash Medium)
-- M18/gemini-3-flash -> MODEL_PLACEHOLDER_M18 (Gemini 3 Flash)
-- M16/M37/gemini-pro/gemini-3.1-pro/pro-high -> MODEL_PLACEHOLDER_M16 (Gemini 3.1 Pro High；M37 是旧占位符)
-- M36/gemini-3.1-pro-low/pro-low -> MODEL_PLACEHOLDER_M36 (Gemini 3.1 Pro Low)
-- M35/sonnet/claude-sonnet -> MODEL_PLACEHOLDER_M35
-- M26/opus/claude-opus -> MODEL_PLACEHOLDER_M26
-- M47 -> 自动转 M18
+- 新版从当前 LS 目录解析 ID、标签及 MODEL_*，不固定绑定 M 编号；旧版 LS 保留原协议和旧别名
+- default/auto/fast/ag-fast/flash -> 当前目录的 Flash High
+- pro/pro-high/gemini-pro/strong/reasoning -> 优先 Carbon High，其次目录中的 Pro、Argon High
+- carbon/hydrogen/argon 及 -high/-xhigh -> 对应系列和档位，显式档位缺失时返回不可用
+- sonnet/claude-sonnet/opus/claude-opus -> 当前目录中的对应 Claude 模型
+- Council 默认备用链按当前可用目录生成；显式备用链和新旧环境变量保持原优先级，未知受理时停止重发
 
 - 若存在 only-text 模型且输入里带 files/images，系统会先用 codex 链路生成纯文本专用转述；支持视觉输入的模型仍直接接收原图
 - webSearch: 默认优先走 Exa MCP；Exa 失败或无结果时降级到 360/Bing HTML fallback，并在结果中带降级说明。DuckDuckGo 默认跳过，可用 duckDuckGo=true 强制尝试

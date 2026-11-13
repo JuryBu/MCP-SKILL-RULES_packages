@@ -4,8 +4,9 @@ import path from "path";
 import { buildAntigravityCliEnvironment, spawnPowerShellScript, withAntigravityCliLease } from "./agy-runtime.js";
 import { councilRuntimeDirectory } from "./paths.js";
 import { councilArtifactPath, registerCouncilArtifact } from "./artifact-store.js";
-import { resolveAntigravityCliModel } from "../ls-client.js";
-import { AntigravityCallError } from "../antigravity-model-catalog.js";
+import { getAntigravityModelCatalog, resolveAntigravityCliModel } from "../ls-client.js";
+import { AntigravityCallError, antigravityCouncilCandidates, selectAntigravityModel } from "../antigravity-model-catalog.js";
+import { resolveAntigravityLsCliCommand } from "../antigravity-cli-ls.js";
 import { runAntigravityAgentCli } from "../antigravity-agent-cli.js";
 
 const INDEX_START = "<<<COUNCIL_INDEX>>>";
@@ -126,14 +127,48 @@ function splitCsvEnv(name: string, fallback: string[]): string[] {
 async function antigravityAttempts(filePath: string, notes: string[], onProgress?: (message: string) => void, signal?: AbortSignal): Promise<string[]> {
     const newEnv = process.env.SANDBOX_COUNCIL_ANTIGRAVITY_INDEX_MODELS;
     const oldEnv = process.env.SANDBOX_COUNCIL_GEMINI_INDEX_MODELS;
-    const defaults = ["default"];
+    const catalog = await getAntigravityModelCatalog(signal);
+    const defaults = ["default", ...(catalog ? antigravityCouncilCandidates(catalog).map(entry => entry.label) : [])];
     const rawModels = newEnv ? splitCsvEnv("SANDBOX_COUNCIL_ANTIGRAVITY_INDEX_MODELS", defaults) : oldEnv ? splitCsvEnv("SANDBOX_COUNCIL_GEMINI_INDEX_MODELS", defaults) : defaults;
     if (!newEnv && oldEnv) {
         const warning = "弃用环境变量 SANDBOX_COUNCIL_GEMINI_INDEX_MODELS 已映射到 Antigravity CLI；请迁移到 SANDBOX_COUNCIL_ANTIGRAVITY_INDEX_MODELS。";
         notes.push(warning);
         onProgress?.(warning);
     }
-    return await Promise.all(rawModels.map(model => resolveAntigravityCliModel(LEGACY_MODEL_LABELS[model.toLowerCase()] || model, signal)));
+    const models: string[] = [];
+    const seenModels = new Set<string>();
+    let rejected: unknown;
+    for (const model of rawModels) {
+        const requested = model;
+        try {
+            let resolved: string;
+            let resolvedModel: string | undefined;
+            if (catalog) {
+                let selected: ReturnType<typeof selectAntigravityModel>;
+                try { selected = selectAntigravityModel(catalog, requested); }
+                catch (error) {
+                    const legacy = LEGACY_MODEL_LABELS[requested.toLowerCase()];
+                    if (!(error instanceof AntigravityCallError) || error.model || !legacy) throw error;
+                    selected = selectAntigravityModel(catalog, legacy);
+                }
+                resolved = selected.label;
+                resolvedModel = selected.model;
+            } else resolved = await resolveAntigravityCliModel(LEGACY_MODEL_LABELS[requested.toLowerCase()] || requested, signal);
+            const identity = resolvedModel || resolved;
+            if (!seenModels.has(identity)) {
+                seenModels.add(identity);
+                models.push(resolved);
+            }
+        } catch (error) {
+            if (!(error instanceof AntigravityCallError) || error.kind !== "rejected" || error.model || error.submitted || error.outcomeUnknown) throw error;
+            rejected = error;
+            const warning = `Antigravity 索引跳过当前目录不可用模型: ${requested}`;
+            notes.push(warning);
+            onProgress?.(warning);
+        }
+    }
+    if (!models.length && rejected) throw rejected;
+    return models;
 }
 
 function codexAttempts(): Array<{ model: string; reasoning: string }> {
@@ -271,7 +306,8 @@ function buildCodexScript(promptPath: string, artifactPath: string, model: strin
 }
 
 function resolveAntigravityCommand(request: BuildCouncilFileIndexRequest): string {
-    return request.params?.command?.trim() || request.params?.cli?.trim() || request.command?.trim() || request.cli?.trim() || process.env.SANDBOX_COUNCIL_ANTIGRAVITY_CLI_COMMAND?.trim() || "agy";
+    return resolveAntigravityLsCliCommand(request.params?.command?.trim() || request.params?.cli?.trim() || request.command?.trim() || request.cli?.trim()
+        || process.env.SANDBOX_COUNCIL_ANTIGRAVITY_CLI_COMMAND?.trim() || process.env.SANDBOX_COUNCIL_GEMINI_CLI_COMMAND?.trim());
 }
 
 function authorizedDirectories(filePath: string, promptPath: string, artifactPath: string, imagePaths: string[]): string[] {

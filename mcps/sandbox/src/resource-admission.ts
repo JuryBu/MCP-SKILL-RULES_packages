@@ -445,7 +445,6 @@ export class ResourceAdmissionController {
                 () => this.rejectPending(pending, "admission_timeout"),
                 admissionBudgetMs,
             );
-            pending.timer.unref?.();
 
             this.queue.push(pending);
             this.waitCounters.queuedTotal += 1;

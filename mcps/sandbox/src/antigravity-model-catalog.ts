@@ -102,6 +102,27 @@ function unavailable(model: AntigravityCatalogModel): AntigravityCallError {
         { model: model.model, submitted: false, outcomeUnknown: false, safeToFallback: false, kind: quota ? "quota-exhausted" : "rejected" });
 }
 
+function available(model: AntigravityCatalogModel): boolean {
+    return !model.disabled && (model.remaining === undefined || model.remaining > 0);
+}
+
+function inFamily(model: AntigravityCatalogModel, family: string): boolean {
+    const tokens = normalized(model.id).split("-");
+    return tokens.includes(family) && !tokens.includes("orchestrator");
+}
+
+export function antigravityCouncilCandidates(catalog: AntigravityCatalog): AntigravityCatalogModel[] {
+    const families = ["carbon", "hydrogen", "pro", "flash", "sonnet", "opus", "argon"];
+    const rank = (model: AntigravityCatalogModel) => families.findIndex(family => inFamily(model, family));
+    const level = (model: AntigravityCatalogModel) => {
+        const suffix = normalized(model.id).match(/-(xhigh|high|medium|low)$/u)?.[1];
+        return suffix ? ["high", "xhigh", "medium", "low"].indexOf(suffix) : 0;
+    };
+    return catalog.models.filter(model => available(model) && rank(model) >= 0).sort((left, right) =>
+        Number(inFamily(left, "argon")) - Number(inFamily(right, "argon")) || level(left) - level(right)
+        || rank(left) - rank(right) || right.id.localeCompare(left.id, undefined, { numeric: true }));
+}
+
 export function selectAntigravityModel(catalog: AntigravityCatalog, requested = "default"): AntigravityCatalogModel {
     const key = normalized(requested || "default");
     const exact = catalog.models.find(entry => [entry.id, entry.label, entry.model, entry.model.replace(/^MODEL_PLACEHOLDER_/u, "")]
@@ -110,25 +131,29 @@ export function selectAntigravityModel(catalog: AntigravityCatalog, requested = 
         if (exact.disabled || (typeof exact.remaining === "number" && exact.remaining <= 0)) throw unavailable(exact);
         return exact;
     }
-    const family = /^(?:default|auto|fast|ag-fast|flash|gemini-flash)$/u.test(key) ? "flash"
-        : /^(?:pro|pro-high|gemini-pro|strong|reasoning|argon|argon-high)$/u.test(key) ? "argon"
-            : /^(?:carbon|carbon-high)$/u.test(key) ? "carbon"
-                : /^(?:sonnet|claude-sonnet)$/u.test(key) ? "sonnet"
-                    : /^(?:opus|claude-opus)$/u.test(key) ? "opus" : undefined;
+    const match = key.match(/^(?:(?:gemini|claude)-)?(flash|pro|argon|carbon|hydrogen|sonnet|opus)(?:-(high|xhigh))?$/u);
+    const family = isDefaultAntigravityModel(key) ? "flash"
+        : /^(?:strong|reasoning)$/u.test(key) ? "pro" : match?.[1];
     if (!family) throw new AntigravityCallError(`Antigravity 当前目录没有模型: ${requested}`,
         { submitted: false, outcomeUnknown: false, safeToFallback: false, kind: "rejected" });
-    const families = family === "argon" && !key.startsWith("argon") ? ["argon", "carbon"] : [family];
-    const candidates = families.flatMap(name => catalog.models.filter(entry => {
-        const modelKey = normalized(entry.id);
-        return modelKey.includes(name) && /-high$/u.test(modelKey) && !modelKey.includes("orchestrator");
-    }).sort((left, right) => {
-        const preferred = (entry: AntigravityCatalogModel) => entry.id === "gemini-3.8-flash-high" ? 1 : 0;
-        return preferred(right) - preferred(left) || right.id.localeCompare(left.id, undefined, { numeric: true });
-    }));
-    const selected = candidates.find(entry => !entry.disabled && (entry.remaining === undefined || entry.remaining > 0));
-    if (selected) return selected;
+    const families = family === "pro" ? ["carbon", "pro", "argon"] : [family];
+    const level = match?.[2] || "high";
+    const candidates: AntigravityCatalogModel[] = [];
+    for (const name of families) {
+        const familyCandidates = catalog.models.filter(entry => {
+            const modelKey = normalized(entry.id);
+            return inFamily(entry, name) && (modelKey.endsWith(`-${level}`)
+                || (level === "high" && ["sonnet", "opus"].includes(name) && !/-(?:xhigh|high|medium|low)$/u.test(modelKey)));
+        }).sort((left, right) => {
+            const preferred = (entry: AntigravityCatalogModel) => entry.id === "gemini-3.8-flash-high" ? 1 : 0;
+            return preferred(right) - preferred(left) || right.id.localeCompare(left.id, undefined, { numeric: true });
+        });
+        const selected = familyCandidates.find(available);
+        if (selected) return selected;
+        candidates.push(...familyCandidates);
+    }
     if (candidates[0]) throw unavailable(candidates[0]);
-    throw new AntigravityCallError(`Antigravity 当前目录没有可用的 ${family} High 模型`,
+    throw new AntigravityCallError(`Antigravity 当前目录没有可用的 ${family} ${level} 模型`,
         { submitted: false, outcomeUnknown: false, safeToFallback: false, kind: "rejected" });
 }
 

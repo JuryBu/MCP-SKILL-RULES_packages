@@ -37,8 +37,8 @@ function configuredMemory(name: string, fallback: number): number {
     return value;
 }
 
-export function resolveAntigravityLsCliCommand(): string {
-    const configured = process.env.SANDBOX_AGY_CLI_COMMAND?.trim() || process.env.SANDBOX_COUNCIL_ANTIGRAVITY_CLI_COMMAND?.trim();
+export function resolveAntigravityLsCliCommand(preferredCommand?: string): string {
+    const configured = preferredCommand?.trim() || process.env.SANDBOX_AGY_CLI_COMMAND?.trim() || process.env.SANDBOX_COUNCIL_ANTIGRAVITY_CLI_COMMAND?.trim();
     if (configured) return configured;
     const installed = path.join(os.homedir(), "AppData", "Local", "agy", "bin", "agy.exe");
     return process.platform === "win32" && fs.existsSync(installed) ? installed : process.platform === "win32" ? "agy.exe" : "agy";

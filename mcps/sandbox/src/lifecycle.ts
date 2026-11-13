@@ -1,7 +1,7 @@
 import fs from "fs";
 import os from "os";
 import path from "path";
-import { exec } from "child_process";
+import { execFile } from "child_process";
 import { formatAdmissionDiagnostic } from "./admission-diagnostics.js";
 
 /**
@@ -77,12 +77,112 @@ export function checkParentAliveWithTolerance(): "alive" | "degraded" | "dead" {
 /**
  * 检测父进程是否为 Antigravity LS
  * 
- * 通过 wmic 查询父进程名称，匹配 language_server 前缀。
- * 仅启动时调用一次，结果缓存。
+ * 通过有界的 Windows 进程快照查询父进程名称与创建时间。
+ * 已知结果缓存，未知时保留 ppid 管理，避免空闲保护误退。
  * 
  * 非 LS 环境（其他 IDE、手动启动等）会启用空闲超时兜底。
  */
 let cachedIsLS: boolean | null = null;
+
+interface WindowsProcessIdentity {
+    pid: number;
+    parentPid: number;
+    name: string;
+    executablePath: string | null;
+    commandLine: string | null;
+    startedAt: number | null;
+}
+
+type WindowsProcessSnapshot = { status: "known"; processes: WindowsProcessIdentity[] } | { status: "unknown" };
+
+async function readWindowsProcessSnapshot(filter: string): Promise<WindowsProcessSnapshot> {
+    const script = [
+        "$ErrorActionPreference='Stop'",
+        "$ProgressPreference='SilentlyContinue'",
+        "[Console]::OutputEncoding=[System.Text.UTF8Encoding]::new($false)",
+        "$items=@(& {",
+        "if (Get-Command Get-CimInstance -ErrorAction SilentlyContinue) {",
+        `Get-CimInstance -ClassName Win32_Process -Filter '${filter}' -Property ProcessId,ParentProcessId,Name,ExecutablePath,CommandLine,CreationDate -ErrorAction Stop`,
+        "} else {",
+        `Get-WmiObject -Class Win32_Process -Filter '${filter}' -Property ProcessId,ParentProcessId,Name,ExecutablePath,CommandLine,CreationDate -ErrorAction Stop`,
+        "}",
+        "})",
+        "$identities=@($items | ForEach-Object {",
+        "$processInfo=$_",
+        "$creationDate=$processInfo.CreationDate",
+        "if ($creationDate -is [string]) { $creationDate=$processInfo.ConvertToDateTime($creationDate) }",
+        "[pscustomobject]@{pid=[int]$processInfo.ProcessId;parentPid=[int]$processInfo.ParentProcessId;name=$processInfo.Name;executablePath=$processInfo.ExecutablePath;commandLine=$processInfo.CommandLine;startedAt=if ($creationDate) {$creationDate.ToUniversalTime().ToString('o')} else {$null}}",
+        "})",
+        "ConvertTo-Json -InputObject $identities -Depth 3 -Compress",
+    ].join("\n");
+    const powershell = process.env.SystemRoot
+        ? path.join(process.env.SystemRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe")
+        : "powershell.exe";
+    try {
+        const stdout = await new Promise<string>((resolve, reject) => {
+            execFile(powershell, ["-NoProfile", "-NonInteractive", "-EncodedCommand", Buffer.from(script, "utf16le").toString("base64")],
+                { encoding: "utf8", timeout: 5000, maxBuffer: 256 * 1024, windowsHide: true },
+                (error, output) => error ? reject(error) : resolve(output));
+        });
+        const parsed: unknown = JSON.parse(stdout.replace(/^\uFEFF/u, "").trim());
+        if (!Array.isArray(parsed)) return { status: "unknown" };
+        const processes: WindowsProcessIdentity[] = [];
+        for (const entry of parsed) {
+            if (!entry || !Number.isInteger(entry.pid) || entry.pid <= 0
+                || !Number.isInteger(entry.parentPid) || entry.parentPid < 0 || typeof entry.name !== "string") {
+                return { status: "unknown" };
+            }
+            const startedAt = typeof entry.startedAt === "string" ? Date.parse(entry.startedAt) : NaN;
+            processes.push({ pid: entry.pid, parentPid: entry.parentPid, name: entry.name,
+                executablePath: typeof entry.executablePath === "string" ? entry.executablePath : null,
+                commandLine: typeof entry.commandLine === "string" ? entry.commandLine : null,
+                startedAt: Number.isFinite(startedAt) ? startedAt : null });
+        }
+        return { status: "known", processes };
+    } catch {
+        return { status: "unknown" };
+    }
+}
+
+function windowsCommandArguments(commandLine: string): string[] {
+    const argumentsList: string[] = [];
+    let argument = "";
+    let quoted = false;
+    let started = false;
+    let backslashes = 0;
+    for (const character of commandLine) {
+        if (character === "\\") {
+            backslashes++;
+            started = true;
+            continue;
+        }
+        if (character === '"') {
+            argument += "\\".repeat(Math.floor(backslashes / 2));
+            if (backslashes % 2) argument += '"';
+            else quoted = !quoted;
+            backslashes = 0;
+            started = true;
+            continue;
+        }
+        argument += "\\".repeat(backslashes);
+        backslashes = 0;
+        if (/\s/u.test(character) && !quoted) {
+            if (started) argumentsList.push(argument);
+            argument = "";
+            started = false;
+        } else {
+            argument += character;
+            started = true;
+        }
+    }
+    argument += "\\".repeat(backslashes);
+    if (started) argumentsList.push(argument);
+    return argumentsList;
+}
+
+function normalizeWindowsPath(filePath: string): string {
+    return path.win32.normalize(filePath).toLowerCase();
+}
 
 export async function isAntigravityLS(): Promise<boolean> {
     if (cachedIsLS !== null) return cachedIsLS;
@@ -93,27 +193,16 @@ export async function isAntigravityLS(): Promise<boolean> {
         return false;
     }
 
-    try {
-        const result = await new Promise<string | null>((resolve) => {
-            exec(
-                `wmic process where ProcessId=${process.ppid} get Name /value`,
-                { encoding: "utf-8", timeout: 5000, windowsHide: true },
-                (error, stdout) => {
-                    if (error) resolve(null);
-                    else resolve(stdout?.trim() || null);
-                }
-            );
-        });
-
-        if (result) {
-            // LS 进程名通常为 language_server_amd64.exe 或类似
-            cachedIsLS = result.toLowerCase().includes("language_server");
-            return cachedIsLS;
-        }
-    } catch { /* 查询失败，保守认定为非 LS */ }
-
-    cachedIsLS = false;
-    return false;
+    const snapshot = await readWindowsProcessSnapshot(`ProcessId=${process.ppid} OR ProcessId=${process.pid}`);
+    const parent = snapshot.status === "known" ? snapshot.processes.find((entry) => entry.pid === process.ppid) : undefined;
+    const current = snapshot.status === "known" ? snapshot.processes.find((entry) => entry.pid === process.pid) : undefined;
+    if (!parent || !current || current.parentPid !== process.ppid || parent.startedAt === null
+        || current.startedAt === null || parent.startedAt > current.startedAt) {
+        console.error("[sandbox] Windows parent process identity unknown; retaining ppid-only lifecycle management");
+        return true;
+    }
+    cachedIsLS = /^language_server(?:[-_.]|$)/iu.test(parent.name);
+    return cachedIsLS;
 }
 
 /**
@@ -132,43 +221,29 @@ export function getIdleTime(): number {
 export async function hasNewerSiblingInstance(): Promise<boolean> {
     if (process.platform !== "win32") return false;
 
-    const currentScript = (process.argv[1] || "").replace(/\\/g, "\\\\");
+    const currentScript = process.argv[1] || "";
     if (!currentScript) return false;
-
-    const escapedScript = currentScript.replace(/'/g, "''");
-
-    try {
-        const result = await new Promise<string | null>((resolve) => {
-            exec(
-                `wmic process where "ParentProcessId=${process.ppid} and name='node.exe'" get ProcessId,CommandLine /format:csv`,
-                { encoding: "utf-8", timeout: 5000, windowsHide: true },
-                (error, stdout) => {
-                    if (error) resolve(null);
-                    else resolve(stdout || null);
-                }
-            );
-        });
-
-        if (!result) return false;
-
-        const lines = result
-            .split(/\r?\n/u)
-            .map((line) => line.trim())
-            .filter(Boolean);
-
-        for (const line of lines) {
-            if (!line.includes(escapedScript)) continue;
-            const parts = line.split(",");
-            const pid = Number(parts[parts.length - 1]);
-            if (Number.isFinite(pid) && pid > process.pid) {
-                return true;
-            }
-        }
-    } catch {
-        return false;
-    }
-
-    return false;
+    const snapshot = await readWindowsProcessSnapshot(`ParentProcessId=${process.ppid}`);
+    if (snapshot.status === "unknown") return false;
+    const current = snapshot.processes.find((entry) => entry.pid === process.pid && entry.parentPid === process.ppid);
+    const executablePath = normalizeWindowsPath(process.execPath);
+    if (!current?.commandLine || !current.executablePath || current.startedAt === null
+        || normalizeWindowsPath(current.executablePath) !== executablePath) return false;
+    const currentArguments = windowsCommandArguments(current.commandLine);
+    let scriptPosition = process.execArgv.length + 1;
+    if (currentArguments[scriptPosition] === "--") scriptPosition++;
+    if (!currentArguments[scriptPosition]
+        || normalizeWindowsPath(currentArguments[scriptPosition]) !== normalizeWindowsPath(currentScript)) return false;
+    const currentStartedAt = current.startedAt;
+    return snapshot.processes.some((entry) => {
+        if (entry.pid === process.pid || entry.parentPid !== process.ppid || !entry.commandLine || !entry.executablePath
+            || entry.startedAt === null || entry.startedAt <= currentStartedAt
+            || normalizeWindowsPath(entry.executablePath) !== executablePath) return false;
+        const argumentsList = windowsCommandArguments(entry.commandLine);
+        return argumentsList.length > scriptPosition
+            && normalizeWindowsPath(argumentsList[scriptPosition]) === normalizeWindowsPath(currentScript)
+            && currentArguments.slice(1, scriptPosition).every((argument, index) => argumentsList[index + 1] === argument);
+    });
 }
 
 /**
