@@ -26,7 +26,9 @@ async function until(operation, predicate, label) {
     assert.fail(`${label} did not settle`);
 }
 
-test('formal RPC retries a known unsent compaction failure with a new maintenance root and retained committed chunks', async () => {
+test(process.env.SANDBOX_RETRY_FIXTURE_RESTART_DEFAULT_OUTPUT === '1'
+    ? 'formal RPC restarts a rebound known truncation and freezes root-bounded compression output without retrying unknown'
+    : 'formal RPC retries a known unsent compaction failure with a new maintenance root and retained committed chunks', async () => {
     const workerThreads = createRequire(import.meta.url)('node:worker_threads');
     const NativeWorker = workerThreads.Worker;
     workerThreads.Worker = class extends NativeWorker {
@@ -40,6 +42,9 @@ test('formal RPC retries a known unsent compaction failure with a new maintenanc
     const work = join(root, 'work');
     await mkdir(work);
     const requests = [];
+    const withRestartDefaults = process.env.SANDBOX_RETRY_FIXTURE_RESTART_DEFAULT_OUTPUT === '1';
+    let truncateNext = false;
+    let disconnectNext = false;
     const withTailEvent = process.env.SANDBOX_RETRY_FIXTURE_TAIL_EVENT === '1';
     const withPriceChange = process.env.SANDBOX_RETRY_FIXTURE_PRICE_CHANGE === '1';
     const server = createServer(async (request, response) => {
@@ -50,14 +55,18 @@ test('formal RPC retries a known unsent compaction failure with a new maintenanc
         let source;
         try { source = JSON.parse(text); } catch {}
         const compression = Array.isArray(source?.targets);
-        requests.push({ compression, source: compression && source.targets.length > 0, hash: createHash('sha256').update(text).digest('hex') });
+        requests.push({ compression, source: compression && source.targets.length > 0, hash: createHash('sha256').update(text).digest('hex'),
+            maxTokens: body.max_tokens, ...(withRestartDefaults ? { wireBody: body } : {}) });
+        if (compression && disconnectNext) { disconnectNext = false; response.destroy(); return; }
+        const truncated = compression && truncateNext;
+        if (truncated) truncateNext = false;
         const digestBody = withTailEvent && compression && source.targets.length > 0 && requests.filter(entry => entry.source).length <= 2
             ? 'Known fixture source fact. '.repeat(100) : 'Known fixture facts and exact source identities retained.';
         const content = compression ? JSON.stringify({ body: digestBody,
             skeleton: 'Fixture source index.', title: 'Fixture', unresolved: [], continuesPrevious: true }) : 'Fixture ordinary step completed.';
         response.writeHead(200, { 'content-type': 'application/json' });
         response.end(JSON.stringify({ id: randomUUID(), model: 'fixture-model', choices: [{ index: 0,
-            message: { role: 'assistant', content }, finish_reason: 'stop' }], usage: { prompt_tokens: 40, completion_tokens: 20 } }));
+            message: { role: 'assistant', content: truncated ? '{"body":"truncated fixture' : content }, finish_reason: truncated ? 'length' : 'stop' }], usage: { prompt_tokens: 40, completion_tokens: 20 } }));
     });
     server.listen(0, '127.0.0.1');
     await once(server, 'listening');
@@ -94,6 +103,12 @@ test('formal RPC retries a known unsent compaction failure with a new maintenanc
                 inputCacheWrite: null, output: 1000, reasoningBilledSeparately: false, media: 'included_in_tokens', serverTools: 'disabled',
                 sourceRef: 'verified_fixture', validFrom: observedAt, expiresAt, coversAllParameters: true }) });
         const pricedEvidence = structuredClone(entry.pricing);
+        if (withRestartDefaults) {
+            entry.contextWindow = evidence(1048576);
+            entry.maxInputTokens = evidence(1048576);
+            entry.maxOutputTokens = evidence(262144);
+            entry.parameters.maxOutputTokens = evidence({ type: 'integer', min: 1, max: 262144, wirePath: 'max_tokens' });
+        }
         if (withPriceChange) {
             entry.pricing = { ...entry.pricing, value: null, status: 'unknown' };
             const originals = [entry.contextWindow, entry.maxInputTokens, entry.thinking, entry.streaming, entry.maxOutputTokens,
@@ -133,7 +148,8 @@ test('formal RPC retries a known unsent compaction failure with a new maintenanc
         let committed = 0;
         model.generate = async (request, signal) => {
             if (committed === (withTailEvent ? 5 : 3)) {
-                throw new AgentFault('E_BUDGET_EXCEEDED', 'Fixture known unsent budget failure', {
+                if (withRestartDefaults) truncateNext = true;
+                else throw new AgentFault('E_BUDGET_EXCEEDED', 'Fixture known unsent budget failure', {
                     budgetReservationRejected: true, rootBudgetId: request.execution.rootBudgetId,
                     compressionRequestAttemptId: request.attemptId });
             }
@@ -153,6 +169,13 @@ test('formal RPC retries a known unsent compaction failure with a new maintenanc
         const originalRunBytes = JSON.stringify(failed.data);
         const ledgerBefore = await services.provider.ledger.read(original.snapshot.execution.rootBudgetId);
         const originalHashes = original.chunks.map(chunk => chunk.inputBodyHash);
+        if (withRestartDefaults) {
+            const { checkRestartAndDefaultOutput } = await import('./context-restart-default-output.mjs');
+            model.generate = generate;
+            await checkRestartAndDefaultOutput({ services, store, client, control, profile, work, budget, requests,
+                before, original, failed, ledgerBefore, until, disconnectNextCompression: () => { disconnectNext = true; } });
+            return;
+        }
         if (!withPriceChange) assert.notEqual(before.configuration.configFingerprint, original.snapshot.config.configFingerprint);
         let pricingCompatibility;
         let declareEntry;

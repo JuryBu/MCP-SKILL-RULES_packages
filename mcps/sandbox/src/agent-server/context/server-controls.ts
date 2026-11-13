@@ -200,7 +200,7 @@ export function createContextServerControls(options: {
                 catch (error) { if (!(error instanceof ContextFault) || error.code !== 'CONTEXT_ATTEMPT_NOT_ACCEPTED') throw error; }
             }
             await options.service.compactor!.restart(input.conversationId);
-        }, candidate?.snapshot.config.configFingerprint);
+        });
         return result(input, 'restart', candidate?.candidateId ?? null, 'idle');
     };
     const recoverCompaction = async (input: ContextServerControlInput & { candidateId: string }): Promise<ContextServerControlResult> => {

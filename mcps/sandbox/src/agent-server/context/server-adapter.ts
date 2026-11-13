@@ -574,7 +574,7 @@ export function createContextServerAdapter(options: ContextServerAdapterOptions)
         if (!profile) throw new ContextFault('MODEL_STALE', '压缩API配置不可用');
         const { entry } = await options.provider.models.get(profileId, selected.modelId, selected.routeId ?? null);
         if (entry.contextWindow.value === null) throw new ContextFault('CONFIG_INVALID', '压缩模型需要可核实的窗口');
-        const maxOutputTokens = resolveRuntimeOutputBudget(entry, profile, Math.min(selected.maxOutputTokens ?? 2048, rootMaximum), now());
+        const maxOutputTokens = resolveRuntimeOutputBudget(entry, profile, Math.min(selected.maxOutputTokens ?? rootMaximum, rootMaximum), now());
         const parameters: JsonObject = { ...(profileId === plan.profile.profileId && selected.modelId === plan.modelId ? plan.parameters : {}),
             ...selected.parameters, maxOutputTokens };
         if (Array.isArray(parameters.responseModalities)) parameters.responseModalities = ['TEXT'];
