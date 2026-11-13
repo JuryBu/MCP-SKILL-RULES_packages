@@ -21,7 +21,7 @@ import { createToolDeliveryStore } from './tool-delivery.js';
 import { renderTaskPlanSnapshot, taskPlanReadyForTakeover } from './task-plan.js';
 import type { TaskPlanSnapshot } from './task-plan.js';
 import type { ContextExecutionViewInput, ContextExecutionViewResolver, ContextPrepareView } from './service.js';
-import type { CompressionModelPort, CompressionModelSelection, CompressionRequest, CompressionResult, ContextPolicy, ContextSourcePort,
+import type { CompactionCandidate, CompressionModelPort, CompressionModelSelection, CompressionRequest, CompressionResult, ContextPolicy, ContextSourcePort,
     ContextCapture, ConversationContextLimits, ExecutionLease, FrozenCompressionConfig, MaintenanceCallbacks, UnknownContextCleanupInput } from './contracts.js';
 import type { ContextExecutionCleanup } from './bpc.js';
 import { computeConversationContextLimits, totalContextTokens } from './budget.js';
@@ -29,6 +29,7 @@ import { derivedContextId, freezeCompressionConfig, hashBytes, hashContext } fro
 import { checkAbort, contextFailure, ContextFault } from './errors.js';
 import { ArtifactProjectionCache, createArtifactHistorySourcePort, readHistoryArtifact } from './artifact-source.js';
 import { createContextServerControls } from './server-controls.js';
+import { factsOnlyCompressionResult } from './compaction.js';
 import type { ContextPreparedMeasurement, ContextServerCompactInput, ContextServerCompactResult, ContextServerControlInput, ContextServerControlResult, ContextServerStatus, ContextServerStatusInput } from './server-controls.js';
 import { createContextMaintenanceCallbacks } from './maintenance-budget.js';
 import { createHistoricalToolResultResolver } from './history-tool-outcomes.js';
@@ -47,7 +48,17 @@ interface DispatchLink extends Record<string, unknown> {
 }
 
 interface DispatchMaterial { snapshot: RequestSnapshot; upperBound: UpperBound }
-interface ContextControlWrite { capture: ContextCapture; configFingerprint: string | null }
+interface PricingCompatibilityRecord extends Record<string, unknown> {
+    candidateId: string; runId: string; runEpoch: number; rootBudgetId: string; historyEpoch: number; compressionGeneration: string;
+    semanticModelFingerprint: string; previousCapabilityVersion: string; currentCapabilityVersion: string;
+    previousEntry: JsonObject; capabilityWithoutPricingHash: string; priceEvidenceHash: string; priceVersion: string;
+}
+const pricingCompatibilityKey = (conversationId: string, candidateId: string) => ({ conversationId, kind: 'step' as const, id: `context:pricing-compatibility:${candidateId}` });
+function withoutPricing(entry: object): Record<string, unknown> {
+    const { pricing: _pricing, ...capability } = entry as Record<string, unknown>;
+    return capability;
+}
+interface ContextControlWrite { capture: ContextCapture; configFingerprint: string | null; rebindOwnedWrites?: boolean }
 
 export interface CompressionSelection {
     profileId?: string;
@@ -71,6 +82,7 @@ export interface ContextServerAdapterOptions {
         policy?: Partial<ContextPolicy>; revision?: number; rules?: string;
     }>;
     resolveView?: ContextExecutionViewResolver;
+    resolveRecoveryExecution?(candidate: CompactionCandidate, execution: ExecutionLease): Promise<{ context: ExecutorContext; plan: ExecutionPlan; tools: import('../providers/types.js').FunctionTool[] }>;
     sourceForConversation?: (conversationId: string) => ContextSourcePort;
     authorizeControlWrite?: (conversationId: string) => Promise<TransitionExpected | void>;
     now?: () => number;
@@ -238,6 +250,24 @@ export class ProviderCompressionModelPort implements CompressionModelPort {
         if (adapter.version !== selection.adapterVersion || adapter.endpoint(profile, selection.model) !== selection.endpoint) {
             throw new ContextFault('MODEL_STALE', '压缩适配器或发送端点已改变');
         }
+        const compatibility = await this.options.store.getRecord<PricingCompatibilityRecord>(pricingCompatibilityKey(request.execution.conversationId, request.snapshot.candidateId));
+        if (compatibility) {
+            const proof = compatibility.value;
+            const ledger = await this.options.provider.ledger.read(request.execution.rootBudgetId);
+            const { entry } = await this.options.provider.models.get(profileId, selection.model);
+            if (ledger.budget.mode !== 'hard' || !ledger.quotaLimit
+                || proof.candidateId !== request.snapshot.candidateId || proof.runId !== request.execution.runId
+                || proof.runEpoch !== request.execution.runEpoch || proof.rootBudgetId !== request.execution.rootBudgetId
+                || proof.historyEpoch !== request.snapshot.historyEpoch || proof.compressionGeneration !== request.snapshot.compressionGeneration
+                || proof.semanticModelFingerprint !== request.snapshot.effectiveModelFingerprint
+                || proof.previousCapabilityVersion !== selection.capabilityVersion || hashContext(proof.previousEntry) !== selection.capabilityVersion
+                || hashContext(entry) !== proof.currentCapabilityVersion
+                || hashContext(withoutPricing(entry)) !== proof.capabilityWithoutPricingHash
+                || hashContext(withoutPricing(proof.previousEntry)) !== proof.capabilityWithoutPricingHash
+                || hashContext(entry.pricing) !== proof.priceEvidenceHash || entry.pricing.value?.priceVersion !== proof.priceVersion) {
+                throw new ContextFault('MODEL_STALE', '计价兼容绑定的执行、语义能力或价格证据已改变');
+            }
+        }
         if (hashBytes(request.chunk.body) !== request.inputBodyHash || request.inputBodyHash !== request.chunk.inputBodyHash) {
             throw new ContextFault('SOURCE_GAP', '压缩分块实际字节与冻结指纹不同');
         }
@@ -264,7 +294,9 @@ export class ProviderCompressionModelPort implements CompressionModelPort {
             inputTokenUpperBound: Buffer.byteLength(canonicalJson(view)) + Buffer.byteLength(canonicalJson(selection.parameters)) + selection.model.length + 512,
             inputUpperBoundReliable: true,
             maxOutputTokens: request.maxOutputTokens, deadlineAt: request.execution.deadlineAt });
-        if (prepared.snapshot.capabilityVersion !== selection.capabilityVersion || prepared.snapshot.profileRevision !== selection.profileRevision) {
+        if (prepared.snapshot.capabilityVersion !== (compatibility?.value.currentCapabilityVersion ?? selection.capabilityVersion)
+            || prepared.snapshot.profileRevision !== selection.profileRevision
+            || compatibility && prepared.snapshot.priceVersion !== compatibility.value.priceVersion) {
             throw new ContextFault('MODEL_STALE', '压缩模型能力目录或配置在发送前已改变');
         }
         const contentId = randomUUID();
@@ -333,6 +365,42 @@ export class ProviderCompressionModelPort implements CompressionModelPort {
         const status = await this.lookup(request);
         return status.status === 'found' ? 'completed' : status.status === 'notAccepted' ? 'cancelled' : 'unknown';
     }
+
+    async verifyCommittedChunks(candidate: CompactionCandidate, lineage: CompactionCandidate[] = [candidate]): Promise<void> {
+        for (const chunk of candidate.chunks) {
+            const attemptId = chunk.requestAttemptId ?? chunk.attemptId;
+            const link = await this.options.store.getRecord<DispatchLink>({ conversationId: candidate.conversationId, kind: 'step', id: `context:dispatch:${attemptId}` });
+            const saved = link ? await this.options.journal.readAttempt(link.value.providerAttemptId) : undefined;
+            const material = link ? await this.options.store.readContent(candidate.conversationId, link.value.contentId) as unknown as DispatchMaterial : undefined;
+            const snapshot = saved?.attempt.snapshot as (RequestSnapshot & Record<string, unknown>) | undefined;
+            const owner = lineage.find(source => source.candidateId === snapshot?.compressionCandidateId);
+            if (!link || link.value.state !== 'committed' || saved?.state !== 'committed' || !saved.response || !material?.snapshot || !snapshot
+                || !owner || saved.attempt.rootBudgetId !== owner.snapshot.execution.rootBudgetId
+                || snapshot.bodyHash !== material.snapshot.bodyHash
+                || snapshot.compressionGeneration !== owner.snapshot.compressionGeneration
+                || snapshot.compressionRequestAttemptId !== attemptId || snapshot.effectiveCompressionModelFingerprint !== candidate.snapshot.effectiveModelFingerprint) {
+                throw new ContextFault('USAGE_MISMATCH', '导入块缺少原候选、模型和根预算的已提交Provider回执', { attemptId });
+            }
+            const findBody = (value: unknown): string | undefined => {
+                if (typeof value === 'string') return hashBytes(value) === chunk.inputBodyHash ? value : undefined;
+                if (value && typeof value === 'object') for (const entry of Object.values(value)) { const found = findBody(entry); if (found) return found; }
+                return undefined;
+            };
+            const encoded = typeof snapshot.body === 'string' ? JSON.parse(snapshot.body) : snapshot.body;
+            const body = findBody(encoded);
+            if (!body || chunk.modelFingerprint !== candidate.snapshot.effectiveModelFingerprint) throw new ContextFault('SOURCE_GAP', '导入块与原请求输入或模型指纹不同', { attemptId });
+            const reorganizationIds = new Set([...(owner.semanticTailReorganizations ?? []),
+                ...(owner.semanticTailReorganization ? [owner.semanticTailReorganization] : [])].map(event => event.chunkId));
+            const request: CompressionRequest = { attemptId, actionId: snapshot.actionId, stepId: snapshot.stepId,
+                reason: reorganizationIds.has(chunk.chunkId) || !owner.snapshot.manifest.rounds.some(round => round.roundId === chunk.roundId) ? 'fold' : owner.reason,
+                execution: owner.snapshot.execution, snapshot: owner.snapshot, model: owner.snapshot.config.model,
+                chunk: { ...chunk, body, inputTokens: Buffer.byteLength(body), inputBodyHash: chunk.inputBodyHash, referenceSpans: [] },
+                maxOutputTokens: candidate.snapshot.config.model.maxOutputTokens, inputBodyHash: chunk.inputBodyHash };
+            const verified = factsOnlyCompressionResult(this.result(request, saved.response, snapshot, true));
+            if (hashContext(verified.digest) !== hashContext(factsOnlyCompressionResult(chunk).digest)
+                || hashContext(verified.coverage) !== hashContext(chunk.coverage) || !chunk.complete) throw new ContextFault('SOURCE_GAP', '导入摘要或覆盖与原完整回执不同', { attemptId });
+        }
+    }
 }
 
 function selectionFromOptions(value: unknown): CompressionSelection | null {
@@ -379,12 +447,23 @@ export function createContextServerAdapter(options: ContextServerAdapterOptions)
         if (authorization) requireRevision(authorization);
         return { ...transition, expected };
     };
+    const rebindOwnedWrite = (frozen: ContextControlWrite, transition: StoreTransition) => {
+        if (!frozen.rebindOwnedWrites) return;
+        const next = transition.records?.find(record => canonicalJson(record.key) === canonicalJson(contextStateKey(frozen.capture.conversationId)));
+        if (!next) return;
+        const state = next.value as unknown as ContextStateData;
+        frozen.capture = { ...frozen.capture, compressionGeneration: state.compressionGeneration,
+            effectiveModelFingerprint: state.effectiveModelFingerprint, candidateId: state.candidateId, execution: state.execution };
+        frozen.configFingerprint = state.configFingerprint;
+    };
     const controlStore = new Proxy(options.store, { get(target, property) {
         if (property === 'commitTransition') return async (transition: StoreTransition) => {
             const frozen = controlWrites.getStore();
             if (!frozen) return target.commitTransition(transition);
             const authorization = await options.authorizeControlWrite?.(frozen.capture.conversationId);
-            return target.commitTransition(await fenceTransition(target, transition, frozen, authorization));
+            const result = await target.commitTransition(await fenceTransition(target, transition, frozen, authorization));
+            rebindOwnedWrite(frozen, transition);
+            return result;
         };
         if (property === 'mutateState') {
             if (!target.mutateState) return undefined;
@@ -394,7 +473,11 @@ export function createContextServerAdapter(options: ContextServerAdapterOptions)
                 if (scope.conversationId !== frozen.capture.conversationId) throw new ContextFault('HISTORY_STALE', '压缩控制的状态事务须属于原会话');
                 const authorization = await options.authorizeControlWrite?.(frozen.capture.conversationId);
                 return target.mutateState!(scope, port => operation({ getRecord: port.getRecord.bind(port),
-                    commitTransition: async transition => port.commitTransition(await fenceTransition(port, transition, frozen, authorization)) }));
+                    commitTransition: async transition => {
+                        const result = await port.commitTransition(await fenceTransition(port, transition, frozen, authorization));
+                        rebindOwnedWrite(frozen, transition);
+                        return result;
+                    } }));
             };
         }
         const value = Reflect.get(target, property, target);
@@ -643,9 +726,79 @@ export function createContextServerAdapter(options: ContextServerAdapterOptions)
     };
 
     const controls = createContextServerControls({ port: compactionPort, service, model: compressionModel, now, readMeasurement: conversationId => measurements.get(conversationId),
-        async withControl(capture, operation, configFingerprint) {
+        async validateRetrySource(candidate, pricingCompatibility) {
+            const conversation = await options.store.getRecord({ conversationId: candidate.conversationId, kind: 'conversation', id: candidate.conversationId });
+            const run = await options.store.getRecord(contextRunKey(candidate.conversationId, candidate.snapshot.runId));
+            const failure = run?.value.failure as { acceptance?: string; error?: { details?: { executionProgress?: { currentOperation?: { acceptance?: string } } } } } | undefined;
+            if (conversation?.value.state !== 'open' || conversation.value.activeRunId || run?.value.state !== 'failed'
+                || run.value.runEpoch !== candidate.snapshot.runEpoch || contextRootBudgetId(run) !== candidate.snapshot.execution.rootBudgetId
+                || !['released', 'not_needed'].includes(String(run.value.cleanupState))
+                || (failure?.acceptance ?? failure?.error?.details?.executionProgress?.currentOperation?.acceptance) !== 'not_sent'
+                    && !(run.value.kind === 'maintenance' && candidate.error?.details?.budgetReservationRejected === true && candidate.error.mayHaveStarted === false)) {
+                throw new ContextFault('HISTORY_STALE', '重试需要已正式重开的空闲会话及确定未发送、清理完成的原失败执行');
+            }
+            const original = candidate.snapshot.config.model;
+            const profile = await options.provider.profiles.get(original.profileId ?? original.provider);
+            if (!profile) throw new ContextFault('MODEL_STALE', '原压缩模型配置已不可用');
+            const selected = await makeSelection({ profile, modelId: original.model, parameters: original.parameters },
+                { profileId: original.profileId, modelId: original.model, parameters: original.parameters, maxOutputTokens: original.maxOutputTokens }, original.maxOutputTokens);
+            let pricingProof: Pick<PricingCompatibilityRecord, 'previousCapabilityVersion' | 'currentCapabilityVersion' | 'previousEntry' | 'capabilityWithoutPricingHash' | 'priceEvidenceHash' | 'priceVersion'> | undefined;
+            if (hashContext(selected) !== hashContext(original)) {
+                const { entry } = await options.provider.models.get(original.profileId ?? original.provider, original.model);
+                if (!pricingCompatibility || hashContext(pricingCompatibility.previousEntry) !== original.capabilityVersion
+                    || pricingCompatibility.expectedCapabilityVersion !== selected.capabilityVersion
+                    || hashContext(withoutPricing(pricingCompatibility.previousEntry)) !== hashContext(withoutPricing(entry))
+                    || hashContext({ ...selected, capabilityVersion: original.capabilityVersion }) !== hashContext(original)
+                    || entry.pricing.status !== 'supported' || !entry.pricing.value?.priceVersion) {
+                    throw new ContextFault('MODEL_STALE', '原能力变化需明确的仅pricing兼容证据，其余冻结模型、参数和规则须保持');
+                }
+                pricingProof = { previousCapabilityVersion: original.capabilityVersion, currentCapabilityVersion: selected.capabilityVersion,
+                    previousEntry: structuredClone(pricingCompatibility.previousEntry), capabilityWithoutPricingHash: hashContext(withoutPricing(entry)),
+                    priceEvidenceHash: hashContext(entry.pricing), priceVersion: entry.pricing.value.priceVersion };
+            } else if (pricingCompatibility && pricingCompatibility.expectedCapabilityVersion !== selected.capabilityVersion) {
+                throw new ContextFault('MODEL_STALE', '显式指定的新计价目录版本已经变化');
+            }
+            const lineage = [candidate];
+            for (let source = candidate; source.snapshot.retryOf;) {
+                const previous = await compactionPort.getCandidate(candidate.conversationId, source.snapshot.retryOf.candidateId);
+                if (!previous || lineage.some(entry => entry.candidateId === previous.candidateId)
+                    || previous.snapshot.sourceManifestHash !== candidate.snapshot.sourceManifestHash
+                    || previous.snapshot.sourcePrefixHash !== candidate.snapshot.sourcePrefixHash
+                    || previous.snapshot.historyEpoch !== candidate.snapshot.historyEpoch
+                    || previous.snapshot.parentViewRevision !== candidate.snapshot.parentViewRevision
+                    || previous.snapshot.effectiveModelFingerprint !== candidate.snapshot.effectiveModelFingerprint) {
+                    throw new ContextFault('SOURCE_GAP', '导入块的原候选来源链无效');
+                }
+                lineage.push(previous);
+                source = previous;
+            }
+            await compressionModel.verifyCommittedChunks(candidate, lineage);
+            if (pricingProof) return async retry => {
+                const snapshot = retry.snapshot;
+                const value: PricingCompatibilityRecord = { ...pricingProof!, candidateId: retry.candidateId,
+                    runId: snapshot.runId, runEpoch: snapshot.runEpoch, rootBudgetId: snapshot.execution.rootBudgetId,
+                    historyEpoch: snapshot.historyEpoch, compressionGeneration: snapshot.compressionGeneration,
+                    semanticModelFingerprint: snapshot.effectiveModelFingerprint };
+                await controlStore.commitTransition({ expected: [{ key: pricingCompatibilityKey(retry.conversationId, retry.candidateId), revision: null }],
+                    records: [{ key: pricingCompatibilityKey(retry.conversationId, retry.candidateId), revision: 1, value }] });
+            };
+        },
+        async recoveryEstimator(candidate, execution) {
+            if (!options.resolveRecoveryExecution) throw new ContextFault('CONFIG_INVALID', '恢复尚未接入真实完整请求构造');
+            const { context, plan, tools } = await options.resolveRecoveryExecution(candidate, execution);
+            const overrides = await options.resolveView?.(context, plan, { tools }) ?? {};
+            return service.createCompactionEstimator({ ...overrides, conversationId: candidate.conversationId, context,
+                adapter: plan.adapter, modelId: plan.modelId, parameters: plan.parameters, policy: candidate.snapshot.config.policy,
+                dynamicContext: taskPlanDynamicContext(overrides, context, plan), targetEndpoint: overrides.targetEndpoint ?? plan.adapter.endpoint(plan.profile, plan.modelId),
+                resolveHistoryIdentity: overrides.resolveHistoryIdentity ?? historyIdentity(),
+                resolveHistoricalToolResults: overrides.resolveHistoricalToolResults ?? createHistoricalToolResultResolver(options.store),
+                readItem: overrides.readItem ?? ((item, bounds) => item.value !== undefined ? Promise.resolve(item.value) : readHistoryArtifact(options.store,
+                    { conversationId: candidate.conversationId, item, maxReadBytes: bounds.maxReadBytes, signal: bounds.signal, mediaExpansion: item.kind === 'model_step' })),
+                baseView: { ...(overrides.baseView ?? { protocol: plan.adapter.protocol }), tools } }, execution);
+        },
+        async withControl(capture, operation, configFingerprint, rebindOwnedWrites) {
             const state = await options.store.getRecord<ContextStateData>(contextStateKey(capture.conversationId));
-            return controlWrites.run({ capture: structuredClone(capture), configFingerprint: configFingerprint ?? state?.value.configFingerprint ?? null }, operation);
+            return controlWrites.run({ capture: structuredClone(capture), configFingerprint: configFingerprint ?? state?.value.configFingerprint ?? null, rebindOwnedWrites }, operation);
         },
         async resolveConfiguration(conversationId, budget) {
             const conversation = await options.store.getRecord({ conversationId, kind: 'conversation', id: conversationId });

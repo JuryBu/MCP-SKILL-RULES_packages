@@ -209,6 +209,39 @@ export async function createAgentServices(options: ServerServiceOptions) {
     let inputAttachments: InputAttachmentService;
     const inputSelections = new WeakMap<ExecutionPlan, AttachmentModelSelection>();
     const contextService = createContextServerAdapter({ store: contextStore, provider, dispatcher, journal,
+        resolveRecoveryExecution: async (candidate, execution) => {
+            const conversation = await options.store.getRecord({ conversationId: candidate.conversationId, kind: 'conversation', id: candidate.conversationId });
+            const run = await options.store.getRecord({ conversationId: candidate.conversationId, kind: 'run', id: execution.runId });
+            const origin = await options.store.getRecord({ conversationId: candidate.conversationId, kind: 'run', id: candidate.snapshot.retryOf?.runId ?? candidate.snapshot.runId });
+            if (!conversation || !run || run.value.runEpoch !== execution.runEpoch || conversation.value.activeRunId !== execution.runId) throw new AgentFault('STALE_RUN_EPOCH', '恢复估计须属于新的活动维护执行');
+            const conversationOptions = { ...(conversation.value.options as Record<string, unknown>), ...(origin?.value.options as Record<string, unknown>) };
+            const signal = new AbortController().signal;
+            const forbidden = async (): Promise<never> => { throw new AgentFault('READ_ONLY_CONTEXT', '恢复估计只读取原文，不执行业务动作'); };
+            const context: ExecutorContext = { snapshot: { ...run.value } as unknown as ExecutorContext['snapshot'], conversationOptions,
+                content: null, signal, continuation: null, checkpoint: async () => {}, takeSteering: async () => [], recordStep: forbidden, requestApproval: forbidden,
+                readHistory: query => contextStore.readHistory({ ...query, conversationId: candidate.conversationId }),
+                readContent: async contentId => {
+                    const value = await options.store.readContent(candidate.conversationId, contentId);
+                    if (value === undefined) throw new AgentFault('NOT_FOUND', '恢复估计原文不存在');
+                    return value;
+                } };
+            const profileId = String(conversationOptions.profileId ?? '');
+            const profile = await provider.profiles.get(profileId);
+            const modelId = String(conversationOptions.modelId ?? profile?.defaultModel ?? '');
+            if (!profile || candidate.snapshot.requestBudget && candidate.snapshot.requestBudget.modelId !== modelId) throw new AgentFault('MODEL_STALE', '恢复估计须保持原前台模型身份');
+            const { catalog, entry } = await provider.models.get(profileId, modelId);
+            const root = await provider.ledger.read(execution.rootBudgetId);
+            const parameters = { ...(conversationOptions.parameters as JsonObject | undefined), maxOutputTokens: root.budget.maxOutputTokens };
+            const selected: ExecutionPlan = { profile, modelId, adapter: provider.adapterFor(profile.protocol), parameters,
+                rootBudgetId: execution.rootBudgetId, deadlineAt: execution.deadlineAt, maxOutputTokens: root.budget.maxOutputTokens,
+                maxModelCalls: root.budget.maxModelCalls, toolNames: selectRequestedTools(conversationOptions, profile, entry),
+                catalogVersion: catalog.catalogVersion, capabilityVersion: 'catalog-validated-at-send', priceVersion: entry.pricing.value?.priceVersion ?? null };
+            const trusted = await toolContext(context);
+            const definitions = tools.modelFunctionSchemasFor(trusted).filter(schema => selected.toolNames === null || selected.toolNames.includes(schema.name))
+                .filter(schema => !['agent_spawn', 'agent_wait', 'agent_close'].includes(schema.name) || conversationOptions.allowInternalAgents === true || conversationOptions.allowSubagents === true)
+                .map(schema => ({ name: schema.name, description: schema.description, parameters: schema.parameters as JsonObject }));
+            return { context, plan: selected, tools: definitions };
+        },
         readTaskPlan: async context => tools.readTaskPlan(await toolContext(context)),
         authorizeControlWrite: async conversationId => {
             const authorization = conversationWrites.getStore();
@@ -799,6 +832,10 @@ export async function createAgentServices(options: ServerServiceOptions) {
                 const promise = conversationWrites.run({ client, params }, async (): Promise<RpcResult> => {
                     await options.runtime.authorizeConversationWrite(client, params);
                     const input = { conversationId: String(params.conversationId),
+                        ...(params.retryKnownFailure === true ? { retryKnownFailure: true, operationId: String(params.clientCommandId),
+                            expectedConfigFingerprint: params.expectedConfigFingerprint as string,
+                            ...(params.pricingCompatibility ? { pricingCompatibility: params.pricingCompatibility as import('./context/server-controls.js').ContextServerControlInput['pricingCompatibility'] } : {}),
+                            ...(params.budget ? { budget: params.budget as import('./protocol.js').JsonObject } : {}) } : {}),
                         ...(typeof params.candidateId === 'string' ? { candidateId: params.candidateId } : {}),
                         ...(typeof params.expectedHistoryEpoch === 'number' ? { expectedHistoryEpoch: params.expectedHistoryEpoch } : {}),
                         ...(typeof params.expectedRunEpoch === 'number' ? { expectedRunEpoch: params.expectedRunEpoch } : {}) };

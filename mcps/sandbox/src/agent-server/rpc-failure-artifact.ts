@@ -44,7 +44,7 @@ export function readableRunResult(result: RpcResult): RpcResult {
     if (!original && !['failed', 'outcome_unknown'].includes(String(run.state)) && run.resultStatus !== 'unknown') return result;
     const state = run.resultStatus === 'unknown' || run.state === 'outcome_unknown' ? '原执行结果待核实'
         : run.state === 'failed' ? '原执行失败' : `原执行状态：${String(run.state)}`;
-    const acceptance = original?.acceptance === 'not_sent' ? '原请求明确未发送。' : original?.acceptance === 'rejected'
+    const acceptance = original?.acceptance === 'not_sent' ? '本次停止处的下一条模型请求未发送；此前请求、已写文件和费用记录仍保留。' : original?.acceptance === 'rejected'
         ? '供应商已拒绝原请求。' : original?.acceptance === 'accepted' ? '供应商已受理原请求。' : '原请求的受理情况继续按原回执核对。';
     const reference = typeof original?.attemptId === 'string' && typeof run.conversationId === 'string'
         ? failureArtifactReference(run.conversationId, original.attemptId) : null;

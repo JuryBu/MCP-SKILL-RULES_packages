@@ -91,7 +91,7 @@ function json(response: http.ServerResponse, value: unknown, status = 200): void
 
 test("dynamic catalog maps semantic choices without embedding current enum numbers", () => {
     const catalog = parseAntigravityCatalog({ models })!;
-    assert.equal(selectAntigravityModel(catalog).model, models[0].model);
+    assert.equal(selectAntigravityModel(catalog).model, models[4].model);
     assert.equal(selectAntigravityModel(catalog, "pro").model, models[2].model);
     assert.equal(selectAntigravityModel(catalog, "argon").model, models[1].model);
     assert.equal(selectAntigravityModel(catalog, "carbon").model, models[2].model);
@@ -112,7 +112,7 @@ test("real supplied catalog is parsed read-only when explicitly provided", { ski
         assert.ok(catalog.models.includes(selected));
         assert.equal(selected.disabled, false);
     }
-    assert.match(selectAntigravityModel(catalog).id, /flash-high$/u);
+    assert.match(selectAntigravityModel(catalog).id, /(?:hydrogen-(?:xhigh|high)|carbon-high|flash-high)$/u);
 });
 
 test("live GetUserStatus shape preserves quota, disabled state and notices", () => {
@@ -122,7 +122,7 @@ test("live GetUserStatus shape preserves quota, disabled state and notices", () 
     assert.equal(catalog.source, "GetUserStatus");
     assert.equal(catalog.models[0].reason, "Limited time");
     assert.equal(catalog.models[0].remaining, 0.5);
-    assert.equal(selectAntigravityModel(catalog).model, models[0].model);
+    assert.equal(selectAntigravityModel(catalog).model, models[4].model);
 });
 
 test("explicit disabled or zero-quota models reject before submission", () => {
@@ -130,14 +130,14 @@ test("explicit disabled or zero-quota models reject before submission", () => {
         const catalog = parseAntigravityCatalog({ models: [models[0], entry] })!;
         assert.throws(() => selectAntigravityModel(catalog, entry.id), error => error instanceof AntigravityCallError && !error.submitted && !error.safeToFallback);
     }
-    assert.throws(() => selectAntigravityModel(parseAntigravityCatalog({ models: [models[3], models[4], models[5]] })!), /flash high/iu);
+    assert.throws(() => selectAntigravityModel(parseAntigravityCatalog({ models: [models[3], models[4], models[5]] })!, "flash"), /flash high/iu);
     assert.throws(() => selectAntigravityModel(parseAntigravityCatalog({ models })!, "MODEL_PLACEHOLDER_M670"), /当前目录没有模型/u);
 });
 
 test("fixture freshness and changed content are checked without an RPC", () => {
     const filePath = fixture();
     const catalog = readAntigravityCatalogFixture()!;
-    assert.equal(selectAntigravityModel(catalog).model, models[0].model);
+    assert.equal(selectAntigravityModel(catalog).model, models[4].model);
     fs.writeFileSync(filePath, JSON.stringify({ observedAt: "2020-01-01T00:00:00Z", models }));
     assert.throws(() => readAntigravityCatalogFixture(), /过期/u);
 });
@@ -186,7 +186,7 @@ test("App LS uses shared fixture and csrf; it does not start CLI or query status
         inject(port);
         const result = await callGetModelResponseDetailed("default", "fixture request", 2000);
         assert.equal(result.text, "APP_OK");
-        assert.equal(result.model, models[0].model);
+        assert.equal(result.model, models[4].model);
         assert.equal(result.transport, "app-ls");
         assert.equal(requests.length, 1);
         assert.equal(requests[0].headers["x-codeium-csrf-token"], "fixture-csrf");
@@ -202,7 +202,7 @@ test("dynamic live catalog is fetched once for concurrent requests", async () =>
         const results = await Promise.all([callGetModelResponseDetailed("default", "one", 2000), callGetModelResponseDetailed("carbon", "two", 2000)]);
         assert.ok(results.every(result => result.text === "DYNAMIC_OK"));
         assert.equal(requests.filter(request => request.method === "GetUserStatus").length, 1);
-        assert.deepEqual(results.map(result => result.model), [models[0].model, models[2].model]);
+        assert.deepEqual(results.map(result => result.model), [models[4].model, models[2].model]);
     }, (request, response) => request.method === "GetUserStatus" ? json(response, { userStatus: { cascadeModelConfigData: { clientModelConfigs: models.map(entry => ({ ...entry, modelId: entry.id, modelOrAlias: { model: entry.model } })) } } })
         : json(response, { response: "DYNAMIC_OK" }));
 });
@@ -509,7 +509,7 @@ test("model bridge and council preserve actual model and stop retries after unkn
         assert.equal(bridge.transport, "app-ls");
         assert.equal(requests[0].body.model, models[2].model);
         const council = await callCouncilModel({ id: "agy-fixture", provider: "antigravity", model: "default" }, "council", [], 2000);
-        assert.equal(council.model, models[0].model);
+        assert.equal(council.model, models[4].model);
         assert.equal(council.metadata?.transport, "app-ls");
         const before = requests.length;
         await assert.rejects(callCouncilModel({ id: "agy-unknown", provider: "antigravity", model: "default", params: { retries: 3 } }, "reset", [], 2000),

@@ -169,6 +169,8 @@ export interface PublishedHistoryFeedback {
 
 export interface CompactionSnapshot {
     candidateId: string;
+    semanticCandidateId?: string;
+    retryOf?: { candidateId: string; runId: string; runEpoch: number; rootBudgetId: string; sourceManifestHash: string; sourcePrefixHash: string };
     conversationId: string;
     runId: string;
     runEpoch: number;
@@ -267,6 +269,7 @@ export interface CompressionChunk {
     inputBodyHash: string;
     inputTokens: number;
     requirementAnchors?: RequirementAnchor[];
+    digestByteLimit?: number;
 }
 
 export interface CompressionRequest {
@@ -393,6 +396,14 @@ export interface CompactionCandidate {
         failedResult: CompressionResult;
         repairAttemptId: string;
     };
+    semanticTailReorganization?: {
+        chunkId: string;
+        afterChunkId: string | null;
+        nodeId: string;
+        hash: string;
+        inputBodyHash: string;
+    };
+    semanticTailReorganizations?: NonNullable<CompactionCandidate['semanticTailReorganization']>[];
     batch: SummaryBatch | null;
     folds: FoldNode[];
     nextView: SummaryView | null;

@@ -109,7 +109,7 @@ export const COMMAND_SPECS: CommandSpec[] = installLifecycleCommandSpecs([
     command('compact status', 'conversations.context', '查看当前压缩，或按原候选ID查回', ['candidateId'], ['params'], [], ['candidateId']),
     command('compact cancel', 'conversations.cancelCompaction', '只取消压缩并冷却，正常任务继续', ['candidateId'], [...MUTATION_OPTIONS, 'history-epoch', 'run-epoch'], [], ['candidateId']),
     command('compact restart', 'conversations.restartCompaction', '解除已确认的冷却或熔断，不新增请求', ['candidateId'], [...MUTATION_OPTIONS, 'history-epoch', 'run-epoch'], [], ['candidateId']),
-    command('compact recover', 'conversations.recoverCompaction', '按原候选ID、配置和attempt恢复', ['candidateId'], [...MUTATION_OPTIONS, 'history-epoch', 'run-epoch']),
+    command('compact recover', 'conversations.recoverCompaction', '按原候选ID、配置和attempt恢复', ['candidateId'], [...MUTATION_OPTIONS, ...BUDGET_OPTIONS, 'history-epoch', 'run-epoch', 'retry-known-failure', 'config-fingerprint']),
     command('rules list', 'conversations.rules.list', '查看已加载规则及来源', [], ['params']),
     command('rules show', 'conversations.rules.get', '读取指定规则的来源与固定版本', ['sourceId'], ['params']),
     command('rules reload', 'conversations.rules.reload', '为下一次请求重新加载规则', [], [...MUTATION_OPTIONS, 'revision']),
@@ -513,6 +513,11 @@ export async function executeCommand(command: ParsedCommand, context: ExecuteCon
     }
     if (spec.name.startsWith('compact ') && positionals[0] !== undefined) params.candidateId = positionals[0];
     if (spec.name === 'compact recover' && !params.candidateId) throw usage('compact recover需要原candidateId，可先用compact status查看');
+    if (spec.name === 'compact recover' && options['retry-known-failure'] === true) {
+        params.retryKnownFailure = true;
+        params.expectedConfigFingerprint = stringOption('config-fingerprint') ?? params.expectedConfigFingerprint;
+        params.budget = parseBudget(parsed, params.budget);
+    }
     if (spec.name.startsWith('settings ')) {
         params.scope = stringOption('scope') ?? 'global';
         if (spec.name === 'settings set') {

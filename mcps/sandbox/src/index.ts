@@ -460,11 +460,13 @@ Provider:
 
 Antigravity 常用别名:
 - 新版从当前 LS 目录解析 ID、标签及 MODEL_*，不固定绑定 M 编号；旧版 LS 保留原协议和旧别名
-- default/auto/fast/ag-fast/flash -> 当前目录的 Flash High
+- 空值/default/auto/fast/ag-fast -> 现代目录按 Hydrogen XHigh → Hydrogen High → Carbon High，同档版本从新到旧；无 Hydrogen/Carbon 的旧目录保留 Flash 默认及备用档
+- flash/gemini-flash -> 当前目录的 Flash High，显式模型和档位保持指定语义
 - pro/pro-high/gemini-pro/strong/reasoning -> 优先 Carbon High，其次目录中的 Pro、Argon High
 - carbon/hydrogen/argon 及 -high/-xhigh -> 对应系列和档位，显式档位缺失时返回不可用
 - sonnet/claude-sonnet/opus/claude-opus -> 当前目录中的对应 Claude 模型
 - Council 默认备用链按当前可用目录生成；显式备用链和新旧环境变量保持原优先级，未知受理时停止重发
+- 请求 model/lsModel 优先于加载时固定的 SANDBOX_LS_MODEL；自动候选仅在完整明确的拒绝后继续，认证、额度和结果未知时停止
 
 - 若存在 only-text 模型且输入里带 files/images，系统会先用 codex 链路生成纯文本专用转述；支持视觉输入的模型仍直接接收原图
 - webSearch: 默认优先走 Exa MCP；Exa 失败或无结果时降级到 360/Bing HTML fallback，并在结果中带降级说明。DuckDuckGo 默认跳过，可用 duckDuckGo=true 强制尝试

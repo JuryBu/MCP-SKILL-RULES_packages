@@ -1,8 +1,42 @@
-import type { ChunkDigest, CompactionSnapshot, SummaryBatch, SummaryNode } from './contracts.js';
+import type { ChunkDigest, CompactionCandidate, CompactionSnapshot, DigestText, SummaryBatch, SummaryNode } from './contracts.js';
 import { derivedContextId, hashContext } from './config.js';
 import { sealSummaryNode } from './view.js';
 import { ContextFault } from './errors.js';
 import { feedbackSourceNodeIds } from './feedback.js';
+
+export function semanticDigestText(digest: Pick<DigestText, 'body' | 'skeleton' | 'title' | 'reorganizedTail'>) {
+    return { body: digest.body, skeleton: digest.skeleton, title: digest.title,
+        ...(digest.reorganizedTail ? { reorganizedTail: digest.reorganizedTail } : {}) };
+}
+
+export function replaySemanticChunks(nodes: SummaryNode[], chunks: ChunkDigest[], snapshot: CompactionSnapshot,
+    reorganization?: CompactionCandidate['semanticTailReorganization'] | CompactionCandidate['semanticTailReorganizations'],
+    reorganized?: ChunkDigest | ChunkDigest[]): SummaryNode[] {
+    const events = Array.isArray(reorganization) ? reorganization : reorganization ? [reorganization] : [];
+    const results = Array.isArray(reorganized) ? reorganized : reorganized ? [reorganized] : [];
+    const applyReorganizations = (previous: SummaryNode[], afterChunkId: string | null) => {
+        let current = previous;
+        for (const event of events.filter(entry => entry.afterChunkId === afterChunkId)) {
+            const result = results.find(entry => entry.chunkId === event.chunkId);
+            if (!result) continue;
+            const tail = current.at(-1);
+            if (!tail || tail.nodeId !== event.nodeId || tail.hash !== event.hash || result.inputBodyHash !== event.inputBodyHash
+                || result.sourceSpans.length || result.anchors.length || !result.complete) {
+                throw new ContextFault('SOURCE_GAP', '末段重整结果与冻结节点或请求不一致');
+            }
+            const { hash: _hash, ...content } = tail;
+            current = [...current.slice(0, -1), sealSummaryNode({ ...content, body: result.digest.body,
+                skeleton: result.digest.skeleton, title: result.digest.title })];
+        }
+        return current;
+    };
+    let result = applyReorganizations([...nodes], null);
+    for (const chunk of chunks) {
+        result = applySemanticChunk(result, chunk, snapshot);
+        result = applyReorganizations(result, chunk.chunkId);
+    }
+    return result;
+}
 
 export function semanticTailInput(nodes: SummaryNode[], roundId?: string) {
     const tail = nodes.at(-1);
@@ -29,7 +63,7 @@ export function applySemanticChunk(nodes: SummaryNode[], chunk: ChunkDigest, sna
     }
     const unique = <Value>(values: Value[]) => [...new Map(values.map(value => [hashContext(value), value])).values()];
     const previous = continuing ? tail : undefined;
-    const node = sealSummaryNode<SummaryBatch>({ kind: 'batch', nodeId: derivedContextId([snapshot.candidateId, chunk.chunkId, 'semantic']),
+    const node = sealSummaryNode<SummaryBatch>({ kind: 'batch', nodeId: derivedContextId([snapshot.semanticCandidateId ?? snapshot.candidateId, chunk.chunkId, 'semantic']),
         firstSeq: previous?.firstSeq ?? round.firstSeq, lastSeq: round.lastSeq,
         roundIds: [...new Set([...(previous?.roundIds ?? []), round.roundId])],
         sourceSpans: unique([...(previous?.sourceSpans ?? []), ...chunk.sourceSpans]),

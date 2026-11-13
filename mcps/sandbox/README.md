@@ -176,7 +176,8 @@ MCP 进程与父 LS 进程绑定（ppid），容错管理：
 - 批量搜索时，顶层 `modelChain` 可作为默认值，`queries[i].modelChain` 可单独覆盖；未填时按 `chain` 兼容规则回退
 - `modelChain` 仅影响 `smart` 模式；`exact` / `fuzzy` 完全不受影响
 - `modelChain="grok"` 需要本机 progrok API 可用；`modelChain="antigravity"` 需要存在可连接的 Antigravity LS；`modelChain="codex"` 需要本机可调用 `codex` CLI；`modelChain="claude-code"` 需要本机可调用 `claude` CLI。显式链路均为硬约束，不可用时直接报错，不做跨 provider 降级
-- Antigravity 新版从当前 LS 的模型目录解析默认模型、简称和可用额度，默认选择目录中的 Flash High，`pro/strong` 优先 Carbon High。显式模型 ID、标签和 `MODEL_*` 以当前目录为准，旧版 LS 继续使用原有协议和旧别名；`SANDBOX_LS_MODEL` 与 `SANDBOX_LS_MODEL_FALLBACKS` 保留覆盖作用。
+- Antigravity 从当前 LS 目录解析模型和可用额度。目录含 Hydrogen/Carbon 时，空值及 `default/auto/fast/ag-fast` 按 Hydrogen XHigh → Hydrogen High → Carbon High 自动选择，同档按版本从新到旧排列，只使用高思考档；没有这两个系列的旧目录继续使用 Flash High 及原有备用档。`pro/strong` 仍优先 Carbon High，显式 `flash/pro`、模型 ID、标签和 `MODEL_*` 保持指定语义，缺少显式档位时直接报错。
+- 请求级 `model/lsModel` 优先于模块加载时读取的 `SANDBOX_LS_MODEL`；目录中的精确模型遇禁用或额度耗尽时直接拒绝，目录中的显式选择提交后遇容量拒绝也停止自动换模型。`SANDBOX_LS_MODEL_FALLBACKS` 保留旧版 LS 的默认备用链覆盖作用。自动候选只在完整、明确的拒绝（例如 503 `No capacity available for ...`）后继续；认证、额度、未知 503 及已提交但结果未知时停止重发。
 - Codex 模型桥默认值：`gpt-5.5` + `model_reasoning_effort=low` + `model_speed_tier=fast`，用于 `smart_search(modelChain="codex")` 这类短同步模型桥；可用 `SANDBOX_CODEX_BRIDGE_REASONING` 覆盖
 - Codex 模型桥稳定性：默认 fallback 链为 `gpt-5.5:low → gpt-5.4:low → gpt-5.4-mini:low`，只在超时、429/5xx、连接中断、空输出等可重试错误时降级；可用 `SANDBOX_CODEX_BRIDGE_FALLBACKS`、`SANDBOX_CODEX_BRIDGE_FALLBACKS_ENABLED=0`、`SANDBOX_CODEX_BRIDGE_RETRIES` 调整。`sandbox_codex` 是可执行 agent 入口，可能有文件写入副作用，不默认自动重试，长任务仍建议 `background=true`
 - Grok/progrok 模型桥默认 `reasoning_effort=low`，`smart_search(modelChain="grok")` 的 index/broad/deep 三阶段共用该默认值；可用 `SANDBOX_PROGROK_REASONING_EFFORT` 或 `SANDBOX_SMART_GROK_REASONING_EFFORT` 覆盖。progrok 可重试错误（超时、截断、429、5xx）会在桥内尝试一次 fallback 模型，默认 `grok-4.20-non-reasoning`，可用 `SANDBOX_PROGROK_FALLBACK_MODEL` 或 `SANDBOX_SMART_GROK_FALLBACK_MODEL` 覆盖；`max_tokens` 保持 4096

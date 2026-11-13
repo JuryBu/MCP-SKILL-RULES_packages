@@ -11,7 +11,7 @@ import { readSourceFrame, utf8Boundary } from './sources.js';
 import { applySummaryFold, mergeRequirements, planSummaryFold, renderSummary, renderSummaryView, sealSummaryNode, validatePublication } from './view.js';
 import { feedbackSourceNodeIds } from './feedback.js';
 import { activeRequirements, boundedRequirementGuidance } from './requirements.js';
-import { applySemanticChunk, semanticTailInput } from './semantic-tail.js';
+import { applySemanticChunk, replaySemanticChunks, semanticDigestText, semanticTailInput } from './semantic-tail.js';
 import { updateCommunicationWindow } from './communication-window.js';
 import { captureCompletedFragments } from './completed-fragments.js';
 
@@ -160,6 +160,8 @@ export async function* createCompressionChunks(input: {
     snapshot: CompactionSnapshot; sources: ContextSourcePort; blocks?: SourceBlock[]; priorGuidance?: string | (() => string);
     requirementAnchors?: () => RequirementAnchor[];
     semanticTail?: (roundId: string) => ReturnType<typeof semanticTailInput>;
+    completedChunks?: readonly ChunkDigest[];
+    prepareChunk?: (roundId: string, staticTokens: number, inputLimit: number) => Promise<void>;
     countTokens?: TokenCounter; signal: AbortSignal;
 }): AsyncGenerator<CompressionChunk> {
     const { snapshot, sources, signal } = input;
@@ -167,6 +169,7 @@ export async function* createCompressionChunks(input: {
     const policy = snapshot.config.policy;
     const limits = computeContextLimits(snapshot.config.model.contextWindow, snapshot.config.model.maxOutputTokens, policy);
     const inputLimit = Math.min(policy.chunkInputTokens, limits.inputBudget - 1);
+    const digestByteLimit = Math.max(1, Math.floor(inputLimit / 3));
     const guidance = () => typeof input.priorGuidance === 'function' ? input.priorGuidance() : input.priorGuidance ?? '';
     const references = input.blocks ? [] : await readReferences(snapshot, sources, countTokens, signal,
         Math.max(0, policy.referenceTokens - countTokens(guidance())));
@@ -176,6 +179,8 @@ export async function* createCompressionChunks(input: {
     let currentRoundId = '';
     const body = (parts: TextPart[], anchors: SourceBlock[]) => canonicalJson({ rules: snapshot.config.rules,
         ...(input.semanticTail ? { semanticTail: input.semanticTail(currentRoundId) } : {}),
+        ...(input.semanticTail ? { digestBudget: { maxUtf8Bytes: digestByteLimit,
+            instructions: 'Aim to keep the encoded body/skeleton/title and any reorganizedTail together within maxUtf8Bytes. Preserve concrete facts and retrieval identities; do not accumulate earlier wording. This target leaves room for the next source delta.' } } : {}),
         taskStateOwner: 'main_model', legacyRequirementsReadOnly: true, taskPlanManaged: policy.taskPlanManaged,
         ...(snapshot.requestBudget ? { requestBudget: snapshot.requestBudget } : {}),
         priorGuidance: guidance(), references, targets: parts.map(part => roundOutcomes.has(part.sourceRoundId)
@@ -194,31 +199,53 @@ export async function* createCompressionChunks(input: {
             referenceSpans: references.map(part => part.span), anchors, body: text, inputBodyHash: hashBytes(text), inputTokens,
             ...(input.requirementAnchors ? { requirementAnchors: input.requirementAnchors() } : {}) });
     };
+    const completedSpans = input.completedChunks?.flatMap(chunk => chunk.sourceSpans) ?? [];
+    const completedOffset = (block: SourceBlock) => {
+        const spans = completedSpans.filter(span => span.itemId === block.itemId && span.blockId === block.blockId)
+            .sort((left, right) => left.startByte - right.startByte);
+        let offset = 0;
+        for (const span of spans) {
+            if (span.blockHash !== block.sha256 || span.startByte !== offset || span.endByte < span.startByte || span.endByte > block.byteLength) {
+                throw new ContextFault('SOURCE_GAP', '已知分块来源不是冻结原文的连续前缀');
+            }
+            offset = span.endByte;
+        }
+        return { offset, complete: spans.length > 0 && offset === block.byteLength };
+    };
+    const prepare = async (parts: TextPart[] = [], anchors: SourceBlock[] = []) => {
+        await input.prepareChunk?.(currentRoundId, countTokens(body(parts, anchors)), inputLimit);
+    };
     for (const roundId of roundIds) {
         currentRoundId = roundId;
         checkAbort(signal);
-        const roundBlocks = blocks.filter(block => block.roundId === roundId);
+        const roundBlocks = blocks.filter(block => block.roundId === roundId && !completedOffset(block).complete);
+        if (!roundBlocks.length) continue;
+        await prepare();
         let anchors: SourceBlock[] = [];
         for (const anchor of roundBlocks.filter(block => block.kind === 'nativeAnchor')) {
             if (countTokens(body([], [...anchors, anchor])) > inputLimit) {
                 if (!anchors.length) throw new ContextFault('CONFIG_INVALID', '单个原生检索锚点超过压缩输入预算');
                 yield finish(roundId, [], anchors);
                 anchors = [];
+                await prepare();
             }
+            if (countTokens(body([], [anchor])) > inputLimit) await prepare([], [anchor]);
             if (countTokens(body([], [anchor])) > inputLimit) throw new ContextFault('CONFIG_INVALID', '单个原生检索锚点及当前末段超过压缩输入预算',
                 { inputLimit, staticTokens: countTokens(body([], [])), itemId: anchor.itemId, blockId: anchor.blockId });
             anchors.push(anchor);
         }
         let parts: TextPart[] = [];
         for (const block of roundBlocks.filter(entry => entry.kind === 'text')) {
-            let offset = 0;
+            let offset = completedOffset(block).offset;
             if (!block.byteLength) {
                 const empty = { text: '', span: spanFor(block, 0, Buffer.alloc(0), 'target'), sourceRoundId: block.roundId };
                 if (countTokens(body([...parts, empty], anchors)) > inputLimit && (parts.length || anchors.length)) {
                     yield finish(roundId, parts, anchors);
                     parts = [];
                     anchors = [];
+                    await prepare();
                 }
+                if (countTokens(body([empty], [])) > inputLimit) await prepare([empty]);
                 if (countTokens(body([empty], [])) > inputLimit) throw new ContextFault('CONFIG_INVALID', '单个空文本的来源头已超过压缩输入预算',
                     { inputLimit, staticTokens: countTokens(body([], [])), itemId: block.itemId, blockId: block.blockId });
                 parts.push(empty);
@@ -229,6 +256,16 @@ export async function* createCompressionChunks(input: {
                     endByte: Math.min(block.byteLength, offset + policy.readFrameBytes), maxBytes: policy.readFrameBytes, signal });
                 const available = utf8Boundary(frame, frame.length);
                 if (!available) throw new ContextFault('SOURCE_GAP', '来源帧无法形成完整UTF-8字符', { itemId: block.itemId, blockId: block.blockId, offset });
+                if (!parts.length && !anchors.length && input.prepareChunk) {
+                    let firstEnd = 1;
+                    while (!utf8Boundary(frame, firstEnd)) firstEnd++;
+                    const bytes = frame.subarray(0, firstEnd);
+                    let text: string;
+                    try { text = new TextDecoder('utf-8', { fatal: true }).decode(bytes); }
+                    catch { throw new ContextFault('SOURCE_GAP', '目标文本包含无效UTF-8', { itemId: block.itemId, blockId: block.blockId, offset }); }
+                    const minimum = { text, span: spanFor(block, offset, bytes, 'target'), sourceRoundId: block.roundId };
+                    if (countTokens(body([minimum], [])) > inputLimit) await prepare([minimum]);
+                }
                 let low = 1;
                 let high = available;
                 let fitted = 0;
@@ -249,6 +286,7 @@ export async function* createCompressionChunks(input: {
                     yield finish(roundId, parts, anchors);
                     parts = [];
                     anchors = [];
+                    await prepare();
                     continue;
                 }
                 const bytes = frame.subarray(0, fitted);
@@ -258,6 +296,7 @@ export async function* createCompressionChunks(input: {
                     yield finish(roundId, parts, anchors);
                     parts = [];
                     anchors = [];
+                    await prepare();
                 }
             }
         }
@@ -287,6 +326,12 @@ export function validateCompressionResult(request: CompressionRequest, result: C
         throw new ContextFault('SOURCE_GAP', outputTruncated ? '压缩模型输出达到本次输出上限而截断，原响应及费用记录已保留，请调整压缩模型参数或输出预算后明确继续' : '压缩模型未返回完整、可核验的摘要结构',
             { attemptId: request.attemptId, ...(knownInvalidDigest ? { knownInvalidDigest: true } : {}),
                 ...(outputTruncated ? { compressionOutputTruncated: true } : {}) }, !knownInvalidDigest);
+    }
+    if (request.chunk.digestByteLimit !== undefined
+        && Buffer.byteLength(canonicalJson(semanticDigestText(result.digest))) > request.chunk.digestByteLimit) {
+        throw new ContextFault('SOURCE_GAP', '压缩摘要超过本次末段长度预算，原响应及费用记录已保留',
+            { attemptId: request.attemptId, knownInvalidDigest: true, digestBudgetExceeded: true,
+                digestByteLimit: request.chunk.digestByteLimit });
     }
     const requested = new Set(request.chunk.sourceSpans.map(span => hashContext(span)));
     const seen = new Set<string>();
@@ -339,7 +384,7 @@ export function validateCoverage(manifest: SourceManifest, chunks: ChunkDigest[]
     return { completeRoundIds, coveredEndSeq, gaps, anchorOnly };
 }
 
-function chunkComplete(chunk: CompressionChunk, result: CompressionResult): boolean {
+function chunkComplete(chunk: Pick<CompressionChunk, 'sourceSpans'>, result: CompressionResult): boolean {
     return chunk.sourceSpans.every(span => result.coverage.some(entry => hashContext(entry.span) === hashContext(span)
         && !entry.gaps.length && (entry.status === 'complete' || (span.purpose === 'nativeAnchor' && entry.status === 'anchorOnly'))));
 }
@@ -522,8 +567,70 @@ export async function generateCompaction(input: {
     try {
         candidate.state = 'generating';
         await port.saveCandidate(structuredClone(candidate));
+        if (candidate.pendingRequest) throw new ContextFault('ATTEMPT_UNKNOWN', '原压缩attempt尚未查明，保持原请求并停止新增请求',
+            { attemptId: candidate.pendingRequest.attemptId }, true);
         await verifyManifestSources(snapshot.manifest, sources, snapshot.config.policy.readFrameBytes, signal);
-        for await (const chunk of createCompressionChunks({ snapshot, sources, priorGuidance, countTokens, signal,
+        const targetRoundIds = new Set(snapshot.manifest.rounds.map(round => round.roundId));
+        const reorganizations = () => candidate.semanticTailReorganizations
+            ?? (candidate.semanticTailReorganization ? [candidate.semanticTailReorganization] : []);
+        const sourceChunks = () => candidate.chunks.filter(chunk => targetRoundIds.has(chunk.roundId)
+            && !reorganizations().some(event => event.chunkId === chunk.chunkId));
+        const replay = (chunks: ChunkDigest[]) => replaySemanticChunks(priorView.nodes, chunks, snapshot, reorganizations(), candidate.chunks);
+        const completed = sourceChunks();
+        for (const chunk of completed) {
+            if (!chunkComplete(chunk, chunk)) break;
+            if (chunk.modelFingerprint !== snapshot.effectiveModelFingerprint) throw new ContextFault('MODEL_STALE', '已知分块与冻结模型身份不同');
+            for (const span of chunk.sourceSpans) {
+                const block = snapshot.manifest.blocks.find(entry => entry.itemId === span.itemId && entry.blockId === span.blockId);
+                if (!block || block.roundId !== chunk.roundId || span.blockHash !== block.sha256
+                    || !Number.isSafeInteger(span.startByte) || !Number.isSafeInteger(span.endByte)
+                    || span.startByte < 0 || span.endByte < span.startByte || span.endByte > block.byteLength
+                    || span.purpose !== (block.kind === 'nativeAnchor' ? 'nativeAnchor' : 'target')) {
+                    throw new ContextFault('SOURCE_GAP', '已知分块与冻结原文范围不一致');
+                }
+                const hash = createHash('sha256');
+                for (let offset = span.startByte; offset < span.endByte; offset += snapshot.config.policy.readFrameBytes) {
+                    hash.update(await readSourceFrame(sources, { block, startByte: offset,
+                        endByte: Math.min(span.endByte, offset + snapshot.config.policy.readFrameBytes),
+                        maxBytes: snapshot.config.policy.readFrameBytes, signal }));
+                }
+                if (hash.digest('hex') !== span.sha256) throw new ContextFault('HISTORY_STALE', '已知分块的实际来源字节与冻结指纹不同');
+            }
+            guidanceCursor += Math.max(1, boundedRequirementGuidance(inherited,
+                Math.floor(snapshot.config.policy.referenceTokens * 0.75), countTokens, guidanceCursor).length);
+        }
+        semanticNodes = replay(completed.filter(chunk => chunkComplete(chunk, chunk)));
+        const prepareChunk = async (_roundId: string, staticTokens: number, inputLimit: number) => {
+            const tail = semanticNodes.at(-1);
+            const digestByteLimit = Math.max(1, Math.floor(inputLimit / 3));
+            if (!tail || Buffer.byteLength(canonicalJson(semanticDigestText(tail))) <= digestByteLimit && staticTokens <= inputLimit) return;
+            const afterChunkId = sourceChunks().at(-1)?.chunkId ?? null;
+            const previous = reorganizations().find(event => event.afterChunkId === afterChunkId && event.nodeId === tail.nodeId);
+            if (previous) {
+                if (candidate.chunks.some(chunk => chunk.chunkId === previous.chunkId && chunk.complete)) return;
+                throw new ContextFault('CONFIG_INVALID', '同一末段来源的一次重整已经使用，停止重复请求',
+                    { inputLimit, staticTokens, chunkId: previous.chunkId });
+            }
+            const body = canonicalJson({ rules: snapshot.config.rules, semanticTail: {
+                body: tail.body, skeleton: tail.skeleton, title: tail.title, retrieval: { nodeId: tail.nodeId, hash: tail.hash } },
+                taskStateOwner: 'main_model', legacyRequirementsReadOnly: true, targets: [], anchors: [],
+                digestBudget: { maxUtf8Bytes: digestByteLimit,
+                    instructions: 'Reorganize only the supplied known tail. Return body/skeleton/title within this combined encoded UTF-8 byte limit. Preserve concrete facts and retrieval identities; earlier segments and source coverage remain unchanged.' } });
+            const inputTokens = countTokens(body);
+            if (!Number.isSafeInteger(inputTokens) || inputTokens < 0 || inputTokens > inputLimit) {
+                throw new ContextFault('CONFIG_INVALID', '已知末段的完整重整请求超过单块输入预算，原结果保持', { inputTokens, inputLimit });
+            }
+            const inputBodyHash = hashBytes(body);
+            const chunkId = derivedContextId([candidate.candidateId, 'semantic-tail-reorganization', tail.nodeId, tail.hash]);
+            candidate.semanticTailReorganizations = [...reorganizations(), { chunkId, afterChunkId,
+                nodeId: tail.nodeId, hash: tail.hash, inputBodyHash }];
+            await runChunk(freezeValue({ chunkId, roundId: `tail-reorganization:${tail.nodeId}`, sourceSpans: [], referenceSpans: [],
+                anchors: [], body, inputBodyHash, inputTokens, digestByteLimit }), 'fold');
+            semanticNodes = replay(sourceChunks());
+        };
+        const hasIncompleteChunk = completed.some(chunk => !chunkComplete(chunk, chunk));
+        for await (const chunk of hasIncompleteChunk ? [] : createCompressionChunks({ snapshot, sources, priorGuidance, countTokens, signal,
+            completedChunks: completed, prepareChunk,
             semanticTail: (roundId: string) => semanticTailInput(semanticNodes, roundId),
             requirementAnchors: () => boundedRequirementGuidance(inherited, Math.floor(snapshot.config.policy.referenceTokens * 0.75), countTokens, guidanceCursor) })) {
             const digest = await runChunk(chunk, candidate.reason);
@@ -535,7 +642,7 @@ export async function generateCompaction(input: {
         if (!coverage.completeRoundIds.length) throw new ContextFault('SOURCE_GAP', '目标来源未完整覆盖一个连续整轮，保持原发送视图', { coverage });
         const accepted = new Set(coverage.completeRoundIds);
         const chunks = candidate.chunks.filter(chunk => accepted.has(chunk.roundId));
-        let nodes = chunks.reduce((previous, chunk) => applySemanticChunk(previous, chunk, snapshot), priorView.nodes);
+        let nodes = replay(chunks);
         const last = nodes.at(-1)!;
         if (last.kind !== 'batch') throw new ContextFault('SOURCE_GAP', '语义增量末节点须为可独立发布的新批');
         candidate.batch = last;

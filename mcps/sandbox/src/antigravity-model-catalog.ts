@@ -86,15 +86,30 @@ export function isDefaultAntigravityModel(requested: string): boolean {
     return /^(?:|default|auto|fast|ag-fast|flash|gemini-flash)$/u.test(normalized(requested));
 }
 
-export function defaultAntigravityFlashCandidates(catalog: AntigravityCatalog, requested: string): AntigravityCatalogModel[] {
+export function isAutomaticAntigravityModel(requested: string): boolean {
+    return /^(?:|default|auto|fast|ag-fast)$/u.test(normalized(requested));
+}
+
+export function defaultAntigravityCandidates(catalog: AntigravityCatalog, requested: string): AntigravityCatalogModel[] {
     const selected = selectAntigravityModel(catalog, requested || "default");
-    if (!isDefaultAntigravityModel(requested)) return [selected];
+    if (!isAutomaticAntigravityModel(requested) || exactAntigravityModel(catalog, normalized(requested || "default"))) return [selected];
+    const modern = modernAutomaticCandidates(catalog);
+    if (modern) {
+        const seen = new Set<string>();
+        return modern.filter(entry => {
+            if (!available(entry) || seen.has(entry.model)) return false;
+            seen.add(entry.model);
+            return true;
+        });
+    }
     const family = selected.id.replace(/-high$/u, "");
     return [selected, ...["medium", "low"].flatMap(level => {
         const candidate = catalog.models.find(entry => entry.id === `${family}-${level}` && !entry.disabled && (entry.remaining === undefined || entry.remaining > 0));
         return candidate ? [candidate] : [];
     })];
 }
+
+export { defaultAntigravityCandidates as defaultAntigravityFlashCandidates };
 
 function unavailable(model: AntigravityCatalogModel): AntigravityCallError {
     const quota = typeof model.remaining === "number" && model.remaining <= 0;
@@ -111,6 +126,21 @@ function inFamily(model: AntigravityCatalogModel, family: string): boolean {
     return tokens.includes(family) && !tokens.includes("orchestrator");
 }
 
+function exactAntigravityModel(catalog: AntigravityCatalog, key: string): AntigravityCatalogModel | undefined {
+    return catalog.models.find(entry => [entry.id, entry.label, entry.model, entry.model.replace(/^MODEL_PLACEHOLDER_/u, "")]
+        .some(value => normalized(value) === key));
+}
+
+function modernAutomaticCandidates(catalog: AntigravityCatalog): AntigravityCatalogModel[] | null {
+    const modern = catalog.models.filter(entry => inFamily(entry, "hydrogen") || inFamily(entry, "carbon"));
+    if (!modern.length) return null;
+    const rank = (entry: AntigravityCatalogModel) => inFamily(entry, "hydrogen")
+        ? normalized(entry.id).endsWith("-xhigh") ? 0 : normalized(entry.id).endsWith("-high") ? 1 : -1
+        : normalized(entry.id).endsWith("-high") ? 2 : -1;
+    return modern.filter(entry => rank(entry) >= 0).sort((left, right) =>
+        rank(left) - rank(right) || right.id.localeCompare(left.id, undefined, { numeric: true }));
+}
+
 export function antigravityCouncilCandidates(catalog: AntigravityCatalog): AntigravityCatalogModel[] {
     const families = ["carbon", "hydrogen", "pro", "flash", "sonnet", "opus", "argon"];
     const rank = (model: AntigravityCatalogModel) => families.findIndex(family => inFamily(model, family));
@@ -125,11 +155,20 @@ export function antigravityCouncilCandidates(catalog: AntigravityCatalog): Antig
 
 export function selectAntigravityModel(catalog: AntigravityCatalog, requested = "default"): AntigravityCatalogModel {
     const key = normalized(requested || "default");
-    const exact = catalog.models.find(entry => [entry.id, entry.label, entry.model, entry.model.replace(/^MODEL_PLACEHOLDER_/u, "")]
-        .some(value => normalized(value) === key));
+    const exact = exactAntigravityModel(catalog, key);
     if (exact) {
         if (exact.disabled || (typeof exact.remaining === "number" && exact.remaining <= 0)) throw unavailable(exact);
         return exact;
+    }
+    if (isAutomaticAntigravityModel(key)) {
+        const modern = modernAutomaticCandidates(catalog);
+        if (modern) {
+            const selected = modern.find(available);
+            if (selected) return selected;
+            if (modern[0]) throw unavailable(modern[0]);
+            throw new AntigravityCallError("Antigravity 当前目录没有可用的 Hydrogen XHigh/High 或 Carbon High 模型",
+                { submitted: false, outcomeUnknown: false, safeToFallback: false, kind: "rejected" });
+        }
     }
     const match = key.match(/^(?:(?:gemini|claude)-)?(flash|pro|argon|carbon|hydrogen|sonnet|opus)(?:-(high|xhigh))?$/u);
     const family = isDefaultAntigravityModel(key) ? "flash"

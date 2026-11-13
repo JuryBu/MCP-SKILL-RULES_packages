@@ -2192,6 +2192,8 @@ export function createAgentRuntime(options: AgentRuntimeOptions = {}) {
                 inputOrder: 0, activeInputId: null, stopTarget: null, executorAvailable: true, resultContentId: null, failure: null,
                 initiator: structuredClone(authorization.client), options: structuredClone(conversation.value.options),
                 maintenanceEpoch: conversation.value.runEpoch + 1, maintenancePurpose: input.purpose ?? 'compression' };
+            if (authorization.params.retryKnownFailure === true) run.options = { ...structuredClone(conversation.value.options),
+                contextRetryOf: { candidateId: String(authorization.params.candidateId), expectedConfigFingerprint: String(authorization.params.expectedConfigFingerprint) } };
             const execution: ExecutionLease = { kind: 'maintenance', conversationId: input.conversationId, runId, runEpoch: run.runEpoch,
                 rootBudgetId: runId, roundId: null, stepId: run.activeStepId!, deadlineAt };
             conversation.value.activeRunId = runId;

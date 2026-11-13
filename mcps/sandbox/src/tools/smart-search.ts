@@ -474,7 +474,7 @@ async function searchSmart(
 
 function smartTimeoutFor(chain: ResolvedModelChain | ModelChain, phase: SmartModelPhase, background = false): number {
     const normalized = chain === "cc" ? "claude-code" : chain;
-    if (phase === "direct" && normalized === "antigravity") return Math.min(SMART_STAGE2_TIMEOUT_MS, 30_000);
+    if (phase === "direct" && normalized === "antigravity") return SMART_STAGE2_TIMEOUT_MS;
     if (normalized === "grok") return SMART_GROK_TIMEOUT_MS;
     if (normalized === "codex") {
         if (phase === "files") return background ? SMART_CODEX_BACKGROUND_FILES_TIMEOUT_MS : SMART_CODEX_FILES_TIMEOUT_MS;
@@ -500,6 +500,27 @@ export function mayRetrySmartModelCall(error: unknown): boolean {
     if (!error || typeof error !== "object") return true;
     const outcome = error as { outcomeUnknown?: boolean; safeToFallback?: boolean; retryable?: boolean };
     return outcome.outcomeUnknown !== true && outcome.safeToFallback !== false && outcome.retryable !== false;
+}
+
+export function serializeSmartModelFailure(error: unknown) {
+    if (!error || typeof error !== "object") return null;
+    const value = error as { message?: string; kind?: string; model?: string; transport?: string;
+        submitted?: boolean; outcomeUnknown?: boolean; safeToFallback?: boolean; retryable?: boolean };
+    if (typeof value.submitted !== "boolean" || typeof value.outcomeUnknown !== "boolean"
+        || typeof value.safeToFallback !== "boolean") return null;
+    return { type: "model_call_failed", message: value.message ?? String(error),
+        submitted: value.submitted, outcomeUnknown: value.outcomeUnknown, safeToFallback: value.safeToFallback,
+        retryable: value.outcomeUnknown ? false : value.retryable ?? value.safeToFallback,
+        ...(typeof value.kind === "string" ? { kind: value.kind } : {}),
+        ...(typeof value.model === "string" ? { model: value.model } : {}),
+        ...(typeof value.transport === "string" ? { transport: value.transport } : {}) };
+}
+
+export function visibleSmartModelFailure(error: unknown): unknown {
+    const failure = serializeSmartModelFailure(error);
+    if (!failure) return error;
+    const suffix = failure.outcomeUnknown ? "\n模型请求可能已经受理，结果未知；本次已停止自动重发，原调用记录继续保留。" : "";
+    return Object.assign(new Error(failure.message + suffix, { cause: error }), { ...failure, message: failure.message + suffix });
 }
 
 export async function callSmartModelWithFallback(
@@ -536,8 +557,8 @@ export async function callSmartModelWithFallback(
             try {
                 return await callBridge(chain, prompt, timeoutMs, bridgeOptionsForSmartChain(chain, opts.signal));
             } catch (err) {
-                assertNotAborted(opts.signal);
                 if (!mayRetrySmartModelCall(err)) throw err;
+                assertNotAborted(opts.signal);
                 const message = err instanceof Error ? err.message : String(err);
                 errors.push(`${chain}${attempt > 1 ? `#retry${attempt}` : ""}: ${message}`);
                 if (!isRetriableSmartModelError(message) || attempt >= SMART_CHAIN_RETRY_ATTEMPTS) break;
@@ -2135,6 +2156,8 @@ export function registerSmartSearch(server: McpServer): void {
                         default:
                             return `❌ 未知模式: ${q.mode}`;
                     }
+                } catch (error) {
+                    throw visibleSmartModelFailure(error);
                 } finally {
                     resourceLease.release();
                 }
@@ -2306,7 +2329,10 @@ export function registerSmartSearch(server: McpServer): void {
                         content: [{ type: "text" as const, text: `❌ ${admissionError.type}: 搜索尚未启动；等待 ${admissionError.queueWaitMs}ms 后仍无资源，建议 ${admissionError.retryAfterMs}ms 后重试` }],
                     });
                 }
-                return { content: [{ type: "text" as const, text: `❌ 搜索失败: ${err.message}` }] };
+                const modelFailure = serializeSmartModelFailure(err);
+                return ensureModelVisibleToolResult({ isError: true,
+                    ...(modelFailure ? { structuredContent: { error: modelFailure } } : {}),
+                    content: [{ type: "text" as const, text: `❌ 搜索失败: ${err.message}` }] });
             }
         }
     );

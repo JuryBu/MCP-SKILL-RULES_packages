@@ -167,10 +167,17 @@ export class ModelCatalog {
 
     async declare(profile: ProviderProfile, entry: ModelEntry, expectedCatalogVersion: string | null): Promise<CatalogSnapshot> {
         validateModelEntry(entry, profile);
+        const previous = await this.port.read(profile.profileId);
+        if ((previous?.catalogVersion ?? null) !== expectedCatalogVersion) throw new AgentFault('E_CATALOG_CONFLICT', '模型声明所依据的目录版本已变化');
+        const current = previous ? effectiveCatalog(previous, this.now()).entries.find(value => value.modelId === entry.modelId && value.routeId === entry.routeId) : undefined;
+        const { pricing: _newPricing, ...newCapabilities } = entry;
+        const { pricing: _oldPricing, ...oldCapabilities } = current ?? entry;
+        const pricingOnly = current !== undefined && canonicalJson(newCapabilities) === canonicalJson(oldCapabilities);
+        if (pricingOnly && entry.pricing.status === 'supported') validatePrice(entry.pricing.value!, this.now());
         const evidence: Evidence<unknown>[] = [entry.contextWindow, entry.maxOutputTokens, entry.inputModalities, entry.outputModalities,
             entry.tools, entry.streaming, entry.pricing, ...Object.values(entry.parameters),
             ...(entry.maxInputTokens ? [entry.maxInputTokens] : []), ...(entry.thinking ? [entry.thinking] : [])];
-        const pendingEvidence = [...evidence];
+        const pendingEvidence = pricingOnly ? [entry.pricing] as Evidence<unknown>[] : [...evidence];
         let checkedEvidence = 0;
         while (pendingEvidence.length) {
             const item = pendingEvidence.pop()!;
@@ -187,9 +194,9 @@ export class ModelCatalog {
                 pendingEvidence.push(...item.conflicts);
             }
         }
-        const previous = await this.port.read(profile.profileId);
-        if ((previous?.catalogVersion ?? null) !== expectedCatalogVersion) throw new AgentFault('E_CATALOG_CONFLICT', '模型声明所依据的目录版本已变化');
-        const { discoveryEntries, declarations: originalDeclarations } = catalogLayers(previous);
+        const { discoveryEntries: previousDiscovery, declarations: originalDeclarations } = catalogLayers(previous);
+        const discoveryEntries = pricingOnly ? [...previousDiscovery.filter(value => value.modelId !== entry.modelId || value.routeId !== entry.routeId
+            || value.protocol !== entry.protocol || value.contextWindow.scope.endpoint !== current!.contextWindow.scope.endpoint), immutableJson(current!)] : previousDiscovery;
         const sourceScope = { endpoint: profile.baseUrl.replace(/\/+$/, ''), protocol: profile.protocol };
         const declarations = [...originalDeclarations.filter(value => value.modelId !== entry.modelId || value.routeId !== entry.routeId
             || value.protocol !== entry.protocol || value.contextWindow.scope.endpoint !== sourceScope.endpoint), immutableJson(entry)];

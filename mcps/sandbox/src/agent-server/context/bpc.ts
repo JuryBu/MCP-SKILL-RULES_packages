@@ -636,14 +636,79 @@ export class ContextCompactor {
         return { state: 'not_needed', candidateId };
     }
 
-    async recover(conversationId: string, candidateId: string): Promise<CompactionHandle | CompactionCandidate> {
+    async retryKnownFailure(input: { conversationId: string; candidateId: string; budget: JsonObject; operationId: string;
+        estimateCompaction(execution: ExecutionLease): Promise<CompactionViewEstimator>;
+        prepareCandidate?(candidate: CompactionCandidate): Promise<void> }): Promise<CompactionHandle> {
+        const conversationId = input.conversationId;
+        if (this.recovering.has(conversationId) || this.starting.has(conversationId)
+            || this.hasLocalCompaction(conversationId, { runningOnly: true })) throw new ContextFault('COMPACTION_BUSY', '原压缩仍在运行');
+        this.recovering.add(conversationId);
+        let execution: ExecutionLease | undefined;
+        try {
+            const original = await this.options.port.getCandidate(conversationId, input.candidateId);
+            if (!original || original.state !== 'failed' || original.pendingRequest || original.publicationReceiptKey
+                || original.publicationRevoked || !original.error || original.error.mayHaveStarted
+                || !(['CONTEXT_CONFIG_INVALID', 'CONTEXT_SUMMARY_BUDGET'].includes(original.error.code)
+                    || original.error.details?.budgetReservationRejected === true)) {
+                throw new ContextFault('COMPACTION_PAUSED', '仅确定未发送的预算失败可以显式重试，原未知请求及发布保持');
+            }
+            if (!this.options.maintenance) throw new ContextFault('BUDGET_REQUIRED', '已知失败重试需要独立维护执行');
+            const before = await this.options.port.inspect(conversationId);
+            const snapshot = original.snapshot;
+            if (before.execution || before.historyEpoch !== snapshot.historyEpoch || before.viewRevision !== snapshot.parentViewRevision
+                || before.appendSeq < snapshot.snapshotAppendSeq) throw new ContextFault('HISTORY_STALE', '原失败来源所属历史或父视图已改变');
+            if (before.candidateId && before.candidateId !== original.candidateId) {
+                const current = await this.options.port.getCandidate(conversationId, before.candidateId);
+                if (current && !['failed', 'cancelled', 'discarded', 'published'].includes(current.state)) throw new ContextFault('COMPACTION_BUSY', '当前会话已有其它有效候选');
+            }
+            const referenceRoundIds = new Set(snapshot.referenceBlocks.map(block => block.roundId));
+            const rounds = [...snapshot.manifest.rounds, ...before.rounds.filter(round => referenceRoundIds.has(round.roundId))];
+            const items = await readSelectedHistory(this.options.port, { ...before, appendSeq: snapshot.snapshotAppendSeq }, rounds,
+                snapshot.config.policy.readFrameBytes);
+            const sourceIds = new Set(snapshot.manifest.blocks.map(block => block.itemId));
+            const manifest = await createSourceManifest(this.options.sources, items.filter(item => sourceIds.has(item.itemId)), snapshot.manifest.rounds);
+            for (const item of items.filter(item => !sourceIds.has(item.itemId))) await this.options.sources.describe(item);
+            if (manifest.hash !== snapshot.sourceManifestHash || manifest.prefixHash !== snapshot.sourcePrefixHash) {
+                throw new ContextFault('HISTORY_STALE', '原失败冻结来源清单或前缀已经变化');
+            }
+            await verifyManifestSources(manifest, this.options.sources, snapshot.config.policy.readFrameBytes);
+            execution = await this.options.maintenance.createRun({ conversationId, config: snapshot.config,
+                budget: input.budget, operationId: input.operationId });
+            const config = await this.options.maintenance.prepareRun?.({ execution, config: snapshot.config }) ?? snapshot.config;
+            if (hashContext(config) !== hashContext(snapshot.config)) throw new ContextFault('MODEL_STALE', '新维护预算须完整承接原冻结模型参数及输出额度');
+            const capture = await this.options.port.claim({ conversationId, execution, expectedHistoryEpoch: before.historyEpoch,
+                expectedViewRevision: before.viewRevision, expectedGeneration: before.compressionGeneration, compressionGeneration: randomUUID() });
+            const candidateId = randomUUID();
+            const candidate: CompactionCandidate = { ...structuredClone(original), candidateId, state: 'snapshotting',
+                snapshot: freezeValue({ ...structuredClone(snapshot), candidateId, runId: execution.runId, runEpoch: execution.runEpoch,
+                    execution, compressionGeneration: capture.compressionGeneration, createdAt: new Date(this.now()).toISOString(),
+                    semanticCandidateId: snapshot.semanticCandidateId ?? snapshot.candidateId,
+                    retryOf: { candidateId: original.candidateId, runId: snapshot.runId, runEpoch: snapshot.runEpoch,
+                        rootBudgetId: snapshot.execution.rootBudgetId, sourceManifestHash: snapshot.sourceManifestHash, sourcePrefixHash: snapshot.sourcePrefixHash } }),
+                error: null, pendingRequest: null, failedResult: null, batch: null, folds: [], nextView: null, coverage: null,
+                publicationReceiptKey: null, publishedViewRevision: null };
+            const estimateCompaction = await input.estimateCompaction(execution);
+            if (candidate.snapshot.requestBudget) await estimateCompaction(candidate.snapshot,
+                { coveredEndSeq: candidate.snapshot.coveredEndSeq, text: '', tokens: 0 });
+            this.active.delete(conversationId);
+            await this.persist(conversationId, emptyCheckpoint());
+            await this.options.port.saveCandidate(structuredClone(candidate));
+            await input.prepareCandidate?.(candidate);
+            return this.run(candidate, capture, new AbortController(), estimateCompaction);
+        } catch (error) {
+            if (execution) await this.options.maintenance!.finishRun({ execution, result: 'failed', failure: contextFailure(error) });
+            throw error;
+        } finally { this.recovering.delete(conversationId); }
+    }
+
+    async recover(conversationId: string, candidateId: string, estimateCompaction?: CompactionViewEstimator): Promise<CompactionHandle | CompactionCandidate> {
         if (this.recovering.has(conversationId) || this.starting.has(conversationId)) throw new ContextFault('COMPACTION_BUSY', '当前会话正在准备或恢复压缩');
         this.recovering.add(conversationId);
-        try { return await this.recoverCandidate(conversationId, candidateId); }
+        try { return await this.recoverCandidate(conversationId, candidateId, estimateCompaction); }
         finally { this.recovering.delete(conversationId); }
     }
 
-    private async recoverCandidate(conversationId: string, candidateId: string): Promise<CompactionHandle | CompactionCandidate> {
+    private async recoverCandidate(conversationId: string, candidateId: string, estimateCompaction?: CompactionViewEstimator): Promise<CompactionHandle | CompactionCandidate> {
         const local = this.active.get(conversationId);
         if (local && (local.candidate.candidateId !== candidateId || !local.settled)) {
             throw new ContextFault('COMPACTION_BUSY', '原本地压缩执行仍在运行，保留原worker和候选');
@@ -796,7 +861,7 @@ export class ContextCompactor {
         checkpoint.lastFailure = null;
         await this.persist(conversationId, checkpoint);
         if (candidate.state === 'ready') {
-            this.active.set(conversationId, { candidate, abort, completion: Promise.resolve(candidate), settled: true });
+            this.active.set(conversationId, { candidate, abort, completion: Promise.resolve(candidate), settled: true, estimateCompaction });
             if (candidate.snapshot.execution.kind === 'maintenance') {
                 await this.publish(conversationId, capture.stepSeq);
                 await this.finishMaintenance(candidate, 'published');
@@ -805,6 +870,6 @@ export class ContextCompactor {
         }
         candidate.state = 'generating';
         await this.options.port.saveCandidate(structuredClone(candidate));
-        return this.run(candidate, capture, abort);
+        return this.run(candidate, capture, abort, estimateCompaction);
     }
 }

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { AntigravityCallError } from "../../src/antigravity-model-catalog.js";
-import { callSmartModelWithFallback, generateIndex, isCompactSmartInput, parallelDispatch, searchCompactUnit, type SearchUnit } from "../../src/tools/smart-search.js";
+import { callSmartModelWithFallback, generateIndex, isCompactSmartInput, parallelDispatch, searchCompactUnit, serializeSmartModelFailure, visibleSmartModelFailure, type SearchUnit } from "../../src/tools/smart-search.js";
 
 function sampleUnit(code = "export function selectModel() { return 'carbon'; }"): SearchUnit {
     return { id: "sample", type: "file", filePath: "sample.ts", allFiles: ["sample.ts"], code,
@@ -83,4 +83,36 @@ test("unknown outcome during the second attempt preserves the original error", a
         throw error;
     }, { concurrency: 1, propagateNonRetryable: true }), actual => actual === error);
     assert.deepEqual(attempts, [1, 2]);
+});
+
+test("direct Antigravity calls use the configured stage budget instead of a hidden thirty-second cap", async () => {
+    let timeout: number | undefined;
+    await callSmartModelWithFallback({ primary: "antigravity", concurrency: 1, fallback: [] }, "prompt", "direct", {
+        callBridge: async (_chain, _prompt, timeoutMs) => { timeout = timeoutMs; return { chainUsed: "antigravity", text: "ok" }; },
+    });
+    assert.equal(timeout, Number(process.env.SANDBOX_SMART_STAGE2_TIMEOUT_MS || "120000"));
+});
+
+test("an accepted unknown outcome survives simultaneous caller cancellation", async () => {
+    const controller = new AbortController();
+    const error = new AntigravityCallError("timeout", { submitted: true, outcomeUnknown: true, safeToFallback: false, kind: "timeout-unknown" });
+    let calls = 0;
+    await assert.rejects(callSmartModelWithFallback({ primary: "antigravity", concurrency: 1, fallback: ["codex"] }, "prompt", "direct", {
+        signal: controller.signal, callBridge: async () => { calls += 1; controller.abort(); throw error; },
+    }), actual => actual === error);
+    assert.equal(calls, 1);
+});
+
+test("foreground and persisted background messages preserve the unknown result and no-retry facts", () => {
+    const error = new AntigravityCallError("timeout", { model: "MODEL_PLACEHOLDER_M525", submitted: true,
+        outcomeUnknown: true, safeToFallback: false, kind: "timeout-unknown" });
+    const visible = visibleSmartModelFailure(error);
+    const serialized = serializeSmartModelFailure(visible);
+    assert.equal(serialized?.submitted, true);
+    assert.equal(serialized?.outcomeUnknown, true);
+    assert.equal(serialized?.retryable, false);
+    assert.equal(serialized?.safeToFallback, false);
+    assert.match(String((visible as Error).message), /结果未知[\s\S]*停止自动重发/);
+    assert.equal((visible as Error).cause, error);
+    assert.equal(serializeSmartModelFailure(new Error("ordinary file error")), null);
 });

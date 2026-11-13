@@ -3,7 +3,7 @@ import fs from "node:fs";
 import { discoverAntigravityLsCandidates, verifyAntigravityLsProcess, type AntigravityLsProcess } from "./antigravity-discovery.js";
 import { openOwnedAntigravityLs, resolveAntigravityLsCliCommand, type OwnedAntigravityLs } from "./antigravity-cli-ls.js";
 import { AntigravityCallError, antigravityOutcomeFromError, parseAntigravityCatalog, readAntigravityCatalogFixture,
-    selectAntigravityModel, defaultAntigravityFlashCandidates, isDefaultAntigravityModel, type AntigravityCatalog, type AntigravityOutcome } from "./antigravity-model-catalog.js";
+    selectAntigravityModel, defaultAntigravityCandidates, isDefaultAntigravityModel, type AntigravityCatalog, type AntigravityOutcome } from "./antigravity-model-catalog.js";
 
 export interface LsProcessInfo extends AntigravityLsProcess {}
 export interface ParentLsConnection { info: LsProcessInfo; port: number; }
@@ -209,7 +209,7 @@ export async function resolveAntigravityCliModel(model: string, signal?: AbortSi
 
 async function callOn(connection: ParentLsConnection, requested: string, prompt: string, signal: AbortSignal, deadline: number): Promise<LsModelResult> {
     const catalog = await catalogFor(connection, signal, deadline);
-    const candidates = catalog ? defaultAntigravityFlashCandidates(catalog, requested).map(entry => entry.model) : legacyModelCandidates(requested);
+    const candidates = catalog ? defaultAntigravityCandidates(catalog, requested).map(entry => entry.model) : legacyModelCandidates(requested);
     let lastError: AntigravityCallError | undefined;
     for (const model of candidates) {
         signal.throwIfAborted();
@@ -225,7 +225,8 @@ async function callOn(connection: ParentLsConnection, requested: string, prompt:
             lastError = antigravityOutcomeFromError(error, { transport: transportOf(connection.info), model, submitted,
                 outcomeUnknown: submitted, safeToFallback: !submitted && !signal.aborted,
                 kind: signal.aborted && !timeout ? "cancelled" : submitted ? timeout ? "timeout-unknown" : "transport-unknown" : signal.aborted ? "cancelled" : "not-started" });
-            if (signal.aborted || !lastError.safeToFallback) throw lastError;
+            if (signal.aborted || !lastError.safeToFallback || lastError.outcomeUnknown
+                || !lastError.submitted || lastError.kind !== "rejected") throw lastError;
         }
     }
     if (lastError?.submitted && lastError.kind === "rejected") throw new AntigravityCallError(lastError.message, { ...lastError, safeToFallback: false }, { cause: lastError });

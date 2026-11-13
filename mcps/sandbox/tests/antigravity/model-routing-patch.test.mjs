@@ -2,16 +2,17 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import http from "node:http";
 import vm from "node:vm";
 import { stripTypeScriptTypes } from "node:module";
 import { afterEach, test } from "node:test";
 
 const sourceRoot = new URL("../../src/", import.meta.url);
-const environmentNames = ["PATH", "SANDBOX_AGY_CLI_COMMAND", "SANDBOX_COUNCIL_ANTIGRAVITY_CLI_COMMAND", "SANDBOX_COUNCIL_GEMINI_CLI_COMMAND", "SANDBOX_COUNCIL_ANTIGRAVITY_INDEX_MODELS", "SANDBOX_COUNCIL_GEMINI_INDEX_MODELS", "SANDBOX_AGY_CATALOG_PATH", "SANDBOX_COUNCIL_ANTIGRAVITY_CLI_MODEL_CHAIN", "SANDBOX_COUNCIL_GEMINI_CLI_MODEL_CHAIN", "SANDBOX_COUNCIL_ANTIGRAVITY_CLI_DEFAULT_FALLBACKS", "SANDBOX_COUNCIL_GEMINI_CLI_DEFAULT_FALLBACKS"];
+const environmentNames = ["PATH", "SANDBOX_AGY_CLI_COMMAND", "SANDBOX_COUNCIL_ANTIGRAVITY_CLI_COMMAND", "SANDBOX_COUNCIL_GEMINI_CLI_COMMAND", "SANDBOX_COUNCIL_ANTIGRAVITY_INDEX_MODELS", "SANDBOX_COUNCIL_GEMINI_INDEX_MODELS", "SANDBOX_AGY_CATALOG_PATH", "SANDBOX_COUNCIL_ANTIGRAVITY_CLI_MODEL_CHAIN", "SANDBOX_COUNCIL_GEMINI_CLI_MODEL_CHAIN", "SANDBOX_COUNCIL_ANTIGRAVITY_CLI_DEFAULT_FALLBACKS", "SANDBOX_COUNCIL_GEMINI_CLI_DEFAULT_FALLBACKS", "SANDBOX_LS_MODEL", "SANDBOX_LS_MODEL_FALLBACKS"];
 const originalEnvironment = new Map(environmentNames.map(name => [name, process.env[name]]));
 const catalogSource = stripTypeScriptTypes(fs.readFileSync(new URL("antigravity-model-catalog.ts", sourceRoot), "utf8"));
 const catalogModule = await import(`data:text/javascript;base64,${Buffer.from(catalogSource).toString("base64")}`);
-const { AntigravityCallError, parseAntigravityCatalog, selectAntigravityModel, antigravityCouncilCandidates } = catalogModule;
+const { AntigravityCallError, parseAntigravityCatalog, selectAntigravityModel, antigravityCouncilCandidates, defaultAntigravityCandidates, defaultAntigravityFlashCandidates } = catalogModule;
 const model = (id, label = id, extra = {}) => ({ id, label, model: `MODEL_${id.replace(/[^a-z0-9]/giu, "_").toUpperCase()}`, disabled: false, remaining: 1, ...extra });
 const modernModels = [
     model("gemini-4-argon-high", "Gemini 4 Argon (High)"),
@@ -32,7 +33,7 @@ afterEach(() => {
 });
 
 async function isolatedSource(relativePath, additions, overrides = {}) {
-    const context = vm.createContext({ console, process, AbortSignal, setTimeout, clearTimeout, Buffer, URL });
+    const context = vm.createContext({ console, process, AbortSignal, AbortController, DOMException, setTimeout, clearTimeout, Buffer, URL });
     const moduleCache = new Map();
     const mocks = {
         fs: { default: fs }, "node:fs": { default: fs }, os: { default: os }, "node:os": { default: os },
@@ -77,6 +78,162 @@ async function isolatedSource(relativePath, additions, overrides = {}) {
     await loaded.evaluate();
     return loaded.namespace;
 }
+
+function reply(response, value, status = 200) {
+    response.writeHead(status, { "content-type": "application/json" });
+    response.end(JSON.stringify(value));
+}
+
+async function withFixtureLs(entries, handler, action, overrides = {}) {
+    delete process.env.SANDBOX_AGY_CATALOG_PATH;
+    const requests = [];
+    const server = http.createServer(async (request, response) => {
+        const chunks = [];
+        for await (const chunk of request) chunks.push(chunk);
+        const body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+        if (request.url.endsWith("/GetUserStatus")) return reply(response, { models: entries });
+        requests.push(body);
+        handler(body, response, request);
+    });
+    await new Promise(resolve => server.listen(0, "127.0.0.1", resolve));
+    try {
+        const port = server.address().port;
+        const loaded = await isolatedSource("ls-client.ts", "", {
+            "node:http": { default: http },
+            "./antigravity-discovery.js": { discoverAntigravityLsCandidates: async () => { throw new Error("live discovery forbidden"); }, verifyAntigravityLsProcess: async () => false },
+            "./antigravity-cli-ls.js": { openOwnedAntigravityLs: async () => { throw new Error("live CLI forbidden"); }, resolveAntigravityLsCliCommand: () => "fixture-only-agy" },
+            ...overrides,
+        });
+        loaded.__setParentLsForTest({ port, info: { pid: 4242, ports: [port], csrfToken: "fixture", workspaceId: "", transport: "app-ls" } });
+        await action(loaded, requests);
+    } finally {
+        server.closeAllConnections();
+        await new Promise(resolve => server.close(resolve));
+    }
+}
+
+test("automatic defaults rank Hydrogen XHigh then High then Carbon High with numeric versions inside each tier", () => {
+    const entries = [...modernModels, model("gemini-10-hydrogen-xhigh"), model("gemini-9-hydrogen-xhigh"), model("gemini-99-hydrogen-high"), model("gemini-99-carbon-high"), model("gemini-100-hydrogen-medium"), model("gemini-100-carbon-xhigh")];
+    const expected = ["gemini-10-hydrogen-xhigh", "gemini-9-hydrogen-xhigh", "gemini-4-hydrogen-xhigh", "gemini-99-hydrogen-high", "gemini-4-hydrogen-high", "gemini-99-carbon-high", "gemini-4-carbon-high"];
+    for (const ordered of [entries, [...entries].reverse()]) {
+        const actual = catalog(ordered);
+        for (const choice of ["", "default", "auto", "fast", "ag-fast"]) {
+            assert.equal(selectAntigravityModel(actual, choice).id, expected[0]);
+            assert.deepEqual(defaultAntigravityCandidates(actual, choice).map(entry => entry.id), expected);
+        }
+        assert.deepEqual(defaultAntigravityFlashCandidates(actual, "default"), defaultAntigravityCandidates(actual, "default"));
+    }
+});
+
+test("modern automatic candidates skip unavailable entries, deduplicate enums and never fall into lower tiers or Flash", () => {
+    const entries = modernModels.map(entry => entry.id.includes("hydrogen") ? { ...entry, remaining: 0 } : entry);
+    entries.push({ ...modernModels[1], id: "gemini-4-carbon-copy-high" });
+    const actual = catalog(entries);
+    assert.equal(selectAntigravityModel(actual).model, modernModels[1].model);
+    assert.deepEqual(defaultAntigravityCandidates(actual, "auto").map(entry => entry.model), [modernModels[1].model]);
+    const blocked = catalog(modernModels.map(entry => /hydrogen|carbon/u.test(entry.id) ? { ...entry, disabled: true } : entry));
+    assert.throws(() => defaultAntigravityCandidates(blocked, "default"), error => !error.safeToFallback && !error.submitted);
+    const lowerOnly = catalog([modernModels[4], model("gemini-4-hydrogen-low"), model("gemini-4-carbon-medium")]);
+    assert.throws(() => selectAntigravityModel(lowerOnly), /Hydrogen XHigh\/High/u);
+});
+
+test("old catalogs retain Flash default siblings while modern explicit aliases and exact identities stay single-model", () => {
+    const flash = [model("gemini-3.8-flash-high"), model("gemini-3.8-flash-medium"), model("gemini-3.8-flash-low")];
+    const old = catalog([model("gemini-3.1-pro-high"), ...flash]);
+    assert.deepEqual(defaultAntigravityCandidates(old, "default").map(entry => entry.id), flash.map(entry => entry.id));
+    const actual = catalog([...modernModels, ...flash.slice(1)]);
+    for (const [choice, expected] of [["flash", modernModels[4]], ["gemini-flash", modernModels[4]], ["pro", modernModels[1]], ["hydrogen", modernModels[2]], ["hydrogen-xhigh", modernModels[3]]]) {
+        assert.deepEqual(defaultAntigravityCandidates(actual, choice).map(entry => entry.model), [expected.model]);
+    }
+    for (const entry of modernModels) for (const choice of [entry.id, entry.label, entry.model]) {
+        assert.deepEqual(defaultAntigravityCandidates(actual, choice).map(candidate => candidate.model), [entry.model]);
+    }
+    const numbered = { ...modernModels[3], model: "MODEL_PLACEHOLDER_M987" };
+    for (const choice of [numbered.id, numbered.label, numbered.model, "M987"]) {
+        assert.deepEqual(defaultAntigravityCandidates(catalog([numbered, ...modernModels.filter(entry => entry.id !== numbered.id)]), choice).map(entry => entry.model), [numbered.model]);
+    }
+    const literalDefault = model("default", "Exact default ID");
+    assert.deepEqual(defaultAntigravityCandidates(catalog([...modernModels, literalDefault]), "default").map(entry => entry.model), [literalDefault.model]);
+    for (const state of [{ disabled: true }, { remaining: 0 }]) {
+        const entry = { ...modernModels[3], ...state };
+        for (const choice of [entry.id, entry.label, entry.model]) assert.throws(() => defaultAntigravityCandidates(catalog([...modernModels.filter(candidate => candidate.id !== entry.id), entry]), choice), error => !error.safeToFallback && !error.submitted);
+        assert.throws(() => defaultAntigravityCandidates(catalog([{ ...numbered, ...state }, ...modernModels.filter(candidate => candidate.id !== numbered.id)]), "M987"), error => !error.safeToFallback && !error.submitted);
+    }
+    assert.throws(() => selectAntigravityModel(catalog([modernModels[2]]), "hydrogen-xhigh"), /hydrogen xhigh/u);
+    assert.throws(() => selectAntigravityModel(catalog([model("gemini-4-carbon-low")]), "carbon-high"), /carbon high/u);
+});
+
+test("modern complete NoCapacity rejections advance only along the high-thinking automatic chain and terminate known", async () => {
+    process.env.SANDBOX_LS_MODEL_FALLBACKS = "flash,argon";
+    const expected = [modernModels[3], modernModels[2], modernModels[1]].map(entry => entry.model);
+    for (const succeeds of [true, false]) await withFixtureLs(modernModels, (body, response) => {
+        if (succeeds && body.model === modernModels[1].model) reply(response, { response: "CARBON_OK" });
+        else reply(response, { code: "unavailable", message: "No capacity available for requested model" }, 503);
+    }, async (loaded, requests) => {
+        const result = await loaded.callGetModelResponseDetailed("default", "fixture", 2000);
+        assert.deepEqual(requests.map(request => request.model), expected);
+        assert.equal(result.outcomeUnknown, false);
+        assert.equal(result.safeToFallback, false);
+        assert.equal(result.kind, succeeds ? "success" : "rejected");
+        assert.equal(result.text, succeeds ? "CARBON_OK" : null);
+    });
+});
+
+test("modern unknown, auth and quota outcomes submit once without automatic replay", async () => {
+    for (const [status, message, unknown] of [[503, "upstream response lost", true], [401, "authentication required", false], [403, "unauthenticated", false], [429, "quota exhausted", false]]) {
+        await withFixtureLs(modernModels, (_body, response) => reply(response, { message }, status), async (loaded, requests) => {
+            const result = await loaded.callGetModelResponseDetailed("auto", "fixture", 2000);
+            assert.equal(result.outcomeUnknown, unknown);
+            assert.equal(result.safeToFallback, false);
+            assert.equal(result.submitted, true);
+            assert.equal(requests.length, 1);
+        });
+    }
+});
+
+test("a pre-submission transport failure preserves endpoint fallback without advancing automatic models", async () => {
+    let attempts = 0;
+    await withFixtureLs(modernModels, () => { throw new Error("generation must not reach fixture"); }, async (loaded, requests) => {
+        const result = await loaded.callGetModelResponseDetailed("default", "not submitted", 2000);
+        assert.equal(attempts, 1);
+        assert.equal(requests.length, 0);
+        assert.equal(result.model, modernModels[3].model);
+        assert.equal(result.kind, "not-started");
+        assert.equal(result.submitted, false);
+        assert.equal(result.outcomeUnknown, false);
+        assert.equal(result.safeToFallback, true);
+    }, { "node:http": { default: { request: (options, callback) => {
+        if (options.path.endsWith("/GetModelResponse")) {
+            attempts += 1;
+            throw new Error("fixture connection was not started");
+        }
+        return http.request(options, callback);
+    } } } });
+});
+
+test("request model and lsModel override the frozen environment model without joining automatic fallbacks", async () => {
+    process.env.SANDBOX_LS_MODEL = "flash";
+    process.env.SANDBOX_LS_MODEL_FALLBACKS = "hydrogen,carbon";
+    await withFixtureLs(modernModels, (body, response) => body.model === modernModels[4].model
+        ? reply(response, { message: "No capacity available for explicit Flash" }, 503)
+        : reply(response, { response: "EXPLICIT_OK" }), async (loaded, requests) => {
+        const bridge = await isolatedSource("model-bridge.ts", "", {
+            child_process: { spawn: () => { throw new Error("live spawn forbidden"); }, spawnSync: () => { throw new Error("live spawn forbidden"); } },
+            "./ls-client.js": loaded,
+            "./lifecycle.js": { isAntigravityLS: () => true },
+            "./claude-code-bridge.js": { callClaudeCodeText: async () => { throw new Error("live model forbidden"); }, claudeCodeOptionsFromParams: () => ({}), isClaudeCodeCliAvailable: () => false },
+            "./grok-bridge.js": { callProgrokAPI: async () => { throw new Error("live model forbidden"); }, DEFAULT_PROGROK_FALLBACK_MODEL: "fixture", DEFAULT_PROGROK_REASONING_EFFORT: "high", normalizeProgrokReasoningEffort: value => value },
+        });
+        process.env.SANDBOX_LS_MODEL = "carbon";
+        await assert.rejects(bridge.callModelBridge("antigravity", "frozen environment", 2000), error => error.model === modernModels[4].model && !error.safeToFallback && !error.outcomeUnknown);
+        assert.equal(requests.length, 1);
+        const requested = await bridge.callModelBridge("antigravity", "request priority", 2000, { model: "hydrogen-high", lsModel: "carbon" });
+        assert.equal(requested.model, modernModels[2].model);
+        const alias = await bridge.callModelBridge("antigravity", "lsModel priority", 2000, { lsModel: "carbon" });
+        assert.equal(alias.model, modernModels[1].model);
+        assert.deepEqual(requests.map(request => request.model), [modernModels[4], modernModels[2], modernModels[1]].map(entry => entry.model));
+    });
+});
 
 test("Hydrogen aliases select High and XHigh while precise IDs and enums stay exact", () => {
     const actual = catalog(modernModels);
@@ -266,7 +423,7 @@ test("public Council default fallback executes dynamic directory branch without 
         fs: { default: { ...fs, mkdirSync: () => {}, writeFileSync: () => {} } },
     });
     await assert.rejects(loaded.callCouncilModel({ id: "dynamic", provider: "antigravityCli", model: "default", params: { retries: 0 } }, "fixture", [], 1000), error => error === stopped);
-    assert.deepEqual(requests, ["gemini-3.8-flash-high", "gemini-4-carbon-high"]);
+    assert.deepEqual(requests, ["gemini-4-hydrogen-xhigh", "gemini-4-carbon-high"]);
     assert.equal(catalogReads, 1);
     assert.equal(fixtureReads, 0);
 });
@@ -347,7 +504,7 @@ test("indexer default chain starts with default then deduplicated available dire
     });
     const notes = [];
     const attempts = Array.from(await loaded.antigravityAttempts("fixture.ts", notes));
-    assert.equal(attempts[0], "Gemini 3.8 Flash (High)");
+    assert.equal(attempts[0], "Gemini 4 Hydrogen (XHigh)");
     assert.ok(attempts.includes("Gemini 4 Carbon (High)"));
     assert.ok(attempts.includes("Gemini 4 Hydrogen (High)"));
     const selected = attempts.map(choice => selectAntigravityModel(catalog(entries), choice));

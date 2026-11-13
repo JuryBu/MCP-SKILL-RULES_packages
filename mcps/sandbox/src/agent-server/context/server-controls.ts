@@ -49,6 +49,11 @@ export interface ContextServerStatusInput { conversationId: string; candidateId?
 export interface ContextServerControlInput extends ContextServerStatusInput {
     expectedHistoryEpoch?: number;
     expectedRunEpoch?: number;
+    retryKnownFailure?: boolean;
+    expectedConfigFingerprint?: string;
+    budget?: JsonObject;
+    operationId?: string;
+    pricingCompatibility?: { previousEntry: JsonObject; expectedCapabilityVersion: string };
 }
 
 export interface ContextServerControlResult {
@@ -81,7 +86,9 @@ export function createContextServerControls(options: {
     resolveConfiguration(conversationId: string, budget?: JsonObject): Promise<ContextServerConfiguration | null>;
     readMeasurement(conversationId: string): ContextPreparedMeasurement | undefined;
     model: Pick<CompressionModelPort, 'lookup'>;
-    withControl<T>(capture: ContextCapture, operation: () => Promise<T>, configFingerprint?: string): Promise<T>;
+    validateRetrySource?(candidate: CompactionCandidate, pricingCompatibility?: ContextServerControlInput['pricingCompatibility']): Promise<((candidate: CompactionCandidate) => Promise<void>) | void>;
+    recoveryEstimator?(candidate: CompactionCandidate, execution: import('./contracts.js').ExecutionLease): Promise<import('./contracts.js').CompactionViewEstimator>;
+    withControl<T>(capture: ContextCapture, operation: () => Promise<T>, configFingerprint?: string, rebindOwnedWrites?: boolean): Promise<T>;
     now: () => number;
 }) {
     const status = async (input: ContextServerStatusInput): Promise<ContextServerStatus> => {
@@ -198,6 +205,28 @@ export function createContextServerControls(options: {
     };
     const recoverCompaction = async (input: ContextServerControlInput & { candidateId: string }): Promise<ContextServerControlResult> => {
         input = { ...input };
+        if (input.retryKnownFailure) {
+            const capture = await options.port.inspect(input.conversationId);
+            const candidate = await options.port.getCandidate(input.conversationId, input.candidateId);
+            if (!candidate || candidate.conversationId !== input.conversationId) throw new ContextFault('SOURCE_GAP', '原失败候选不存在');
+            if (!input.operationId || !input.budget || input.expectedHistoryEpoch !== capture.historyEpoch
+                || input.expectedConfigFingerprint !== candidate.snapshot.config.configFingerprint
+                || input.expectedRunEpoch !== undefined && input.expectedRunEpoch !== candidate.snapshot.runEpoch) {
+                throw new ContextFault('CONFIG_INVALID', '已知失败重试需要原配置指纹、当前历史代次、操作ID和新的维护预算');
+            }
+            if (input.pricingCompatibility && input.budget.costMode !== 'hard') {
+                throw new ContextFault('BUDGET_REQUIRED', '计价兼容恢复必须使用已批准的hard维护预算');
+            }
+            if (!options.validateRetrySource || !options.recoveryEstimator) throw new ContextFault('CONFIG_INVALID', '正式重试尚未接入原回执核验和完整请求估计');
+            const prepareCandidate = await options.validateRetrySource(candidate, input.pricingCompatibility);
+            return options.withControl(capture, async () => {
+                const handle = await options.service.compactor!.retryKnownFailure({ conversationId: input.conversationId,
+                    candidateId: input.candidateId, budget: input.budget!, operationId: input.operationId!,
+                    ...(prepareCandidate ? { prepareCandidate } : {}),
+                    estimateCompaction: execution => options.recoveryEstimator!(candidate, execution) });
+                return result({ ...input, candidateId: handle.candidateId }, 'recover', handle.candidateId, undefined, true);
+            }, undefined, true);
+        }
         const { capture, candidate } = await captureControl(input);
         if (!candidate) throw new ContextFault('SOURCE_GAP', '恢复需要原压缩候选');
         if (candidate.state === 'published' && (capture.candidateId !== candidate.candidateId
@@ -218,7 +247,9 @@ export function createContextServerControls(options: {
                     '原压缩attempt尚无完整结果，保留原候选、配置和预算', { candidateId: candidate.candidateId,
                         attemptId: candidate.pendingRequest.attemptId, lookupStatus: lookup.status }, true);
             }
-            const recovered = await options.service.compactor!.recover(input.conversationId, candidate.candidateId);
+            const estimator = candidate.snapshot.requestBudget && options.recoveryEstimator
+                ? await options.recoveryEstimator(candidate, candidate.snapshot.execution) : undefined;
+            const recovered = await options.service.compactor!.recover(input.conversationId, candidate.candidateId, estimator);
             return result(input, 'recover', candidate.candidateId, undefined, 'completion' in recovered);
         }, candidate.snapshot.config.configFingerprint);
     };
