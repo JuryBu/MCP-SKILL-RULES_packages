@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { canonicalJson } from '../../../src/agent-server/protocol.ts';
-import { ProviderCompressionModelPort } from '../../../src/agent-server/context/server-adapter.ts';
+import { hasKnownDigestFailure, ProviderCompressionModelPort } from '../../../src/agent-server/context/server-adapter.ts';
 import { validateCompressionResult } from '../../../src/agent-server/context/compaction.ts';
 import { derivedContextId, hashBytes, hashContext } from '../../../src/agent-server/context/config.ts';
 import { createFixture, ready } from './context-fixtures.mjs';
@@ -54,6 +54,17 @@ async function fixture({ required = true, continuation, explicit = false, invali
     candidate.failedResult = { ...initial.result, complete: false, usage: { ...initial.result?.usage, digestValidation: 'semantic tail continuation' } };
     return { model, request, candidate, snapshot, saved, link, response, dispatches: () => dispatches };
 }
+
+test('classifies only settled maintenance digest failures for committed-response revalidation', () => {
+    const candidate = { state: 'failed', pendingRequest: null,
+        error: { code: 'CONTEXT_SOURCE_GAP', details: { knownInvalidDigest: true }, mayHaveStarted: false } };
+    assert.equal(hasKnownDigestFailure(candidate, 'maintenance'), true);
+    assert.equal(hasKnownDigestFailure(candidate, 'task'), false);
+    assert.equal(hasKnownDigestFailure({ ...candidate, pendingRequest: {} }, 'maintenance'), false);
+    assert.equal(hasKnownDigestFailure({ ...candidate, state: 'unknown' }, 'maintenance'), false);
+    assert.equal(hasKnownDigestFailure({ ...candidate, error: { ...candidate.error, mayHaveStarted: true } }, 'maintenance'), false);
+    assert.equal(hasKnownDigestFailure({ ...candidate, error: { ...candidate.error, details: {} } }, 'maintenance'), false);
+});
 
 test('required same-round continuation defaults to true without changing the provider response', async () => {
     const value = await fixture();

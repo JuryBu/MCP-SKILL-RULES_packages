@@ -183,6 +183,12 @@ function parseDigest(request: CompressionRequest, response: NormalizedResponse):
         validationError: error instanceof Error ? error.message : 'digest validation failed' }; }
 }
 
+export function hasKnownDigestFailure(candidate: CompactionCandidate, runKind: unknown): boolean {
+    return runKind === 'maintenance' && candidate.state === 'failed' && !candidate.pendingRequest
+        && candidate.error?.code === 'CONTEXT_SOURCE_GAP' && candidate.error.details?.knownInvalidDigest === true
+        && candidate.error.mayHaveStarted === false;
+}
+
 export class ProviderCompressionModelPort implements CompressionModelPort {
     private readonly active = new Map<string, { abort: AbortController; completion: Promise<CompressionResult> }>();
     private readonly now: () => number;
@@ -797,11 +803,13 @@ export function createContextServerAdapter(options: ContextServerAdapterOptions)
             const conversation = await options.store.getRecord({ conversationId: candidate.conversationId, kind: 'conversation', id: candidate.conversationId });
             const run = await options.store.getRecord(contextRunKey(candidate.conversationId, candidate.snapshot.runId));
             const failure = run?.value.failure as { acceptance?: string; error?: { details?: { executionProgress?: { currentOperation?: { acceptance?: string } } } } } | undefined;
+            const knownDigestFailure = hasKnownDigestFailure(candidate, run?.value.kind);
             if (conversation?.value.state !== 'open' || conversation.value.activeRunId || run?.value.state !== 'failed'
                 || run.value.runEpoch !== candidate.snapshot.runEpoch || contextRootBudgetId(run) !== candidate.snapshot.execution.rootBudgetId
                 || !['released', 'not_needed'].includes(String(run.value.cleanupState))
                 || (failure?.acceptance ?? failure?.error?.details?.executionProgress?.currentOperation?.acceptance) !== 'not_sent'
-                    && !(run.value.kind === 'maintenance' && candidate.error?.details?.budgetReservationRejected === true && candidate.error.mayHaveStarted === false)) {
+                    && !(run.value.kind === 'maintenance' && candidate.error?.details?.budgetReservationRejected === true && candidate.error.mayHaveStarted === false)
+                    && !knownDigestFailure) {
                 throw new ContextFault('HISTORY_STALE', '重试需要已正式重开的空闲会话及确定未发送、清理完成的原失败执行');
             }
             const original = candidate.snapshot.config.model;
@@ -840,7 +848,7 @@ export function createContextServerAdapter(options: ContextServerAdapterOptions)
                 source = previous;
             }
             await compressionModel.verifyCommittedChunks(candidate, lineage);
-            const recovered = candidate.error?.details?.knownInvalidDigest === true ? await compressionModel.recoverCommittedFailure(candidate, lineage) : undefined;
+            const recovered = knownDigestFailure ? await compressionModel.recoverCommittedFailure(candidate, lineage) : undefined;
             if (pricingProof || recovered) return async retry => {
                 if (recovered) {
                     retry.chunks.push(structuredClone(recovered));
