@@ -698,8 +698,8 @@ export function createContextServerAdapter(options: ContextServerAdapterOptions)
         }
     };
 
-    const releaseConversation = (conversationId: string): boolean => {
-        if (!service.compactor!.releaseCachedConversation(conversationId)) return false;
+    const releaseConversation = (conversationId: string, confirmedUnknownCandidateId?: string): boolean => {
+        if (!service.compactor!.releaseCachedConversation(conversationId, { confirmedUnknownCandidateId })) return false;
         compactionPort.releaseConversation(conversationId);
         service.releaseReadTail(conversationId);
         sourcePorts.delete(conversationId);
@@ -711,9 +711,12 @@ export function createContextServerAdapter(options: ContextServerAdapterOptions)
         indexConversations: compactionPort.cacheSnapshot().conversations, indexItems: compactionPort.cacheSnapshot().items });
 
     const confirmUnknownCleanup: ContextServerAdapter['confirmUnknownCleanup'] = async input => {
-        if (service.compactor!.hasLocalCompaction(input.conversationId)) return false;
+        if (service.compactor!.hasLocalCompaction(input.conversationId, { runningOnly: true })) return false;
+        const capture = await compactionPort.inspect(input.conversationId);
+        if (!service.compactor!.canReleaseCachedConversation(input.conversationId,
+            { confirmedUnknownCandidateId: capture.candidateId ?? undefined })) return false;
         if (!await compactionPort.confirmUnknownExecutionCleanup(input)) return false;
-        return releaseConversation(input.conversationId);
+        return releaseConversation(input.conversationId, capture.candidateId ?? undefined);
     };
 
     const reconcileCleanup: ContextServerAdapter['reconcileCleanup'] = async input => {

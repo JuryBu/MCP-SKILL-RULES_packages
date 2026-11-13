@@ -2,9 +2,11 @@ import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { mkdir, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
+import { contextStateKey } from '../../../src/agent-server/storage/context-transactions.ts';
+import { createSqliteProviderPorts } from '../../../src/agent-server/storage/provider-journal.ts';
 
 export async function checkRestartAndDefaultOutput(fixture) {
-    const { services, client, control, profile, work, budget, requests, before, original, failed, ledgerBefore, until } = fixture;
+    const { services, store, client, control, profile, work, budget, requests, before, original, failed, ledgerBefore, until } = fixture;
     const port = services.contextService.compactionPort;
     const evidence = { formalServices: true, sqlite: true, externalApiCalls: 0, observations: [] };
     const call = (method, params = {}, selectedControl = control) => services.dispatch(method,
@@ -106,6 +108,97 @@ export async function checkRestartAndDefaultOutput(fixture) {
             for (const key of ['budget', 'reservations', 'charges']) assert.deepEqual(unchanged[key], ledger[key]);
             evidence.observations.push({ scenario: selected.label, blocked, candidate, noResend: true,
                 schedulerUnchanged: true, ledgerUnchanged: true });
+            const conversationId = selectedControl.conversationId;
+            const compactor = services.contextService.service.compactor;
+            await until(async () => compactor.hasLocalCompaction(conversationId, { runningOnly: true }),
+                value => !value, 'unknown local execution settled');
+            assert.equal(compactor.hasLocalCompaction(conversationId), true);
+            const identity = { conversationId, runId: candidate.snapshot.execution.runId,
+                runEpoch: candidate.snapshot.execution.runEpoch, rootBudgetId: candidate.snapshot.execution.rootBudgetId };
+            const unknownRun = await until(() => services.dispatch('runs.get', { conversationId,
+                runId: identity.runId }, client), value => value.data?.state === 'outcome_unknown', 'unknown maintenance run');
+            const contextBefore = await store.getRecord(contextStateKey(conversationId));
+            const activeBefore = compactor.active.get(conversationId);
+            const checkpointBefore = compactor.checkpoints.get(conversationId);
+            const journal = createSqliteProviderPorts(store.persistent).journal;
+            const pendingAttemptBefore = await journal.readAttempt(candidate.pendingRequest.attemptId);
+            assert.ok(pendingAttemptBefore);
+            const assertRetained = async () => {
+                assert.equal(compactor.active.get(conversationId), activeBefore);
+                assert.equal(compactor.checkpoints.get(conversationId), checkpointBefore);
+                assert.deepEqual(await store.getRecord(contextStateKey(conversationId)), contextBefore);
+                assert.equal(JSON.stringify(await port.getCandidate(conversationId, candidate.candidateId)), candidateBytes);
+                assert.deepEqual(await journal.readAttempt(candidate.pendingRequest.attemptId), pendingAttemptBefore);
+                assert.deepEqual(await services.provider.ledger.read(identity.rootBudgetId), ledger);
+            };
+            const wrongCandidateId = randomUUID();
+            for (const options of [{}, { confirmedUnknownCandidateId: wrongCandidateId }]) {
+                assert.equal(compactor.canReleaseCachedConversation(conversationId, options), false);
+                await assertRetained();
+                assert.equal(compactor.releaseCachedConversation(conversationId, options), false);
+                await assertRetained();
+            }
+            assert.equal(compactor.canReleaseCachedConversation(conversationId,
+                { confirmedUnknownCandidateId: candidate.candidateId }), true);
+            await assertRetained();
+            const inspect = port.inspect;
+            const confirm = port.confirmUnknownExecutionCleanup;
+            let mismatchedConfirmationCalls = 0;
+            try {
+                port.confirmUnknownExecutionCleanup = async (...params) => {
+                    mismatchedConfirmationCalls++;
+                    return confirm.apply(port, params);
+                };
+                for (const candidateId of [null, wrongCandidateId]) {
+                    port.inspect = async (...params) => ({ ...await inspect.apply(port, params), candidateId });
+                    assert.equal(await services.contextService.confirmUnknownCleanup(identity), false);
+                    assert.equal(mismatchedConfirmationCalls, 0);
+                    await assertRetained();
+                }
+            } finally {
+                port.inspect = inspect;
+                port.confirmUnknownExecutionCleanup = confirm;
+            }
+            try {
+                port.confirmUnknownExecutionCleanup = async () => false;
+                assert.equal(await services.contextService.confirmUnknownCleanup(identity), false);
+                await assertRetained();
+            } finally { port.confirmUnknownExecutionCleanup = confirm; }
+            const acknowledged = await call('runs.cancel', { runId: identity.runId,
+                expectedRunEpoch: unknownRun.data.runEpoch, acknowledgeUnknown: true }, selectedControl);
+            assert.equal(acknowledged.ok, true, JSON.stringify(acknowledged));
+            assert.equal(acknowledged.data.waitEnded, true, JSON.stringify(acknowledged));
+            assert.equal(acknowledged.data.accountingUnchanged, true, JSON.stringify(acknowledged));
+            const contextAfter = await store.getRecord(contextStateKey(conversationId));
+            for (const key of ['execution', 'candidateId', 'checkpoint', 'checkpointContentId']) assert.equal(contextAfter.value[key], null, key);
+            assert.equal(compactor.active.has(conversationId), false);
+            assert.equal(compactor.checkpoints.has(conversationId), false);
+            assert.equal(JSON.stringify(await port.getCandidate(conversationId, candidate.candidateId)), candidateBytes);
+            assert.deepEqual(await services.provider.ledger.read(identity.rootBudgetId), ledger);
+            const ledgerAfterAcknowledgement = await services.provider.ledger.read(identity.rootBudgetId);
+            const pendingAttemptAfterAcknowledgement = await journal.readAttempt(candidate.pendingRequest.attemptId);
+            assert.deepEqual(pendingAttemptAfterAcknowledgement, pendingAttemptBefore);
+            assert.equal(requests.length, requestCount);
+            const continued = await call('conversations.compact', { mode: 'manual',
+                budget: { ...budget, maxOutputTokens: selected.root } }, selectedControl);
+            assert.equal(continued.ok, true, JSON.stringify(continued));
+            assert.equal(continued.data.started, true, JSON.stringify(continued));
+            const nextCandidate = await until(() => port.getCandidate(conversationId, continued.data.candidateId),
+                value => ['published', 'failed', 'unknown'].includes(value?.state), 'new manual root after unknown owner cleanup');
+            assert.equal(nextCandidate.state, 'published', JSON.stringify(nextCandidate));
+            assert.notEqual(nextCandidate.snapshot.execution.rootBudgetId, identity.rootBudgetId);
+            assert.equal(JSON.stringify(await port.getCandidate(conversationId, candidate.candidateId)), candidateBytes);
+            const ledgerAfterNewRoot = await services.provider.ledger.read(identity.rootBudgetId);
+            for (const key of ['budget', 'reservations', 'charges']) assert.deepEqual(ledgerAfterNewRoot[key], ledger[key]);
+            assert.deepEqual(await journal.readAttempt(candidate.pendingRequest.attemptId), pendingAttemptBefore);
+            evidence.observations.push({ scenario: 'settled-unknown-owner-acknowledgement', unknownRun,
+                acknowledged, contextBefore, contextAfter, originalCandidate: candidate, ledgerBefore: ledger,
+                ledgerAfterAcknowledgement, ledgerAfterNewRoot, pendingAttemptBefore, pendingAttemptAfterAcknowledgement,
+                mismatchedConfirmationCalls, continued, nextCandidate,
+                defaultReleaseBlocked: true, wrongCandidateBlocked: true, formalConfirmationFailureBlocked: true,
+                purePreflightUnchanged: true, mismatchedPreflightBlockedBeforePersistence: true,
+                sameCore: true, unknownCandidateAndPendingUnchanged: true, entireLedgerUnchangedAtAcknowledgement: true,
+                oldRootLedgerUnchangedAfterNewRoot: true });
         }
         evidence.observations.push({ ...selected, selected: selected.selected ?? 'omitted',
             frozenSelection: candidate.snapshot.config.model, wire, candidateId: candidate.candidateId, state: candidate.state });

@@ -59,10 +59,18 @@ export class ContextCompactor {
         if (!Number.isSafeInteger(this.maxCachedConversations) || this.maxCachedConversations < 1) throw new ContextFault('CONFIG_INVALID', 'Context调度缓存上限须为正安全整数');
     }
 
-    releaseCachedConversation(conversationId: string): boolean {
+    canReleaseCachedConversation(conversationId: string, options: { confirmedUnknownCandidateId?: string } = {}): boolean {
         const active = this.active.get(conversationId);
+        const confirmedUnknown = active?.candidate.state === 'unknown'
+            && active.candidate.candidateId === options.confirmedUnknownCandidateId;
         if (this.starting.has(conversationId) || this.recovering.has(conversationId)
-            || active && (!active.settled || ['snapshotting', 'generating', 'ready', 'publishing', 'unknown'].includes(active.candidate.state))) return false;
+            || active && (!active.settled || ['snapshotting', 'generating', 'ready', 'publishing'].includes(active.candidate.state)
+                || active.candidate.state === 'unknown' && !confirmedUnknown)) return false;
+        return true;
+    }
+
+    releaseCachedConversation(conversationId: string, options: { confirmedUnknownCandidateId?: string } = {}): boolean {
+        if (!this.canReleaseCachedConversation(conversationId, options)) return false;
         this.active.delete(conversationId);
         this.checkpoints.delete(conversationId);
         for (const [runId, owner] of this.finishedMaintenance) if (owner.conversationId === conversationId) this.finishedMaintenance.delete(runId);

@@ -57,7 +57,13 @@ test(process.env.SANDBOX_RETRY_FIXTURE_RESTART_DEFAULT_OUTPUT === '1'
         const compression = Array.isArray(source?.targets);
         requests.push({ compression, source: compression && source.targets.length > 0, hash: createHash('sha256').update(text).digest('hex'),
             maxTokens: body.max_tokens, ...(withRestartDefaults ? { wireBody: body } : {}) });
-        if (compression && disconnectNext) { disconnectNext = false; response.destroy(); return; }
+        if (compression && disconnectNext) {
+            disconnectNext = false;
+            response.writeHead(200, { 'content-type': 'application/json' });
+            response.write('{"id":"fixture-partial","choices":[');
+            setTimeout(() => response.destroy(), 10);
+            return;
+        }
         const truncated = compression && truncateNext;
         if (truncated) truncateNext = false;
         const digestBody = withTailEvent && compression && source.targets.length > 0 && requests.filter(entry => entry.source).length <= 2
@@ -78,7 +84,9 @@ test(process.env.SANDBOX_RETRY_FIXTURE_RESTART_DEFAULT_OUTPUT === '1'
     let services;
     const open = async () => {
         store = await openAgentStore({ dataDir: join(dataDir, 'store') });
-        runtime = createAgentRuntime({ store, cleanupGraceMs: 1000, onConversationClosed: conversation => services?.onConversationClosed(conversation) });
+        runtime = createAgentRuntime({ store, cleanupGraceMs: 1000,
+            reconcileRunCleanup: input => services?.reconcileRunCleanup(input) ?? Promise.resolve('unconfirmed'),
+            onConversationClosed: conversation => services?.onConversationClosed(conversation) });
         services = await createAgentServices({ store, runtime, catalogPort, sharedServices: [], authority: {
             dataDir, runtimeDir: join(dataDir, 'runtime'), principalId: client.principalId, credentialRef: 'fixture-only',
             secret: Buffer.alloc(32), endpoint: 'fixture-only' } });
