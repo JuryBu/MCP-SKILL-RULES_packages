@@ -21,7 +21,7 @@ import { createToolDeliveryStore } from './tool-delivery.js';
 import { renderTaskPlanSnapshot, taskPlanReadyForTakeover } from './task-plan.js';
 import type { TaskPlanSnapshot } from './task-plan.js';
 import type { ContextExecutionViewInput, ContextExecutionViewResolver, ContextPrepareView } from './service.js';
-import type { CompactionCandidate, CompressionModelPort, CompressionModelSelection, CompressionRequest, CompressionResult, ContextPolicy, ContextSourcePort,
+import type { ChunkDigest, CompactionCandidate, CompressionModelPort, CompressionModelSelection, CompressionRequest, CompressionResult, ContextPolicy, ContextSourcePort,
     ContextCapture, ConversationContextLimits, ExecutionLease, FrozenCompressionConfig, MaintenanceCallbacks, UnknownContextCleanupInput } from './contracts.js';
 import type { ContextExecutionCleanup } from './bpc.js';
 import { computeConversationContextLimits, totalContextTokens } from './budget.js';
@@ -29,7 +29,7 @@ import { derivedContextId, freezeCompressionConfig, hashBytes, hashContext } fro
 import { checkAbort, contextFailure, ContextFault } from './errors.js';
 import { ArtifactProjectionCache, createArtifactHistorySourcePort, readHistoryArtifact } from './artifact-source.js';
 import { createContextServerControls } from './server-controls.js';
-import { factsOnlyCompressionResult } from './compaction.js';
+import { factsOnlyCompressionResult, validateCompressionResult } from './compaction.js';
 import type { ContextPreparedMeasurement, ContextServerCompactInput, ContextServerCompactResult, ContextServerControlInput, ContextServerControlResult, ContextServerStatus, ContextServerStatusInput } from './server-controls.js';
 import { createContextMaintenanceCallbacks } from './maintenance-budget.js';
 import { createHistoricalToolResultResolver } from './history-tool-outcomes.js';
@@ -164,6 +164,7 @@ function parseDigest(request: CompressionRequest, response: NormalizedResponse):
         const payloadValue = JSON.parse(request.chunk.body) as { semanticTail?: { continuesPreviousRequired?: boolean } | null };
         const semantic: Partial<CompressionResult['digest']> = {};
         if (payloadValue.semanticTail) {
+            if (payloadValue.semanticTail.continuesPreviousRequired === true && value.continuesPrevious === undefined) value.continuesPrevious = true;
             if (typeof value.continuesPrevious !== 'boolean'
                 || payloadValue.semanticTail.continuesPreviousRequired && !value.continuesPrevious) throw new Error('semantic tail continuation');
             semantic.continuesPrevious = value.continuesPrevious;
@@ -400,6 +401,69 @@ export class ProviderCompressionModelPort implements CompressionModelPort {
             if (hashContext(verified.digest) !== hashContext(factsOnlyCompressionResult(chunk).digest)
                 || hashContext(verified.coverage) !== hashContext(chunk.coverage) || !chunk.complete) throw new ContextFault('SOURCE_GAP', '导入摘要或覆盖与原完整回执不同', { attemptId });
         }
+    }
+
+    async recoverCommittedFailure(candidate: CompactionCandidate, lineage: CompactionCandidate[] = [candidate]): Promise<ChunkDigest> {
+        const failed = candidate.failedResult;
+        const usage = failed?.usage && typeof failed.usage === 'object' && !Array.isArray(failed.usage) ? failed.usage : null;
+        const attemptId = failed?.requestAttemptId;
+        if (!failed || !attemptId || candidate.state !== 'failed' || candidate.pendingRequest || candidate.error?.mayHaveStarted !== false
+            || candidate.error.code !== 'CONTEXT_SOURCE_GAP' || candidate.error.details?.knownInvalidDigest !== true
+            || usage?.digestValidation !== 'semantic tail continuation' || candidate.error.details.attemptId !== attemptId) {
+            throw new ContextFault('SOURCE_GAP', '仅可从原已提交响应恢复已知的强制同轮续接字段缺失');
+        }
+        const link = await this.options.store.getRecord<DispatchLink>({ conversationId: candidate.conversationId, kind: 'step', id: `context:dispatch:${attemptId}` });
+        const saved = link ? await this.options.journal.readAttempt(link.value.providerAttemptId) : undefined;
+        const material = link ? await this.options.store.readContent(candidate.conversationId, link.value.contentId) as unknown as DispatchMaterial : undefined;
+        const snapshot = saved?.attempt.snapshot as (RequestSnapshot & Record<string, unknown>) | undefined;
+        if (!link || link.value.state !== 'committed' || saved?.state !== 'committed' || !saved.response || !material?.snapshot || !snapshot
+            || link.value.attemptId !== attemptId || link.value.providerAttemptId !== attemptId || saved.attempt.attemptId !== attemptId
+            || saved.response.attemptId !== attemptId || failed.attemptId !== attemptId
+            || snapshot.compressionCandidateId !== candidate.candidateId || snapshot.compressionRequestAttemptId !== attemptId
+            || snapshot.conversationId !== candidate.conversationId || snapshot.runId !== candidate.snapshot.runId
+            || snapshot.runEpoch !== candidate.snapshot.runEpoch || snapshot.roundId !== candidate.snapshot.execution.roundId
+            || saved.attempt.rootBudgetId !== candidate.snapshot.execution.rootBudgetId || snapshot.rootBudgetId !== candidate.snapshot.execution.rootBudgetId
+            || snapshot.compressionGeneration !== candidate.snapshot.compressionGeneration
+            || snapshot.effectiveCompressionModelFingerprint !== candidate.snapshot.effectiveModelFingerprint
+            || snapshot.historyEpoch !== candidate.snapshot.historyEpoch || snapshot.appendSeq !== candidate.snapshot.snapshotAppendSeq
+            || snapshot.viewRevision !== candidate.snapshot.parentViewRevision || snapshot.workspaceRevision !== candidate.snapshot.workspaceRevision
+            || hashContext(snapshot) !== hashContext(material.snapshot) || hashBytes(snapshot.body) !== snapshot.bodyHash) {
+            throw new ContextFault('USAGE_MISMATCH', '已知失败缺少身份一致的原已提交Provider响应', { attemptId });
+        }
+        const findBody = (value: unknown): string | undefined => {
+            if (typeof value === 'string') return hashBytes(value) === failed.inputBodyHash ? value : undefined;
+            if (value && typeof value === 'object') for (const entry of Object.values(value)) { const found = findBody(entry); if (found) return found; }
+            return undefined;
+        };
+        const body = findBody(JSON.parse(snapshot.body));
+        if (!body) throw new ContextFault('SOURCE_GAP', '原冻结请求输入字节不可恢复', { attemptId });
+        const payload = JSON.parse(body) as { semanticTail?: { continuesPreviousRequired?: boolean }; targets?: Array<{ sourceRoundId: string; span: ChunkDigest['sourceSpans'][number] }>;
+            anchors?: unknown[]; references?: Array<{ span: ChunkDigest['sourceSpans'][number] }> };
+        if (payload.semanticTail?.continuesPreviousRequired !== true || !payload.targets?.length || !Array.isArray(payload.anchors)
+            || payload.anchors.length || !Array.isArray(payload.references)) throw new ContextFault('SOURCE_GAP', '原失败不属于可确定恢复的同轮文本续接', { attemptId });
+        const roundId = payload.targets[0].sourceRoundId;
+        const sourceSpans = payload.targets.map(target => target.span);
+        if (payload.targets.some(target => target.sourceRoundId !== roundId || !candidate.snapshot.manifest.blocks.some(block => block.roundId === roundId
+            && block.itemId === target.span.itemId && block.blockId === target.span.blockId && block.sha256 === target.span.blockHash
+            && target.span.startByte >= 0 && target.span.endByte > target.span.startByte && target.span.endByte <= block.byteLength))) {
+            throw new ContextFault('SOURCE_GAP', '原请求来源与冻结清单不一致', { attemptId });
+        }
+        const chunkId = derivedContextId([candidate.snapshot.candidateId, roundId, sourceSpans]);
+        const request: CompressionRequest = { attemptId, actionId: snapshot.actionId, stepId: snapshot.stepId, reason: candidate.reason,
+            execution: candidate.snapshot.execution, snapshot: candidate.snapshot, model: candidate.snapshot.config.model,
+            chunk: { chunkId, roundId, sourceSpans, referenceSpans: payload.references.map(reference => reference.span), anchors: [], body,
+                inputBodyHash: hashBytes(body), inputTokens: Buffer.byteLength(body) }, inputBodyHash: hashBytes(body),
+            maxOutputTokens: candidate.snapshot.config.model.maxOutputTokens };
+        if (candidate.validationRepair?.repairAttemptId === attemptId) request.validationRepair = {
+            previousAttemptId: candidate.validationRepair.request.attemptId,
+            validationError: String((candidate.validationRepair.failedResult.usage as JsonObject)?.digestValidation),
+            previousResponse: candidate.validationRepair.failedResult.digest.body };
+        const lookup = await this.lookup(request);
+        if (lookup.status !== 'found') throw new ContextFault('ATTEMPT_UNKNOWN', '原已知失败响应尚未确定提交', { attemptId }, true);
+        validateCompressionResult(request, lookup.result);
+        const chunk: ChunkDigest = { ...structuredClone(factsOnlyCompressionResult(lookup.result)), chunkId, roundId, sourceSpans, anchors: [] };
+        await this.verifyCommittedChunks({ ...candidate, chunks: [...candidate.chunks, chunk] }, lineage);
+        return chunk;
     }
 }
 
@@ -776,7 +840,13 @@ export function createContextServerAdapter(options: ContextServerAdapterOptions)
                 source = previous;
             }
             await compressionModel.verifyCommittedChunks(candidate, lineage);
-            if (pricingProof) return async retry => {
+            const recovered = candidate.error?.details?.knownInvalidDigest === true ? await compressionModel.recoverCommittedFailure(candidate, lineage) : undefined;
+            if (pricingProof || recovered) return async retry => {
+                if (recovered) {
+                    retry.chunks.push(structuredClone(recovered));
+                    await compactionPort.saveCandidate(structuredClone(retry));
+                }
+                if (!pricingProof) return;
                 const snapshot = retry.snapshot;
                 const value: PricingCompatibilityRecord = { ...pricingProof!, candidateId: retry.candidateId,
                     runId: snapshot.runId, runEpoch: snapshot.runEpoch, rootBudgetId: snapshot.execution.rootBudgetId,

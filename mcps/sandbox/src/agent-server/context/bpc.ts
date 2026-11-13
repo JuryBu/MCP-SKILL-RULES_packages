@@ -657,8 +657,10 @@ export class ContextCompactor {
             if (!original || original.state !== 'failed' || original.pendingRequest || original.publicationReceiptKey
                 || original.publicationRevoked || !original.error || original.error.mayHaveStarted
                 || !(['CONTEXT_CONFIG_INVALID', 'CONTEXT_SUMMARY_BUDGET'].includes(original.error.code)
-                    || original.error.details?.budgetReservationRejected === true)) {
-                throw new ContextFault('COMPACTION_PAUSED', '仅确定未发送的预算失败可以显式重试，原未知请求及发布保持');
+                    || original.error.details?.budgetReservationRejected === true
+                    || original.error.code === 'CONTEXT_SOURCE_GAP' && original.error.details?.knownInvalidDigest === true
+                        && original.failedResult && input.prepareCandidate)) {
+                throw new ContextFault('COMPACTION_PAUSED', '仅确定未发送的预算失败或已核验原完整响应的摘要失败可以显式重试，原未知请求及发布保持');
             }
             if (!this.options.maintenance) throw new ContextFault('BUDGET_REQUIRED', '已知失败重试需要独立维护执行');
             const before = await this.options.port.inspect(conversationId);
