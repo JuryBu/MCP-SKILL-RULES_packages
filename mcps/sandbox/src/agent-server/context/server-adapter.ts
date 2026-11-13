@@ -627,6 +627,7 @@ export function createContextServerAdapter(options: ContextServerAdapterOptions)
     const toolDeliveries = createToolDeliveryStore(options.store);
     const service = new ContextService({ preserveToolResult: toolDeliveries.preserve, readToolDelivery: toolDeliveries.read,
         compaction: { port: compactionPort, sources, model: compressionModel, maintenance, now,
+        runBackground: operation => controlWrites.exit(operation),
         maxCachedConversations: maximumConversations }, policy: options.policy, readVersionState: async conversationId => {
             const record = await options.store.getRecord({ conversationId, kind: 'conversation', id: conversationId });
             const historyEpoch = record?.value.historyEpoch;

@@ -53,6 +53,7 @@ export class ContextCompactor {
         countTokens?: TokenCounter;
         now?: () => number;
         maxCachedConversations?: number;
+        runBackground?: <Value>(operation: () => Value) => Value;
     }) {
         this.now = options.now ?? Date.now;
         this.maxCachedConversations = options.maxCachedConversations ?? 16;
@@ -178,6 +179,11 @@ export class ContextCompactor {
     }
 
     private run(candidate: CompactionCandidate, capture: ContextCapture, abort: AbortController, estimateCompaction?: CompactionViewEstimator): CompactionHandle {
+        const startGeneration = () => this.startBackgroundGeneration(candidate, capture, abort, estimateCompaction);
+        return this.options.runBackground ? this.options.runBackground(startGeneration) : startGeneration();
+    }
+
+    private startBackgroundGeneration(candidate: CompactionCandidate, capture: ContextCapture, abort: AbortController, estimateCompaction?: CompactionViewEstimator): CompactionHandle {
         let settled = false;
         const completion = generateCompaction({ candidate, priorView: capture.view, port: this.options.port, sources: this.options.sources,
             model: this.options.model, signal: abort.signal, countTokens: this.options.countTokens, now: this.now, estimateCompaction }).then(async result => {
