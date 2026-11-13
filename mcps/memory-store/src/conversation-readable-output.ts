@@ -16,6 +16,10 @@ function string(value: unknown): string {
     return typeof value === "string" ? value : "";
 }
 
+function preparationStopped(result: ResultObject): boolean {
+    return ["done", "completed", "error", "failed", "cancelled", "canceled", "resumable"].includes(string(result.status));
+}
+
 function warningLines(value: unknown): string[] {
     return Array.isArray(value) ? [...new Set(value.filter(item => typeof item === "string"))].map(item => `⚠️ ${item}`) : [];
 }
@@ -36,6 +40,9 @@ export function withCorpusOutputFormat(value: unknown, format: "markdown" | "jso
     const entry = object(value);
     if (!Object.keys(entry).length) return value;
     const output = { ...entry };
+    const progress = object(entry.progress);
+    if (preparationStopped(entry) && Object.keys(progress).length) output.progress = { ...progress, stage: entry.status,
+        detail: string(entry.error) || string(entry.preparationError) || `任务已结束，状态：${entry.status}` };
     if (entry.next) output.next = nextFormat(entry.next, format);
     for (const key of ["cachePreparation", "fullFetchCache", "ready", "prepared", "changes", "match"]) {
         if (entry[key]) output[key] = withCorpusOutputFormat(entry[key], format);
@@ -83,6 +90,9 @@ function attachmentLines(value: ResultObject): string[] {
             references.add(reference);
             lines.push(`📎 ${attachment.kind === "image" ? "图片" : "附件"}${attachment.name ? `「${attachment.name}」` : ""}：${reference}`);
         }
+        if (!reference && attachment.kind === "image" && attachment.claudeCodeInlineImage) {
+            lines.push("📎 图片：对话中保存的内嵌图片");
+        }
         if (attachment.warning) lines.push(`⚠️ ${attachment.warning}`);
         else if (attachment.exists === false) lines.push("⚠️ 附件原路径当前不可用，来源引用已保留");
     }
@@ -110,7 +120,7 @@ function readableRef(reference: unknown): string {
 }
 
 function detailsPreparationLines(result: ResultObject): string[] {
-    if (result.phase !== "details-not-prepared") return [];
+    if (result.phase !== "details-not-prepared" || preparationStopped(result)) return [];
     const depths = [result.preparedDepth && `已准备 ${result.preparedDepth}`, result.requestedDepth && `请求 ${result.requestedDepth}`].filter(Boolean);
     return [`ℹ️ 已有正文可读，详情需要补充准备${depths.length ? `（${depths.join("，")}）` : ""}`, ...(result.detail ? [string(result.detail)] : []),
         ...(result.requestedSelection ? [`原请求范围：${JSON.stringify(result.requestedSelection)}`] : [])];
@@ -146,6 +156,7 @@ function messageLines(message: ResultObject, context: { source: string; baseSour
 }
 
 function readLines(result: ResultObject, params: CorpusToolParams): string[] {
+    const stopped = preparationStopped(result);
     const source = object(result.source);
     const conversation = object(result.conversation || source.conversation);
     const messages = objects(result.messages);
@@ -175,7 +186,9 @@ function readLines(result: ResultObject, params: CorpusToolParams): string[] {
     if (conversation.isChildThread) lines.push(`子代理：${conversation.agentNickname || conversation.agentRole || conversation.id}${conversation.parentConversationId ? ` · 主对话：${conversation.parentConversationId}` : ""}`);
     if (result.requestedRangeComplete === false || result.partial === true) lines.push("⚠️ 当前只返回可读范围，未覆盖内容与来源缺口见后续提示");
     if (result.sourceRangeVerified === false) lines.push("⚠️ 来源范围仍待核验");
-    if (result.fullSourceComplete === false || result.fullSourceProjectionComplete === false) lines.push("⏳ 其余历史尚未完整准备，已就绪内容可以继续使用");
+    if (stopped) lines.push(`任务状态：${result.status}，本任务已结束`);
+    if (result.fullSourceComplete === false || result.fullSourceProjectionComplete === false) lines.push(stopped
+        ? "本次未准备完整历史，已就绪内容可以继续使用" : "⚠️ 完整历史尚未确认，已就绪正文可以继续读取");
     if (relative) lines.push("相对轮号仅属于当前已准备范围，绝对轮号仍待核实");
     lines.push(...detailsPreparationLines(result));
     let briefTruncated = messages.some(message => message.truncated === true);
@@ -228,8 +241,10 @@ function readLines(result: ResultObject, params: CorpusToolParams): string[] {
         if (result[key]) lines.push("", `${key}：\`${key === "ref" ? readableRef(result[key]) : result[key]}\``);
     }
     lines.push(...warningLines(result.warnings));
+    if (result.error) lines.push(`⚠️ ${result.error}`);
+    if (result.preparationError) lines.push(`⚠️ 完整历史准备失败：${result.preparationError}`);
     const preparation = object(result.cachePreparation);
-    if (preparation.taskId) lines.push(`⏳ 缓存准备任务：\`${preparation.taskId}\``);
+    if (preparation.taskId) lines.push(`${stopped || preparationStopped(preparation) ? "缓存准备任务（已结束）" : "⏳ 缓存准备任务"}：\`${preparation.taskId}\``);
     nextCall(lines, result.next || preparation.next);
     return lines;
 }
@@ -303,17 +318,17 @@ function searchLines(result: ResultObject, params: CorpusToolParams): string[] {
 function preparationLines(result: ResultObject): string[] {
     const ready = object(result.ready);
     const request = object(result.request);
-    const stopped = ["done", "failed", "cancelled", "canceled", "resumable"].includes(string(result.status));
-    const lines = ["# ⏳ 对话历史准备", `任务：\`${result.taskId || ""}\``, `状态：${result.status || result.phase || "准备中"}`];
+    const stopped = preparationStopped(result);
+    const lines = [stopped ? "# 📋 对话历史准备结果" : "# ⏳ 对话历史准备", `任务：\`${result.taskId || ""}\``, `状态：${result.status || result.phase || "准备中"}`];
     if (request.dataChain || request.conversationId) lines.push(`${request.dataChain || ""} · ${request.conversationId || ""}`);
-    if (result.phase === "details-not-prepared") lines.push(...detailsPreparationLines(result));
+    if (result.phase === "details-not-prepared" && !stopped) lines.push(...detailsPreparationLines(result));
     else if (result.rangeAvailable) lines.push(result.requestedRangeComplete === false
         ? stopped ? "⚠️ 本任务已结束，已取得部分范围；请求范围尚未全部取得" : "⏳ 已有部分范围可读，所需范围仍在准备"
         : "✅ 所需范围已经就绪，可以读取、搜索和定位");
     else lines.push(stopped ? "⚠️ 本任务已结束，未取得所需范围" : "⏳ 所需范围仍在准备，请沿原任务查询进度");
     if (result.fullSourceComplete === false) lines.push(stopped ? "本次未准备完整历史" : "⏳ 完整历史尚未准备完成");
     const progress = object(result.progress);
-    if (progress.detail) lines.push(string(progress.detail));
+    if (progress.detail && !stopped) lines.push(string(progress.detail));
     for (const range of objects(result.completeRanges || ready.completeRanges || object(ready.cache).completeRanges)) lines.push(`已就绪${range.kind === "relative" ? "相对" : ""}轮次：${range.startRound}–${range.endRound}${range.blockId ? ` · ${range.blockId}` : ""}`);
     if (Array.isArray(result.availableMessageRoles)) lines.push(`可读角色：${result.availableMessageRoles.join("、")}`);
     lines.push(...warningLines(result.warnings), ...warningLines(ready.warnings));

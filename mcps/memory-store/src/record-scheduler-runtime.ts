@@ -62,6 +62,7 @@ import {
     CandidateSnapshotSchema,
     createRecordSourceSnapshot,
     discoverRecordCandidates,
+    listAntigravityRecordConversations,
     selectRecordDiscoveryCandidates,
     type CandidateSnapshot as DiscoveryCandidateSnapshot,
     type Immutable as DiscoveryImmutable,
@@ -312,7 +313,17 @@ export interface RecordSchedulerProductionSourceApis {
     listWindsurfThreads: typeof listRecentWindsurfThreads;
     scanWindsurf: typeof scanWindsurfConsumerSourceEvidence;
     resolveWindsurfId: (conversationId: string) => Promise<string | null>;
-    listAntigravityConversations: typeof listConversationsByMtime;
+    listAntigravityConversations: (options?: Parameters<typeof listConversationsByMtime>[0]) => Array<ReturnType<typeof listConversationsByMtime>[number] & {
+        workspace?: string;
+        workspaces?: string[];
+        sourceKind?: string;
+        sourcePath?: string;
+    }> | Promise<Array<ReturnType<typeof listConversationsByMtime>[number] & {
+        workspace?: string;
+        workspaces?: string[];
+        sourceKind?: string;
+        sourcePath?: string;
+    }>> | Promise<Awaited<ReturnType<typeof listAntigravityRecordConversations>>>;
     createAntigravityAdapter: typeof createAntigravityLsSourceEvidenceAdapter;
 }
 
@@ -1316,7 +1327,7 @@ const DEFAULT_PRODUCTION_SOURCE_APIS: RecordSchedulerProductionSourceApis = {
     listWindsurfThreads: listRecentWindsurfThreads,
     scanWindsurf: scanWindsurfConsumerSourceEvidence,
     resolveWindsurfId: conversationId => resolveConversationId(conversationId, "windsurf", process.cwd(), "background"),
-    listAntigravityConversations: listConversationsByMtime,
+    listAntigravityConversations: listAntigravityRecordConversations,
     createAntigravityAdapter: createAntigravityLsSourceEvidenceAdapter,
 };
 
@@ -1512,26 +1523,38 @@ async function listProductionDiscoverySeeds(
     }
     if (hosts.includes("antigravity")) {
         try {
-            const conversations = apis.listAntigravityConversations({
+            const listing = await apis.listAntigravityConversations({
                 ...(typeof request.filters?.after === "string" ? { after: request.filters.after } : {}),
                 ...(typeof request.filters?.before === "string" ? { before: request.filters.before } : {}),
                 limit: scanLimit,
             });
+            const conversations = Array.isArray(listing) ? listing : listing.conversations;
             markHostDiscoverySuccess("antigravity", conversations.length);
+            if (!Array.isArray(listing) && listing.partial) {
+                enumerations.set("antigravity", {
+                    chain: "antigravity", complete: false, paginationExhausted: false, truncated: true,
+                    error: `Antigravity source discovery incomplete: ${JSON.stringify({ diagnostics: listing.diagnostics, warnings: listing.warnings })}`,
+                });
+            }
             for (const conversation of conversations) {
+                const actualWorkspaces = [conversation.workspace, ...(conversation.workspaces || [])]
+                    .filter((workspace): workspace is string => typeof workspace === "string" && Boolean(workspace.trim()));
+                const actualWorkspace = actualWorkspaces.find(workspace => matchesRequestedWorkspace(workspace, request.workspacePath));
+                if (request.workspacePath && !actualWorkspace) continue;
                 add({
                     host: "antigravity",
                     conversationId: conversation.id,
                     title: conversation.title || conversation.id,
                     workspaceHash,
-                    workspacePath: request.workspacePath || null,
+                    workspacePath: actualWorkspace || actualWorkspaces[0] || null,
                     sourceUpdatedAtMs: conversation.mtime.getTime(),
                     listed: true,
-                    sourceAuthorityRoot: request.workspacePath || null,
+                    sourceAuthorityRoot: actualWorkspace || actualWorkspaces[0] || null,
                     sourceRevisionHint: stableJsonHash({
                         id: conversation.id,
                         mtimeMs: conversation.mtime.getTime(),
                         sizeKB: conversation.sizeKB,
+                        sourcePath: conversation.sourcePath,
                     }),
                 });
             }

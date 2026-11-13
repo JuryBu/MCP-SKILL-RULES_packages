@@ -4,7 +4,7 @@ import { escapeUnpairedUnicode, sliceUnicodeSafe } from "./unicode-text.js";
 import fs from "fs";
 import path from "path";
 import { TEMP_DIR, ensureTempDir } from "./temp-store.js";
-import { extractAntigravityToolImages, mergeRoundAttachments } from "./conversation-attachments.js";
+import { extractAntigravityToolImages, filterRoundAttachmentsForRoles, mergeRoundAttachments } from "./conversation-attachments.js";
 import {
     conversationAutomationEventKey,
     projectConversationAutomationInput,
@@ -348,7 +348,13 @@ function mergeRoundData(target: ConversationRound, source: ConversationRound, pr
     target.endStep = Math.max(target.endStep, source.endStep);
 }
 
+function roundWithAttachmentRoles(round: ConversationRound, roles: ReadonlySet<string>): ConversationRound {
+    return filterRoundAttachmentsForRoles({ ...round, mediaAttachments: round.mediaAttachments || [],
+        aiResponses: round.aiResponses || [], toolCalls: round.toolCalls || [] }, roles);
+}
+
 function rawRoundUserMessages(round: ConversationRound): ConversationUserMessage[] {
+    round = roundWithAttachmentRoles(round, new Set(["user"]));
     if (round.userMessages) {
         if (round.userMessages.length > 0) return round.userMessages;
         if ((round.attachments?.length || 0) > 0 || (round.mediaAttachments?.length || 0) > 0) {
@@ -367,6 +373,22 @@ function rawRoundUserMessages(round: ConversationRound): ConversationUserMessage
         mediaAttachments: round.mediaAttachments || [],
         attachments: round.attachments,
     }];
+}
+
+export function getRoundToolAttachments(round: ConversationRound, stepIndex?: number): import("./conversation-attachments.js").ConversationAttachment[] {
+    const filtered = roundWithAttachmentRoles(round, new Set(["tool"]));
+    const roundAttachments = filtered.attachments || [];
+    const roundSteps = new Set(roundAttachments.map(attachment => attachment.stepIndex));
+    const attachments = [...roundAttachments, ...(filtered.semanticEvents || [])
+        .filter(event => event.semanticRole === "tool").flatMap(event => event.attachments || []).filter(attachment => !roundSteps.has(attachment.stepIndex))];
+    const seen = new Set<string>();
+    return attachments.filter(attachment => {
+        if (stepIndex !== undefined && attachment.stepIndex !== stepIndex) return false;
+        const key = JSON.stringify([attachment.stepIndex, attachment.kind, attachment.reference || attachment.dataUrl || attachment.tempPath || attachment.originalPath || attachment.name]);
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+    });
 }
 
 export function getRoundUserMessages(round: ConversationRound): ConversationUserMessage[] {
@@ -840,16 +862,24 @@ function bucketAttachmentsByStep(round: ConversationRound): {
     userBucket: ConversationAttachment[];
     legacyBucket: ConversationAttachment[];
     byAiStep: Map<number, ConversationAttachment[]>;
+    byToolStep: Map<number, ConversationAttachment[]>;
 } {
     const userBucket: ConversationAttachment[] = [];
     const legacyBucket: ConversationAttachment[] = [];
     const byAiStep = new Map<number, ConversationAttachment[]>();
+    const byToolStep = new Map<number, ConversationAttachment[]>();
+    const toolAttachments = new Set(roundWithAttachmentRoles(round, new Set(["tool"])).attachments || []);
+    for (const attachment of getRoundToolAttachments(round)) {
+        const step = attachment.stepIndex ?? round.endStep;
+        byToolStep.set(step, [...(byToolStep.get(step) || []), attachment]);
+    }
     const aiSteps = round.aiResponses
         .map(a => a.stepIndex)
         .filter(s => Number.isFinite(s))
         .sort((a, b) => a - b);
 
     for (const att of round.attachments || []) {
+        if (toolAttachments.has(att)) continue;
         if (typeof att.stepIndex !== "number" || !Number.isFinite(att.stepIndex)) {
             legacyBucket.push(att);
             continue;
@@ -871,7 +901,7 @@ function bucketAttachmentsByStep(round: ConversationRound): {
         if (list) list.push(att);
         else byAiStep.set(target, [att]);
     }
-    return { userBucket, legacyBucket, byAiStep };
+    return { userBucket, legacyBucket, byAiStep, byToolStep };
 }
 
 /**
@@ -886,6 +916,7 @@ export function formatRound(
     const lines: string[] = [];
     const stepsRange = `steps ${round.startStep}-${round.endStep}`;
     const userMessages = getRoundUserMessages(round);
+    const userAttachments = roundWithAttachmentRoles(round, new Set(["user"]));
 
     lines.push(`## 轮次 ${round.roundIndex} (${stepsRange})`);
 
@@ -920,7 +951,7 @@ export function formatRound(
     }
     // 用户附件图片
     const singleMessageMedia = userMessages.length === 1
-        ? (round.mediaAttachments.length > 0 ? round.mediaAttachments : userMessages[0].mediaAttachments || [])
+        ? (userAttachments.mediaAttachments.length > 0 ? userAttachments.mediaAttachments : userMessages[0].mediaAttachments || [])
         : [];
     if (singleMessageMedia.length > 0) {
         for (const [index, uri] of singleMessageMedia.entries()) {
@@ -938,8 +969,8 @@ export function formatRound(
     if (!interleave) {
         // 非附件时间线分支：normal/full 的 AI 与工具仍按 stepIndex 交替渲染。
         const singleMessageAttachments = userMessages.length === 1
-            ? (round.attachments || userMessages[0].attachments || [])
-            : round.attachments || [];
+            ? (userAttachments.attachments || userMessages[0].attachments || [])
+            : userAttachments.attachments || [];
         if (singleMessageAttachments.length) {
             for (const attachment of singleMessageAttachments) {
                 const label = attachment.kind === "image" ? "图片" : "文件";
@@ -992,6 +1023,11 @@ export function formatRound(
                 lines.push(`🔧 工具: ${counts.join(", ")}`);
                 lines.push("");
             }
+            const attachments = getRoundToolAttachments(round);
+            if (attachments.length) {
+                lines.push("#### 🔧 工具附件");
+                for (const attachment of attachments) renderAttachmentLine(lines, attachment, round.roundIndex, options.attachmentMode);
+            }
         } else {
             type Ev = { step: number; seq: number; isTool: boolean; render: (l: string[]) => void };
             const events: Ev[] = [];
@@ -1003,6 +1039,10 @@ export function formatRound(
             }
             for (const tc of round.toolCalls) {
                 events.push({ step: safeStep(tc.stepIndex), seq: seq++, isTool: true, render: (l) => renderToolCallLine(l, tc, depth, extraTypes) });
+            }
+            for (const attachment of getRoundToolAttachments(round)) {
+                events.push({ step: safeStep(attachment.stepIndex ?? round.endStep), seq: seq++, isTool: true,
+                    render: (lines) => renderAttachmentLine(lines, attachment, round.roundIndex, options.attachmentMode) });
             }
             events.sort((a, b) => a.step - b.step || a.seq - b.seq);
             let prevToolStep: number | null = null;
@@ -1052,6 +1092,10 @@ export function formatRound(
         }
         for (const tc of round.toolCalls) {
             events.push({ step: safeStep(tc.stepIndex), seq: seq++, isTool: true, render: (l) => renderToolCallLine(l, tc, depth, extraTypes) });
+        }
+        for (const [step, attachments] of buckets.byToolStep) {
+            for (const attachment of attachments) events.push({ step: safeStep(step), seq: seq++, isTool: true,
+                render: (lines) => renderAttachmentLine(lines, attachment, round.roundIndex, options.attachmentMode) });
         }
 
         events.sort((a, b) => a.step - b.step || a.seq - b.seq);
@@ -1271,7 +1315,7 @@ export function formatRoundForMessageRoles(
             for (const line of messageLines) {
                 if (!pushLine(lines, line)) break;
             }
-            const attachments = message.attachments || (userMessages.length === 1 ? round.attachments || [] : []);
+            const attachments = message.attachments || (userMessages.length === 1 ? roundWithAttachmentRoles(round, new Set(["user"])).attachments || [] : []);
             for (const attachment of attachments) {
                 const label = attachment.kind === "image" ? "图片" : "文件";
                 const target = attachment.tempPath || attachment.originalPath || attachment.name || "JSONL 内联图片";
@@ -1342,9 +1386,17 @@ export function formatRoundForMessageRoles(
         return pushLine(lines, "");
     };
 
+    const toolAttachmentsByStep = new Map<number | undefined, ConversationAttachment[]>();
+    if (includeTool) for (const attachment of getRoundToolAttachments(round)) toolAttachmentsByStep.set(attachment.stepIndex,
+        [...(toolAttachmentsByStep.get(attachment.stepIndex) || []), attachment]);
     const renderToolLine = (tc: ConversationRound["toolCalls"][number]): boolean => {
-        if (depth === "full" || extraTypes.includes("tool_results")) return pushLine(lines, formatCompleteToolCall(tc));
-        return pushLine(lines, `- ${tc.name}`);
+        if (!pushLine(lines, depth === "full" || extraTypes.includes("tool_results") ? formatCompleteToolCall(tc) : `- ${tc.name}`)) return false;
+        for (const attachment of toolAttachmentsByStep.get(tc.stepIndex) || []) {
+            const rendered: string[] = [];
+            renderAttachmentLine(rendered, attachment, round.roundIndex, "text");
+            for (const line of rendered) if (!pushLine(lines, line)) return false;
+        }
+        return true;
     };
 
     if (!budgetState.exceeded && (mergeAiTool || includeTool)) {

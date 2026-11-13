@@ -119,7 +119,12 @@ export function createHostCorpusProvider(source: HostCorpusSource, options: Host
                     statuses = result.statuses;
                     return result.candidates;
                 }
-                const candidates = (await backend.list(request, control)).filter(conversation => {
+                let listed = await backend.list(request, control);
+                if (source === "windsurf" && request.conversationIds?.length && !listed.length) {
+                    assertActive(control);
+                    listed = await backend.list(request, control);
+                }
+                const candidates = listed.filter(conversation => {
                     if (conversation.source !== source) throw new Error(`Unexpected ${conversation.source} candidate from ${source}`);
                     return hostConversationMatches(conversation, request);
                 });

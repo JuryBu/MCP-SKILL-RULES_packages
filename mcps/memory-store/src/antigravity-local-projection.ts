@@ -134,22 +134,23 @@ function annotations(value: unknown): ConversationAnnotation[] {
     }).filter(item => item.selectedText || item.comment);
 }
 
-function attachments(value: unknown, stepIndex: number): ConversationAttachment[] {
+function attachments(value: unknown, stepIndex: number, semanticRole: "user" | "tool" = "user"): ConversationAttachment[] {
     return (Array.isArray(value) ? value : []).flatMap(item => {
         const media = object(item);
         const uri = text(media.uri || media.path || media.url);
         if (!uri) return [];
         const mimeType = text(media.mime_type || media.mimeType);
         return [{ kind: mimeType.startsWith("image/") || /\.(png|jpe?g|webp|gif)(?:$|[?#])/iu.test(uri) ? "image" as const : "file" as const,
-            source: "antigravity-raw-attachment" as const, reference: uri, originalPath: uri, mimeType: mimeType || undefined, stepIndex }];
+            source: "antigravity-raw-attachment" as const, reference: uri, originalPath: uri, mimeType: mimeType || undefined, stepIndex, semanticRole }];
     });
 }
 
 function reindexFragment(fragment: ConversationRound, stepIndex: number): ConversationRound {
     const mapped = <Value extends { stepIndex?: number }>(values: Value[] | undefined): Value[] => (values || []).map(value => ({ ...value, stepIndex }));
-    return { ...fragment, startStep: stepIndex, endStep: stepIndex, userMessages: mapped(fragment.userMessages), attachments: mapped(fragment.attachments),
+    return { ...fragment, startStep: stepIndex, endStep: stepIndex,
+        userMessages: mapped(fragment.userMessages).map(message => ({ ...message, attachments: mapped(message.attachments) })), attachments: mapped(fragment.attachments),
         aiResponses: mapped(fragment.aiResponses), toolCalls: mapped(fragment.toolCalls), taskBoundaries: mapped(fragment.taskBoundaries),
-        codeActions: mapped(fragment.codeActions), semanticEvents: mapped(fragment.semanticEvents), fileViews: mapped(fragment.fileViews) };
+        codeActions: mapped(fragment.codeActions), semanticEvents: mapped(fragment.semanticEvents).map(event => ({ ...event, attachments: mapped(event.attachments) })), fileViews: mapped(fragment.fileViews) };
 }
 
 function addFragment(target: ConversationRound, source: ConversationRound): void {
@@ -224,9 +225,10 @@ export function antigravityEventsToRounds(events: AntigravityLocalEvent[]): Conv
         } else if (event.type === "GENERIC" && !raw.pb) {
             const result = text(raw.content);
             const name = text(raw.tool_name || raw.name) || pendingTools.shift() || "antigravity-generic";
+            const media = [...attachments(raw.media ?? raw.attachments, stepIndex, "tool"), ...extractAntigravityToolImages({ resultString: result }, stepIndex)];
             fragment.toolCalls.push({ stepIndex, name, argsSummary: "", resultSummary: result.slice(0, 500), resultFull: result });
-            fragment.semanticEvents!.push({ stepIndex, createdAt, rawRole, semanticRole: "tool", kind: "tool", name, resultSummary: result.slice(0, 500), resultFull: result });
-            fragment.attachments!.push(...attachments(raw.media ?? raw.attachments, stepIndex), ...extractAntigravityToolImages({ resultString: result }, stepIndex));
+            fragment.semanticEvents!.push({ stepIndex, createdAt, rawRole, semanticRole: "tool", kind: "tool", name, resultSummary: result.slice(0, 500), resultFull: result, attachments: media });
+            fragment.attachments!.push(...media);
         } else if (!isUser && event.type !== "PLANNER_RESPONSE" && event.type !== "MODEL_RESPONSE" && !raw.pb) {
             fragment.semanticEvents!.push({ stepIndex, createdAt, rawRole, semanticRole: "system", kind: event.type === "ERROR_MESSAGE" ? "error" : event.type.toLowerCase(), text: text(raw.error || raw.content) });
         }

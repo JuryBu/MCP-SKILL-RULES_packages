@@ -83,7 +83,9 @@ function headingsOf(lines: string[]): TargetHeading[] {
 }
 
 function isAddendum(title: string): boolean {
-    return /待复核|小本本|追加|handoff|证据可见性/iu.test(title);
+    if (/待复核|小本本|handoff|证据可见性/iu.test(title)) return true;
+    const explicitStage = /^(?:stage\s*\d|u\d)/iu.test(normalizedText(title));
+    return /追加/iu.test(title) && !explicitStage;
 }
 
 function isGlobal(title: string): boolean {

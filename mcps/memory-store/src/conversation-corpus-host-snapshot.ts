@@ -4,9 +4,10 @@ import path from "node:path";
 import { DATA_ROOT } from "./store.js";
 import { readHostCache, writeHostCache } from "./conversation-host-files.js";
 import { readHostSnapshotRound, writeHostSnapshotRound, type HostSnapshotRound } from "./conversation-corpus-host-snapshot-rounds.js";
-import { projectCodexCorpusRound } from "./conversation-corpus-reader-projection.js";
+import { codexCorpusAttachmentReferences, projectCodexCorpusRound } from "./conversation-corpus-reader-projection.js";
 import type { CorpusConversation, CorpusMessageRole, CorpusProjection, CorpusReadControl, CorpusRoundReadRequest } from "./conversation-corpus-types.js";
-import type { ConversationRound } from "./trajectory.js";
+import { getRoundToolAttachments, getRoundUserMessages, type ConversationRound } from "./trajectory.js";
+import { filterRoundAttachmentsForRoles } from "./conversation-attachments.js";
 
 interface SnapshotOptions { cacheRoot?: string; cacheMaxBytes?: number; canonicalRounds?: boolean }
 interface StoredSnapshot {
@@ -150,6 +151,7 @@ function optionsCanonicalRoles(values: CorpusMessageRole[]): boolean {
 
 function selectRound(round: ConversationRound, requested: CorpusMessageRole[], subagentSource = false): ConversationRound {
     if (ALL_ROLES.every(role => requested.includes(role))) return round;
+    round = filterRoundAttachmentsForRoles(round, new Set(requested), subagentSource);
     const user = subagentSource ? requested.includes("subagent") : requested.includes("user");
     const assistant = subagentSource ? requested.includes("subagent") : requested.includes("assistant");
     const tool = requested.includes("tool");
@@ -157,7 +159,7 @@ function selectRound(round: ConversationRound, requested: CorpusMessageRole[], s
         ...round, roundIndex: round.roundIndex, startStep: round.startStep, endStep: round.endStep, createdAt: round.createdAt,
         legacyRoundIndices: round.legacyRoundIndices,
         userMessage: user ? round.userMessage : "", userMessages: user ? round.userMessages : undefined,
-        mediaAttachments: user ? round.mediaAttachments : [], attachments: user ? round.attachments : undefined,
+        mediaAttachments: round.mediaAttachments, attachments: round.attachments,
         aiResponses: assistant ? round.aiResponses : [], toolCalls: tool ? round.toolCalls : [],
         taskBoundaries: tool ? round.taskBoundaries : [], codeActions: tool ? round.codeActions : [],
         fileViews: tool ? round.fileViews : undefined,
@@ -172,9 +174,20 @@ function selectRound(round: ConversationRound, requested: CorpusMessageRole[], s
 
 export function selectHostCorpusProjectionRoles(projection: CorpusProjection, messageRoles?: CorpusMessageRole[]): CorpusProjection {
     const requested = roles(messageRoles);
+    const rounds = new Map(projection.rounds?.map(round => [round.roundIndex, round]));
     return {
         ...projection,
-        messages: projection.messages.filter(message => requested.includes(message.role)),
+        messages: projection.messages.filter(message => requested.includes(message.role)).flatMap(message => {
+            const round = rounds.get(message.round);
+            if (!round || !["user", "tool"].includes(message.role)) return [message];
+            const { attachments: previousAttachments, mediaAttachments: previousMedia, ...body } = message;
+            const stepIndex = message.position.ordinal;
+            if (message.role === "tool") return [{ ...body, ...codexCorpusAttachmentReferences({ attachments: getRoundToolAttachments(round, stepIndex) }, stepIndex) }];
+            const users = getRoundUserMessages(round);
+            const user = users.find(user => user.stepIndex === stepIndex) || (users.length === 1 ? users[0] : undefined);
+            if (!user && !message.text.trim()) return [];
+            return [{ ...body, ...codexCorpusAttachmentReferences(user || {}, stepIndex) }];
+        }),
         rounds: projection.rounds?.map(round => selectRound(round, requested, projection.conversation.isChildThread)),
     };
 }

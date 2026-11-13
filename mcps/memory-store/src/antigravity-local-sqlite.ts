@@ -1,6 +1,8 @@
 import * as pbReader from "./local-pb-reader.js";
 import type { LocalPbReadResult, LocalPbStep, LocalPbSourceFlavor } from "./local-pb-reader.js";
 import { assertAntigravityReadActive, type AntigravityLocalCandidate, type AntigravityLocalDiagnostic, type AntigravityLocalOptions } from "./antigravity-local-sources.js";
+import { withAntigravitySqliteSnapshot } from "./antigravity-sqlite-snapshot.js";
+import type { DatabaseSync } from "node:sqlite";
 
 function protobufBytesField(payload: Uint8Array, wanted: number): Uint8Array | undefined {
     let offset = 0;
@@ -39,13 +41,10 @@ function sqliteErrorMessage(payload: Uint8Array): string {
     }).filter(Boolean).join("\n\n");
 }
 
-export async function readAntigravitySqliteIndices(metadata: AntigravityLocalCandidate, options: AntigravityLocalOptions): Promise<number[] | undefined> {
+export async function readAntigravitySqliteIndices(metadata: AntigravityLocalCandidate, options: AntigravityLocalOptions, connection?: DatabaseSync): Promise<number[] | undefined> {
     const source = metadata.files.find(file => file.kind === "db" && file.path.endsWith(".db"));
     if (!source) return undefined;
-    const { DatabaseSync } = await import("node:sqlite");
-    const database = new DatabaseSync(source.path, { readOnly: true, allowExtension: false, timeout: 100 });
-    try {
-        database.exec("PRAGMA query_only=ON");
+    const read = async (database: DatabaseSync): Promise<number[]> => {
         const maximum = options.maxRecords ?? 100_000;
         const indices: number[] = [];
         for (const row of database.prepare("SELECT idx FROM steps ORDER BY idx LIMIT ?").iterate(maximum + 1)) {
@@ -55,10 +54,11 @@ export async function readAntigravitySqliteIndices(metadata: AntigravityLocalCan
             if (indices.length % 128 === 0) await new Promise<void>(resolve => setImmediate(resolve));
         }
         return indices;
-    } finally { database.close(); }
+    };
+    return connection ? read(connection) : withAntigravitySqliteSnapshot(metadata, options, read);
 }
 
-export async function readAntigravitySqliteBody(metadata: AntigravityLocalCandidate, options: AntigravityLocalOptions, indices?: number[]): Promise<{ result?: LocalPbReadResult; diagnostics: AntigravityLocalDiagnostic[] }> {
+export async function readAntigravitySqliteBody(metadata: AntigravityLocalCandidate, options: AntigravityLocalOptions, indices?: number[], connection?: DatabaseSync): Promise<{ result?: LocalPbReadResult; diagnostics: AntigravityLocalDiagnostic[] }> {
     const source = metadata.files.find(file => file.kind === "db" && file.path.endsWith(".db"));
     if (!source) return { diagnostics: [] };
     const diagnostics: AntigravityLocalDiagnostic[] = [];
@@ -68,10 +68,7 @@ export async function readAntigravitySqliteBody(metadata: AntigravityLocalCandid
         diagnose("ANTIGRAVITY_SQLITE_DECODER_UNAVAILABLE", "step_format=0 requires the shared decodeLocalPbStepPayload export");
         return { diagnostics };
     }
-    const { DatabaseSync } = await import("node:sqlite");
-    const database = new DatabaseSync(source.path, { readOnly: true, allowExtension: false, timeout: 100 });
-    try {
-        database.exec("PRAGMA query_only=ON");
+    const read = async (database: DatabaseSync): Promise<{ result?: LocalPbReadResult; diagnostics: AntigravityLocalDiagnostic[] }> => {
         const columns = new Set(database.prepare("PRAGMA table_info(steps)").all().map(row => String(row.name)));
         if (!["idx", "step_payload", "step_format"].every(column => columns.has(column))) {
             diagnose("ANTIGRAVITY_SQLITE_SCHEMA_UNSUPPORTED", "Expected steps(idx,step_payload,step_format)");
@@ -120,5 +117,6 @@ export async function readAntigravitySqliteBody(metadata: AntigravityLocalCandid
         for (const diagnostic of wireDiagnostics) if (diagnostic.kind === "partial" || diagnostic.kind === "unknown_variant") diagnose(`ANTIGRAVITY_SQLITE_${diagnostic.kind.toUpperCase()}`, diagnostic.message);
         return { result: { sourceFlavor: "antigravity", candidate: "active", label: "sqlite-step-format-0", encryptedBytes: 0, decryptedBytes: bytes,
             trajectory: { id: trajectoryId, steps }, diagnostics: wireDiagnostics, partial: diagnostics.length > 0 }, diagnostics };
-    } finally { database.close(); }
+    };
+    return connection ? read(connection) : withAntigravitySqliteSnapshot(metadata, options, read);
 }

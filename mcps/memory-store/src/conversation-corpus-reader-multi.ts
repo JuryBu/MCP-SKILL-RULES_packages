@@ -53,6 +53,9 @@ export function createMultiCorpusProvider(options: MultiCorpusOptions = {}): Cor
                 statuses.push({ source, status: declared?.status === "error" ? "error" : partial ? "partial" : "ok",
                     candidateCount: candidates.length, warnings, ...(declared?.error ? { error: declared.error } : {}) });
                 if (declared?.status === "error" && request.sourceFailureMode === "fail") throw new Error(declared.error || "Corpus source listing failed");
+                if (!candidates.length && declared?.status === "partial" && request.sourceFailureMode === "fail") {
+                    throw Object.assign(new Error(`${source} source listing is incomplete: ${warnings.join("; ") || "source metadata is not fully available"}`), { code: "SOURCE_WORKER_UNAVAILABLE" });
+                }
                 return candidates;
             } catch (error) {
                 const message = error instanceof Error ? error.message : String(error);

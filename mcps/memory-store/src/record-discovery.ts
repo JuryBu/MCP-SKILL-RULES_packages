@@ -25,6 +25,41 @@ import {
 const RECORD_DISCOVERY_SCHEMA_VERSION = 2;
 export const LOST_RECHECK_INTERVAL_MS = 60 * 60 * 1000;
 
+export async function listAntigravityRecordConversations(options: {
+    after?: string;
+    before?: string;
+    limit?: number;
+    deadlineMs?: number;
+    isCancelled?: () => boolean;
+} = {}) {
+    const { listConversationCandidates } = await import("./conversation-filter.js");
+    const limit = options.limit ?? 50;
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 20_000) throw new Error("Antigravity Record enumeration limit must be between 1 and 20000");
+    const after = options.after ? Date.parse(options.after) : -Infinity;
+    const before = options.before ? Date.parse(options.before) : Infinity;
+    if (Number.isNaN(after) || Number.isNaN(before) || after > before) throw new Error("Antigravity Record enumeration requires a valid after/before range");
+    const enumerationLimit = options.after || options.before ? 20_000 : limit;
+    const listed = await listConversationCandidates({ dataChains: ["antigravity"], source: "auto", threadMode: "main",
+        limit: enumerationLimit, candidateLimit: enumerationLimit, deadlineMs: options.deadlineMs,
+        isCancelled: options.isCancelled, sourceFailureMode: "fail" });
+    const failures = listed.statuses.filter(status => status.status === "failed");
+    if (failures.length) throw new Error(`Antigravity Record enumeration failed: ${failures.map(status => status.error || status.dataChain).join("; ")}`);
+    const conversations = listed.candidates.map(candidate => ({
+        id: candidate.id, title: candidate.title, mtime: new Date(candidate.updatedAt),
+        sizeKB: (candidate.sourceBytes || 0) / 1024, workspace: candidate.workspace,
+        workspaces: candidate.workspaces || [], sourceKind: candidate.sourceKind, sourcePath: candidate.sourcePath,
+    })).filter(candidate => candidate.mtime.getTime() >= after && candidate.mtime.getTime() <= before).slice(0, limit);
+    const enumerationPartial = Boolean(listed.partial) && (
+        listed.candidates.length >= enumerationLimit || !listed.statuses.length || Boolean(listed.contextLocate?.truncated)
+        || listed.statuses.some(status => status.status !== "ok" || Boolean(status.error)
+            || (Boolean(status.partial) && !status.warnings?.length)
+            || status.warnings?.some(warning => !/^ANTIGRAVITY_METADATA_ONLY(?::|$)/u.test(warning)))
+    );
+    return { conversations, partial: enumerationPartial,
+        diagnostics: listed.statuses.flatMap(status => status.diagnostics || []),
+        warnings: listed.statuses.flatMap(status => status.warnings || []) };
+}
+
 const HashSchema = z.string().regex(/^sha256:[0-9a-f]{64}$/);
 const SafeSequenceSchema = z.number().int().safe().nonnegative();
 const IdentifierSchema = z.string().min(1).transform(value => value.normalize("NFC")).refine(value => (

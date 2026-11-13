@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { createCodexRoundCollector } from "./codex-client.js";
-import { createConsecutiveHumanRoundMerger, getRoundUserMessages, type ConversationRound, type SubagentSummary } from "./trajectory.js";
+import { createConsecutiveHumanRoundMerger, getRoundToolAttachments, getRoundUserMessages, type ConversationRound, type SubagentSummary } from "./trajectory.js";
 import type { CorpusMessage, CorpusMessageRole, CorpusSourcePosition } from "./conversation-corpus-types.js";
 import type { CodexStreamingHistoryPosition } from "./codex-history-source.js";
 import type { ConversationAttachment } from "./conversation-attachments.js";
@@ -77,7 +77,11 @@ export function projectCodexCorpusRound(
     if (roles.includes("subagent") && !(round.semanticEvents || []).some(event => event.semanticRole === "subagent")) {
         for (const child of round.subagentSummaries) append("subagent", [child.nickname, child.summary || child.status || ""].filter(Boolean).join("\n"), round.endStep, undefined, { attachments: child.attachments }, child);
     }
-    for (const tool of round.toolCalls) append("tool", [tool.name, tool.argsFull || tool.argsSummary, tool.resultFull || tool.resultSummary].filter(Boolean).join("\n"), tool.stepIndex);
+    const toolAttachments = new Map<number | undefined, ConversationAttachment[]>();
+    for (const attachment of getRoundToolAttachments(round)) toolAttachments.set(attachment.stepIndex,
+        [...(toolAttachments.get(attachment.stepIndex) || []), attachment]);
+    for (const tool of round.toolCalls) append("tool", [tool.name, tool.argsFull || tool.argsSummary, tool.resultFull || tool.resultSummary].filter(Boolean).join("\n"), tool.stepIndex,
+        undefined, { attachments: toolAttachments.get(tool.stepIndex) || [] });
     return messages.sort((left, right) => left.step - right.step || left.sequence - right.sequence).map(({ step: _step, sequence: _sequence, ...message }) => message);
 }
 

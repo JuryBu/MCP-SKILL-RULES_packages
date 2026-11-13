@@ -6,7 +6,8 @@ import os from "node:os";
 import { z } from "zod";
 import { touchActivity } from "../lifecycle.js";
 import { restoreRecordToolMaterials } from "../record-tool-material.js";
-import { listConversationsByMtime, detectWorkspaceFromSteps, fetchFirstPageSteps } from "../ls-client.js";
+import { detectWorkspaceFromSteps, fetchFirstPageSteps } from "../ls-client.js";
+import { listAntigravityRecordConversations } from "../record-discovery.js";
 import {
     readRecord, readRecordAsync, writeRecord, writeRecordWithCommitArtifactLockHeld, upsertRecordIndex,
     deleteRecord, deleteRecordWithCommitArtifactLockHeld, withRecordCommitArtifactLock, listRecords, copyRecordToHash,
@@ -1532,9 +1533,9 @@ action:
             conversationId: z.string().optional()
                 .describe("对话 ID（update 不传则自动获取当前对话）；audit默认目标，显式recordIds/auditAll时仅保留调用来源身份"),
             workspace: z.string().optional()
-                .describe("Record 存储工作区路径，显式指定时优先使用该工作区；audit 的来源工作区仍取原对话元数据"),
+                .describe("Record 存储工作区路径；范围操作默认 scope=workspace，必须显式提供非空路径；共享 broker 不从 cwd 或 conversationId 猜测。audit 的来源工作区仍取原对话元数据"),
             scope: z.enum(["workspace", "global", "general"]).optional()
-                .describe("[search/list/audit/migrate_unknown_chain/stale_check] 范围，默认 workspace；workspace 严格只读指定工作区"),
+                .describe("[list/search/guide/audit_ownership/repair_ownership/migrate_unknown_chain/stale_check] 默认 workspace，须提供 workspace；general 显式选择通用区，global 显式选择全部范围"),
             includeGeneral: z.boolean().optional()
                 .describe("[list/search/audit_ownership/stale_check] 兼容开关：显式把 general 也并入 workspace 结果，默认 false"),
             query: z.string().optional()
@@ -1626,6 +1627,13 @@ action:
                     || args.action === "stale_check",
             });
             try {
+                const requiresWorkspaceScope = ["list", "search", "guide", "audit_ownership", "repair_ownership", "migrate_unknown_chain", "stale_check"].includes(args.action);
+                if (requiresWorkspaceScope && (args.scope ?? "workspace") === "workspace" && !args.workspace?.trim()) {
+                    return {
+                        ...rt(`❌ record_manage(${args.action}) 的 scope=workspace（默认）需要非空 workspace 路径。请传 workspace="实际工作区绝对路径"；检查通用区请显式传 scope="general"，检查全部范围请显式传 scope="global"。workspace 必须单独提供，共享 broker 不从 conversationId 或服务 cwd 推断工作区。`, startMs),
+                        isError: true,
+                    };
+                }
                 const hash = await resolveWorkspaceHashForRecordAsync(args.workspace);
                 const chains = resolveChainSplit({ chain: args.chain, dataChain: args.dataChain, modelChain: args.modelChain });
                 if (
@@ -1713,7 +1721,7 @@ action:
                         }
                     }
                     case "repair_ownership":
-                        return await handleRepairOwnership(hash, args.scope, chains.dataChain, args.dryRun ?? true, args.backup ?? true, startMs);
+                        return await handleRepairOwnership(hash, args.scope ?? "workspace", chains.dataChain, args.dryRun ?? true, args.backup ?? true, startMs);
                     case "migrate_unknown_chain":
                         return await handleUnknownChainMigration(hash, args.scope, args.includeGeneral, args.apply, startMs);
                     case "edit":
@@ -3481,8 +3489,9 @@ interface ConversationMtimeInfo {
 async function fetchConversationListForChain(chain: string, limit: number): Promise<Map<string, ConversationMtimeInfo>> {
     const map = new Map<string, ConversationMtimeInfo>();
     if (chain === "antigravity") {
-        const conversations = listConversationsByMtime({ limit: Math.max(limit * 3, 50) });
-        for (const conv of conversations) {
+        const listing = await listAntigravityRecordConversations({ limit: Math.max(limit * 3, 50) });
+        if (listing.partial) throw new Error(`Antigravity Record directory is incomplete: ${JSON.stringify({ diagnostics: listing.diagnostics, warnings: listing.warnings })}`);
+        for (const conv of listing.conversations) {
             map.set(conv.id, { id: conv.id, lastModifiedMs: conv.mtime.getTime(), title: conv.title });
         }
     } else if (chain === "codex") {
@@ -5131,7 +5140,8 @@ async function resolveFrozenBatchWorkspace(
     resolvedChain: ResolvedConversationChain,
     workspaceFilter: string | undefined,
 ): Promise<{ workspace: string | null; workspaceUnresolved: boolean }> {
-    if (resolvedChain === "antigravity") {
+    const hasDirectoryWorkspace = [candidate.workspace, ...(candidate.workspaceUris || [])].some(workspace => typeof workspace === "string" && workspace.trim());
+    if (resolvedChain === "antigravity" && !hasDirectoryWorkspace) {
         const steps = await fetchFirstPageSteps(candidate.id);
         const detectedWorkspace = steps ? detectWorkspaceFromSteps(steps) : "";
         if (!detectedWorkspace) return { workspace: null, workspaceUnresolved: true };
@@ -5152,12 +5162,8 @@ export function resolveBatchCandidateWorkspace(
     workspaceFilter: string | undefined,
     detectedWorkspace?: string,
 ): string | null {
-    if (resolvedChain === "antigravity") {
-        if (!detectedWorkspace) return null;
-        return workspaceMatchesFilter(detectedWorkspace, workspaceFilter) ? detectedWorkspace : null;
-    }
-    const workspaces = resolvedChain === "windsurf"
-        ? [candidate.workspace, ...(candidate.workspaceUris || [])]
+    const workspaces = resolvedChain === "windsurf" || resolvedChain === "antigravity"
+        ? [candidate.workspace, ...(candidate.workspaceUris || []), ...(resolvedChain === "antigravity" && detectedWorkspace ? [detectedWorkspace] : [])]
         : [candidate.workspace];
     const actualWorkspace = workspaces.find(workspace => typeof workspace === "string" && workspaceMatchesFilter(workspace, workspaceFilter));
     return actualWorkspace || null;
@@ -5181,23 +5187,26 @@ async function collectBatchConversationCandidates(
     let sourceEnumerationLimited = false;
 
     if (resolvedChain === "antigravity") {
-        const conversations = listConversationsByMtime({
+        const listing = await listAntigravityRecordConversations({
             after: args.after,
             before: args.before,
             limit: sourceEnumerationLimit,
         });
+        const conversations = listing.conversations;
+        sourceEnumerationLimited = listing.partial || conversations.length >= sourceEnumerationLimit;
         if (conversations.length === 0) {
             return {
                 candidates: [],
-                emptyReason: "📦 无符合条件的对话",
-                diagnostics: emptyRecordBatchCandidateDiagnostics(),
+                emptyReason: listing.partial ? "📦 来源目录尚未完整枚举，当前未找到符合条件的对话" : "📦 无符合条件的对话",
+                diagnostics: emptyRecordBatchCandidateDiagnostics({ sourceEnumerationLimited }),
             };
         }
-        sourceEnumerationLimited = conversations.length >= sourceEnumerationLimit;
         rawCandidates = conversations.map(conv => ({
             id: conv.id,
             chain: "antigravity",
             lastModifiedMs: conv.mtime.getTime(),
+            workspace: conv.workspace,
+            workspaceUris: conv.workspaces,
         }));
     } else if (resolvedChain === "codex") {
         const afterMs = args.after ? new Date(args.after).getTime() : null;

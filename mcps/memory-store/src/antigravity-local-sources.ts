@@ -32,6 +32,7 @@ export interface AntigravityLocalDiagnostic {
     sourcePath?: string;
     conversationId?: string;
     occurrences?: number;
+    conversationIds?: string[];
 }
 
 export interface AntigravityLocalCandidate {
@@ -135,15 +136,12 @@ function workspaceUris(value: unknown): string[] {
 }
 
 async function metadataRows(root: AntigravityDataRoot, options: AntigravityLocalOptions): Promise<Record<string, unknown>[]> {
-    const filename = path.join(root.root, "conversation_summaries.db");
-    try { await fs.access(filename); } catch (error) {
-        if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
-        throw error;
-    }
-    const { DatabaseSync } = await import("node:sqlite");
-    const database = new DatabaseSync(filename, { readOnly: true, allowExtension: false, timeout: 100 });
-    try {
-        database.exec("PRAGMA query_only=ON");
+    const source = await antigravitySourceFile(root.root, "conversation_summaries.db", "db");
+    if (!source) return [];
+    const wal = await antigravitySourceFile(root.root, "conversation_summaries.db-wal", "db");
+    const files = wal ? [source, wal] : [source];
+    const { withAntigravitySqliteSnapshot } = await import("./antigravity-sqlite-snapshot.js");
+    return withAntigravitySqliteSnapshot({ files }, options, async database => {
         const columns = new Set(database.prepare("PRAGMA table_info(conversation_summaries)").all().map(row => String(row.name)));
         if (!columns.has("conversation_id")) throw new Error("Antigravity summary index has no conversation_id");
         const fields = ["conversation_id", "title", "preview", "workspace_uris", "step_count", "last_modified_time", "parent_conversation_id", "agent_name", "nesting_depth"]
@@ -176,7 +174,7 @@ async function metadataRows(root: AntigravityDataRoot, options: AntigravityLocal
             if (rows.length % 128 === 0) await new Promise<void>(resolve => setImmediate(resolve));
         }
         return rows;
-    } finally { database.close(); }
+    });
 }
 
 export async function listAntigravityLocalConversations(options: AntigravityLocalOptions = {}): Promise<AntigravityLocalCandidate[]> {
@@ -188,56 +186,64 @@ export async function listAntigravityLocalConversations(options: AntigravityLoca
         options.onDiagnostic?.({ code: "ANTIGRAVITY_METADATA_UNAVAILABLE", message: String(error), sourcePath: root.root });
     };
     for (const root of antigravityDataRoots(options)) {
-        assertAntigravityReadActive(options);
-        const metadata = new Map<string, Record<string, unknown>>();
-        try { for (const row of await metadataRows(root, options)) metadata.set(String(row.conversation_id), row); }
-        catch (error) { report(root, error); }
-        const ids = new Set(metadata.keys());
-        if (options.conversationIds?.length) {
-            for (const target of options.conversationIds.map(splitAntigravityId)) if (target.kind === root.kind) ids.add(target.nativeId);
-        } else {
-            for (const folder of ["conversations", "implicit", "brain"]) {
-                try {
-                    const directory = await fs.opendir(path.join(root.root, folder));
-                    for await (const entry of directory) {
-                        assertAntigravityReadActive(options);
-                        const id = folder === "brain" && entry.isDirectory() ? entry.name : entry.isFile() && /\.(pb|db)$/iu.test(entry.name) ? entry.name.slice(0, -3) : "";
-                        if (id && /^[a-zA-Z0-9_-]+$/u.test(id)) ids.add(id);
-                        if (ids.size > 20_000) {
-                            options.onDiagnostic?.({ code: "ANTIGRAVITY_CANDIDATE_LIMIT", message: "Antigravity discovery reached 20000 candidates", sourcePath: root.root });
-                            break;
-                        }
-                    }
-                } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") report(root, error); }
-            }
-        }
-        for (const nativeId of ids) {
+        const metadataOnlyIds: string[] = [];
+        try {
             assertAntigravityReadActive(options);
-            if (!/^[a-zA-Z0-9_-]+$/u.test(nativeId)) continue;
-            const row = metadata.get(nativeId) || {};
-            const id = antigravityQualifiedId(nativeId, root.kind);
-            if (options.conversationIds?.length && !options.conversationIds.includes(id)) continue;
-            const parentConversationId = row.parent_conversation_id ? antigravityQualifiedId(String(row.parent_conversation_id), root.kind) : undefined;
-            const isChildThread = Boolean(parentConversationId || Number(row.nesting_depth));
-            if (options.threadMode === "children" && (id === options.parentConversationId || parentConversationId !== options.parentConversationId)) continue;
-            if (options.threadMode === "main" && isChildThread) continue;
-            const files = await antigravityConversationFiles(root, nativeId, options);
-            if (!files.length && !metadata.has(nativeId)) continue;
-            const workspaces = workspaceUris(row.workspace_uris);
-            const query = options.query?.trim().toLowerCase();
-            if (query && ![id, row.title, row.preview, ...workspaces, row.agent_name].join("\n").toLowerCase().includes(query)) continue;
-            const hasPb = files.some(file => file.kind === "pb");
-            const hasJsonl = files.some(file => file.kind === "jsonl");
-            if (!files.length) options.onDiagnostic?.({ code: "ANTIGRAVITY_METADATA_ONLY", conversationId: id,
-                sourcePath: path.join(root.root, "conversation_summaries.db"),
-                message: `${id}: directory metadata only; no local conversation body. GUI and CLI IDs are independent; no title-based association was made.` });
-            const lastModified = Math.max(0, ...files.map(file => file.mtimeMs), Date.parse(String(row.last_modified_time || "")) || 0);
-            output.push({ id, nativeId, root, title: String(row.title || row.preview || id), workspace: workspaces[0] || "", workspaces,
-                updatedAt: new Date(lastModified).toISOString(), sourceKind: `antigravity-${root.kind}-${hasPb && hasJsonl ? "pb+jsonl" : hasJsonl ? "jsonl" : hasPb ? "pb" : "sqlite-metadata"}`,
-                sourcePath: files.find(file => file.kind === "jsonl")?.path || files[0]?.path || path.join(root.root, "conversation_summaries.db"),
-                parentConversationId,
-                isChildThread, agentName: String(row.agent_name || "") || undefined,
-                stepCount: typeof row.step_count === "number" ? row.step_count : undefined, bytes: files.reduce((sum, file) => sum + file.size, 0), files });
+            const metadata = new Map<string, Record<string, unknown>>();
+            try { for (const row of await metadataRows(root, options)) metadata.set(String(row.conversation_id), row); }
+            catch (error) { report(root, error); }
+            const ids = new Set(metadata.keys());
+            if (options.conversationIds?.length) {
+                for (const target of options.conversationIds.map(splitAntigravityId)) if (target.kind === root.kind) ids.add(target.nativeId);
+            } else {
+                for (const folder of ["conversations", "implicit", "brain"]) {
+                    try {
+                        const directory = await fs.opendir(path.join(root.root, folder));
+                        for await (const entry of directory) {
+                            assertAntigravityReadActive(options);
+                            const id = folder === "brain" && entry.isDirectory() ? entry.name : entry.isFile() && /\.(pb|db)$/iu.test(entry.name) ? entry.name.slice(0, -3) : "";
+                            if (id && /^[a-zA-Z0-9_-]+$/u.test(id)) ids.add(id);
+                            if (ids.size > 20_000) {
+                                options.onDiagnostic?.({ code: "ANTIGRAVITY_CANDIDATE_LIMIT", message: "Antigravity discovery reached 20000 candidates", sourcePath: root.root });
+                                break;
+                            }
+                        }
+                    } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") report(root, error); }
+                }
+            }
+            for (const nativeId of ids) {
+                assertAntigravityReadActive(options);
+                if (!/^[a-zA-Z0-9_-]+$/u.test(nativeId)) continue;
+                const row = metadata.get(nativeId) || {};
+                const id = antigravityQualifiedId(nativeId, root.kind);
+                if (options.conversationIds?.length && !options.conversationIds.includes(id)) continue;
+                const parentConversationId = row.parent_conversation_id ? antigravityQualifiedId(String(row.parent_conversation_id), root.kind) : undefined;
+                const isChildThread = Boolean(parentConversationId || Number(row.nesting_depth));
+                if (options.threadMode === "children" && (id === options.parentConversationId || parentConversationId !== options.parentConversationId)) continue;
+                if (options.threadMode === "main" && isChildThread) continue;
+                const files = await antigravityConversationFiles(root, nativeId, options);
+                if (!files.length && !metadata.has(nativeId)) continue;
+                const workspaces = workspaceUris(row.workspace_uris);
+                const query = options.query?.trim().toLowerCase();
+                if (query && ![id, row.title, row.preview, ...workspaces, row.agent_name].join("\n").toLowerCase().includes(query)) continue;
+                const hasPb = files.some(file => file.kind === "pb");
+                const hasJsonl = files.some(file => file.kind === "jsonl");
+                if (!files.length) metadataOnlyIds.push(id);
+                const lastModified = Math.max(0, ...files.map(file => file.mtimeMs), Date.parse(String(row.last_modified_time || "")) || 0);
+                output.push({ id, nativeId, root, title: String(row.title || row.preview || id), workspace: workspaces[0] || "", workspaces,
+                    updatedAt: new Date(lastModified).toISOString(), sourceKind: `antigravity-${root.kind}-${hasPb && hasJsonl ? "pb+jsonl" : hasJsonl ? "jsonl" : hasPb ? "pb" : "sqlite-metadata"}`,
+                    sourcePath: files.find(file => file.kind === "jsonl")?.path || files[0]?.path || path.join(root.root, "conversation_summaries.db"),
+                    parentConversationId,
+                    isChildThread, agentName: String(row.agent_name || "") || undefined,
+                    stepCount: typeof row.step_count === "number" ? row.step_count : undefined, bytes: files.reduce((sum, file) => sum + file.size, 0), files });
+            }
+        } finally {
+            if (metadataOnlyIds.length) {
+                const sourcePath = path.join(root.root, "conversation_summaries.db");
+                options.onDiagnostic?.({ code: "ANTIGRAVITY_METADATA_ONLY", sourcePath,
+                    occurrences: metadataOnlyIds.length, conversationId: metadataOnlyIds[0], conversationIds: metadataOnlyIds,
+                    message: `${metadataOnlyIds.length} ${root.kind} conversations have directory metadata only; local bodies are unavailable. Affected conversationIds and exact lookup are retained in structured diagnostics.` });
+            }
         }
     }
     const sorted = output.sort((left, right) => Date.parse(right.updatedAt) - Date.parse(left.updatedAt));

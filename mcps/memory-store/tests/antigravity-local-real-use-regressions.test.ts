@@ -61,7 +61,7 @@ try {
     await writeLog(gui, "mixed", log);
     writeDatabase("mixed");
     const mixed = await loadAntigravityLocalConversation("mixed", options);
-    assert.equal(ANTIGRAVITY_LOCAL_NORMALIZATION_VERSION, 3);
+    assert.equal(ANTIGRAVITY_LOCAL_NORMALIZATION_VERSION, 4);
     assert.equal(mixed?.partial, false);
     assert.equal(mixed?.coverage.complete, true);
     assert.equal(mixed?.totalSteps, 3);

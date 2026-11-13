@@ -9,10 +9,11 @@ import { antigravityConversationFiles, assertAntigravityReadActive, listAntigrav
     type AntigravityLocalCandidate, type AntigravityLocalDiagnostic, type AntigravityLocalFile, type AntigravityLocalOptions } from "./antigravity-local-sources.js";
 import { antigravityEventsToRounds, antigravityPbEvents, mergeAntigravityEventSequences, type AntigravityLocalEvent } from "./antigravity-local-projection.js";
 import { readAntigravitySqliteBody, readAntigravitySqliteIndices } from "./antigravity-local-sqlite.js";
+import { withAntigravitySqliteSnapshot } from "./antigravity-sqlite-snapshot.js";
 
 export { listAntigravityLocalConversations, antigravityDataRoots, splitAntigravityId } from "./antigravity-local-sources.js";
 export type { AntigravityDataRoot, AntigravityLocalCandidate, AntigravityLocalDiagnostic, AntigravityLocalOptions } from "./antigravity-local-sources.js";
-export const ANTIGRAVITY_LOCAL_NORMALIZATION_VERSION = 3;
+export const ANTIGRAVITY_LOCAL_NORMALIZATION_VERSION = 4;
 
 export interface AntigravityLocalConversationResult {
     rounds: ConversationRound[];
@@ -195,23 +196,25 @@ export async function loadAntigravityLocalConversation(conversationId: string, o
     }
     if (metadata.files.some(file => file.kind === "db" && file.path.endsWith(".db"))) {
         try {
-            persistedIndices = await readAntigravitySqliteIndices(metadata, options);
-            const available = new Set(events.map(event => event.stepIndex));
-            const missing = persistedIndices?.filter(index => !available.has(index)) || [];
-            if (events.length && missing.length > 256) diagnose("ANTIGRAVITY_SQLITE_SUPPLEMENT_BUDGET", `${missing.length} DB-only positions exceed the 256-position supplement budget`);
-            else if (missing.length) {
-                const sqlite = await readAntigravitySqliteBody(metadata, options, missing);
-                for (const diagnostic of sqlite.diagnostics) diagnose(diagnostic.code, diagnostic.message, diagnostic.sourcePath);
-                if (sqlite.result) {
-                    pbResults.push(sqlite.result);
-                    const sourcePath = metadata.files.find(file => file.path.endsWith(".db"))!.path;
-                    for (const event of antigravityPbEvents(sqlite.result, sourcePath)) {
-                        const position = events.findIndex(item => item.stepIndex > event.stepIndex);
-                        events.splice(position < 0 ? events.length : position, 0, { ...event, raw: { ...event.raw, sqlite: true } });
+            await withAntigravitySqliteSnapshot(metadata, options, async database => {
+                persistedIndices = await readAntigravitySqliteIndices(metadata, options, database);
+                const available = new Set(events.map(event => event.stepIndex));
+                const missing = persistedIndices?.filter(index => !available.has(index)) || [];
+                if (events.length && missing.length > 256) diagnose("ANTIGRAVITY_SQLITE_SUPPLEMENT_BUDGET", `${missing.length} DB-only positions exceed the 256-position supplement budget`);
+                else if (missing.length) {
+                    const sqlite = await readAntigravitySqliteBody(metadata, options, events.length ? missing : undefined, database);
+                    for (const diagnostic of sqlite.diagnostics) diagnose(diagnostic.code, diagnostic.message, diagnostic.sourcePath);
+                    if (sqlite.result) {
+                        pbResults.push(sqlite.result);
+                        const sourcePath = metadata.files.find(file => file.path.endsWith(".db"))!.path;
+                        for (const event of antigravityPbEvents(sqlite.result, sourcePath)) {
+                            const position = events.findIndex(item => item.stepIndex > event.stepIndex);
+                            events.splice(position < 0 ? events.length : position, 0, { ...event, raw: { ...event.raw, sqlite: true } });
+                        }
+                        actualSourceKind = `antigravity-${metadata.root.kind}-${metadata.files.some(file => file.kind === "pb") ? "pb+" : ""}${jsonlEvents ? "jsonl+" : ""}sqlite`;
                     }
-                    actualSourceKind = `antigravity-${metadata.root.kind}-${metadata.files.some(file => file.kind === "pb") ? "pb+" : ""}${jsonlEvents ? "jsonl+" : ""}sqlite`;
                 }
-            }
+            });
         } catch (error) {
             assertAntigravityReadActive(options);
             diagnose("ANTIGRAVITY_SQLITE_COVERAGE_UNAVAILABLE", String(error));

@@ -1998,7 +1998,7 @@ fetch/search/read/recall/export 必须传 conversationId（共享 broker 后端�
             sourceRevision: z.string().min(1).optional()
                 .describe("[read_hit] 搜索命中项的来源版本，确保轮次和原文对应"),
             lastRounds: z.number().int().min(1).max(100000).optional()
-                .describe("[read_hit/read_fast] 读取最后几轮，与startRound/endRound择一；冷来源需扫描采用链以取得正式末轮"),
+                .describe("[prepare/read_hit/read_fast/read_ready及带progressiveTaskId的read/export] 读取最后几轮，与startRound/endRound择一；旧read未带progressiveTaskId时请改用read_fast，冷来源需扫描采用链以取得正式末轮"),
             prepareCache: z.boolean().optional()
                 .describe("[read_fast] 默认true，并行准备完整正文缓存，返回可查询/取消/恢复的原taskId；false仅取得所需原文"),
             progressive: z.boolean().optional()
@@ -2114,6 +2114,37 @@ fetch/search/read/recall/export 必须传 conversationId（共享 broker 后端�
             try {
                 if (isProgressiveAction(params) || (params.action === "read_fast" && params.lastRounds !== undefined && params.progressive !== false && !dependencies.corpus && !params.forceRefresh && params.source !== "cache" && params.source !== "ls")) {
                     return corpusToolResult(await runProgressiveAction(params), params);
+                }
+                if (params.action === "read" && params.lastRounds !== undefined) {
+                    const callerConversationId = params.conversationId?.trim();
+                    const targetConversationIds = params.conversationIds ?? (callerConversationId ? [callerConversationId] : []);
+                    const dataChain = resolveChainSplit({ chain: params.chain, dataChain: params.dataChain }).dataChain;
+                    const next = callerConversationId && targetConversationIds.length === 1 && targetConversationIds[0]?.trim() && dataChain !== "auto"
+                        ? {
+                            action: "read_fast" as const,
+                            conversationId: callerConversationId,
+                            conversationIds: [targetConversationIds[0].trim()],
+                            dataChain,
+                            lastRounds: params.lastRounds,
+                            ...(params.progressive !== undefined ? { progressive: params.progressive } : {}),
+                            ...(params.prepareCache !== undefined ? { prepareCache: params.prepareCache } : {}),
+                            ...(params.source === "local" ? { source: "local" as const } : {}),
+                            ...(params.messageRoles ? { messageRoles: params.messageRoles } : {}),
+                            ...(params.depth ? { depth: params.depth } : {}),
+                            ...(params.extraTypes ? { extraTypes: params.extraTypes } : {}),
+                            ...(params.format ? { format: params.format } : {}),
+                        }
+                        : undefined;
+                    return appendTiming({
+                        isError: true,
+                        structuredContent: { code: "READ_LAST_ROUNDS_REQUIRES_READ_FAST", callerConversationId, targetConversationIds, ...(next ? { next } : {}) },
+                        content: [{ type: "text" as const, text: [
+                            "❌ 旧 action=read 未带 progressiveTaskId 时不支持 lastRounds，本次未加载或返回整篇原文。",
+                            "读取末 N 轮请用 action=read_fast、lastRounds 和明确的 dataChain；conversationId 保持当前调用者，conversationIds 指定一个目标。已准备范围可沿原 progressiveTaskId 使用 read+lastRounds。",
+                            "固定旧缓存版本或 LS 的 read 请移除 lastRounds，并使用 startRound/endRound；read_fast 使用 source=auto/local，不携带旧 cacheGeneration/continuationCursor。",
+                            ...(next ? [`next: ${JSON.stringify(next)}`] : []),
+                        ].join("\n") }],
+                    }, startTime);
                 }
                 if (isCorpusAction(params.action)) {
                     if (params.action === "search_all" && params.background === false) throw new Error("search_all使用可查询的后台任务，请省略background或设为true");
@@ -3470,6 +3501,10 @@ fetch/search/read/recall/export 必须传 conversationId（共享 broker 后端�
             } catch (error) {
                 return appendTiming({
                     isError: true,
+                    structuredContent: {
+                        callerConversationId: params.conversationId,
+                        ...(params.conversationIds !== undefined ? { targetConversationIds: params.conversationIds } : {}),
+                    },
                     content: [{
                         type: "text" as const,
                         text: formatToolError(`conversation_read_original(${params.action})`, error, {
@@ -3484,7 +3519,9 @@ fetch/search/read/recall/export 必须传 conversationId（共享 broker 后端�
                             chain: params.chain,
                             dataChain: params.dataChain,
                             modelChain: params.modelChain,
-                        }),
+                        }) + (params.conversationIds !== undefined
+                            ? `\n调用者 conversationId: ${JSON.stringify(params.conversationId ?? null)}；目标 conversationIds: ${JSON.stringify(params.conversationIds)}`
+                            : ""),
                     }],
                 }, startTime);
             }

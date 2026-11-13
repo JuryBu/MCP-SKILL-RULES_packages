@@ -628,10 +628,27 @@ async function listSourceCandidates(
             : await dsh.list(limit));
         return rows.map(candidateFromDshSession);
     }
-    const discovered = await adapters.antigravity.discover?.(limit, options);
-    if (discovered) diagnostics.push(...discovered.diagnostics);
-    const rows = discovered?.conversations || await adapters.antigravity.list(limit);
-    const candidates = rows.map(item => ({
+    let localCandidates: UnifiedConversationCandidate[] = [];
+    if (options.source !== "ls" && (!options.adapters || adapters.localList)) {
+        try {
+            const localOptions = { ...options, threadMode: undefined, parentConversationId: undefined };
+            localCandidates = adapters.localList ? await adapters.localList("antigravity", limit, localOptions)
+                : await listLocalSourceCandidates("antigravity", limit, localOptions, diagnostics);
+        } catch (error) {
+            if (options.isCancelled?.() || options.signal?.aborted || options.sourceFailureMode === "fail") throw error;
+            diagnostics.push({ code: "AGY_LOCAL_METADATA_UNAVAILABLE", sourceKind: "antigravity-local", message: String(error) });
+        }
+    }
+    let rows: Awaited<ReturnType<ConversationSourceAdapters["antigravity"]["list"]>> = [];
+    try {
+        const discovered = await adapters.antigravity.discover?.(limit, options);
+        if (discovered) diagnostics.push(...discovered.diagnostics);
+        rows = discovered?.conversations || await adapters.antigravity.list(limit);
+    } catch (error) {
+        if (options.isCancelled?.() || options.signal?.aborted || options.sourceFailureMode === "fail" || !localCandidates.length) throw error;
+        diagnostics.push({ code: "AGY_LEGACY_METADATA_UNAVAILABLE", sourceKind: "antigravity-pb", message: String(error) });
+    }
+    const candidates: UnifiedConversationCandidate[] = rows.map(item => ({
         id: item.id,
         dataChain: "antigravity",
         title: item.title || "",
@@ -639,11 +656,25 @@ async function listSourceCandidates(
         updatedAt: item.mtime.toISOString(),
         detail: `${(item.sizeKB || 0).toFixed(1)} KB`,
     } satisfies UnifiedConversationCandidate));
+    const byId = new Map(candidates.map(candidate => [candidate.id, candidate]));
+    for (const local of localCandidates) {
+        const legacy = byId.get(local.id);
+        if (!legacy) { candidates.push(local); byId.set(local.id, local); continue; }
+        const merged = { ...legacy, ...local,
+            title: local.title && local.title !== local.id ? local.title : legacy.title || local.title,
+            workspace: local.workspace || legacy.workspace,
+            workspaces: [...new Set([...(local.workspaces || []), local.workspace, legacy.workspace].filter(Boolean))],
+            updatedAt: (Date.parse(local.updatedAt) || 0) >= (Date.parse(legacy.updatedAt) || 0) ? local.updatedAt : legacy.updatedAt,
+        };
+        Object.assign(legacy, merged);
+    }
+    candidates.sort((left, right) => (Date.parse(right.updatedAt) || 0) - (Date.parse(left.updatedAt) || 0));
     if (!probeWorkspace) return candidates;
     const probeLimit = Math.min(candidates.length, Math.max(Number(process.env.MEMORY_STORE_CONVERSATION_ANTIGRAVITY_WORKSPACE_PROBE_LIMIT || 50), 0));
     const timeoutMs = Math.max(Number(process.env.MEMORY_STORE_CONVERSATION_ANTIGRAVITY_WORKSPACE_PROBE_TIMEOUT_MS || 5000), 100);
     await Promise.all(candidates.slice(0, probeLimit).map(async candidate => {
         if (candidate.workspace) return;
+        if (candidate.id.startsWith("antigravity-cli:")) return;
         try {
             if (options.isCancelled?.()) throw new Error("Antigravity workspace discovery cancelled");
             const remainingMs = Math.min(timeoutMs, (options.deadlineAt ?? Date.now() + timeoutMs) - Date.now());

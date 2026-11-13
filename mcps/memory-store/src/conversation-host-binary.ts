@@ -59,7 +59,8 @@ export async function listBinaryHostConversations(source: "windsurf" | "antigrav
             ?? (request.threadMode === "children" && request.parentConversationId ? [request.parentConversationId] : undefined);
         const discovered = await discoverDevinConversations({ ...options.devinOptions,
             conversationIds: parentTargets,
-            limit: options.listLimit || 10_000, verifyAliases: false, isCancelled: control.isCancelled });
+            limit: options.listLimit || 10_000, verifyAliases: false, isCancelled: control.isCancelled,
+            deadlineMs: control.deadlineAt ?? options.devinOptions?.deadlineMs });
         partial ||= discovered.partial;
         warnings.push(...discovered.diagnostics.map(item => `${item.code}: ${item.message}`));
         conversations.push(...discovered.conversations.map(summary => ({ source, id: summary.canonicalId, canonicalId: summary.canonicalId,

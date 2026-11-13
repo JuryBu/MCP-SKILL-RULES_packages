@@ -4,7 +4,7 @@ import path from "path";
 import { readFiniteIntegerEnv } from "./conversation-source-cache.js";
 import { TEMP_DIR } from "./temp-store.js";
 import { materializeClaudeCodeInlineImage, type ClaudeCodeInlineImageSource } from "./claude-code-attachments.js";
-import type { ConversationRound } from "./trajectory.js";
+import type { ConversationRound, ConversationMessageRole } from "./trajectory.js";
 
 export type ConversationAttachmentKind = "image" | "file";
 export type ConversationAttachmentSource =
@@ -39,6 +39,7 @@ export interface ConversationAttachment {
     tempPath?: string;
     warning?: string;
     stepIndex?: number;   // 新增：附件在 trajectory 中的原始 step；export 时定位时序，缺失回退旧行为
+    semanticRole?: ConversationMessageRole;
     claudeCodeInlineImage?: ClaudeCodeInlineImageSource;
 }
 
@@ -61,7 +62,7 @@ export function filterRoundAttachmentsForRoles(round: ConversationRound, roles: 
     for (const response of round.aiResponses) roleByStep.set(response.stepIndex, "assistant");
     for (const tool of round.toolCalls) roleByStep.set(tool.stepIndex, "tool");
     for (const event of round.semanticEvents || []) {
-        if (event.stepIndex !== undefined) roleByStep.set(event.stepIndex, event.semanticRole);
+        if (event.stepIndex !== undefined && event.kind !== "source_record") roleByStep.set(event.stepIndex, event.semanticRole);
     }
     const selected = (role: string): boolean => subagentSource && ["user", "assistant", "model"].includes(role)
         ? roles.has("subagent")
@@ -69,23 +70,31 @@ export function filterRoundAttachmentsForRoles(round: ConversationRound, roles: 
     const referenceKey = (attachment: ConversationAttachment): string => attachment.dataUrl
         || normalizePathKey(attachment.tempPath || attachment.originalPath || attachment.reference || "");
     const userReferences = new Set(userMessages.flatMap(message => (message.attachments || []).map(referenceKey)).filter(Boolean));
-    const keep = (attachment: ConversationAttachment): boolean => {
+    const attachmentRole = (attachment: ConversationAttachment): string | undefined => {
+        if (attachment.semanticRole) return attachment.semanticRole;
+        if (attachment.source === "antigravity-uri" || attachment.source === "antigravity-tool-image") return "tool";
         const role = attachment.stepIndex === undefined ? undefined : roleByStep.get(attachment.stepIndex);
-        if (role) return selected(role);
-        if (userReferences.has(referenceKey(attachment))) return selected("user");
-        if (attachment.source === "antigravity-uri" || attachment.source === "antigravity-tool-image") return selected("tool");
-        if (attachment.stepIndex !== undefined) return false;
-        return selected("user");
+        if (role) return role;
+        if (userReferences.has(referenceKey(attachment))) return "user";
+        return attachment.stepIndex === undefined ? "user" : undefined;
     };
+    const keep = (attachment: ConversationAttachment): boolean => {
+        const role = attachmentRole(attachment);
+        return role !== undefined && selected(role);
+    };
+    const userMedia = (reference: string): boolean => !(round.attachments || []).some(attachment => referenceKey(attachment)
+        === (reference.startsWith("data:") ? reference : normalizePathKey(reference)) && attachmentRole(attachment) !== "user");
     return {
         ...round,
-        mediaAttachments: selected("user") ? [...round.mediaAttachments] : [],
+        mediaAttachments: selected("user") ? round.mediaAttachments.filter(userMedia) : [],
         attachments: round.attachments?.filter(keep),
         userMessages: round.userMessages?.map(message => ({
             ...message,
-            mediaAttachments: selected("user") ? message.mediaAttachments : [],
-            attachments: selected("user") ? message.attachments : [],
+            mediaAttachments: selected("user") ? message.mediaAttachments?.filter(userMedia) : [],
+            attachments: selected("user") ? message.attachments?.filter(attachment => attachmentRole(attachment) === "user"
+                && (attachment.stepIndex === undefined || message.stepIndex === undefined || attachment.stepIndex === message.stepIndex)) : [],
         })),
+        semanticEvents: round.semanticEvents?.map(event => ({ ...event, attachments: event.attachments?.filter(keep) })),
     };
 }
 
@@ -193,6 +202,14 @@ function attachmentMaterializationKey(attachment: ConversationAttachment): strin
     return undefined;
 }
 
+function applyMaterializedAttachment(attachment: ConversationAttachment, resolved: ConversationAttachment): ConversationAttachment {
+    const details: Partial<ConversationAttachment> = {};
+    for (const key of ["mimeType", "sizeBytes", "sha256", "exists", "tempPath", "warning"] as const) {
+        if (resolved[key] !== undefined) Object.assign(details, { [key]: resolved[key] });
+    }
+    return { ...attachment, ...details };
+}
+
 function dedupeAttachments(attachments: ConversationAttachment[]): ConversationAttachment[] {
     const seen = new Set<string>();
     const result: ConversationAttachment[] = [];
@@ -203,8 +220,9 @@ function dedupeAttachments(attachments: ConversationAttachment[]): ConversationA
             ? `${attachment.kind}:data:${attachment.dataUrl.slice(0, 160)}:${attachment.dataUrl.length}`
             : materializationKey ? `${attachment.kind}:data:${materializationKey}`
                 : `${attachment.kind}:path:${normalizePathKey(attachment.originalPath || attachment.name || "")}`;
-        if (seen.has(key)) continue;
-        seen.add(key);
+        const occurrenceKey = `${attachment.stepIndex ?? "legacy"}:${attachment.semanticRole || ""}:${key}`;
+        if (seen.has(occurrenceKey)) continue;
+        seen.add(occurrenceKey);
         result.push(attachment);
     }
     return result;
@@ -380,6 +398,7 @@ export function extractAntigravityToolImages(mt: any, stepIndex: number): Conver
             originalPath: normalized,
             exists: true,
             stepIndex,
+            semanticRole: "tool",
         });
     }
     return attachments;
@@ -525,6 +544,8 @@ export async function materializeRoundAttachments(
             ...message,
             attachments: message.attachments?.filter(attachment => !isRequestHeadingAttachment(attachment)),
         })),
+        semanticEvents: round.semanticEvents?.map(event => ({ ...event,
+            attachments: event.attachments?.filter(attachment => !isRequestHeadingAttachment(attachment)) })),
     }));
     const jobs: Array<{ round: ConversationRound; attachment: ConversationAttachment; index: number }> = [];
     const hasBudgetExpired = (): boolean => Number.isFinite(options.deadlineAt) && Date.now() >= Number(options.deadlineAt);
@@ -634,7 +655,14 @@ export async function materializeRoundAttachments(
             message.attachments = message.attachments.map(attachment => {
                 const key = attachmentMaterializationKey(attachment);
                 const resolved = key ? materializedByDataUrl.get(key) : undefined;
-                return resolved ? { ...attachment, ...resolved } : attachment;
+                return resolved ? applyMaterializedAttachment(attachment, resolved) : attachment;
+            });
+        }
+        for (const event of round.semanticEvents || []) {
+            event.attachments = event.attachments?.map(attachment => {
+                const key = attachmentMaterializationKey(attachment);
+                const resolved = key ? materializedByDataUrl.get(key) : undefined;
+                return resolved ? applyMaterializedAttachment(attachment, resolved) : attachment;
             });
         }
     }

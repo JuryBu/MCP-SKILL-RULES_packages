@@ -137,6 +137,7 @@ export interface ConversationLoadResult {
     sourcePartial?: boolean;
     antigravityNormalizationVersion?: number;
     antigravityLocalNormalizationVersion?: number;
+    antigravitySourceSelectionVersion?: number;
     sourceCoverage?: {
         unit: "step";
         startStep: number;
@@ -163,6 +164,8 @@ export function conversationSourceIsPartial(loaded: Pick<ConversationLoadResult,
 
 function conversationCacheNormalizationNeedsRefresh(snapshot: ConversationLoadResult): boolean {
     return Boolean(
+        (snapshot.chainUsed === "antigravity" && snapshot.antigravitySourceSelectionVersion !== 1)
+        ||
         (snapshot.antigravityLocalNormalizationVersion !== undefined
             && snapshot.antigravityLocalNormalizationVersion !== ANTIGRAVITY_LOCAL_NORMALIZATION_VERSION)
         ||
@@ -186,6 +189,7 @@ export function getConversationRoundIndexBounds(loaded: Pick<ConversationLoadRes
 
 interface CachedConversationLoadResult extends ConversationLoadResult {
     cacheAuthority?: ConversationCacheAuthority;
+    antigravityFullLocalTranscript?: boolean;
 }
 
 function countConversationOverview(rounds: ConversationRound[]): { aiResponseCount: number; toolCallCount: number } {
@@ -1471,6 +1475,7 @@ async function lsConversationResult(
         return {
             chainUsed: resolved,
             conversationId,
+            antigravitySourceSelectionVersion: 1,
             rounds: mergeConsecutiveHumanRounds(parseRounds(steps)),
             totalSteps: trajectory.numTotalSteps || steps.length,
             cacheAuthority: "ls",
@@ -1512,8 +1517,13 @@ async function localAntigravityConversationResult(
     if (!hasConversationVisibleBody(local.rounds)) throw new Error(`Antigravity ${conversationId} has metadata but no readable local conversation body`);
     return {
         chainUsed: "antigravity", conversationId: local.metadata.id,
+        antigravitySourceSelectionVersion: 1,
         rounds: local.rounds, totalSteps: local.totalSteps,
         cacheAuthority: "local", sourcePartial: local.partial,
+        antigravityFullLocalTranscript: local.metadata.id === conversationId && local.sourceComplete
+            && local.coverage.complete && local.coverage.startStep === 0
+            && local.coverage.endStepExclusive === local.coverage.totalSteps
+            && local.sourceFiles.some(file => file.kind === "jsonl" && /[\\/]transcript_full\.jsonl$/u.test(file.path)),
         antigravityLocalNormalizationVersion: ANTIGRAVITY_LOCAL_NORMALIZATION_VERSION,
         cacheFingerprint: local.fingerprint,
         sourceRevision: { revision: local.fingerprint.revision || "", contentCursor: String(local.coverage.endStepExclusive), eventWatermark: null },
@@ -1567,7 +1577,7 @@ async function loadRawConversationData(
             ? localAntigravityConversationResult(effectiveId, options)
             : localPbToConversationResult(resolved, effectiveId, options);
         if (source === "ls") return lsConversationResult(resolved, effectiveId, options);
-        let local: ConversationLoadResult | null = null;
+        let local: CachedConversationLoadResult | null = null;
         let localError: unknown;
         let localReservedBytes = 0;
         try {
@@ -1577,7 +1587,18 @@ async function loadRawConversationData(
         } catch (error) {
             throwIfConversationLoadCancelled(options);
             if (error instanceof LocalPbReaderError && (error.code === "CANCELLED" || error.code === "DEADLINE_EXCEEDED")) throw error;
+            if (resolved === "antigravity" && !(error instanceof LocalPbReaderError)
+                && !/^(?:ANTIGRAVITY_BODY_UNAVAILABLE:|Antigravity .+ has metadata but no readable local conversation body$)/u.test(error instanceof Error ? error.message : String(error))) throw error;
             localError = error;
+        }
+        if (local?.antigravityFullLocalTranscript) {
+            if (local.sourceCoverage) local.sourceCoverage = { ...local.sourceCoverage, comparison: "not_requested" };
+            local.sourceDiagnostics = [...(local.sourceDiagnostics || []), "auto: 完整本地 JSONL 已按文件身份、连续覆盖与来源修订认证，直接采用本地正文，未调用旧 LS 解析"];
+            return local;
+        }
+        if (resolved === "antigravity" && effectiveId.startsWith("antigravity-cli:")) {
+            if (localError) throw localError;
+            return local;
         }
         if (local && options.locateWindow) {
             local.sourcePartial = true;
@@ -1604,7 +1625,8 @@ async function loadRawConversationData(
             if (relation === "conflict") {
                 throw new Error(`${resolved} 本地 PB 与 LS 内容冲突，拒绝盲目拼接`);
             }
-            const selected = relation === "local_contains_live" ? local : live;
+            const selected = relation === "local_contains_live"
+                || (resolved === "antigravity" && relation === "equal" && !local.sourcePartial) ? local : live;
             if (selected.sourceCoverage) selected.sourceCoverage = { ...selected.sourceCoverage, comparison: "complete" };
             selected.sourceDiagnostics = [
                 ...(local.sourceDiagnostics || []),

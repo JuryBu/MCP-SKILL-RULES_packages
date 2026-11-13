@@ -1,4 +1,4 @@
-# MCP Memory Store v1.27.10
+# MCP Memory Store v1.28.1
 
 原文各入口统一使用`conversationId`记录调用者、`conversationIds`选择目标。单条`fetch/search/read/recall/export`接受一个目标，旧调用省略目标数组时仍按`conversationId`读取；批量导出显式使用`exportBatch=true`。历史范围先准备所需内容，再把完整构建沿原任务排入后台，已发布引用继续可读。
 
@@ -40,7 +40,7 @@ Codex采用明文追加段时，近期窗口可先返回局部正文，旧压缩
 
 `record_manage(action="audit_ownership")`只读核查。默认以`conversationId`选择单条Record；显式`recordIds`选择多条，此时`conversationId`保留调用来源身份。检查整个范围须明确传`auditAll=true`，它与`recordIds`互斥；目标未匹配返回零项及未匹配ID，不扩大查询。
 
-有`workspace`时默认`scope="workspace"`，没有时默认`general`；工作区默认排除general，显式`includeGeneral=true`可合并。`limit`默认50、最大200，限制实际检查的唯一对话ID数，同一ID在范围内的全部副本一起参与判定。
+归属核查与过期检查默认使用`scope="workspace"`，必须显式提供非空`workspace`路径；通用区或全范围分别明确传`scope="general"`或`"global"`。共享broker不会从服务目录猜当前工作区。工作区默认排除general，显式`includeGeneral=true`可合并。`limit`默认50、最大200，限制实际检查的唯一对话ID数，同一ID在范围内的全部副本一起参与判定。
 
 `format="json"`返回全部本页分类、范围覆盖、共享来源查找开销与逐ID检测耗时；文本展示异常预览，并同时返回同一`structuredContent`。保留相同范围和目标参数，以`nextAuditCursor`作为下一次`auditCursor`继续。游标绑定所选索引，范围或目标索引变化会拒绝续页；`coverage.hasMore`表示还有下一页，`complete`只在本页覆盖整个目标集时为true，分页并集由调用者逐页核对。
 
