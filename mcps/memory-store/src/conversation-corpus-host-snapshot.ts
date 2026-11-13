@@ -170,6 +170,15 @@ function selectRound(round: ConversationRound, requested: CorpusMessageRole[], s
     };
 }
 
+export function selectHostCorpusProjectionRoles(projection: CorpusProjection, messageRoles?: CorpusMessageRole[]): CorpusProjection {
+    const requested = roles(messageRoles);
+    return {
+        ...projection,
+        messages: projection.messages.filter(message => requested.includes(message.role)),
+        rounds: projection.rounds?.map(round => selectRound(round, requested, projection.conversation.isChildThread)),
+    };
+}
+
 export async function rememberHostCorpusProjection(projection: CorpusProjection, control: CorpusReadControl,
     options: SnapshotOptions = {}): Promise<void> {
     let lock: string | undefined;

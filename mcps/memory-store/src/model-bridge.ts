@@ -1250,14 +1250,14 @@ async function callModelResponseInternal(
             const lsModel = options.antigravityModelOverride || model;
             const rawResult = options.responseValidator
                 ? await callValidatedLsCandidates(lsModel, prompt, remainingMs, deadline.signal, options.responseValidator, failures)
-                : { ...await callLsModelDetailed(lsModel, prompt, remainingMs), modelUsed: lsModel };
+                : await callLsModelDetailed(lsModel, prompt, remainingMs, { signal: deadline.signal });
             const actualModel = rawResult.modelUsed || lsModel;
             const result = validateCandidate("antigravity", actualModel, rawResult);
             if (deadline.remainingMs() === 0) {
                 recordFailure("antigravity", actualModel, result.error || deadlineFailure("execution").error!, result.failureClass ?? "UnknownOutcome");
                 return { ...deadlineFailure("execution"), modelUsed: actualModel, error: [result.error, deadlineFailure("execution").error].filter(Boolean).join("；") };
             }
-            if (result.cancelled || result.failureClass === "UnknownOutcome") return { ...result, chainUsed: "antigravity", modelUsed: actualModel };
+            if (result.cancelled || result.failureClass === "UnknownOutcome" || result.safetyStopped) return { ...result, chainUsed: null, modelUsed: actualModel };
             if (candidates.length === 1) singleCandidateFailureClass = result.failureClass;
             if (result.text) return { text: result.text, chainUsed: "antigravity", modelUsed: actualModel };
             recordFailure("antigravity", actualModel, result.error || "Antigravity LS 模型调用失败", result.failureClass);

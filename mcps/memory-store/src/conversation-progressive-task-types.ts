@@ -58,6 +58,7 @@ export interface ProgressiveReadyState {
     fullFetchCache?: { cacheKey: ConversationSourceCacheKey; cacheGeneration: string; conversationId: string; sourcePartial: boolean; roundCount: number };
     updatedAt: string;
     warnings: string[];
+    historicalWarnings?: string[];
     initialWindow?: { revision: string; kind: string; endRound: number };
 }
 

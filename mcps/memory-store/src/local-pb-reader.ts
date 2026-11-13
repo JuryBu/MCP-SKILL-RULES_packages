@@ -547,6 +547,12 @@ function findTrajectory(root: ProtoMessage, kind: LocalPbCandidateKind): ProtoMe
     return best;
 }
 
+export function decodeLocalPbStepPayload(payload: Uint8Array, index: number, sourceFlavor: LocalPbSourceFlavor): LocalPbStep {
+    if (!Number.isSafeInteger(index) || index < 0) throw new LocalPbReaderError("INVALID_RANGE", "Step index must be a nonnegative safe integer");
+    if (payload.byteLength > DEFAULT_MAX_PAYLOAD_BYTES) throw new LocalPbReaderError("PAYLOAD_TOO_LARGE", "Step payload exceeds the supported byte budget");
+    return parseStep(parseProtoMessage(payload), index, sourceFlavor);
+}
+
 function parseStep(message: ProtoMessage, index: number, sourceFlavor: LocalPbSourceFlavor): LocalPbStep {
     const plannerMessage = firstNestedField(message, 20);
     const metadataMessage = firstNestedField(message, 5);

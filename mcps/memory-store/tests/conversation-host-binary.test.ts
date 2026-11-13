@@ -60,7 +60,13 @@ try {
         const changed = await provider.read(conversation, {});
         assert.equal(changed.totalRounds, 201);
         assert.notEqual(changed.revision, full.revision);
-        await assert.rejects(provider.readRounds(conversation, { revision: full.revision, startRound: 1, endRound: 1 }), /revision changed/u);
+        const historical = await provider.readRounds(conversation, { revision: full.revision, startRound: 1, endRound: 1 });
+        assert.equal(historical.revision, full.revision);
+        assert.equal(historical.snapshotSourceRevision, full.revision);
+        assert.equal(historical.sourceRevalidatedThisCall, false);
+        assert.doesNotMatch(historical.messages.map(message => message.text).join("\n"), /edited/u);
+        const uncached = createHostCorpusProvider(source, { ...options, cacheRoot: path.join(root, `${source}-uncached`) });
+        await assert.rejects(uncached.readRounds(conversation, { revision: full.revision, startRound: 1, endRound: 1 }), /revision changed/u);
         await assert.rejects(provider.readFast(conversation, { lastRounds: 1 }, { isCancelled: () => true }), error => (error as Error).name === "AbortError");
         const invalid = path.join(root, `${source}-invalid.pb`);
         await writeFile(invalid, Buffer.alloc(64));

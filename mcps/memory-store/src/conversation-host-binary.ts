@@ -9,6 +9,7 @@ import { assertHostFileUnchanged, captureHostFile, type HostFileRevision } from 
 import { assertHostReadActive, hostCorpusDigest, type HostCorpusSnapshot } from "./conversation-host-projection.js";
 import type { HostCorpusReaderOptions } from "./conversation-corpus-reader-hosts.js";
 import type { CorpusConversation, CorpusFastReadRequest, CorpusReadControl, CorpusSearchRequest, CorpusSourceStatus, CorpusVerifiedIdentity } from "./conversation-corpus-types.js";
+import { listAntigravityLocalConversations, loadAntigravityLocalConversation } from "./antigravity-local-history.js";
 
 const verifiedIdentities = new WeakMap<CorpusConversation, CorpusVerifiedIdentity>();
 
@@ -37,6 +38,17 @@ export function corpusProjectionIdentityMatches(actual: CorpusConversation, expe
 }
 
 export async function listBinaryHostConversations(source: "windsurf" | "antigravity", request: CorpusSearchRequest, control: CorpusReadControl, options: HostCorpusReaderOptions): Promise<{ conversations: CorpusConversation[]; statuses: CorpusSourceStatus[] }> {
+    if (source === "antigravity") {
+        const warnings: string[] = [];
+        const local = await listAntigravityLocalConversations({ conversationIds: request.conversationIds, limit: options.listLimit || 10_000,
+            isCancelled: control.isCancelled, onDiagnostic: diagnostic => warnings.push(`${diagnostic.code}: ${diagnostic.message}`) });
+        const conversations: CorpusConversation[] = local.map(candidate => ({ source, id: candidate.id, canonicalId: candidate.id,
+            title: candidate.title, workspace: candidate.workspace, updatedAt: candidate.updatedAt, rolloutPath: candidate.sourcePath,
+            sourceKind: candidate.sourceKind, sourceWarnings: [], parentConversationId: candidate.parentConversationId,
+            isChildThread: candidate.isChildThread, agentRole: candidate.isChildThread ? "subagent" : undefined }));
+        assertHostReadActive(control);
+        return { conversations, statuses: [{ source, status: warnings.length ? "partial" : "ok", candidateCount: conversations.length, warnings }] };
+    }
     const { listLocalPbConversationCandidates } = await import("./conversation-local-list.js");
     const warnings: string[] = [];
     const conversations: CorpusConversation[] = [];
@@ -129,6 +141,7 @@ function comparePbCandidates(results: LocalPbReadResult[]): LocalPbReadResult {
 
 export function createBinaryHostReader(source: "windsurf" | "antigravity", options: HostCorpusReaderOptions) {
     let preparedState: PreparedState | undefined;
+    let antigravityFull: HostCorpusSnapshot | undefined;
     const readPb = async (conversation: CorpusConversation, request: CorpusFastReadRequest | undefined, control: CorpusReadControl): Promise<HostCorpusSnapshot> => {
         const started = performance.now();
         const id = conversation.canonicalId || conversation.id;
@@ -204,7 +217,30 @@ export function createBinaryHostReader(source: "windsurf" | "antigravity", optio
     const read = async (conversation: CorpusConversation, request: CorpusFastReadRequest | undefined, control: CorpusReadControl): Promise<HostCorpusSnapshot> => {
         const started = performance.now();
         assertHostReadActive(control);
-        if (source === "antigravity" || options.pbCandidates) return readPb(conversation, request, control);
+        if (options.pbCandidates) return readPb(conversation, request, control);
+        if (source === "antigravity") {
+            const id = conversation.canonicalId || conversation.id;
+            const origin = (await listAntigravityLocalConversations({ conversationIds: [id], limit: 1, isCancelled: control.isCancelled }))[0];
+            if (origin?.root.kind === "gui" && origin.files.length && origin.files.every(file => file.kind === "pb")) return readPb(conversation, request, control);
+            if (!control.forceRefresh && antigravityFull?.conversation?.id === conversation.id) {
+                const { fingerprintAntigravityLocalConversation } = await import("./antigravity-local-history.js");
+                const fingerprint = await fingerprintAntigravityLocalConversation(id, { maxBytes: options.maxSourceBytes, isCancelled: control.isCancelled });
+                if (fingerprint?.revision === antigravityFull.revision) return { ...antigravityFull,
+                    timings: { ...antigravityFull.timings, totalMs: performance.now() - started, preparedReused: 1 } };
+            }
+            const local = await loadAntigravityLocalConversation(conversation.canonicalId || conversation.id, {
+                maxBytes: options.maxSourceBytes, pbReaderOptions: options.pbReaderOptions, isCancelled: control.isCancelled,
+            });
+            if (!local) throw new Error(`No Antigravity local history source for ${conversation.id}`);
+            const snapshot: HostCorpusSnapshot = { conversation: { ...conversation, canonicalId: local.metadata.id, sourceKind: local.sourceKind, rolloutPath: local.metadata.sourcePath,
+                title: local.metadata.title, workspace: local.metadata.workspace, parentConversationId: local.metadata.parentConversationId,
+                isChildThread: local.metadata.isChildThread }, revision: local.fingerprint.revision!, rounds: local.rounds, roundNumbering: "absolute",
+                totalRounds: local.rounds.length, sourceComplete: local.sourceComplete, rangeComplete: !local.partial,
+                partial: local.partial, warnings: local.sourceDiagnostics.map(diagnostic => `${diagnostic.code}: ${diagnostic.message}`),
+                sourceBytes: local.timings.sourceBytes, timings: { ...local.timings, totalMs: performance.now() - started } };
+            antigravityFull = snapshot;
+            return snapshot;
+        }
         const ownedIdentityCache = options.devinOptions?.identityCache ? undefined : new DevinIdentityCache();
         const physicalWindow = Boolean(request?.lastRounds && conversation.sourceKind === "devin-desktop"
             && /^[\da-f]{8}-[\da-f]{4}-[\da-f]{4}-[\da-f]{4}-[\da-f]{12}$/iu.test(conversation.canonicalId || conversation.id));

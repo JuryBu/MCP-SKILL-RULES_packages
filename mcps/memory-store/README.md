@@ -253,7 +253,7 @@ Record markdown 仍是唯一事实源。v1.12 的 Record Reader 方向只增强�
 - 路径别名会先做保守规范化：`C:\project` 与 `\\?\C:\project` 会归为同一 workspace identity；已存在的旧 alias hash 作为兼容候选读取，但成功 repair/update 后会被标记为 `superseded`。
 - `repair_ownership` 默认 `dryRun=true`，只返回迁移计划；非 dry-run 首版只 copy/upsert 到目标 workspace，并写入 ownership sidecar 标记来源副本被取代，不删除来源副本。
 
-### Codex / Claude Code / Windsurf 对话原文来源
+### 五端对话原文来源
 
 当工具走 `chain="codex"` 时，对话原文来自 Codex 本地数据：
 
@@ -280,7 +280,11 @@ Claude Code 的 `compact_boundary + isCompactSummary` 续聊摘要默认作为�
 
 Claude Code 的桌面 UI 有时会让用户以为仍在同一条聊天里继续，但底层可能已经写入新的 JSONL；MCP 默认不把这些物理会话自动拼成一条，避免同名标题误合并。需要排查时可先用 `conversation_read_original(action="fetch", dataChain="claude-code", conversationId="...", logicalChain="explain")` 查看候选；只有显式 `logicalChain="auto|strict"` 或 Record 更新的安全自动路径，才会在强证据足够时恢复逻辑续聊链。
 
-Windsurf 链路下的原文来自本机 Windsurf Language Server 的只读 Cascade 接口。工具只调用 `GetAllCascadeTrajectories` 和 `GetCascadeTrajectorySteps`，不会调用发送消息、模型代理或 ACP summary-agent。WSF 用户图片从 `userInput.images[]` 转成 `windsurf-data-url` 附件描述，`fetch/list` 只显示统计，`read/search` 命中轮次时再按既有数量、大小、并发和总量限制生成临时图片。WSF 首版不支持 `deep_locate` 后台深搜，也不把 `.pb` 离线文件当主读取来源。
+Windsurf/Devin链路同时接入旧Cascade只读LS/PB与Devin Local只读SQLite，按实际来源选择读取。词对ID与桌面UUID只在结构化身份核验后关联，完整fetch后的普通read/search默认复用已发布缓存；显式source=auto/local重新核来源版本，source=cache固定已提交内容。新正文搜索、范围准备及后台deep_locate均支持windsurf；图片仍按所选轮次懒处理，来源缺口和未核身份保留提示。
+
+Antigravity链路同时支持旧PB及新版GUI/CLI本地历史，GUI与CLI的同名ID分开记录。完整JSONL优先，紧凑日志被截短的事件需补齐或标记缺失；跨代同ID对话保留旧历史、尾部内容和PB内部ID映射。SQLite补充目录、父子关系及实际支持的正文格式，格式未知时保留诊断。App关闭仍可读取已有本地来源；在线LS继续按实际认证与覆盖使用。完整fetch generation供Record、提取和Guard复用，partial来源保留已取得内容及缺口，完整来源消费者继续检查完整性。
+
+Antigravity文字模型分支按当前账号GetUserStatus目录选择可用型号，普通材料默认Flash M318，较强模型和Claude保留显式选择。App在线时核验Hub、PID和端口；App离线时按需启动本任务CLI自带LS，仅用必要prompt/model生成，用完回收。目录读取、生成成功和结果未知分别记录，未知结果停止原调用；原Grok、Codex及其它外层模型顺序保持。
 
 WSF 工具类 steps 从 v1.15.2 起会进入统一执行记录：`CORTEX_STEP_TYPE_RUN_COMMAND`、`MCP_TOOL`、`FIND`、`VIEW_FILE`、`CODE_ACTION`、`LIST_DIRECTORY`、`COMMAND_STATUS`、`PROXY_WEB_SERVER` 会分别映射为命令、MCP、检索、文件查看、代码改动、目录、状态等短证据。Stage Guard 会读取这些归一化证据；如果 WSF LS 因单个超大 step 返回 partial，Guard 和 Record 仍会明确提示 partial 风险，不把缺失片段当作已验证。
 

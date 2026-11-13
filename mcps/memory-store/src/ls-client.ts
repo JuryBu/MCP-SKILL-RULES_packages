@@ -13,6 +13,8 @@ import {
 } from "./ls-registry.js";
 import type { LocalPbStepRangeRequest, LocalPbStepCoverage } from "./local-pb-reader.js";
 import { DEFAULT_ANTIGRAVITY_LS_MODEL_FALLBACKS } from "./ls-model-defaults.js";
+import { discoverAppLsProcesses } from "./ls-app-discovery.js";
+import { resolveLsCliCommand, runLsModelRequest, type LsRuntimeOptions, type LsRuntimeResult } from "./ls-model-runtime.js";
 import {
     type LsProcessInfo,
     rpcCall,
@@ -21,7 +23,6 @@ import {
     HEAVY_TIMEOUT,
     LIGHT_TIMEOUT,
 } from "./ls-rpc.js";
-import type { FailureClass } from "./record-scheduler-contracts.js";
 import {
     resolveEndpointForConversation,
     enumerateActiveLs,
@@ -79,6 +80,7 @@ let parentLs: ParentLsConnection | null = null;
 let parentLsInitPromise: Promise<void> | null = null;
 let parentLsInitDone = false;
 let lsDisabledForTest = false;
+let parentLsInjectedForTest = false;
 
 /**
  * 测试专用：完全禁用 LS 发现路径，使 isLsAvailable() 返回 false。
@@ -103,6 +105,7 @@ export function getParentLs(): ParentLsConnection | null {
  */
 export function __setParentLsForTest(conn: ParentLsConnection | null): void {
     parentLs = conn;
+    parentLsInjectedForTest = conn !== null;
     parentLsInitDone = conn !== null;
     if (conn === null) lsDisabledForTest = false;
 }
@@ -116,6 +119,7 @@ export function __resetLsTestOverridesForTest(): void {
     parentLs = null;
     parentLsInitDone = false;
     parentLsInitPromise = null;
+    parentLsInjectedForTest = false;
 }
 
 /**
@@ -262,6 +266,7 @@ export function __setLsDiscoveryForTest(fn: (() => LsProcessInfo[]) | null): voi
 
 export function discoverLsProcesses(): LsProcessInfo[] {
     if (lsDiscoveryOverride) return lsDiscoveryOverride();
+    const appProcesses = discoverAppLsProcesses();
     try {
         const encodedCmd = Buffer.from(LS_DISCOVERY_SCRIPT, 'utf16le').toString('base64');
         const stdout = execSync(`powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand ${encodedCmd}`, {
@@ -270,9 +275,9 @@ export function discoverLsProcesses(): LsProcessInfo[] {
             windowsHide: true,
         }).trim();
 
-        return parseLsDiscoveryOutput(stdout);
+        return [...appProcesses, ...parseLsDiscoveryOutput(stdout).filter(entry => !appProcesses.some(app => app.pid === entry.pid))];
     } catch {
-        return [];
+        return appProcesses;
     }
 }
 
@@ -1367,6 +1372,7 @@ export function detectWorkspaceFromSteps(steps: any[]): string | null {
 export async function isLsAvailable(): Promise<boolean> {
     if (lsDisabledForTest) return false;
     if (parentLs) return true;
+    if (resolveLsCliCommand()) return true;
 
     try {
         const lsInfo = discoverParentLs();
@@ -1398,94 +1404,7 @@ export function getLsModelCandidates(model: string): string[] {
     return candidates;
 }
 
-async function callGetModelResponseOn(
-    info: LsProcessInfo,
-    port: number,
-    model: string,
-    prompt: string,
-    timeout: number
-): Promise<string | null> {
-    let lastHttpFailure: number | undefined;
-    let receivedSuccessfulResponse = false;
-    for (const candidate of getLsModelCandidates(model)) {
-        const result = await rpcCall(info, port, "GetModelResponse", {
-            model: candidate,
-            prompt,
-        }, timeout);
-        if (result.status !== 200) {
-            lastHttpFailure = result.status;
-            continue;
-        }
-        receivedSuccessfulResponse = true;
-        const text = result.data?.response ?? null;
-        if (text) {
-            if (candidate !== model) {
-                console.error(`[ls-client] GetModelResponse model fallback: ${model} -> ${candidate}`);
-            }
-            return text;
-        }
-    }
-    if (!receivedSuccessfulResponse && lastHttpFailure !== undefined) {
-        throw new Error(`GetModelResponse HTTP ${lastHttpFailure}`);
-    }
-    return null;
-}
-
-/** 结构化模型调用结果，透传真超时信号（区别于普通失败）。 */
-export interface LsModelResult {
-    text: string | null;
-    error?: string;
-    /** true 仅表示「真超时」（wall-clock 兜底或 socket inactivity 超时）；
-     *  连接被拒 / 进程死 / 空响应等普通失败一律 false，仍可由上层重试或换候选。 */
-    timedOut?: boolean;
-    failureClass?: FailureClass;
-}
-
-/** 哨兵错误：wall-clock 兜底超时（区别于 socket "Request timeout"）。 */
-const LS_WALL_CLOCK_TIMEOUT = Symbol("ls-wall-clock-timeout");
-
-/** 判定一个错误是否属于「真超时」。
- *  真超时来源有二：① 本层 wall-clock 兜底（LS_WALL_CLOCK_TIMEOUT 哨兵）；
- *  ② httpPost 的 socket inactivity 超时（reject Error("Request timeout")）。
- *  连接被拒（ECONNREFUSED）、进程死、解析失败等都不算超时。 */
-function isTimeoutError(err: unknown): boolean {
-    if (err === LS_WALL_CLOCK_TIMEOUT) return true;
-    const message = err instanceof Error ? err.message : String(err ?? "");
-    // 仅匹配 httpPost 显式抛出的超时文案，避免把含 "timeout" 的其它错误误判成真超时。
-    return /^Request timeout$/u.test(message);
-}
-
-/**
- * 给一个 Promise 套上 wall-clock 超时兜底。
- * socket inactivity 超时（httpPost 内的 req.timeout）在「连接活着但 LS 长时间不返回」时
- * 不一定可靠触发（TCP keep-alive / 偶发数据会重置计时器），故在此再叠一层确定性 wall-clock 超时，
- * 保证 timeoutMs 到点后必定以「真超时」收口，不会无限挂起、也不会把超时误压成普通失败。
- */
-function withWallClockTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
-    return new Promise<T>((resolve, reject) => {
-        let settled = false;
-        const timer = setTimeout(() => {
-            if (settled) return;
-            settled = true;
-            reject(LS_WALL_CLOCK_TIMEOUT);
-        }, timeoutMs);
-        if (typeof timer.unref === "function") timer.unref();
-        promise.then(
-            (value) => {
-                if (settled) return;
-                settled = true;
-                clearTimeout(timer);
-                resolve(value);
-            },
-            (err) => {
-                if (settled) return;
-                settled = true;
-                clearTimeout(timer);
-                reject(err);
-            },
-        );
-    });
-}
+export type LsModelResult = LsRuntimeResult;
 
 /**
  * 结构化版：返回 {text, error, timedOut}，把「真超时」与「普通失败」区分开。
@@ -1496,44 +1415,21 @@ export async function callGetModelResponseDetailed(
     model: string,
     prompt: string,
     timeoutMs?: number,
+    options: LsRuntimeOptions = {},
 ): Promise<LsModelResult> {
-    const timeout = timeoutMs || LIGHT_TIMEOUT;
-    let attemptedLsCall = false;
-    try {
-        const text = await withWallClockTimeout((async () => {
-            if (parentLs) {
-                attemptedLsCall = true;
-                return await callGetModelResponseOn(parentLs.info, parentLs.port, model, prompt, timeout);
+    if (lsDisabledForTest) return { text: null, error: "Antigravity LS disabled for test", failureClass: "Availability" };
+    return runLsModelRequest(model, prompt, timeoutMs || LIGHT_TIMEOUT, {
+        ...options,
+        connection: options.connection || (parentLsInjectedForTest ? parentLs || undefined : undefined),
+        discoverLegacy: options.discoverLegacy || (async () => {
+            const info = discoverParentLs();
+            if (info) {
+                const port = await findHttpPort(info);
+                if (port) return { info, port };
             }
-
-            // parentLs 未初始化时降级
-            const lsInfo = discoverParentLs();
-            if (lsInfo) {
-                const port = await findHttpPort(lsInfo);
-                if (port) {
-                    attemptedLsCall = true;
-                    return await callGetModelResponseOn(lsInfo, port, model, prompt, timeout);
-                }
-            }
-
-            const fallback = await findFallbackLsConnection();
-            if (!fallback) return null;
-            attemptedLsCall = true;
-            return await callGetModelResponseOn(fallback.info, fallback.port, model, prompt, timeout);
-        })(), timeout);
-
-        if (text) return { text };
-        if (attemptedLsCall) {
-            return { text: null, error: "Antigravity LS 模型返回为空", timedOut: false, failureClass: "Quality" };
-        }
-        return { text: null, error: "Antigravity LS 连接或进程不可用", timedOut: false, failureClass: "Availability" };
-    } catch (err: any) {
-        const timedOut = isTimeoutError(err);
-        const message = err === LS_WALL_CLOCK_TIMEOUT
-            ? `Antigravity LS 模型调用超时（${timeout}ms）`
-            : (err?.message ? `Antigravity LS 模型调用失败: ${err.message}` : "Antigravity LS 模型调用失败");
-        return { text: null, error: message, timedOut, failureClass: "Availability" };
-    }
+            return findFallbackLsConnection();
+        }),
+    });
 }
 
 export type AntigravityEvidenceCacheState = "bypassed" | "used" | "stale";

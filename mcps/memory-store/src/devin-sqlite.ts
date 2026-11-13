@@ -5,6 +5,7 @@ import type { ConversationSourceFingerprint } from "./conversation-source-cache.
 import type { DevinConversationSummary, DevinDesktopMessage, DevinRawConversation, DevinReadOptions, DevinDiscoveryOptions, DevinDiscoveryResult, DevinDiscoveryDiagnostic } from "./devin-types.js";
 import { findCliIdentityCandidates, readCliConversations, validateDevinRoundRange, type CliConversation } from "./devin-sqlite-cli.js";
 import { DevinIdentityCache } from "./devin-identity-cache.js";
+import { devinSourceValidationRevision } from "./devin-source-validation.js";
 import { ReadBudget, DevinReadError, asTimestamp, columns, desktopFiles, devinPaths, digest, inSnapshot, isFile, jsonObject } from "./devin-sqlite-store.js";
 
 export { DevinReadError } from "./devin-sqlite-store.js";
@@ -28,6 +29,7 @@ interface CatalogEntry {
 }
 
 const verifiedAliasSummaries = new Map<string, DevinConversationSummary>();
+type ValidatedDevinSummary = DevinConversationSummary & { identitySourceRevision?: string };
 
 export function verifiedDevinAliasHints(): DevinConversationSummary[] {
     return [...verifiedAliasSummaries.values()].map(summary => structuredClone(summary));
@@ -271,6 +273,11 @@ async function readTargetIdentityCatalog(id: string, budget: ReadBudget, filenam
     if (rangeRequested && cli?.summary.warnings.some(warning => /^DEVIN_(?:CHAIN_|SUMMARY_REFERENCE_|INVALID_JSON)/u.test(warning))) {
         throw new DevinReadError("DEVIN_RANGE_UNAVAILABLE", `Cannot establish round boundaries in the selected CLI source: ${cli.summary.warnings.join(", ")}; use a full read to inspect source diagnostics.`);
     }
+    if (hint && (hint as ValidatedDevinSummary).identitySourceRevision
+        && (hint as ValidatedDevinSummary).identitySourceRevision === devinSourceValidationRevision(budget.maxDesktopFiles, () => budget.check())) {
+        const selected = await Promise.all(hint.desktopPaths.map(filename => readDesktop(filename, budget, true)));
+        return readCatalog(budget, true, hint.desktopPaths, [hint.canonicalId], selected, cli ? [cli] : undefined);
+    }
     const selected: DesktopConversation[] = [];
     const exactDesktop = desktops.find(filename => path.parse(filename).name.toLowerCase() === id.toLowerCase());
     if (cli) {
@@ -306,36 +313,13 @@ async function readTargetIdentityCatalog(id: string, budget: ReadBudget, filenam
 }
 
 async function reuseVerifiedAliases(result: DevinDiscoveryResult, budget: ReadBudget): Promise<void> {
-    const paths = devinPaths();
-    if (!isFile(paths.cli)) return;
     const present = new Set(result.conversations.map(summary => summary.id));
+    const revision = devinSourceValidationRevision(budget.maxDesktopFiles, () => budget.check());
     for (const [key, cached] of [...verifiedAliasSummaries]) {
         if (key !== aliasCacheKey(cached) || !cached.aliases.some(alias => present.has(alias))) continue;
-        if (!cached.desktopPaths.every(filename => isFile(filename))) { verifiedAliasSummaries.delete(key); continue; }
-        const validation = new DevinIdentityCache();
-        try {
-        const filenames = [paths.cli, ...cached.desktopPaths].sort();
-        const before = await validation.version(filenames, budget);
-        const desktops: DesktopConversation[] = [];
-        for (const filename of cached.desktopPaths) {
-            if (!isFile(filename)) { verifiedAliasSummaries.delete(key); break; }
-            desktops.push(await readDesktop(filename, budget, true));
-        }
-        if (!verifiedAliasSummaries.has(key) || !desktops.length) continue;
-        const cli = (await readCliConversations(paths.cli, budget, { identityOnly: true, sessionId: cached.canonicalId }))[0];
-        const matches = await findCliIdentityCandidates(paths.cli, budget,
-            [...new Set(desktops.flatMap(desktop => [...desktop.messageIds]))],
-            [...new Set(desktops.flatMap(desktop => [...desktop.toolCallIds]))], cli && !cli.summary.partial ? [cli.summary.canonicalId] : []);
-        if (cli) matches.sessionIds.unshift(cli.summary.canonicalId);
-        if (matches.uncertain || !matches.sessionIds.length) { verifiedAliasSummaries.delete(key); continue; }
-        const entries = await readCatalog(budget, true, cached.desktopPaths, matches.sessionIds, desktops);
-        const verified = entries.find(entry => entry.summary.canonicalId === cached.canonicalId && entry.summary.uuid === cached.uuid && !entry.excludedFromList);
-        if (!verified || !cached.aliases.every(alias => verified.summary.aliases.includes(alias))) { verifiedAliasSummaries.delete(key); continue; }
-        if (await validation.version(filenames, budget) !== before) { verifiedAliasSummaries.delete(key); continue; }
-        result.conversations = result.conversations.filter(summary => !verified.summary.aliases.includes(summary.id));
-        result.conversations.push(verified.summary);
-        rememberVerifiedAliases(verified.summary);
-        } finally { validation.close(); }
+        if ((cached as ValidatedDevinSummary).identitySourceRevision !== revision) continue;
+        result.conversations = result.conversations.filter(summary => !cached.aliases.includes(summary.id));
+        result.conversations.push(structuredClone(cached));
     }
 }
 
@@ -378,7 +362,15 @@ async function readPhysicalIdentityCatalog(id: string, budget: ReadBudget, optio
 }
 
 async function readIdentityCatalog(id: string, budget: ReadBudget, options: DevinReadOptions): Promise<{ entries: CatalogEntry[]; version?: string; cacheHit?: boolean }> {
-    if (!options.identityCache) return { entries: options.identityMode === "physical" ? await readPhysicalIdentityCatalog(id, budget, options) : await readTargetIdentityCatalog(id, budget, undefined, Boolean(options.roundRange)) };
+    if (!options.identityCache) {
+        if (options.identityMode === "physical") return { entries: await readPhysicalIdentityCatalog(id, budget, options) };
+        const revision = devinSourceValidationRevision(budget.maxDesktopFiles, () => budget.check());
+        const entries = await readTargetIdentityCatalog(id, budget, undefined, Boolean(options.roundRange));
+        if (revision === devinSourceValidationRevision(budget.maxDesktopFiles, () => budget.check())) {
+            for (const entry of entries) (entry.summary as ValidatedDevinSummary).identitySourceRevision = revision;
+        }
+        return { entries };
+    }
     const sources = catalogSources(budget, id, options);
     const key = digest([id, options.identityMode, options.physicalSourceKind, sources.filenames]);
     const version = await options.identityCache.version(sources.filenames, budget);
@@ -401,9 +393,10 @@ function toRaw(entry: CatalogEntry): DevinRawConversation {
         return cli ? { ...message, payload: { ...message.payload, rawNodes: cli.payload.rawNodes, compactions: cli.payload.compactions, partial: cli.payload.partial, source: "devin-cli-with-desktop" } } : message;
     });
     const representedAgents = new Set(enrichedDesktop.filter(message => message.kind === "subagent").map(message => message.payload.agentId));
+    const { identitySourceRevision: _identitySourceRevision, ...contentSummary } = entry.summary as ValidatedDevinSummary;
     const fingerprint: ConversationSourceFingerprint = {
         path: entry.summary.sourcePath,
-        revision: `devin-sqlite/v1:${digest([entry.summary, entry.cli?.revision, entry.desktops.map(desktop => desktop.revision)])}`,
+        revision: `devin-sqlite/v1:${digest([contentSummary, entry.cli?.revision, entry.desktops.map(desktop => desktop.revision)])}`,
     };
     return {
         summary: entry.summary, nodes: entry.cli?.nodes ?? [],
@@ -499,7 +492,7 @@ export async function discoverDevinConversations(options: DevinDiscoveryOptions 
             await readCliConversations(paths.cli, budget, { metadataOnly: true,
                 conversationIds: idsAreCliOnly ? options.conversationIds : undefined,
                 excludeHidden: true,
-                discovery: options.verifyAliases === false || options.verifyAliases !== true && !verifiedAliasSummaries.size ? options : undefined,
+                discovery: options.verifyAliases !== true ? options : undefined,
                 maxConversations: options.limit !== undefined && options.verifyAliases !== true && !options.conversationIds?.length ? Math.min(options.limit, 20_000) + 1 : undefined,
                 acceptSummary: summary => discoveryMatches(summary, options, true), onSession: () => { result.scannedSessions++; },
                 onConversation: item => { if (!item.hidden && !item.empty) result.conversations.push(item.summary); },

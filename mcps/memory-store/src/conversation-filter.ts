@@ -35,6 +35,7 @@ import type { ContextLocateReadBudget, ConversationContextLocateAdapters, Conver
 import { annotateContextLocateCandidates, contextLocateResolution, locateConversationContext, locatePositiveInteger } from "./conversation-context-locate.js";
 import type { DevinConversationSummary } from "./devin-types.js";
 import { listLocalPbConversationCandidates, type ConversationDiscoveryDiagnostic } from "./conversation-local-list.js";
+import { listAntigravityLocalConversations } from "./antigravity-local-history.js";
 import { discoverDevinConversations } from "./devin-sqlite.js";
 import type { ConversationSourceCacheKey } from "./conversation-source-cache.js";
 import { listCachedContextCandidates } from "./conversation-context-locate-cache.js";
@@ -92,6 +93,7 @@ export interface SourceStatus {
 export interface ListConversationCandidatesOptions {
     dataChains?: Array<DataChainInput | string>;
     query?: string;
+    mode?: "auto" | "exact" | "fuzzy" | "smart";
     workspaces?: string[];
     workspaceMode?: WorkspaceMatchMode;
     workspaceScope?: WorkspaceMatchScope;
@@ -413,6 +415,17 @@ export function candidateFromDevinConversation(item: DevinConversationSummary): 
 }
 
 async function listLocalSourceCandidates(source: "antigravity" | "windsurf", limit: number, options: ListConversationCandidatesOptions = {}, diagnostics: ConversationDiscoveryDiagnostic[] = []): Promise<UnifiedConversationCandidate[]> {
+    if (source === "antigravity") {
+        const local = await listAntigravityLocalConversations({ limit, conversationIds: options.conversationIds,
+            threadMode: options.threadMode === "children" && !options.parentConversationId ? undefined : options.threadMode,
+            parentConversationId: options.parentConversationId,
+            deadlineMs: options.deadlineAt, isCancelled: options.isCancelled, signal: options.signal,
+            onDiagnostic: diagnostic => diagnostics.push({ ...diagnostic, sourceKind: "antigravity-local" }) });
+        return local.map(item => ({ id: item.id, dataChain: "antigravity", title: item.title, workspace: item.workspace,
+            workspaces: item.workspaces, updatedAt: item.updatedAt, sourceKind: item.sourceKind, sourcePath: item.sourcePath,
+            sourceBytes: item.bytes, parentConversationId: item.parentConversationId, isChildThread: item.isChildThread,
+            agentRole: item.isChildThread ? "subagent" : null, agentNickname: item.agentName, detail: item.sourceKind }));
+    }
     const pbCandidates = listLocalPbConversationCandidates(source, { limit, conversationIds: options.conversationIds,
         deadlineAt: options.deadlineAt, isCancelled: options.isCancelled, onDiagnostic: diagnostic => diagnostics.push(diagnostic) });
     const candidates: UnifiedConversationCandidate[] = pbCandidates.map(item => ({
@@ -459,10 +472,24 @@ function queryTermsMatch(haystack: string, queryTerms: string[]): boolean {
     return queryTerms.length > 1 && queryTerms.some(term => haystack.includes(term));
 }
 
-function candidateMatchesQuery(item: UnifiedConversationCandidate, normalizedQuery: string, queryTerms: string[] = []): boolean {
+export function conversationTitleMatchesFuzzyQuery(titleInput: string, queryInput: string): boolean {
+    const compact = (value: string) => normalizeConversationQuery(value).replace(/[\s\p{P}\p{S}]/gu, "");
+    const needle = compact(queryInput);
+    const title = compact(titleInput);
+    if (needle.length < 4 || !/\p{Script=Han}/u.test(needle) || title.length < needle.length || needle.length / title.length < 0.65) return false;
+    let matched = 0;
+    for (const character of title) {
+        if (character === needle[matched]) matched += 1;
+        if (matched === needle.length) return true;
+    }
+    return false;
+}
+
+function candidateMatchesQuery(item: UnifiedConversationCandidate, normalizedQuery: string, queryTerms: string[] = [], mode?: ListConversationCandidatesOptions["mode"]): boolean {
     if (!normalizedQuery) return true;
     const haystack = candidateSearchHaystack(item);
-    return haystack.includes(normalizedQuery) || queryTermsMatch(haystack, queryTerms);
+    return haystack.includes(normalizedQuery) || queryTermsMatch(haystack, queryTerms)
+        || ((mode === "auto" || mode === "fuzzy") && conversationTitleMatchesFuzzyQuery(item.title, normalizedQuery));
 }
 
 function fieldIncludesAny(field: string, queryTerms: string[]): boolean {
@@ -716,7 +743,7 @@ function applyThreadMode(
         return {
             filtered: filtered
                 .filter(item => item.isChildThread && item.parentConversationId === parentId)
-                .filter(item => candidateMatchesQuery(item, normalizedQuery, queryTerms))
+                .filter(item => candidateMatchesQuery(item, normalizedQuery, queryTerms, options.mode))
                 .filter(item => workspaceMatches(candidateWorkspacesForScope(item, options.workspaceScope || "any"), options.workspaces || [], options.workspaceMode || "any")),
             warnings,
         };
@@ -936,14 +963,14 @@ export async function listConversationCandidates(options: ListConversationCandid
         let filtered = raw
             .filter(item => !options.conversationIds?.length || options.conversationIds.some(id => item.id === id || item.aliases?.includes(id) || item.uuid === id || item.sessionId === id))
             .filter(item => !options.contextProbe?.trim() || !targets?.length || targets.some(id => candidateMatchesIdentity(item, id)))
-            .filter(item => options.contextProbe?.trim() || candidateMatchesQuery(item, normalizedQuery, queryTerms))
+            .filter(item => options.contextProbe?.trim() || candidateMatchesQuery(item, normalizedQuery, queryTerms, options.mode))
             .filter(item => workspaceMatches(candidateWorkspacesForScope(item, options.workspaceScope || "any"), options.workspaces || [], options.workspaceMode || "any"))
             .sort((a, b) => {
                 const queryPriority = candidateQueryPriority(a, normalizedQuery, queryTerms) - candidateQueryPriority(b, normalizedQuery, queryTerms);
                 if (queryPriority !== 0) return queryPriority;
                 return (Date.parse(b.updatedAt || "") || 0) - (Date.parse(a.updatedAt || "") || 0);
             });
-        if (!options.contextProbe?.trim() && (source === "codex" || source === "claude-code" || source === "windsurf" || source === "dsh")) {
+        if (!options.contextProbe?.trim() && (source === "codex" || source === "claude-code" || source === "windsurf" || source === "dsh" || source === "antigravity")) {
             const result = applyThreadMode(raw, filtered, normalizedQuery, queryTerms, options);
             filtered = result.filtered;
             warnings.push(...result.warnings);

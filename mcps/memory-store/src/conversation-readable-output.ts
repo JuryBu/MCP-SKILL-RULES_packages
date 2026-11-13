@@ -17,7 +17,7 @@ function string(value: unknown): string {
 }
 
 function warningLines(value: unknown): string[] {
-    return Array.isArray(value) ? value.filter(item => typeof item === "string").map(item => `⚠️ ${item}`) : [];
+    return Array.isArray(value) ? [...new Set(value.filter(item => typeof item === "string"))].map(item => `⚠️ ${item}`) : [];
 }
 
 function nextCall(lines: string[], next: unknown, label = "➡️ 下一步参数"): void {
@@ -121,7 +121,9 @@ function messageLines(message: ResultObject, context: { source: string; baseSour
     const briefRoles: Record<string, string> = { user: "👤", assistant: "🤖", tool: "🔧 工具", subagent: "🧩 子代理" };
     const role = string(message.role);
     const agent = role === "subagent" ? string(message.agentNickname) || string(message.nickname) || string(message.agentRole) : "";
-    const lines = [`### ${(context.brief ? briefRoles : roles)[role] || role}${agent ? ` · ${agent}` : ""}${message.timestamp ? ` · ${localTime(string(message.timestamp), context.pageDate)}` : ""}`];
+    const cliInput = role === "user" && string(message.rawRole).startsWith("antigravity-cli.");
+    const label = cliInput ? `📥 CLI 输入（原始source=${string(message.rawRole).split(".source=")[1] || "unknown"}，作者未核）` : (context.brief ? briefRoles : roles)[role] || role;
+    const lines = [`### ${label}${agent ? ` · ${agent}` : ""}${message.timestamp ? ` · ${localTime(string(message.timestamp), context.pageDate)}` : ""}`];
     const source = string(message.sourceThreadId) || context.baseSource;
     if (source && source !== context.source) lines.push(`来源对话：\`${source}\``);
     if (source) context.source = source;
@@ -196,6 +198,8 @@ function readLines(result: ResultObject, params: CorpusToolParams): string[] {
             const roles = new Set<ConversationMessageRole>((params.messageRoles || defaults) as ConversationMessageRole[]);
             if (roles.delete("model" as ConversationMessageRole)) roles.add("assistant");
             let rendered = formatRoundForMessageRoles(round as unknown as ConversationRound, params.depth || "normal", params.extraTypes || [], roles, "full");
+            const cliMessage = objects(round.userMessages).find(message => string(message.rawRole).startsWith("antigravity-cli."));
+            if (cliMessage) rendered = rendered.replace(/### 👤 用户/gu, `### 📥 CLI 输入（原始source=${string(cliMessage.rawRole).split(".source=")[1] || "unknown"}，作者未核）`);
             if (brief) rendered = rendered.replace(/\n\n⚠️ 本段过长已截断（\d+→\d+字），可用 depth="full" 展开/gu, () => { briefTruncated = true; return "…"; });
             lines.push(rendered);
         } else {
@@ -299,11 +303,15 @@ function searchLines(result: ResultObject, params: CorpusToolParams): string[] {
 function preparationLines(result: ResultObject): string[] {
     const ready = object(result.ready);
     const request = object(result.request);
+    const stopped = ["done", "failed", "cancelled", "canceled", "resumable"].includes(string(result.status));
     const lines = ["# ⏳ 对话历史准备", `任务：\`${result.taskId || ""}\``, `状态：${result.status || result.phase || "准备中"}`];
     if (request.dataChain || request.conversationId) lines.push(`${request.dataChain || ""} · ${request.conversationId || ""}`);
     if (result.phase === "details-not-prepared") lines.push(...detailsPreparationLines(result));
-    else lines.push(result.rangeAvailable ? result.requestedRangeComplete === false ? "⏳ 已有部分范围可读，所需范围仍在准备" : "✅ 所需范围已经就绪，可以读取、搜索和定位" : "⏳ 所需范围仍在准备，请沿原任务查询进度");
-    if (result.fullSourceComplete === false) lines.push("⏳ 完整历史尚未准备完成");
+    else if (result.rangeAvailable) lines.push(result.requestedRangeComplete === false
+        ? stopped ? "⚠️ 本任务已结束，已取得部分范围；请求范围尚未全部取得" : "⏳ 已有部分范围可读，所需范围仍在准备"
+        : "✅ 所需范围已经就绪，可以读取、搜索和定位");
+    else lines.push(stopped ? "⚠️ 本任务已结束，未取得所需范围" : "⏳ 所需范围仍在准备，请沿原任务查询进度");
+    if (result.fullSourceComplete === false) lines.push(stopped ? "本次未准备完整历史" : "⏳ 完整历史尚未准备完成");
     const progress = object(result.progress);
     if (progress.detail) lines.push(string(progress.detail));
     for (const range of objects(result.completeRanges || ready.completeRanges || object(ready.cache).completeRanges)) lines.push(`已就绪${range.kind === "relative" ? "相对" : ""}轮次：${range.startRound}–${range.endRound}${range.blockId ? ` · ${range.blockId}` : ""}`);

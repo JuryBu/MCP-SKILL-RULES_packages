@@ -59,22 +59,33 @@ export async function exportProgressiveReadyRange(params: ReadyExportRequest) {
     if (!row && !params.blockId && (params.startRound !== undefined || params.endRound !== undefined)
         && status.completeRanges.some(range => range.kind === "relative")) throw new Error("相对轮次请带原blockId或rangeRef导出，绝对轮次仍待核实");
     let result: ProgressiveReadResult;
+    const selection = { blockId: params.blockId,
+        ...(!params.blockId && !row && ready.preferredBlockIds?.length ? { blockIds: ready.preferredBlockIds } : {}) };
     if (row) {
         if ((params.startRound !== undefined && params.startRound !== row.round.roundIndex)
             || (params.endRound !== undefined && params.endRound !== row.round.roundIndex)) throw new Error("rangeRef与导出轮次不一致");
         result = { status, rows: [row], rounds: [row.round], messages: row.messages, requestedRangeComplete: true };
     } else if (params.lastRounds !== undefined) {
-        const latest = await cache.readLatest({ blockId: params.blockId, direction: "latest" }, params.lastRounds);
+        const latest = await cache.readLatest({ ...selection, direction: "latest" }, params.lastRounds);
         const rows = latest.rows.slice().reverse();
         result = { ...latest, rows, rounds: rows.map(item => item.round), messages: rows.flatMap(item => item.messages) };
-    } else result = await cache.read({ blockId: params.blockId, startRound: params.startRound, endRound: params.endRound, direction: "oldest" });
+    } else result = await cache.read({ ...selection, startRound: params.startRound, endRound: params.endRound, direction: "oldest" });
     if (!result.rounds.length) throw new Error("所选范围尚未就绪，请沿原taskId查询prepare_status");
     const sourceRangeVerified = (status.source.snapshot as { source?: { sourceRangeVerified?: boolean } })?.source?.sourceRangeVerified !== false;
     const partial = !status.complete || !sourceRangeVerified || !result.requestedRangeComplete;
     const ranges = result.rows.map(item => ({ round: item.round.roundIndex, kind: item.kind, ref: item.ref, blockId: item.blockId }));
+    const rounds = result.rows.map(item => {
+        const replies = item.messages.filter(message => message.role === "subagent");
+        if (!replies.length) return item.round;
+        return { ...item.round, subagentSummaries: replies.map(message => {
+            const threadId = message.sourceThreadId || `message:${message.id}`;
+            const previous = item.round.subagentSummaries.find(summary => summary.threadId === threadId);
+            return { ...previous, threadId, nickname: previous?.nickname || "subagent", summary: message.text };
+        }) };
+    });
     const exported = await exportConversation({
         conversationId: status.source.conversationId, chainUsed: status.source.host,
-        rounds: result.rounds, totalSteps: Math.max(...result.rounds.map(round => round.endStep)) + 1,
+        rounds, totalSteps: Math.max(...result.rounds.map(round => round.endStep)) + 1,
         totalStepsKnown: false, totalRounds: status.source.totalRounds ?? result.rounds.length,
         totalRoundsKnown: status.source.totalRounds !== undefined,
         startRound: Math.min(...result.rounds.map(round => round.roundIndex)), endRound: Math.max(...result.rounds.map(round => round.roundIndex)),

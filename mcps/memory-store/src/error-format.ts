@@ -91,7 +91,7 @@ export function classifyError(err: unknown): ClassifiedError {
 
     if (
         lowerCode === "etimedout" ||
-        has("timed out", "timeout", "超时", "deadline exceeded")
+        has("timed out", "timeout", "超时", "deadline exceeded", "exceeded its deadline", "deadline_exceeded", "devin_deadline")
     ) {
         return {
             category: "timeout",

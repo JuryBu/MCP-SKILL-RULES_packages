@@ -93,3 +93,5 @@ Devin先发现元数据，再核目标身份和主链，按需要的轮次读取
 PB目录元数据缺少工作区时，按工作区筛选会列出 `pb_workspace_metadata_unavailable`及来源覆盖缺口；指定明确对话ID仍可读取。DSH未完成帧、PB未知变体等保留partial，工具不将它们计入完整来源。首次扫描、内容哈希、解密及完整构建仍有成本，接口持续报告实际进度与已就绪范围。
 
 Antigravity未映射的PB字段保留为未分类来源事件。`depth="full"`并选择`messageRoles=["tool"]`可在规范轮次的`semanticEvents`查看；`extraTypes=["tool_results"]`也提供`sourceEvents`。这些事件保留字段名与原始线索，不编造工具名称或调用成功状态，来源仍为`partial`。
+
+Antigravity新版读取支持GUI与独立CLI根，目录返回的`antigravity-cli:`限定ID保留来源身份。完整JSONL优先，新旧同ID合并保留早期PB及内部ID映射，紧凑日志截短和未知正文格式继续给出缺口。父子关系从实际目录元数据读取，不按标题或ID形状猜测；工具转存文件只保留对应会话引用，按所需详情补读。新旧兼容与完整消费者说明见[Antigravity新旧版本兼容](antigravity-local-compatibility.md)。

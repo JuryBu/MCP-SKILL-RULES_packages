@@ -35,7 +35,7 @@ import {
     type WindsurfConversationReadResult,
 } from "./windsurf-client.js";
 import {
-    listDshSessionSnapshots,
+    readDshSessionFingerprint,
     readDshSession,
     resolveDshSessionsRoot,
     type DshSessionHeader,
@@ -50,6 +50,7 @@ import { withConversationSourcePressure } from "./conversation-source-pressure.j
 import { isAntigravityLS } from "./lifecycle.js";
 import { fetchTrajectory, getCurrentCascadeId, isLsAvailable, listLiveAntigravityConversationIds } from "./ls-client.js";
 import { setCurrentContext } from "./conversation-router.js";
+import { antigravityDataRoots, fingerprintAntigravityLocalConversation, loadAntigravityLocalConversation, ANTIGRAVITY_LOCAL_NORMALIZATION_VERSION } from "./antigravity-local-history.js";
 import { createConsecutiveHumanRoundMerger, mergeConsecutiveHumanRounds, normalizeConversationAutomationRound, parseRounds, type ConversationRound } from "./trajectory.js";
 import {
     buildConversationCompactionMetadata,
@@ -91,7 +92,9 @@ import {
     type SourceFailureMode,
 } from "./conversation-filter.js";
 import type { SourceRevision } from "./source-evidence-contracts.js";
-import { fingerprintDevinConversation, resolveDevinConversation } from "./devin-sqlite.js";
+import { fingerprintDevinConversation } from "./devin-sqlite.js";
+import { devinSourceValidationFingerprint, isDevinSourceValidationFingerprint } from "./devin-source-validation.js";
+import { resolveDevinIdentityOnce, schedulePublishedDevinIdentityVerification, type DevinPublishedIdentityVerification } from "./devin-identity-cache-flight.js";
 import { readDevinConversation, splitDevinSubagentId, devinSubagentId, DEVIN_NORMALIZATION_VERSION } from "./devin-conversation.js";
 import { getDevinIdentityReadTargets, rememberDevinIdentity, resolveCachedDevinIdentity } from "./devin-identity.js";
 import { windsurfSummaryFromDevin } from "./windsurf-client.js";
@@ -126,12 +129,14 @@ export interface ConversationLoadResult {
     cacheState?: "hit" | "built" | "stale";
     cacheCreatedAt?: string;
     cacheReadPolicy?: "published" | "verified";
+    identityVerification?: DevinPublishedIdentityVerification;
     cacheBuildFailure?: ConversationSourceCacheBuildFailure;
     cacheFingerprint?: ConversationSourceFingerprint | null;
     sourceMode?: ConversationRawSource;
     sourceDiagnostics?: string[];
     sourcePartial?: boolean;
     antigravityNormalizationVersion?: number;
+    antigravityLocalNormalizationVersion?: number;
     sourceCoverage?: {
         unit: "step";
         startStep: number;
@@ -158,6 +163,9 @@ export function conversationSourceIsPartial(loaded: Pick<ConversationLoadResult,
 
 function conversationCacheNormalizationNeedsRefresh(snapshot: ConversationLoadResult): boolean {
     return Boolean(
+        (snapshot.antigravityLocalNormalizationVersion !== undefined
+            && snapshot.antigravityLocalNormalizationVersion !== ANTIGRAVITY_LOCAL_NORMALIZATION_VERSION)
+        ||
         (snapshot.chainUsed === "antigravity" && snapshot.localPbActivities?.sourceFlavor === "antigravity"
             && snapshot.antigravityNormalizationVersion !== ANTIGRAVITY_PB_NORMALIZATION_VERSION)
         || (snapshot.chainUsed === "claude-code" && snapshot.claudeCodeData?.normalizationVersion !== CLAUDE_CODE_NORMALIZATION_VERSION)
@@ -277,7 +285,8 @@ function throwIfConversationLoadCancelled(options: Pick<ConversationLoadOptions,
 export async function resolveConversationChain(chain: DataChain = "auto"): Promise<ResolvedConversationChain | null> {
     chain = normalizeDataChain(chain);
     if (chain === "antigravity") {
-        return (await isLsAvailable()) ? "antigravity" : null;
+        return antigravityDataRoots().some(root => ["brain", "conversations"].some(directory => fs.existsSync(`${root.root}/${directory}`)))
+            || await isLsAvailable() ? "antigravity" : null;
     }
     if (chain === "codex") {
         return isCodexSessionStoreAvailable() ? "codex" : null;
@@ -441,10 +450,11 @@ async function loadFromResolvedChain(
     if (source === "ls" && (resolved === "codex" || resolved === "claude-code" || resolved === "dsh")) {
         throw new Error(`source=ls 不支持 ${resolved}；该宿主的权威原始源是本地 JSONL`);
     }
-    let effectiveId = (source === "cache" || source === "local" || options.publishedCacheOnly) && conversationId
+    let effectiveId = (source === "cache" || source === "local" || options.publishedCacheOnly || resolved === "windsurf") && conversationId
         ? conversationId
         : await resolveConversationId(conversationId, resolved, options.cwd, options.requestClass, options.sourceReadBudget);
     if (!effectiveId) return null;
+    let windsurfFingerprint: ConversationSourceFingerprint | undefined;
     if (resolved === "windsurf") {
         if ((source === "cache" || options.publishedCacheOnly) && options.cacheGeneration) {
             const readTargets = [...new Set([effectiveId, ...getDevinIdentityReadTargets(effectiveId)])];
@@ -456,13 +466,29 @@ async function loadFromResolvedChain(
         }
         if (source === "cache" || options.publishedCacheOnly) effectiveId = resolveCachedDevinIdentity(effectiveId);
         else {
+            if (source !== "ls" && !options.refresh && !options.forceRawCacheRebuild && !options.cacheGeneration) {
+                const cachedId = resolveCachedDevinIdentity(effectiveId);
+                const cachedKey = conversationSourceCacheKey(resolved, cachedId, options);
+                const cached = readCachedConversationSourceCache<CachedConversationLoadResult>({ key: cachedKey });
+                if (cached && cached.cacheState !== "stale" && cached.snapshot.windsurfData?.thread.sourceKind
+                    && cached.snapshot.windsurfData.thread.aliases?.some(alias => alias.toLowerCase() === effectiveId!.toLowerCase())
+                    && !conversationCacheNormalizationNeedsRefresh(cached.snapshot) && cached.fingerprint?.path && isDevinSourceValidationFingerprint(cached.fingerprint)) {
+                    const current = devinSourceValidationFingerprint(cached.fingerprint!.path, options.sourceReadBudget?.maxDesktopFiles, () => throwIfConversationLoadCancelled(options));
+                    if (fingerprintRevision(current) === fingerprintRevision(cached.fingerprint)) {
+                        return hydrateConversationCache(cached.snapshot, cached.generation, "hit", current, cachedKey, source, options, cached.roundCount, undefined, cached.createdAt);
+                    }
+                }
+            }
             const child = splitDevinSubagentId(effectiveId);
             const requestedDevinId = child?.parentId || effectiveId;
-            const devin = await withLegacyWindsurfFallback(effectiveId, () => resolveDevinConversation(requestedDevinId, options.sourceReadBudget), { source, requestClass: options.requestClass });
+            const devin = await withLegacyWindsurfFallback(effectiveId, () => resolveDevinIdentityOnce(requestedDevinId, options.sourceReadBudget), { source, requestClass: options.requestClass });
             if (devin) {
                 if (source === "ls") throw new Error("Devin Local 没有 Cascade LS/PB 来源；请使用 source=auto 或 local 只读 SQLite，或 cache 读取已提交缓存");
                 rememberDevinIdentity(devin);
                 effectiveId = child ? devinSubagentId(devin.canonicalId, child.agentId) : devin.canonicalId;
+                windsurfFingerprint = devinSourceValidationFingerprint(devin.sourcePath, options.sourceReadBudget?.maxDesktopFiles, () => throwIfConversationLoadCancelled(options));
+            } else if (source !== "local") {
+                effectiveId = await resolveWindsurfThreadId(effectiveId, { ...options.sourceReadBudget, requestClass: options.requestClass, skipDevin: true }) || effectiveId;
             }
         }
     }
@@ -501,9 +527,12 @@ async function loadFromResolvedChain(
             || conversationCacheNormalizationNeedsRefresh(previous.snapshot)
         ),
     );
-    const freshness = resolved === "codex" && options.expectedCodexSource
+    const freshness = windsurfFingerprint
+        ? { fingerprint: windsurfFingerprint, buildSource: "local" as const }
+        : resolved === "codex" && options.expectedCodexSource
         ? { fingerprint: null, buildSource: source }
         : await prepareConversationCacheFreshness(resolved, effectiveId, source, previous, options.requestClass, options.sourceReadBudget);
+    let antigravityLocalBuildFingerprint: ConversationSourceFingerprint | null = null;
     const cached = await readOrBuildConversationSourceCache<CachedConversationLoadResult, ConversationRound>({
         key,
         fingerprint: options.expectedCodexSource
@@ -519,7 +548,14 @@ async function loadFromResolvedChain(
             || (options.refresh === true && (resolved === "antigravity" || resolved === "windsurf")),
         assertPublishable: resolved === "codex" && options.expectedCodexSource
             ? () => assertCodexSourceVersion(options.expectedCodexSource!.sourcePath, options.expectedCodexSource, "before cache publication", options.isCancelled)
-            : undefined,
+            : resolved === "antigravity" && source !== "ls" ? async () => {
+                if (!antigravityLocalBuildFingerprint) return;
+                throwIfConversationLoadCancelled(options);
+                const current = await localConversationSourceFingerprint(resolved, effectiveId, "local");
+                if (fingerprintRevision(current) !== fingerprintRevision(antigravityLocalBuildFingerprint)) {
+                    throw new Error("Antigravity source changed before cache publication; retry fetch with a fresh snapshot");
+                }
+            } : undefined,
         validateBuild: resolved === "codex" ? assertCodexNormalizedCacheBuild : undefined,
         build: async () => withConversationSourcePressure(options.requestClass || "foreground", async () => {
             throwIfConversationLoadCancelled(options);
@@ -599,8 +635,22 @@ async function loadFromResolvedChain(
             );
             throwIfConversationLoadCancelled(options);
             if (!loaded) throw new Error(`无法从 ${resolved} 的 ${source} 原始源构建 fetch 缓存`);
+            if (windsurfFingerprint && loaded.windsurfData?.sourceFingerprint) {
+                const current = devinSourceValidationFingerprint(windsurfFingerprint.path!, options.sourceReadBudget?.maxDesktopFiles, () => throwIfConversationLoadCancelled(options));
+                if (fingerprintRevision(current) !== fingerprintRevision(windsurfFingerprint)) {
+                    throw new Error("Devin source changed during readonly source preparation; retry fetch with a fresh snapshot");
+                }
+                loaded.windsurfData = { ...loaded.windsurfData, sourceFingerprint: current };
+            }
             if (loaded.windsurfData?.sourceFingerprint && fingerprintRevision(loaded.windsurfData.sourceFingerprint) !== fingerprintRevision(freshness.fingerprint)) {
                 throw new Error("Devin source changed between discovery and readonly snapshot; retry fetch to publish one consistent revision");
+            }
+            if (resolved === "antigravity" && loaded.cacheAuthority === "local") {
+                const matches = source === "auto"
+                    ? localFingerprintMatchesAutoLsCache(freshness.fingerprint, loaded.cacheFingerprint || null)
+                    : fingerprintRevision(loaded.cacheFingerprint || null) === fingerprintRevision(freshness.fingerprint);
+                if (!matches) throw new Error("Antigravity source changed between discovery and readonly snapshot; retry fetch to publish one consistent revision");
+                antigravityLocalBuildFingerprint = loaded.cacheFingerprint || null;
             }
             if (resolved === "codex" && !loaded.sourceRevision) {
                 loaded.sourceRevision = codexSourceRevisionFromRounds(
@@ -1094,7 +1144,10 @@ async function localConversationSourceFingerprint(
         return { path: version.sourcePath, size: version.sourceSize, mtime: version.sourceMtimeMs, revision: version.historySource?.revision };
     }
     if (resolved === "claude-code") return fileFingerprint(getClaudeCodeThread(conversationId)?.jsonlPath);
-    if (resolved === "windsurf" || resolved === "antigravity") {
+    if (resolved === "antigravity") {
+        return source === "ls" ? null : fingerprintAntigravityLocalConversation(conversationId);
+    }
+    if (resolved === "windsurf") {
         if (source === "ls") return null;
         const candidates = discoverLocalPbCandidates(resolved, conversationId);
         return candidates.length ? fingerprintLocalPbCandidates(candidates, resolved) : null;
@@ -1196,16 +1249,8 @@ async function prepareConversationCacheFreshness(
     }
     if (resolved !== "antigravity" && resolved !== "windsurf") {
         if (resolved === "dsh") {
-            const snapshot = (await listDshSessionSnapshots()).find(item => item.id === conversationId);
             return {
-                fingerprint: snapshot
-                    ? {
-                        path: snapshot.provenance.sourcePath,
-                        size: snapshot.provenance.sourceSizeBytes,
-                        mtime: snapshot.provenance.sourceMtimeMs,
-                        revision: snapshot.fingerprint,
-                    }
-                    : null,
+                fingerprint: await readDshSessionFingerprint(conversationId, {}, previous?.fingerprint?.path),
                 buildSource: "local",
             };
         }
@@ -1279,6 +1324,9 @@ function hydrateConversationCache(
         cacheFingerprint: fingerprint,
         sourceMode,
     };
+    if (options.publishedCacheOnly && loaded.chainUsed === "windsurf" && loaded.windsurfData?.thread.sourceKind) {
+        loaded.identityVerification = schedulePublishedDevinIdentityVerification(loaded.conversationId, generation, fingerprint, loaded.windsurfData.thread.aliases || [loaded.conversationId]);
+    }
     if (loaded.codexData) loaded.codexData = { ...loaded.codexData, rounds };
     if (loaded.claudeCodeData) loaded.claudeCodeData = { ...loaded.claudeCodeData, rounds };
     if (loaded.windsurfData) loaded.windsurfData = { ...loaded.windsurfData, rounds };
@@ -1450,6 +1498,36 @@ async function lsConversationResult(
     };
 }
 
+async function localAntigravityConversationResult(
+    conversationId: string,
+    options: ConversationLoadOptions,
+    onBytesReserved?: (bytes: number) => void,
+): Promise<CachedConversationLoadResult | null> {
+    const local = await loadAntigravityLocalConversation(conversationId, {
+        ...options.sourceReadBudget,
+        isCancelled: () => Boolean(options.isCancelled?.() || options.sourceReadBudget?.isCancelled?.()),
+    });
+    if (!local) return null;
+    onBytesReserved?.(local.timings.sourceBytes || 0);
+    if (!hasConversationVisibleBody(local.rounds)) throw new Error(`Antigravity ${conversationId} has metadata but no readable local conversation body`);
+    return {
+        chainUsed: "antigravity", conversationId: local.metadata.id,
+        rounds: local.rounds, totalSteps: local.totalSteps,
+        cacheAuthority: "local", sourcePartial: local.partial,
+        antigravityLocalNormalizationVersion: ANTIGRAVITY_LOCAL_NORMALIZATION_VERSION,
+        cacheFingerprint: local.fingerprint,
+        sourceRevision: { revision: local.fingerprint.revision || "", contentCursor: String(local.coverage.endStepExclusive), eventWatermark: null },
+        sourceCoverage: { ...local.coverage, complete: local.sourceComplete, source: "local",
+            roundNumbering: local.coverage.startStep > 0 ? "relative" : "absolute",
+            comparison: options.source === "local" ? "not_requested" : "deferred" },
+        sourceDiagnostics: [
+            `Antigravity local ${local.sourceKind}: ${local.rounds.length} rounds/${local.totalSteps} steps; complete=${local.sourceComplete}`,
+            ...local.sourceDiagnostics.map(diagnostic => `${diagnostic.code}: ${diagnostic.message}`),
+            ...local.internalTrajectoryIds.filter(id => id !== conversationId).map(id => `Antigravity fileId=${conversationId}; payload trajectoryId=${id}; original identity retained`),
+        ],
+    };
+}
+
 async function loadRawConversationData(
     resolved: ResolvedConversationChain,
     effectiveId: string,
@@ -1485,13 +1563,17 @@ async function loadRawConversationData(
     }
 
     if (resolved === "antigravity" || resolved === "windsurf") {
-        if (source === "local") return localPbToConversationResult(resolved, effectiveId, options);
+        if (source === "local") return resolved === "antigravity"
+            ? localAntigravityConversationResult(effectiveId, options)
+            : localPbToConversationResult(resolved, effectiveId, options);
         if (source === "ls") return lsConversationResult(resolved, effectiveId, options);
         let local: ConversationLoadResult | null = null;
         let localError: unknown;
         let localReservedBytes = 0;
         try {
-            local = localPbToConversationResult(resolved, effectiveId, options, bytes => { localReservedBytes = bytes; });
+            local = resolved === "antigravity"
+                ? await localAntigravityConversationResult(effectiveId, options, bytes => { localReservedBytes = bytes; })
+                : localPbToConversationResult(resolved, effectiveId, options, bytes => { localReservedBytes = bytes; });
         } catch (error) {
             throwIfConversationLoadCancelled(options);
             if (error instanceof LocalPbReaderError && (error.code === "CANCELLED" || error.code === "DEADLINE_EXCEEDED")) throw error;

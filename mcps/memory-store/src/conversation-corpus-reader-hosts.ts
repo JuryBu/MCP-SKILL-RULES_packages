@@ -1,12 +1,12 @@
 import type { CorpusSource } from "./conversation-corpus-sources.js";
-import type { CorpusConversation, CorpusFastReadRequest, CorpusProjection, CorpusRangeProvider, CorpusReadControl, CorpusSearchRequest, CorpusSourceStatus, CorpusVerifiedIdentity } from "./conversation-corpus-types.js";
+import type { CorpusConversation, CorpusFastReadRequest, CorpusMessageRole, CorpusProjection, CorpusRangeProvider, CorpusReadControl, CorpusSearchRequest, CorpusSourceStatus, CorpusVerifiedIdentity } from "./conversation-corpus-types.js";
 import { canIsolateSourceOptions, isIsolatedSourceWorker, runIsolatedSource } from "./conversation-isolated-source.js";
 import { assertHostReadActive, HOST_CORPUS_VERSION, hostConversationMatches, projectHostCorpus, validateHostRange, type HostCorpusSnapshot } from "./conversation-host-projection.js";
 import type { ClaudeCodeThreadInfo } from "./claude-code-client.js";
 import type { DshReaderOptions } from "./dsh-session-reader.js";
 import type { LocalPbFileCandidate, LocalPbReaderOptions } from "./local-pb-reader.js";
 import type { DevinReadOptions } from "./devin-types.js";
-import { rememberHostCorpusProjection, readHostCorpusSnapshot } from "./conversation-corpus-host-snapshot.js";
+import { rememberHostCorpusProjection, readHostCorpusSnapshot, selectHostCorpusProjectionRoles } from "./conversation-corpus-host-snapshot.js";
 
 export type HostCorpusSource = Exclude<CorpusSource, "codex">;
 
@@ -58,7 +58,7 @@ export function createHostCorpusProvider(source: HostCorpusSource, options: Host
     if (!["claude-code", "windsurf", "antigravity", "dsh"].includes(source)) throw new Error("Host corpus provider requires an explicit non-Codex source");
     const backend = options.backend || defaultBackend(source, options);
     const isolated = !isIsolatedSourceWorker() && canIsolateSourceOptions(options);
-    const canonicalRounds = source === "dsh" || source === "claude-code";
+    const canonicalRounds = source === "dsh" || source === "claude-code" || source === "windsurf";
     let statuses: CorpusSourceStatus[] = [];
     const assertActive = (control: CorpusReadControl) => {
         assertHostReadActive(control);
@@ -71,36 +71,45 @@ export function createHostCorpusProvider(source: HostCorpusSource, options: Host
         if (conversation.source !== source) throw new Error(`Provider ${source} cannot read ${conversation.source}`);
     };
     const remember = async (projection: CorpusProjection, control: CorpusReadControl): Promise<CorpusProjection> => {
-        await rememberHostCorpusProjection(projection, control, { ...options, canonicalRounds });
+        const completeRoles = ["user", "assistant", "tool", "subagent"].every(role => control.messageRoles?.includes(role as CorpusMessageRole));
+        await rememberHostCorpusProjection(projection, control, { ...options, canonicalRounds: canonicalRounds && (source !== "windsurf" || completeRoles) });
         assertActive(control);
         return projection;
     };
     const read = async (conversation: CorpusConversation, request: CorpusFastReadRequest | undefined, control: CorpusReadControl): Promise<CorpusProjection> => {
         assertSource(conversation, control);
         if (request) validateHostRange(request);
+        const requestedRoles = request?.messageRoles ?? control.messageRoles;
+        const snapshotRoles: CorpusMessageRole[] = ["user", "assistant", "tool", "subagent"];
+        const snapshotControl = source === "windsurf" && !request ? { ...control, messageRoles: snapshotRoles } : control;
+        const snapshotRequest = request;
         if (isolated) {
             const result = await runIsolatedSource<{ projection: CorpusProjection; identity?: CorpusVerifiedIdentity }>("host-read",
-                { source, options, conversation, request, messageRoles: control.messageRoles, forceRefresh: control.forceRefresh }, control,
+                { source, options, conversation, request: snapshotRequest, messageRoles: snapshotControl.messageRoles, forceRefresh: control.forceRefresh }, control,
                 { timeoutMs: request ? 30_000 : 120_000 });
             const { restoreIsolatedCorpusIdentity } = await import("./conversation-host-binary.js");
             restoreIsolatedCorpusIdentity(result.projection.conversation, result.identity);
-            if (!request && control.onChunk) await control.onChunk({ ...result.projection, verified: !result.projection.partial });
+            const projection = source === "windsurf" ? selectHostCorpusProjectionRoles(result.projection, requestedRoles) : result.projection;
+            if (!request && control.onChunk) await control.onChunk({ ...projection, verified: !projection.partial });
             assertActive(control);
-            return remember(result.projection, control);
+            await remember(result.projection, snapshotControl);
+            return projection;
         }
-        const snapshot = await backend.read(conversation, request, control);
+        const snapshot = await backend.read(conversation, snapshotRequest, snapshotControl);
         assertActive(control);
-        const projection = projectHostCorpus(conversation, snapshot, request, control);
+        const storedProjection = projectHostCorpus(conversation, snapshot, snapshotRequest, snapshotControl);
+        const projection = source === "windsurf" ? selectHostCorpusProjectionRoles(storedProjection, requestedRoles) : storedProjection;
         if (!request && control.onChunk) await control.onChunk({
             conversation: projection.conversation, revision: projection.revision, messages: projection.messages,
             rounds: projection.rounds, roundNumbering: projection.roundNumbering, warnings: projection.warnings,
             sourceBytes: projection.sourceBytes, verified: !snapshot.partial,
         });
         assertActive(control);
-        return remember(projection, control);
+        await remember(storedProjection, snapshotControl);
+        return projection;
     };
     return {
-        semanticVersion: `${HOST_CORPUS_VERSION}/${source}`,
+        semanticVersion: `${HOST_CORPUS_VERSION}/${source}${source === "windsurf" ? "/role-snapshot-v2" : ""}`,
         sourceStatuses: () => { const current = backend.sourceStatuses?.(); return current?.length ? current : statuses; },
         async list(request, control) {
             assertActive(control);
@@ -124,16 +133,23 @@ export function createHostCorpusProvider(source: HostCorpusSource, options: Host
         },
         async readCached(conversation, control) {
             assertSource(conversation, control);
+            const snapshotControl = source === "windsurf"
+                ? { ...control, messageRoles: ["user", "assistant", "tool", "subagent"] as CorpusMessageRole[] } : control;
             if (isolated) {
-                const result = await runIsolatedSource<{ projection: CorpusProjection | null; identity?: CorpusVerifiedIdentity }>("host-cached", { source, options, conversation, messageRoles: control.messageRoles, forceRefresh: control.forceRefresh }, control);
+                const result = await runIsolatedSource<{ projection: CorpusProjection | null; identity?: CorpusVerifiedIdentity }>("host-cached", { source, options, conversation, messageRoles: snapshotControl.messageRoles, forceRefresh: control.forceRefresh }, control);
                 if (result.projection) {
                     const { restoreIsolatedCorpusIdentity } = await import("./conversation-host-binary.js");
                     restoreIsolatedCorpusIdentity(result.projection.conversation, result.identity);
                 }
-                return result.projection ? remember(result.projection, control) : null;
+                if (!result.projection) return null;
+                await remember(result.projection, snapshotControl);
+                return source === "windsurf" ? selectHostCorpusProjectionRoles(result.projection, control.messageRoles) : result.projection;
             }
-            const cached = await backend.readCached?.(conversation, control);
-            return cached ? remember(projectHostCorpus(conversation, cached, undefined, control), control) : null;
+            const cached = await backend.readCached?.(conversation, snapshotControl);
+            if (!cached) return null;
+            const projection = projectHostCorpus(conversation, cached, undefined, snapshotControl);
+            await remember(projection, snapshotControl);
+            return source === "windsurf" ? selectHostCorpusProjectionRoles(projection, control.messageRoles) : projection;
         },
         read: (conversation, control) => read(conversation, undefined, control),
         readFast: (conversation, request, control = {}) => read(conversation, request, control),

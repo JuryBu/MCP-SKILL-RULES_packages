@@ -49,7 +49,8 @@ export function assertConversationConsumerSourceComplete(snapshot: unknown): voi
     if (!snapshot || typeof snapshot !== "object") throw new Error("Conversation source snapshot is unavailable");
     const source = snapshot as Record<string, any>;
     const parts = [source, source.windsurfData, source.devinData, source.devinData?.raw];
-    if (source.cacheState === "stale" || parts.some(part => part?.partial === true || part?.summary?.partial === true)) {
+    if (source.cacheState === "stale" || source.sourcePartial === true || source.sourceCoverage?.complete === false
+        || parts.some(part => part?.partial === true || part?.summary?.partial === true)) {
         throw new Error("Record/Guard refuses a stale or partial conversation source snapshot");
     }
 }

@@ -102,8 +102,8 @@ function hostRoots(host: LocalPbSourceFlavor): Array<{ kind: "active" | "implici
         ];
     }
     return [
-        { kind: "active", root: process.env.MEMORY_STORE_ANTIGRAVITY_PB_ACTIVE_ROOT || path.join(home, ".gemini", "antigravity", "conversations") },
-        { kind: "implicit", root: process.env.MEMORY_STORE_ANTIGRAVITY_PB_IMPLICIT_ROOT || path.join(home, ".gemini", "antigravity", "implicit") },
+        { kind: "active", root: process.env.MEMORY_STORE_ANTIGRAVITY_PB_ACTIVE_ROOT || path.join(process.env.MEMORY_STORE_ANTIGRAVITY_ROOT || path.join(home, ".gemini", "antigravity"), "conversations") },
+        { kind: "implicit", root: process.env.MEMORY_STORE_ANTIGRAVITY_PB_IMPLICIT_ROOT || path.join(process.env.MEMORY_STORE_ANTIGRAVITY_ROOT || path.join(home, ".gemini", "antigravity"), "implicit") },
     ];
 }
 

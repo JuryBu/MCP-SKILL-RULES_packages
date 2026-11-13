@@ -37,6 +37,18 @@ check("ETIMEDOUT code → timeout + retryable", () => {
     assert.equal(r.retryable, true);
 });
 
+check("Devin SQLite deadline 的原始回执归为超时", () => {
+    for (const error of [
+        new Error("Devin SQLite reading exceeded its deadline; no complete result was returned."),
+        errWithCode("Source read stopped", "DEVIN_DEADLINE"),
+        errWithCode("Source read stopped", "DEADLINE_EXCEEDED"),
+    ]) {
+        const classified = classifyError(error);
+        assert.equal(classified.category, "timeout");
+        assert.equal(classified.retryable, true);
+    }
+});
+
 check("ENOENT / not found → not_found + 不可重试", () => {
     const r = classifyError(errWithCode("no such file", "ENOENT"));
     assert.equal(r.category, "not_found");

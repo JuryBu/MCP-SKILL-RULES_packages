@@ -141,21 +141,31 @@ export async function findCliIdentityCandidates(filename: string, budget: ReadBu
         const userMatch = messageIds.length ? `user_id IN (SELECT value FROM json_each(?))` : "0";
         const toolMatch = toolCallIds.length ? `tool_id IN (SELECT value FROM json_each(?))
                     OR EXISTS (SELECT 1 FROM json_each(tool_ids) AS call WHERE call.value IN (SELECT value FROM json_each(?)))` : "0";
-        const userProjection = messageIds.length ? `json_extract(chat_message,'$.metadata.extensions."chisel/client-message-id"')` : "NULL";
-        const toolProjection = toolCallIds.length ? `json_extract(chat_message,'$.tool_call_id')` : "NULL";
+        let messageProjection = "chat_message";
+        try {
+            database.prepare("SELECT jsonb('{}') AS value").get();
+            messageProjection = "jsonb(chat_message)";
+        } catch {}
+        const userProjection = messageIds.length ? `json_extract(message_json,'$.metadata.extensions."chisel/client-message-id"')` : "NULL";
+        const toolProjection = toolCallIds.length ? `json_extract(message_json,'$.tool_call_id')` : "NULL";
         const toolIdsProjection = toolCallIds.length ? `(SELECT json_group_array(json_extract(call.value,'$.id'))
-            FROM json_each(chat_message,'$.tool_calls') AS call WHERE call.type='object')` : "NULL";
+            FROM json_each(message_json,'$.tool_calls') AS call WHERE call.type='object')` : "NULL";
         const query = (comparison: string) => database.prepare(`WITH page AS MATERIALIZED (
             SELECT rowid AS identity_cursor FROM message_nodes
             WHERE rowid ${comparison} ? AND (session_id IS NULL OR session_id NOT IN (SELECT value FROM json_each(?))) ORDER BY rowid LIMIT ?),
-            projected AS MATERIALIZED (
+            normalized AS MATERIALIZED (
             SELECT identity_cursor, session_id,
-                CASE WHEN json_valid(chat_message) THEN json_type(chat_message) END AS message_kind,
-                CASE WHEN json_valid(chat_message) AND json_extract(chat_message,'$.role')='user' THEN ${userProjection} END AS user_id,
-                CASE WHEN json_valid(chat_message) AND json_extract(chat_message,'$.role')='tool' THEN ${toolProjection} END AS tool_id,
-                CASE WHEN json_valid(chat_message) AND json_extract(chat_message,'$.role')='assistant' THEN ${toolIdsProjection} END AS tool_ids,
+                CASE WHEN json_valid(chat_message) THEN ${messageProjection} END AS message_json,
                 CASE WHEN metadata IS NOT NULL AND metadata!='' AND (NOT json_valid(metadata) OR json_type(metadata) NOT IN ('object','null')) THEN 1 ELSE 0 END AS invalid_metadata
             FROM page JOIN message_nodes ON message_nodes.rowid=page.identity_cursor),
+            typed AS MATERIALIZED (
+            SELECT identity_cursor, session_id, message_json, invalid_metadata,
+                json_type(message_json) AS message_kind, json_extract(message_json,'$.role') AS message_role FROM normalized),
+            projected AS MATERIALIZED (
+            SELECT identity_cursor, session_id, message_kind, invalid_metadata,
+                CASE WHEN message_role='user' THEN ${userProjection} END AS user_id,
+                CASE WHEN message_role='tool' THEN ${toolProjection} END AS tool_id,
+                CASE WHEN message_role='assistant' THEN ${toolIdsProjection} END AS tool_ids FROM typed),
             matches AS MATERIALIZED (SELECT identity_cursor, session_id,
                 coalesce(length(CAST(user_id AS BLOB)),0) + coalesce(length(CAST(tool_id AS BLOB)),0)
                     + coalesce(length(CAST(tool_ids AS BLOB)),0) + coalesce(length(CAST(session_id AS BLOB)),0) + 32 AS identity_bytes,

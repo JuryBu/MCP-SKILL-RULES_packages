@@ -234,7 +234,9 @@ export async function readDevinConversation(id: string, options: DevinConversati
     const { readDevinRawConversation } = await import("./devin-sqlite.js");
     const child = splitDevinSubagentId(id);
     if (child && options.roundRange) throw new DevinReadError("DEVIN_RANGE_UNAVAILABLE", "Devin child round ranges require a full child read; omit roundRange.");
-    let raw = await readDevinRawConversation(child?.parentId || id, child ? { ...options, childDiscoveryOnly: false, childAgentId: child.agentId } : options);
+    const sourceOptions = options.messageRoles?.includes("tool") && !options.messageRoles.includes("assistant")
+        ? { ...options, messageRoles: [...options.messageRoles, "assistant"] } : options;
+    let raw = await readDevinRawConversation(child?.parentId || id, child ? { ...sourceOptions, childDiscoveryOnly: false, childAgentId: child.agentId } : sourceOptions);
     if (!raw) return null;
     if (child) {
         const payload = selectDevinSubagents(raw).get(child.agentId)?.payload;

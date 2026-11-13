@@ -1,6 +1,4 @@
-import { getLsModelCandidates, getParentLs, type LsModelResult } from "./ls-client.js";
-import { enumerateActiveLs } from "./conversation-router.js";
-import { rpcCall } from "./ls-rpc.js";
+import { callGetModelResponseDetailed, type LsModelResult } from "./ls-client.js";
 import { AGY_MODEL_SEQUENCE, callAgyModel, type AgyFallbackResult, type AgyInvocationOptions, type AgyAttempt } from "./agy-client.js";
 import type { ModelBridgeAttemptFailure, ModelBridgeOptions, ModelResponseCandidate } from "./model-bridge.js";
 
@@ -19,15 +17,6 @@ function rejectResponse(text: string, provider: ModelResponseCandidate["provider
     return error;
 }
 
-function untilAborted<Value>(promise: Promise<Value>, signal: AbortSignal): Promise<Value> {
-    return new Promise((resolve, reject) => {
-        const aborted = () => reject(new Error("summary-candidate-aborted"));
-        signal.addEventListener("abort", aborted, { once: true });
-        promise.then(resolve, reject).finally(() => signal.removeEventListener("abort", aborted));
-        if (signal.aborted) aborted();
-    });
-}
-
 export async function callValidatedLsCandidates(
     model: string,
     prompt: string,
@@ -36,36 +25,13 @@ export async function callValidatedLsCandidates(
     validator: Validator,
     failures: ModelBridgeAttemptFailure[],
 ): Promise<LsModelResult & { modelUsed?: string; cancelled?: boolean }> {
-    const deadlineAt = performance.now() + timeoutMs;
-    let actualModel = model;
-    let launched = false;
-    try {
-        const parent = getParentLs();
-        const endpoint = parent ? null : (await untilAborted(enumerateActiveLs("antigravity"), signal))[0];
-        const connection = parent || (endpoint ? {
-            info: { pid: endpoint.pid, csrfToken: endpoint.csrfToken, workspaceId: endpoint.workspaceId || "", ports: [endpoint.port] },
-            port: endpoint.port,
-        } : null);
-        if (!connection) return { text: null, error: "Antigravity LS connection unavailable", failureClass: "Availability", modelUsed: model };
-        let last: LsModelResult & { modelUsed?: string } = { text: null, error: "Antigravity LS empty response", failureClass: "Quality", modelUsed: model };
-        for (const candidate of getLsModelCandidates(model)) {
-            if (signal.aborted || performance.now() >= deadlineAt) break;
-            actualModel = candidate;
-            launched = true;
-            const response = await untilAborted(rpcCall(connection.info, connection.port, "GetModelResponse", { model: candidate, prompt }, Math.max(1, Math.floor(deadlineAt - performance.now()))), signal);
-            const text = typeof response.data?.response === "string" ? response.data.response : "";
-            const error = response.status === 200
-                ? rejectResponse(text, "antigravity", candidate, validator, failures)
-                : `Antigravity LS HTTP ${response.status}`;
-            if (!error) return { text, modelUsed: candidate };
-            last = { text: null, error, modelUsed: candidate, failureClass: response.status === 200 ? "Quality" : "Availability" };
-            if (response.status !== 200) failures.push({ provider: "antigravity", model: candidate, reason: error, occurredAt: new Date().toISOString(), kind: "provider", failureClass: last.failureClass });
-        }
-        if (signal.aborted || performance.now() >= deadlineAt) return { text: null, error: "Antigravity LS candidate deadline reached", timedOut: true, modelUsed: actualModel, failureClass: launched ? "UnknownOutcome" : "Availability" };
-        return last;
-    } catch (error) {
-        return { text: null, error: error instanceof Error ? error.message : String(error), modelUsed: actualModel, failureClass: launched ? "UnknownOutcome" : "Availability", ...(signal.aborted ? { cancelled: true } : {}) };
-    }
+    return callGetModelResponseDetailed(model, prompt, timeoutMs, {
+        signal,
+        validator: (text, candidate) => rejectResponse(text, "antigravity", candidate, validator, failures),
+        onFailure: (candidate, error, failureClass) => {
+            if (failureClass !== "Quality") failures.push({ provider: "antigravity", model: candidate, reason: error, occurredAt: new Date().toISOString(), kind: "provider", failureClass });
+        },
+    });
 }
 
 export async function callValidatedAgyCandidates(

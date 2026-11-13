@@ -51,6 +51,44 @@ export interface AttachmentSummary {
     missingPaths: number;
 }
 
+export function filterRoundAttachmentsForRoles(round: ConversationRound, roles: ReadonlySet<string>, subagentSource = false): ConversationRound {
+    if (!roles.size) return round;
+    const userMessages: NonNullable<ConversationRound["userMessages"]> = round.userMessages || (round.userMessage ? [{ stepIndex: round.startStep, text: round.userMessage }] : []);
+    const roleByStep = new Map<number, string>();
+    for (const message of userMessages) {
+        if (message.stepIndex !== undefined) roleByStep.set(message.stepIndex, "user");
+    }
+    for (const response of round.aiResponses) roleByStep.set(response.stepIndex, "assistant");
+    for (const tool of round.toolCalls) roleByStep.set(tool.stepIndex, "tool");
+    for (const event of round.semanticEvents || []) {
+        if (event.stepIndex !== undefined) roleByStep.set(event.stepIndex, event.semanticRole);
+    }
+    const selected = (role: string): boolean => subagentSource && ["user", "assistant", "model"].includes(role)
+        ? roles.has("subagent")
+        : roles.has(role) || ((role === "assistant" || role === "model") && (roles.has("assistant") || roles.has("model")));
+    const referenceKey = (attachment: ConversationAttachment): string => attachment.dataUrl
+        || normalizePathKey(attachment.tempPath || attachment.originalPath || attachment.reference || "");
+    const userReferences = new Set(userMessages.flatMap(message => (message.attachments || []).map(referenceKey)).filter(Boolean));
+    const keep = (attachment: ConversationAttachment): boolean => {
+        const role = attachment.stepIndex === undefined ? undefined : roleByStep.get(attachment.stepIndex);
+        if (role) return selected(role);
+        if (userReferences.has(referenceKey(attachment))) return selected("user");
+        if (attachment.source === "antigravity-uri" || attachment.source === "antigravity-tool-image") return selected("tool");
+        if (attachment.stepIndex !== undefined) return false;
+        return selected("user");
+    };
+    return {
+        ...round,
+        mediaAttachments: selected("user") ? [...round.mediaAttachments] : [],
+        attachments: round.attachments?.filter(keep),
+        userMessages: round.userMessages?.map(message => ({
+            ...message,
+            mediaAttachments: selected("user") ? message.mediaAttachments : [],
+            attachments: selected("user") ? message.attachments : [],
+        })),
+    };
+}
+
 const DEFAULT_MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024;
 const DEFAULT_MAX_TOTAL_ATTACHMENT_BYTES = 50 * 1024 * 1024;
 const DEFAULT_MATERIALIZE_LIMIT = 20;
@@ -159,6 +197,7 @@ function dedupeAttachments(attachments: ConversationAttachment[]): ConversationA
     const seen = new Set<string>();
     const result: ConversationAttachment[] = [];
     for (const attachment of attachments) {
+        if (isRequestHeadingAttachment(attachment)) continue;
         const materializationKey = attachmentMaterializationKey(attachment);
         const key = attachment.dataUrl
             ? `${attachment.kind}:data:${attachment.dataUrl.slice(0, 160)}:${attachment.dataUrl.length}`
@@ -169,6 +208,10 @@ function dedupeAttachments(attachments: ConversationAttachment[]): ConversationA
         result.push(attachment);
     }
     return result;
+}
+
+export function isRequestHeadingAttachment(attachment: ConversationAttachment): boolean {
+    return attachment.source === 'files-mentioned' && /^my request(?: for codex)?$/iu.test(attachment.name || '');
 }
 
 export function extractCodexMessageAttachments(
@@ -284,14 +327,16 @@ export function extractFilesMentionedAttachments(
     const markerIndex = text.indexOf(marker);
     if (markerIndex < 0) return [];
 
-    const block = text.slice(markerIndex + marker.length);
+    const remainder = text.slice(markerIndex + marker.length);
+    const requestMarker = /^#{1,2}[\t ]+My request(?: for Codex)?[\t ]*:/imu.exec(remainder);
+    const block = requestMarker ? remainder.slice(0, requestMarker.index) : remainder;
     const attachments: ConversationAttachment[] = [];
-    const linePattern = /^##\s+(.+?)\s*:\s*(.+)$/gmu;
+    const linePattern = /^##[\t ]+(.+?)[\t ]*:[\t ]*(.+)$/gmu;
     let match: RegExpExecArray | null;
     while ((match = linePattern.exec(block)) !== null) {
         const displayName = match[1].trim();
         const rawPath = match[2].trim();
-        if (/^my request for codex$/iu.test(displayName)) continue;
+        if (/^my request(?: for codex)?$/iu.test(displayName)) continue;
         if (!rawPath) continue;
         const resolved = resolveMentionPath(rawPath, options.cwd);
         attachments.push({
@@ -475,10 +520,10 @@ export async function materializeRoundAttachments(
     let truncated = 0;
     const cloned = rounds.map(round => ({
         ...round,
-        attachments: round.attachments ? [...round.attachments] : undefined,
+        attachments: round.attachments?.filter(attachment => !isRequestHeadingAttachment(attachment)),
         userMessages: round.userMessages?.map(message => ({
             ...message,
-            attachments: message.attachments ? [...message.attachments] : undefined,
+            attachments: message.attachments?.filter(attachment => !isRequestHeadingAttachment(attachment)),
         })),
     }));
     const jobs: Array<{ round: ConversationRound; attachment: ConversationAttachment; index: number }> = [];

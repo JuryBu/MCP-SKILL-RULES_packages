@@ -5,6 +5,8 @@ import type { ConversationLinkMode } from "../chain.js";
 import { normalizeProgressiveProjection, type ProgressiveRequest } from "../conversation-progressive-task-types.js";
 import { availableProgressiveRoles } from "../conversation-progressive-projection.js";
 import type { ProgressiveSource } from "../conversation-progressive-types.js";
+import { selectedProgressiveStatus } from "../conversation-progressive-presentation.js";
+import { isRequestHeadingAttachment } from "../conversation-attachments.js";
 import { normalizeCodexCorpusConversationId } from "../conversation-corpus-search.js";
 import { getCodexThreadMetadataByIdAsync } from "../codex-client.js";
 import { resolveCorpusSources } from "../conversation-corpus-sources.js";
@@ -61,13 +63,19 @@ function roles(params: ProgressiveToolParams): CorpusMessageRole[] {
     return selection;
 }
 
+export function progressiveReadRoles(params: ProgressiveToolParams, available: readonly CorpusMessageRole[]): CorpusMessageRole[] {
+    return params.messageRoles === undefined ? [...available] : roles(params);
+}
+
 export function formatProgressiveReadRows(result: Pick<ProgressiveReadResult, "rows" | "messages" | "status">, params: ProgressiveToolParams, selectedRoles = roles(params)) {
     const source = result.status.source;
+    const presentedMessages = result.messages.map(message => message.attachments
+        ? { ...message, attachments: message.attachments.filter(attachment => !isRequestHeadingAttachment(attachment)) } : message);
     const userOnly = selectedRoles.length === 1 && selectedRoles[0] === "user";
     const formatted = formatCorpusReadProjection({
         conversation: source.conversation || { source: source.host as CorpusConversation["source"], id: source.conversationId, title: "", workspace: "" },
         revision: source.revision, complete: result.status.complete, warnings: [],
-        messages: result.messages, rounds: result.rows.map(item => item.round),
+        messages: presentedMessages, rounds: result.rows.map(item => item.round),
     }, {
         depth: params.depth as Depth | undefined, messageRoles: selectedRoles,
         extraTypes: userOnly ? [] : params.extraTypes as ExtraType[] | undefined,
@@ -83,7 +91,16 @@ export function formatProgressiveReadRows(result: Pick<ProgressiveReadResult, "r
             for (const name of names) if (name) counts.set(name, (counts.get(name) || 0) + 1);
         }
         const details = formatted.rounds[index];
-        return { ...details, ...(userOnly ? { compactionSummaries: undefined } : {}),
+        const visibleMessages = presentedMessages.filter(message => message.round === item.round.roundIndex && selectedRoles.includes(message.role));
+        const visibleSteps = new Set(visibleMessages.flatMap(message => [message.position?.ordinal,
+            ...(message.attachments || []).map(attachment => attachment.stepIndex)]).filter((step): step is number => typeof step === "number"));
+        const visibleReferences = new Set(visibleMessages.flatMap(message => [...(message.mediaAttachments || []),
+            ...(message.attachments || []).flatMap(attachment => [attachment.reference, attachment.originalPath, attachment.tempPath].filter((value): value is string => Boolean(value)))]).map(value => value.replace(/\\/gu, "/")));
+        const attachments = (item.round.attachments || visibleMessages.flatMap(message => message.attachments || [])).filter(attachment => !isRequestHeadingAttachment(attachment)).filter(attachment => typeof attachment.stepIndex === "number"
+            ? visibleSteps.has(attachment.stepIndex)
+            : [attachment.reference, attachment.originalPath, attachment.tempPath].some(value => typeof value === "string" && visibleReferences.has(value.replace(/\\/gu, "/"))));
+        const mediaAttachments = item.round.mediaAttachments.filter(value => visibleReferences.has(value.replace(/\\/gu, "/")));
+        return { ...details, ...(attachments ? { attachments } : {}), ...(mediaAttachments ? { mediaAttachments } : {}), ...(userOnly ? { compactionSummaries: undefined } : {}),
             ref: item.ref, blockId: item.blockId, round: item.round.roundIndex, roundNumbering: item.kind,
             ...(showToolSummary ? { toolSummary: [...counts].map(([name, count]) => ({ name, count })),
                 toolSummaryAvailable: item.round.toolSummary !== undefined || availableProgressiveRoles(source).includes("tool") || counts.size > 0 } : {}) };
@@ -156,8 +173,7 @@ export async function runProgressiveAction(params: ProgressiveToolParams): Promi
     const { cache, ready, row } = await openProgressiveTaskCache(identity, params.rangeRef);
     const status = await cache.status();
     const availableMessageRoles = availableProgressiveRoles(status.source);
-    const selectedRoles = params.messageRoles === undefined && status.source.conversation?.isChildThread
-        ? availableMessageRoles.filter(role => role === "subagent" || (params.depth === "full" && role === "tool")) : roles(params);
+    const selectedRoles = progressiveReadRoles(params, availableMessageRoles);
     if ((params.depth === "full" || params.extraTypes?.length) && preparation.request.depth !== "full") {
         const selectedBlock = params.blockId ? status.blocks.find(block => block.blockId === params.blockId) : undefined;
         const relativeSelection = row?.kind === "relative" || selectedBlock?.coverage.kind === "relative"
@@ -194,7 +210,10 @@ export async function runProgressiveAction(params: ProgressiveToolParams): Promi
             requestedRangeComplete: verifiedSourceRange(status.source), warnings: ready.warnings,
             round: row.round.roundIndex, roundNumbering: row.kind, messages: row.messages.filter(message => selectedRoles.includes(message.role)) };
     }
-    const selection: ProgressiveSelection = { blockId: params.blockId, startRound: params.startRound, endRound: params.endRound, direction: "oldest" };
+    const preferredBlockIds = !params.blockId && !row
+        ? ready.preferredBlockIds?.filter(blockId => status.blocks.some(block => block.blockId === blockId)) : undefined;
+    const selection: ProgressiveSelection = { blockId: params.blockId, startRound: params.startRound, endRound: params.endRound, direction: "oldest",
+        ...(preferredBlockIds?.length ? { blockIds: preferredBlockIds } : {}) };
     if ((params.startRound !== undefined || params.endRound !== undefined) && !params.blockId
         && status.completeRanges.some(range => range.kind === "relative")) {
         throw new Error("Accurate global round numbers are still being prepared; use the returned blockId with local bounds, or rangeRef");
@@ -211,7 +230,7 @@ export async function runProgressiveAction(params: ProgressiveToolParams): Promi
         const sourceRevision = originRevision;
         const referenceCall = (rangeRef: string) => ({ action: "read_ready", conversationId: ownerId,
             dataChain: preparation!.request.dataChain, taskId, rangeRef, messageRoles: selectedRoles, depth: params.depth || "normal" });
-        return { taskId, phase: ready.phase, availableMessageRoles, ...result,
+        return { taskId, phase: ready.phase, availableMessageRoles, ...result, status: selectedProgressiveStatus(result.status, selection.blockIds),
             cacheRevision, originRevision,
             match: result.match ? { ...result.match, sourceRevision,
                 snippets: result.match.snippets.map(snippet => ({ ...snippet, sourceRevision })) } : null,
@@ -238,12 +257,14 @@ export async function runProgressiveAction(params: ProgressiveToolParams): Promi
                 ? Math.min(amount, Math.max(0, status.source.totalRounds - startRound + 1)) : amount;
             result = { ...earliest, requestedRangeComplete: earliest.rows.length === expectedRounds };
         } else {
-            const latest = await cache.readLatest({ ...selection, direction: "latest" }, amount);
+            const latest = await cache.readLatest({ ...selection, direction: "latest",
+                ...(selection.blockIds ? { blockIds: [...selection.blockIds].reverse() } : {}) }, amount);
             const rows = latest.rows.slice().reverse();
             result = { ...latest, rows, rounds: rows.map(item => item.round), messages: rows.flatMap(item => item.messages),
                 requestedRangeComplete: latest.requestedRangeComplete || latest.status.complete };
         }
     } else result = await cache.read(selection);
+    result = { ...result, status: selectedProgressiveStatus(result.status, selection.blockIds) };
     const { messages, rounds } = formatProgressiveReadRows(result, params, selectedRoles);
     const sourceRangeVerified = verifiedSourceRange(result.status.source);
     let conversation = result.status.source.conversation;

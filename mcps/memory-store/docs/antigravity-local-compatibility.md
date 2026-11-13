@@ -1,0 +1,21 @@
+# Antigravity新旧版本兼容
+
+## 选择数据与模型来源
+
+对话数据使用dataChain="antigravity"。conversationId填写当前调用者稳定ID，conversationIds选择目标；CLI本地会话使用目录返回的antigravity-cli:限定ID，避免与GUI同名会话混合。模型调用使用modelChain，不从对话ID猜模型链路。
+
+旧PB和新版本地正文按来源身份与修订读取。完整transcript_full.jsonl优先；仅有紧凑transcript.jsonl时检查truncated_fields，缺失正文继续标partial。新旧同ID以可核事件身份合并，重复步号本身不足以删除事件，PB内部trajectoryId与文件ID均保留。SQLite目录提供工作区、父子关系和来源位置，正文读取只接纳已识别格式。
+
+## 日常读取与完整消费者
+
+只看末尾或某段，使用read_fast/prepare，沿同一任务读取已就绪范围；正文检索使用search_all/read_hit。需要完整Record或回顾时使用fetch及返回的完整缓存generation。完整来源检查保留sourcePartial与覆盖缺口；已经就绪的部分仍可读，未查范围不算零命中。
+
+工具结果在宿主中被转存为output.txt时，正文保留原引用，按需要补读对应详情；同一会话来源、同一轮次和输出引用共同定位，不把另一条会话的同名文件拼进来。大型MCP响应仍按本工具返回的continuation或结果ID续读。
+
+## 模型与错误恢复
+
+Antigravity模型分支先核当前GetUserStatus目录，过滤禁用或已知零额度条目。普通默认M318；Argon、Carbon和Claude通过明确型号选择。旧环境没有新目录时保留原型号映射，外层Grok/Codex等模型顺序保持。
+
+App在线使用经过PID、用途、loopback端口与认证核验的Hub。App离线按需启动本任务CLI自带LS，初始化和目录查询不会发送ACP生成提示，实际文字生成只提交prompt/model，用完回收自有进程。已发送生成后遇到断连、超时或取消，保留原结果未知状态，先查原调用；完整服务容量拒绝单独记录，避免把它当成登录失败。
+
+Guard仍是单轮小阶段审查，明确绑定Plan/Task和阶段。外部文件是必需证据、聊天只作参考时，check显式executionEvidenceRole="reference"并提供必需evidenceAssets；默认required会检查聊天范围是否完整，相对末尾窗口不能代替指定绝对轮次。已有后台taskId用于查询原调用；修改证据参数后向同一Guard发新check，保留旧回执。

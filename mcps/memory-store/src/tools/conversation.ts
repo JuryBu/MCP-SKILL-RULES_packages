@@ -68,6 +68,7 @@ import { formatLocalPbActivities } from "../conversation-source-adapters.js";
 import {
     listConversationCandidates,
     formatSourceStatuses,
+    conversationTitleMatchesFuzzyQuery,
     type SourceFailureMode,
     type IdResolutionMode,
     type WorkspaceMatchScope,
@@ -1001,7 +1002,9 @@ function formatRoundForMessageRolesWithOptionalBudget(
 }
 
 function formatWindsurfSourceDiagnostics(loaded: NonNullable<Awaited<ReturnType<typeof loadConversationData>>>): string {
-    const lines: string[] = (loaded.sourceDiagnostics || []).map(detail => `🔎 对话源: ${detail}`);
+    const counts = new Map<string, number>();
+    for (const detail of loaded.sourceDiagnostics || []) counts.set(detail, (counts.get(detail) || 0) + 1);
+    const lines: string[] = [...counts].map(([detail, count]) => `🔎 对话源: ${detail}${count > 1 ? `（共 ${count} 次）` : ""}`);
     if (loaded.cacheGeneration) {
         lines.push(`🧠 fetch 缓存: ${loaded.cacheState || "hit"} | generation=${loaded.cacheGeneration} | source=${loaded.sourceMode || "auto"}`);
     }
@@ -1194,6 +1197,10 @@ export function listCandidateMatchesQuery(item: ConversationListCandidate, norma
     if (!normalizedQuery) return true;
     const haystack = listCandidateHaystack(item);
     return haystack.includes(normalizedQuery) || listQueryTermsMatch(haystack, queryTerms);
+}
+
+export function listCandidateMatchesFuzzyTitle(item: ConversationListCandidate, normalizedQuery: string): boolean {
+    return conversationTitleMatchesFuzzyQuery(item.title || "", normalizedQuery);
 }
 
 function listFieldIncludesAny(field: string, queryTerms: string[]): boolean {
@@ -2279,6 +2286,7 @@ fetch/search/read/recall/export 必须传 conversationId（共享 broker 后端�
                             source, contextProbe, maxBytes, maxHits, candidateLimit: maxFiles, deadlineMs,
                             conversationIds,
                             query,
+                            mode,
                             workspaces,
                             workspaceMode,
                             workspaceScope: workspaceScope as WorkspaceMatchScope,
@@ -2413,6 +2421,11 @@ fetch/search/read/recall/export 必须传 conversationId（共享 broker 后端�
                         filtered = applyDefaultMainThreadMode(filtered);
                     }
                     let matchMode = normalizedQuery ? (queryTerms.length > 1 ? "metadata-or" : "exact") : "";
+                    if (normalizedQuery && filtered.length === 0 && (mode === "auto" || mode === "fuzzy")) {
+                        filtered = probeResult.candidates.filter(item => listCandidateMatchesFuzzyTitle(item, normalizedQuery));
+                        if (!threadMode && (resolved === "codex" || resolved === "claude-code" || resolved === "windsurf")) filtered = applyDefaultMainThreadMode(filtered);
+                        if (filtered.length) matchMode = "fuzzy-title";
+                    }
                     const listNotes: string[] = [];
                     if (probeResult.matchMode) {
                         filtered = probeResult.hitCount > 0
@@ -2953,7 +2966,7 @@ fetch/search/read/recall/export 必须传 conversationId（共享 broker 后端�
                 }
                 const readConversation = dependencies.loadConversation || loadConversationData;
                 let loaded = await readConversation(chains.dataChain, conversationId, loadOptions);
-                if (publishedCacheOnly && loaded && loaded.chainUsed !== "codex") {
+                if (publishedCacheOnly && loaded && loaded.chainUsed !== "codex" && loaded.chainUsed !== "windsurf" && loaded.chainUsed !== "dsh") {
                     const cachedRecovery = loaded;
                     loaded = await readConversation(loaded.chainUsed, loaded.conversationId, { ...loadOptions, publishedCacheOnly: false });
                     if (!loaded) throw new Error(`dataChain=auto 定位到 ${cachedRecovery.chainUsed}，原文来源读取失败；旧缓存仍可使用 source=cache, link=${link}, cacheGeneration=${cachedRecovery.cacheGeneration || "unknown"} 读取`);
@@ -2974,6 +2987,7 @@ fetch/search/read/recall/export 必须传 conversationId（共享 broker 后端�
                 const cacheNextParams = conversationSearchReadNextParams(loaded, cacheRequest);
 
                 const cascadeId = loaded.conversationId;
+                const targetReadParams = { conversationId: callerConversationId!, conversationIds: [cascadeId] };
                 const rounds = loaded.rounds;
                 const totalSteps = loaded.totalSteps;
                 const windsurfSourceDiagnostics = formatWindsurfSourceDiagnostics(loaded);
@@ -3064,7 +3078,7 @@ fetch/search/read/recall/export 必须传 conversationId（共享 broker 后端�
                     }
                     const nextParams = {
                         action: "recall",
-                        conversationId: cascadeId,
+                        ...targetReadParams,
                         dataChain: loaded.chainUsed,
                         recallMode,
                         source,
@@ -3252,8 +3266,8 @@ fetch/search/read/recall/export 必须传 conversationId（共享 broker 后端�
                         if (truncated > 0) output.push(`⚠️ ${truncated} 个附件超过单次生成上限，未生成临时文件\n`);
                     }
                     const orderedMatches = [...new Set(matchedRoundIndices)].sort((left, right) => left - right);
-                    output.push("💡 固定同代读取参数", JSON.stringify({ action: "read", conversationId: cascadeId, dataChain: loaded.chainUsed,
-                        startRound: orderedMatches[0], endRound: orderedMatches.at(-1), ...cacheNextParams,
+                    output.push("💡 固定同代读取参数", JSON.stringify({ action: "read", ...targetReadParams, dataChain: loaded.chainUsed,
+                        startRound: orderedMatches[0], endRound: orderedMatches[0], ...cacheNextParams,
                         ...(messageRoles?.length ? { messageRoles } : {}) }));
                     let text = formatConversationSearchDelivery(output.join("\n"), matchedRoundIndices);
                     text = appendConversationReadDetail(text, formatConversationReadSegmentTiming(searchTiming));
@@ -3275,7 +3289,7 @@ fetch/search/read/recall/export 必须传 conversationId（共享 broker 后端�
                         const { text } = formatPaginatedConversationReadText({
                             conversationId: cascadeId, text: activityText, sourcePositions: [], continuationCursor, maxBytes,
                             detail: [cacheReadDetail, windsurfSourceDiagnostics, formatConversationReadSegmentTiming(readTiming)].filter(Boolean).join("\n"),
-                            nextParams: { action: "read", conversationId: cascadeId, dataChain: loaded.chainUsed, depth,
+                            nextParams: { action: "read", ...targetReadParams, dataChain: loaded.chainUsed, depth,
                                 ...(maxBytes !== undefined ? { maxBytes } : {}), ...cacheNextParams },
                         });
                         return appendTiming({ content: [{ type: "text" as const, text }] }, startTime);
@@ -3317,11 +3331,6 @@ fetch/search/read/recall/export 必须传 conversationId（共享 broker 后端�
                     if (logicalChainNote) pushOutputWithBuildBudget(output, logicalChainNote, buildState, "read 输出");
                     const roleFilter = normalizeMessageRoles(messageRoles as ConversationMessageRole[] | undefined);
                     pushOutputWithBuildBudget(output, `📖 读取轮次 ${start}-${roundWindow.endRound}${roleFilter.size ? ` | 角色过滤: ${[...roleFilter].join(", ")}` : ""}\n`, buildState, "read 输出");
-                    if (windsurfSourceDiagnostics) {
-                        pushOutputWithBuildBudget(output, windsurfSourceDiagnostics, buildState, "read 输出");
-                        pushOutputWithBuildBudget(output, "", buildState, "read 输出");
-                    }
-
                     const selectedRounds = roundWindow.rounds;
                     const sourcePositions: ConversationReadSourcePosition[] = [{
                         charPosition: 0,
@@ -3416,10 +3425,10 @@ fetch/search/read/recall/export 必须传 conversationId（共享 broker 后端�
                         sourcePositions,
                         continuationCursor,
                         maxBytes,
-                        detail: [cacheReadDetail, formatConversationReadSegmentTiming(readTiming)].filter(Boolean).join("\n"),
+                        detail: [cacheReadDetail, windsurfSourceDiagnostics, formatConversationReadSegmentTiming(readTiming)].filter(Boolean).join("\n"),
                         nextParams: {
                             action: "read",
-                            conversationId: cascadeId,
+                            ...targetReadParams,
                             dataChain: loaded.chainUsed,
                             depth,
                             compactionMode: effectiveCompactionMode,
@@ -3434,7 +3443,7 @@ fetch/search/read/recall/export 必须传 conversationId（共享 broker 后端�
                         ...(roundWindow.hasMore ? {
                             terminalNextParams: {
                                 action: "read",
-                                conversationId: cascadeId,
+                                ...targetReadParams,
                                 dataChain: loaded.chainUsed,
                                 depth,
                                 compactionMode: effectiveCompactionMode,

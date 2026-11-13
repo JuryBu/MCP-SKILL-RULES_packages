@@ -19,6 +19,7 @@ export interface LsProcessInfo {
     csrfToken: string;
     workspaceId: string;
     ports: number[];
+    transport?: "app" | "cli" | "legacy";
 }
 
 export interface RpcResult {
@@ -45,9 +46,26 @@ function httpPost(
     urlPath: string,
     body: string,
     headers: Record<string, string>,
-    timeoutMs = 15000
+    timeoutMs = 15000,
+    signal?: AbortSignal,
 ): Promise<{ status: number; body: string }> {
     return new Promise((resolve, reject) => {
+        let sent = false;
+        let settled = false;
+        let deadline: NodeJS.Timeout;
+        const finish = (error?: Error, response?: { status: number; body: string }) => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(deadline);
+            signal?.removeEventListener("abort", abort);
+            if (error) reject(Object.assign(error, { mayHaveStarted: sent }));
+            else resolve(response!);
+        };
+        const abort = () => {
+            const error = Object.assign(new Error("LS request cancelled"), { cancelled: true });
+            finish(error);
+            req.destroy(error);
+        };
         const req = http.request(
             {
                 hostname: host,
@@ -66,15 +84,26 @@ function httpPost(
                 res.on("data", (chunk: Buffer) => chunks.push(chunk));
                 res.on("end", () => {
                     const responseBody = Buffer.concat(chunks).toString("utf-8");
-                    resolve({ status: res.statusCode || 0, body: responseBody });
+                    finish(undefined, { status: res.statusCode || 0, body: responseBody });
                 });
+                res.on("aborted", () => finish(new Error("LS response disconnected")));
+                res.on("error", error => finish(error));
             }
         );
-        req.on("error", reject);
-        req.on("timeout", () => {
-            req.destroy();
-            reject(new Error("Request timeout"));
+        req.on("socket", socket => {
+            if (socket.connecting) socket.once("connect", () => { sent = true; });
+            else sent = true;
         });
+        req.on("error", error => finish(error));
+        const expire = () => {
+            const error = Object.assign(new Error("Request timeout"), { timedOut: true });
+            finish(error);
+            req.destroy(error);
+        };
+        deadline = setTimeout(expire, Math.max(1, timeoutMs));
+        req.on("timeout", expire);
+        signal?.addEventListener("abort", abort, { once: true });
+        if (signal?.aborted) { abort(); return; }
         req.write(body);
         req.end();
     });
@@ -88,16 +117,17 @@ async function realRpcCall(
     port: number,
     method: string,
     payload: Record<string, unknown> = {},
-    timeoutMs = 15000
+    timeoutMs = 15000,
+    signal?: AbortSignal,
 ): Promise<RpcResult> {
     const rpcPath = `/exa.language_server_pb.LanguageServerService/${method}`;
     const body = JSON.stringify(payload);
     const headers = {
-        "x-codeium-csrf-token": lsInfo.csrfToken,
+        ...(lsInfo.csrfToken ? { "x-codeium-csrf-token": lsInfo.csrfToken } : {}),
         "Connect-Protocol-Version": "1",
     };
 
-    const resp = await httpPost("127.0.0.1", port, rpcPath, body, headers, timeoutMs);
+    const resp = await httpPost("127.0.0.1", port, rpcPath, body, headers, timeoutMs, signal);
 
     let data: any;
     try {
@@ -115,7 +145,8 @@ type RpcImpl = (
     port: number,
     method: string,
     payload: Record<string, unknown>,
-    timeoutMs: number
+    timeoutMs: number,
+    signal?: AbortSignal,
 ) => Promise<RpcResult>;
 
 let rpcOverride: RpcImpl | null = null;
@@ -137,10 +168,11 @@ export async function rpcCall(
     port: number,
     method: string,
     payload: Record<string, unknown> = {},
-    timeoutMs = 15000
+    timeoutMs = 15000,
+    signal?: AbortSignal,
 ): Promise<RpcResult> {
     const impl = rpcOverride ?? realRpcCall;
-    return impl(lsInfo, port, method, payload, timeoutMs);
+    return impl(lsInfo, port, method, payload, timeoutMs, signal);
 }
 
 /**

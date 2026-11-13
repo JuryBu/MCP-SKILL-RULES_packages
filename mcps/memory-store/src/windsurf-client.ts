@@ -1654,12 +1654,12 @@ export async function withLegacyWindsurfFallback<Result>(
 
 export async function resolveWindsurfThreadId(
     input: string,
-    options: Pick<WindsurfLsTransportCallOptions, "requestClass"> & DevinReadOptions = {},
+    options: Pick<WindsurfLsTransportCallOptions, "requestClass"> & DevinReadOptions & { skipDevin?: boolean } = {},
 ): Promise<string | null> {
     const query = input.trim().toLowerCase();
     if (!query) return null;
     const child = splitDevinSubagentId(input);
-    const devin = await withLegacyWindsurfFallback(input, () => resolveDevinConversation(child?.parentId || input, options), options);
+    const devin = options.skipDevin ? null : await withLegacyWindsurfFallback(input, () => resolveDevinConversation(child?.parentId || input, options), options);
     if (devin) {
         rememberDevinIdentity(devin);
         return child ? devinSubagentId(devin.canonicalId, child.agentId) : devin.canonicalId;

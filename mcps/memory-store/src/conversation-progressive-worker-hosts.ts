@@ -11,6 +11,7 @@ import { normalizeProgressiveProjection, type ProgressiveReadyState, type Progre
 import type { CorpusMessage, CorpusProjection, CorpusRangeProvider } from "./conversation-corpus-types.js";
 import type { ProgressiveCache, ProgressiveSource, ProgressiveWriter } from "./conversation-progressive-types.js";
 import type { ConversationRound } from "./trajectory.js";
+import { reconcileProgressiveWarnings } from "./conversation-progressive-presentation.js";
 
 export interface HostProgressiveControl {
     isCancelled: () => boolean;
@@ -92,6 +93,8 @@ export async function executeHostProgressivePreparation(payload: ProgressiveTask
             conversationId: loaded.conversationId, sourcePartial: conversationSourceIsPartial(loaded), roundCount: loaded.roundCount ?? loaded.rounds.length };
         ready.phase = "complete";
         await writeReady();
+        await control.onProgress({ type: "progress", stage: "complete", current: ready.fullFetchCache.roundCount,
+            unit: "轮", detail: "完整fetch缓存已发布，已就绪范围可以继续读取" });
     };
     const select = async (cacheDirectory: string, source: ProgressiveSource): Promise<void> => {
         if (ready.current?.directory !== cacheDirectory) {
@@ -125,6 +128,10 @@ export async function executeHostProgressivePreparation(payload: ProgressiveTask
         const totalRounds = input.totalRounds ?? (input.complete && kind === "absolute"
             ? rounds.reduce((maximum, round) => Math.max(maximum, round.roundIndex), 0) : undefined);
         const sourceRangeVerified = input.partial !== true && input.requestedRangeComplete !== false;
+        const currentWarnings = reconcileProgressiveWarnings([...ready.warnings, ...input.warnings, ...(conversation.sourceWarnings ?? [])],
+            final && input.complete && kind === "absolute" && sourceRangeVerified);
+        ready.warnings = currentWarnings.warnings;
+        ready.historicalWarnings = [...new Set([...(ready.historicalWarnings ?? []), ...currentWarnings.historicalWarnings])];
         const source = projectProgressiveSource({ conversationId: request.conversationId, host: request.dataChain,
             revision: input.revision, snapshot: { source: request.dataChain, conversationId: input.conversation.id, revision: input.revision, sourceRangeVerified },
             totalRounds, conversation: input.conversation }, request);
@@ -156,7 +163,6 @@ export async function executeHostProgressivePreparation(payload: ProgressiveTask
                 }, request, input.conversation.isChildThread), check);
                 const status = await cache.status();
                 const count = kind === "relative" ? status.relativeReadyRounds : status.coveredAbsoluteRounds;
-                ready.warnings = [...new Set([...ready.warnings, ...input.warnings, ...(conversation.sourceWarnings ?? [])])];
                 ready.phase = initial ? "range-ready" : "publishing-full-ranges";
                 const requestedEnd = request.direction === "oldest" ? Math.min(request.initialRounds, totalRounds ?? request.initialRounds)
                     : totalRounds ?? (initialWindow?.kind === "absolute" && initialWindow.revision === input.revision ? initialWindow.endRound : undefined);

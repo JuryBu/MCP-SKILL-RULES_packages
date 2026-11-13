@@ -10,7 +10,7 @@ const root = fs.mkdtempSync(path.join(os.tmpdir(), "auto-summary-bridge-"));
 process.env.MEMORY_STORE_DATA_ROOT = root;
 process.env.MEMORY_STORE_AUTO_RECORD = "0";
 process.env.MEMORY_STORE_AGY_AUTO_ENABLED = "0";
-process.env.MEMORY_STORE_CODEX_COMMAND = path.join(root, "no-real-codex-command");
+process.env.MEMORY_STORE_CODEX_COMMAND = process.execPath;
 process.env.MEMORY_STORE_LS_MODEL_FALLBACKS = "summary-fallback,summary-last";
 const notice = "Synthetic Model is no longer available. Please switch to another model.";
 let grokText = notice;
@@ -46,6 +46,7 @@ delete process.env.MEMORY_STORE_AUTOSUMMARY_TIMEOUT_MS;
 const summary = await import("../src/auto-summary.ts");
 ls.__setParentLsForTest({ info: { pid: process.pid, csrfToken: "synthetic", workspaceId: "synthetic", ports: [1] }, port: 1 });
 rpc.__setLsRpcImplForTest(async (_info, _port, method, payload) => {
+    if (method === "GetUserStatus") return { status: 404, data: {}, rawSize: 0 };
     assert.equal(method, "GetModelResponse");
     const model = String(payload.model);
     lsModels.push(model);

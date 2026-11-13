@@ -148,7 +148,8 @@ format="json"和structuredContent包含items、selection、coverage、sourceTimi
 - memory_query、memory_batch(query)、memory_write、memory_update、memory_stats(action="enhance") 也支持 modelChain；旧 chain 继续作为模型链路兼容别名
 - "chain=\"auto\"" 优先当前宿主链路；模型调用按 Grok →（仅 MEMORY_STORE_AGY_AUTO_ENABLED=1 时）agy → Antigravity → Codex → 可选 Claude Code CLI 探测
 - 显式指定 "modelChain=\"grok\""、"modelChain=\"agy\"" 或对应旧 chain 时只使用该模型链路，不可用直接报错；agy 内部仅按「Gemini 3.8 Flash (High) → Flash (Medium) → Gemini 3.1 Pro (Low)」fallback，不会跨到其它宿主模型链路；显式指定 "chain=\"antigravity\""、"chain=\"codex\"" 或 "chain=\"claude-code\"" 时同样不静默回退
-- Antigravity 链路通过 Language Server 本地 API 获取解密数据，无需手动解密 .pb 文件
+- Antigravity 原文支持旧PB与新版GUI/CLI本地来源；完整JSONL优先，紧凑日志的truncated_fields不会被当作完整正文。新旧同ID保留早期内容和来源映射，来源缺口继续标partial；完整fetch后Record/Guard使用已验证缓存，显式范围提取保留范围说明。
+- Antigravity模型分支先核当前GetUserStatus目录，普通材料默认M318，Argon/Carbon及Claude按显式选择；App在线使用认证Hub，App离线按需使用本任务CLI自带LS，仅发送必要prompt/model，用完回收。未知生成结果不自动重放，Grok/Codex等外层链路顺序保留。
 - Codex 链路通过本地线程索引与原始事件流重建轮次
 - Codex 附件懒解析(v1.12.2): fetch 只返回附件统计；read/search 只对实际输出轮次按需处理图片和文件路径。local_images 本地路径优先；仅当图片只存在于 JSONL 的 data:image base64 时，才并行限流写入 memory-store/temp/codex-attachments/<conversationId>/round-xxxxxx/sha256-*.png。普通 PDF/DOCX/Markdown 文件从 Files mentioned 文本块解析路径并标注存在性，不读取正文。可用 MEMORY_STORE_CODEX_ATTACHMENT_MATERIALIZE_LIMIT / MEMORY_STORE_CODEX_ATTACHMENT_MATERIALIZE_CONCURRENCY / MEMORY_STORE_CODEX_ATTACHMENT_MAX_BYTES / MEMORY_STORE_CODEX_ATTACHMENT_MAX_TOTAL_BYTES 控制数量、并发、单图大小和单次总解码量。
 - Codex 超大 JSONL 流式读取(v1.12.6): 本地 rollout 改为分块逐行解析，超长 session_meta / 加密 reasoning / 单条超大文本在读取层丢弃或裁剪；conversation_read_original 的 fetch/read/search 也会按预算构建输出，避免 1GB+ 对话在原文读取或 Record 更新前置阶段触发 V8 字符串上限。

@@ -10,8 +10,16 @@ import { formatCorpusReadableResult, withCorpusOutputFormat } from "../conversat
 import type { ExtraType } from "../trajectory.js";
 import { runIsolatedSource } from "../conversation-isolated-source.js";
 import { DATA_ROOT } from "../store.js";
+import { corpusSearchContinuation } from "../conversation-corpus-search-next.js";
 
 const actions = new Set(["search_all", "search_all_status", "search_all_cancel", "search_all_resume", "read_hit", "read_fast", "read_result"]);
+
+function withSearchContinuation(result: unknown, ownerId: string): unknown {
+    if (!result || typeof result !== "object") return result;
+    const state = result as Parameters<typeof corpusSearchContinuation>[0];
+    if (!state.taskId || !state.status || !state.request?.dataChains?.length) return result;
+    return { ...result, ...corpusSearchContinuation({ ...state, ownerId }) };
+}
 
 export function isCorpusAction(action: string): boolean {
     return actions.has(action);
@@ -124,7 +132,7 @@ export async function runCorpusAction(params: CorpusToolParams, supplied?: Corpu
         if (params.parentQuery !== undefined) throw new Error("search_all的子线程范围需要明确parentConversationId；先用list按parentQuery定位父对话");
         const parentDataChain = params.parentDataChain === undefined ? undefined : resolveCorpusSources({ dataChain: params.parentDataChain })[0];
         if (parentDataChain && (sources!.length !== 1 || sources![0] !== parentDataChain)) throw new Error("search_all的parentDataChain须与唯一dataChain一致");
-        return api.start({ ownerId, provider: api.provider, request: {
+        return withSearchContinuation(await api.start({ ownerId, provider: api.provider, request: {
             query: params.query, allTerms: params.allTerms, anyTerms: params.anyTerms, excludeTerms: params.excludeTerms,
             expression: params.searchExpression, conversationIds: params.conversationIds, workspaces: params.workspaces,
             workspaceMode: params.workspaceMode, messageRoles: roles, intersectionScope: params.intersectionScope,
@@ -132,7 +140,7 @@ export async function runCorpusAction(params: CorpusToolParams, supplied?: Corpu
             dataChains: sources!, sourceFailureMode: params.sourceFailureMode,
             parentConversationId: params.parentConversationId, parentDataChain, threadMode: params.threadMode,
             maxFiles: params.maxFiles, maxBytes: params.maxBytes, maxHits: params.maxHits, deadlineMs: params.deadlineMs,
-        } });
+        } }), ownerId);
     }
     if (params.action === "read_hit" || params.action === "read_fast") {
         if (sources!.length !== 1) throw new Error("读取命中项或单个范围时使用该命中的具体dataChain");
@@ -185,12 +193,12 @@ export async function runCorpusAction(params: CorpusToolParams, supplied?: Corpu
             waitMs: Math.min(45000, Math.max(0, (params.waitSeconds || 0) * 1000)) });
         if (status && typeof status === "object" && "changes" in status) {
             const changes = status.changes as { throughRevision?: number } | undefined;
-            return { ...status, nextAfterRevision: changes?.throughRevision };
+            return withSearchContinuation({ ...status, nextAfterRevision: changes?.throughRevision }, ownerId);
         }
-        return status;
+        return withSearchContinuation(status, ownerId);
     }
-    if (params.action === "search_all_cancel") return api.cancel(identity);
-    if (params.action === "search_all_resume") return api.resume({ ...identity, provider: api.provider });
+    if (params.action === "search_all_cancel") return withSearchContinuation(await api.cancel(identity), ownerId);
+    if (params.action === "search_all_resume") return withSearchContinuation(await api.resume({ ...identity, provider: api.provider }), ownerId);
     throw new Error("未知全库检索动作");
 }
 

@@ -79,6 +79,8 @@ conversation_read_original：正文查找和范围读取按下文「关于对话
 
 关于对话原文读取
 conversation_read_original 支持五端正文搜索、范围准备和完整规范化缓存。本端填写 `dataChain="antigravity"`；跨端按目标来源填写，宿主归属以来源元数据核对。`search_all/read_hit/read_fast` 的 `source` 省略或填 `auto/local`；`read_fast` 不使用 `forceRefresh=true`，刷新仅用于新建 `search_all`。旧完整缓存用 `search/read(source="cache")`，`ls` 通过支持的旧入口读取。
+
+Antigravity 数据同时保留旧版 PB、桌面新版 JSONL/SQLite 与独立 CLI 来源；同一文件 ID 的旧历史和新尾部联合核对，保留真实缺口与原身份。完整版 JSONL 优先，紧凑版截短和数据库独有步骤按实际来源补齐。桌面与 CLI 根分开，CLI 目标使用返回的 `antigravity-cli:<id>`；父子关系以来源证据核验。日常原文继续用上述 MCP 范围入口，离线原件作为排障来源；具体见[新旧 Antigravity 兼容](../../mcps/memory-store/docs/antigravity-local-compatibility.md)。
 - 触发场景（应主动使用）：
   · CHECKPOINT 压缩后需要恢复丢失的上下文细节（最常见场景）
   · 新对话中需要回溯旧对话的具体操作过程
@@ -123,6 +125,7 @@ Record 是对话粒度的结构化过程日志，按实际选择的模型生成�
 - 主人可随时调用 stage_guard(action="status") 查看或 stage_guard(action="cancel") 取消
 - 如果显式要求使用另一侧模型链路，先确认目标宿主在线；不要在主人明确指定链路后悄悄回退到本地链路
 - 不知道当前对话 ID 时，先 `conversation_read_original(action="list", dataChain="antigravity", query="标题或工作区")` 核对来源，再把同一个 ID 用于后续 `start/status/check/cancel`
+- 当前宿主已明确注入 Conversation ID 时直接复用该稳定 ID。审核和摘要模型优先沿已有 Grok 路线；显式 Antigravity 模型从当前已验证 App/自有 CLI 目录选择，旧 LS 兼容保留。认证、额度、取消或生成结果未知时按原任务核实，明确容量拒绝才尝试目录内下一候选。
 
 关于旧版工作记忆的兼容
 有些老项目根文件夹下可能存在「工作记忆」或「对话记忆」文件夹，里面有手写的 memory_x_yyy.md 系列文件，这是 MCP memory-store 部署前的旧方案。如果你在项目中看到这类文件夹，应当阅读理解其中内容作为上下文，并考虑将有价值的内容迁移到 MCP memory-store 中。新项目不再使用这种手动方式。

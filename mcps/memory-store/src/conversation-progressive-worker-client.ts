@@ -4,6 +4,7 @@ import { execFile, fork, type ChildProcess } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import type { BackgroundTaskContext } from "./background-tasks.js";
 import type { ProgressiveTaskPayload } from "./conversation-progressive-task-types.js";
+import { progressiveWorkerProgress } from "./conversation-progressive-presentation.js";
 
 async function terminateProgressiveWorkerTree(child: ChildProcess): Promise<void> {
     if (child.pid === undefined) return;
@@ -87,8 +88,8 @@ export async function runProgressiveWorker(payload: ProgressiveTaskPayload, cont
         child.stderr?.on("data", chunk => { stderr = (stderr + chunk.toString("utf8")).slice(-8000); });
         child.on("message", message => {
             if (!message || typeof message !== "object") return;
-            const event = message as { type?: string; stage?: string; detail?: string; current?: number; result?: string; error?: string };
-            if (event.type === "progress") context.updateProgress({ stage: event.stage, detail: event.detail, current: event.current, unit: "轮" });
+            const event = message as { type?: string; stage?: string; detail?: string; current?: number; total?: number; unit?: string; result?: string; error?: string };
+            if (event.type === "progress") context.updateProgress(progressiveWorkerProgress(event));
             if (event.type === "result") result = event.result;
             if (event.type === "error" && !deadlineExceeded) failure = new Error(event.error || "Progressive worker failed");
         });

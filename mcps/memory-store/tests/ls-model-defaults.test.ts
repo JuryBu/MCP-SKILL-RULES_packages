@@ -6,6 +6,7 @@ import {
 import { getLsModelCandidates } from "../src/ls-client.ts";
 
 const expectedOrder = [
+    "MODEL_PLACEHOLDER_M318",
     "MODEL_PLACEHOLDER_M132",
     "MODEL_PLACEHOLDER_M20",
     "MODEL_PLACEHOLDER_M18",
@@ -13,7 +14,7 @@ const expectedOrder = [
     "MODEL_PLACEHOLDER_M36",
 ];
 
-assert.equal(DEFAULT_ANTIGRAVITY_LS_MODEL, "MODEL_PLACEHOLDER_M132");
+assert.equal(DEFAULT_ANTIGRAVITY_LS_MODEL, "MODEL_PLACEHOLDER_M318");
 assert.deepEqual(DEFAULT_ANTIGRAVITY_LS_MODEL_FALLBACKS, expectedOrder);
 
 assert.deepEqual(getLsModelCandidates(DEFAULT_ANTIGRAVITY_LS_MODEL), expectedOrder);

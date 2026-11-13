@@ -10,7 +10,7 @@ export interface ConversationSearchReadRequest {
 }
 
 export function shouldUsePublishedConversationCache(action: string, dataChain: string, sourceExplicit: boolean): boolean {
-    return !sourceExplicit && (action === "search" || action === "read") && (dataChain === "codex" || dataChain === "auto");
+    return !sourceExplicit && (action === "search" || action === "read") && (dataChain === "codex" || dataChain === "windsurf" || dataChain === "dsh" || dataChain === "auto");
 }
 
 export function assertConversationStrictCacheState(loaded: ConversationLoadResult, action: string, request: ConversationSearchReadRequest): void {

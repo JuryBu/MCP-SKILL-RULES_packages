@@ -12,6 +12,7 @@ import { acquireCorpusLease } from "./conversation-corpus-task-store.js";
 import { withConversationSourcePressure } from "./conversation-source-pressure.js";
 import { openProgressiveCache, ProgressiveCacheError } from "./conversation-progressive-cache.js";
 import { runProgressiveWorker } from "./conversation-progressive-worker-client.js";
+import { progressiveCompletedProgress, progressiveWarningView, selectedProgressiveStatus } from "./conversation-progressive-presentation.js";
 import {
     isProgressiveRequest, isProgressiveTaskPayload, type ProgressiveReadyState,
     type ProgressiveRequest, type ProgressiveTaskPayload,
@@ -217,9 +218,12 @@ export async function getProgressiveTaskStatus(identity: ProgressiveTaskIdentity
     let afterRevision = identity.afterRevision;
     for (;;) {
         const task = getBackgroundTask(record.backgroundTaskId);
-        const ready = await readyFor(record);
-        const cache = ready?.current ? await openReadyGeneration(ready.current) : undefined;
-        const status = cache ? await cache.status() : undefined;
+        const storedReady = await readyFor(record);
+        const cache = storedReady?.current ? await openReadyGeneration(storedReady.current) : undefined;
+        const rawStatus = cache ? await cache.status() : undefined;
+        const status = rawStatus ? selectedProgressiveStatus(rawStatus, storedReady?.preferredBlockIds) : undefined;
+        const ready = storedReady ? progressiveWarningView(storedReady,
+            status?.complete === true && storedReady.fullFetchCache?.sourcePartial !== true) : undefined;
         const cancellationPending = task?.status === "cancelled" && running.has(identity.taskId);
         const rangeAvailable = Boolean(status?.blocks.length);
         const partialFailure = rangeAvailable && task?.status === "error";
@@ -231,7 +235,8 @@ export async function getProgressiveTaskStatus(identity: ProgressiveTaskIdentity
             taskId: identity.taskId, backgroundTaskId: record.backgroundTaskId, request: record.payload.request,
             status: partialFailure ? "partial" : task?.status || "unknown", phase: ready?.phase || task?.progress?.stage || "queued",
             progress: partialFailure && task?.progress ? { ...task.progress,
-                detail: "完整历史准备已结束并返回错误，已经就绪的范围仍可使用", updatedAt: task.updatedAt } : task?.progress,
+                detail: "完整历史准备已结束并返回错误，已经就绪的范围仍可使用", updatedAt: task.updatedAt }
+                : progressiveCompletedProgress(task?.progress, task?.status === "done" && ready?.phase === "complete" && Boolean(ready.fullFetchCache), ready?.fullFetchCache?.roundCount),
             error: partialFailure ? undefined : task?.error,
             preparationError: partialFailure ? task?.error : undefined,
             backgroundPreparation: { status: task?.status || "unknown", error: task?.error },
@@ -244,6 +249,7 @@ export async function getProgressiveTaskStatus(identity: ProgressiveTaskIdentity
                     link: record.payload.request.link || "reference", startRound: 1, endRound: Math.min(3, ready.fullFetchCache.roundCount) || 1 } } } : {}),
             rangeAvailable, cancellationPending,
             warnings: [...(ready?.warnings || []), ...(partialFailure ? [`PREPARATION_FAILED_WITH_READABLE_RANGE: ${task?.error}`] : [])],
+            historicalWarnings: ready?.historicalWarnings,
             next: rangeAvailable
                 ? progressiveReadyReadNext(record.payload.request, identity.taskId,
                     ready?.preferredBlockIds?.filter(blockId => status?.blocks.some(block => block.blockId === blockId)))
@@ -259,8 +265,10 @@ export async function getProgressiveTaskStatus(identity: ProgressiveTaskIdentity
 
 export async function openProgressiveTaskCache(identity: ProgressiveTaskIdentity, ref?: string) {
     const record = await recordFor(identity);
-    const ready = await readyFor(record);
-    if (!ready) throw new Error("No range is ready yet; poll prepare_status with the same taskId");
+    const storedReady = await readyFor(record);
+    if (!storedReady) throw new Error("No range is ready yet; poll prepare_status with the same taskId");
+    const currentStatus = storedReady.current ? await (await openReadyGeneration(storedReady.current)).status() : undefined;
+    const ready = progressiveWarningView(storedReady, currentStatus?.complete === true && storedReady.fullFetchCache?.sourcePartial !== true);
     const generations = [ready.current, ...ready.previous].filter(item => item !== undefined);
     if (!generations.length) throw new Error("No range is ready yet; poll prepare_status with the same taskId");
     for (const generation of generations) {

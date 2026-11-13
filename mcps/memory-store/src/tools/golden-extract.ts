@@ -292,7 +292,7 @@ async function runGoldenExtract(
                 }
 
                 const cascadeId = loaded.conversationId;
-                if (full?.windsurfData?.thread.sourceKind) assertConversationConsumerSourceComplete(full);
+                if (full) assertConversationConsumerSourceComplete(full);
                 const scopeText = progressive?.scopeText;
                 const scoped = (text: string): string => scopeText ? `${scopeText}\n\n${text}` : text;
                 let rounds = loaded.rounds;

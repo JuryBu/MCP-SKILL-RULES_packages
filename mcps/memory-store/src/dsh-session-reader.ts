@@ -226,6 +226,22 @@ export async function readDshSession(input: ReadInput, options: DshReaderOptions
     return readDshSessionIncremental(source, normalized.options);
 }
 
+export async function readDshSessionFingerprint(id: string, options: DshReaderOptions = {}, knownSourcePath?: string): Promise<{ path: string; size: number; mtime: number; revision: string } | null> {
+    const configuredRoot = resolveDshSessionsRoot(options);
+    const sessionsRoot = await realDirectory(configuredRoot, configuredRoot);
+    if (!sessionsRoot) return null;
+    let sourcePath = knownSourcePath ? await realFile(knownSourcePath, sessionsRoot) : null;
+    if (!sourcePath) {
+        const discovery = await discoverDshSessionSources({ ...options, conversationIds: [id] });
+        sourcePath = discovery.sources.find(source => source.id === id)?.provenance.sourcePath || null;
+    }
+    if (!sourcePath) return null;
+    const revision = await captureHostFile(sourcePath, { isCancelled: options.isCancelled,
+        onProgress: (bytes, totalBytes) => options.onProgress?.({ bytes, totalBytes, phase: "verify" }) });
+    return { path: revision.path, size: revision.size, mtime: revision.mtimeMs,
+        revision: createHash("sha256").update(`dsh-reader:${DSH_READER_REVISION}:stream1\0${revision.path}\0${revision.sha256}`).digest("hex") };
+}
+
 function normalizeReaderOptions(input: ReaderInput): DshReaderOptions {
     if (typeof input === "string") return { sessionsRoot: input };
     return input ?? {};

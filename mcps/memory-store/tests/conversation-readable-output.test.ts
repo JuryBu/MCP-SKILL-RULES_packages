@@ -20,6 +20,20 @@ assert.equal(formatCorpusReadableResult(result, { ...params, format: "json" }), 
 assert.equal(formatCorpusReadableResult(result), undefined);
 assert.deepEqual(result.messages[0].annotations, [{ selectedText: "原句", comment: "补充要求" }]);
 
+for (const status of ["done", "failed", "cancelled", "resumable"]) {
+    const completedPreparation = formatCorpusReadableResult({ taskId: "finished-partial", status, rangeAvailable: true,
+        requestedRangeComplete: false, fullSourceComplete: false }, { action: "prepare_status" })!;
+    assert.ok(completedPreparation.includes("本任务已结束，已取得部分范围"));
+    assert.ok(completedPreparation.includes("本次未准备完整历史"));
+    assert.ok(!completedPreparation.includes("仍在准备"));
+}
+const runningPreparation = formatCorpusReadableResult({ taskId: "running-partial", status: "running", rangeAvailable: true,
+    requestedRangeComplete: false, fullSourceComplete: false }, { action: "prepare_status" })!;
+assert.ok(runningPreparation.includes("所需范围仍在准备"));
+const finishedEmptyPreparation = formatCorpusReadableResult({ taskId: "finished-empty", status: "done", rangeAvailable: false,
+    requestedRangeComplete: false }, { action: "prepare_status" })!;
+assert.ok(finishedEmptyPreparation.includes("本任务已结束，未取得所需范围"));
+
 const next = { action: "read_result", taskId: "result-example", continuationCursor: "digest:24000" };
 const page = formatCorpusReadableResult({ delivery: "paged", format: "markdown", text: "中文正文", startByte: 0, endByte: 24000, bytes: 30000, artifactPath: "example.md", next }, { action: "read_result" })!;
 assert.ok(page.startsWith("中文正文"));

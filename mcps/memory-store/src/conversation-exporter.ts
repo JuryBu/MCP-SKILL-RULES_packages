@@ -1,12 +1,13 @@
 import crypto from "crypto";
 import fs from "fs";
 import path from "path";
-import { fileURLToPath } from "url";
+import { fileURLToPath, pathToFileURL } from "url";
 import { DATA_ROOT, writeJsonAtomic, writeTextAtomic } from "./store.js";
 import {
     formatOverview,
     formatRound,
     formatRoundForMessageRoles,
+    getRoundSubagentSummaries,
     normalizeMessageRoles,
     searchInRounds,
     type CompactionMode,
@@ -15,7 +16,7 @@ import {
     type Depth,
     type ExtraType,
 } from "./trajectory.js";
-import { materializeRoundAttachments, type ConversationAttachment } from "./conversation-attachments.js";
+import { filterRoundAttachmentsForRoles, materializeRoundAttachments, type ConversationAttachment } from "./conversation-attachments.js";
 import { iterateCachedConversationSourceCacheRounds, type ConversationSourceCacheKey } from "./conversation-source-cache.js";
 import { renderConversationPdf } from "./conversation-pdf.js";
 import type { BackgroundTaskContext } from "./background-tasks.js";
@@ -195,6 +196,11 @@ function cloneRound(round: ConversationRound): ConversationRound {
         ...round,
         mediaAttachments: [...(round.mediaAttachments || [])],
         attachments: round.attachments ? round.attachments.map(item => ({ ...item })) : undefined,
+        userMessages: round.userMessages?.map(message => ({
+            ...message,
+            mediaAttachments: message.mediaAttachments ? [...message.mediaAttachments] : undefined,
+            attachments: message.attachments?.map(attachment => ({ ...attachment })),
+        })),
         aiResponses: round.aiResponses.map(item => ({
             ...item,
             toolCalls: item.toolCalls.map(tc => ({ ...tc })),
@@ -339,13 +345,13 @@ function writeInlineImageAsset(
     const parsed = parseInlineImage(uri);
     if (!parsed) return { ...asset, warning: "内联图片不是可识别的 base64 image data URL，未复制" };
     const sizeBytes = parsed.bytes.length;
-    if (budget.remainingCount <= 0) return { ...asset, sizeBytes, warning: "超过导出附件数量预算，未复制" };
     if (sizeBytes > budget.maxBytes) return { ...asset, sizeBytes, warning: `超过单附件大小预算 ${budget.maxBytes} bytes，未复制` };
-    if (sizeBytes > budget.remainingBytes) return { ...asset, sizeBytes, warning: "超过导出附件总大小预算，未复制" };
     const sha256 = crypto.createHash("sha256").update(parsed.bytes).digest("hex");
-    const key = `data:${sha256}`;
+    const key = `sha256:${sha256}`;
     const cached = budget.copiedByKey.get(key);
-    if (cached) return { ...cached, roundIndex: asset.roundIndex, source: asset.source, displayName: asset.displayName };
+    if (cached) return { ...cached, ...asset };
+    if (budget.remainingCount <= 0) return { ...asset, sizeBytes, warning: "超过导出附件数量预算，未复制" };
+    if (sizeBytes > budget.remainingBytes) return { ...asset, sizeBytes, warning: "超过导出附件总大小预算，未复制" };
 
     const directory = path.join(exportDir, "assets", "images");
     fs.mkdirSync(directory, { recursive: true });
@@ -387,15 +393,13 @@ function copyAsset(
     } catch {
         return { ...asset, originalPath: sourcePath, warning: "附件路径不存在或不可访问，未复制" };
     }
-    if (budget.remainingCount <= 0) return { ...asset, originalPath: sourcePath, sizeBytes: stat.size, warning: "超过导出附件数量预算，未复制" };
     if (stat.size > budget.maxBytes) return { ...asset, originalPath: sourcePath, sizeBytes: stat.size, warning: `超过单附件大小预算 ${budget.maxBytes} bytes，未复制` };
-    if (stat.size > budget.remainingBytes) return { ...asset, originalPath: sourcePath, sizeBytes: stat.size, warning: "超过导出附件总大小预算，未复制" };
-
-    const key = path.normalize(sourcePath).toLowerCase();
-    const cached = budget.copiedByKey.get(key);
-    if (cached) return { ...cached, roundIndex: asset.roundIndex, source: asset.source, displayName: asset.displayName };
-
     const { sha256, sizeBytes } = hashFile(sourcePath);
+    const key = `sha256:${sha256}`;
+    const cached = budget.copiedByKey.get(key);
+    if (cached) return { ...cached, ...asset, originalPath: sourcePath };
+    if (budget.remainingCount <= 0) return { ...asset, originalPath: sourcePath, sizeBytes, warning: "超过导出附件数量预算，未复制" };
+    if (sizeBytes > budget.remainingBytes) return { ...asset, originalPath: sourcePath, sizeBytes, warning: "超过导出附件总大小预算，未复制" };
     const directory = asset.kind === "image" ? path.join(exportDir, "assets", "images") : path.join(exportDir, "assets", "files");
     fs.mkdirSync(directory, { recursive: true });
     const ext = extensionForAsset(sourcePath, asset.kind);
@@ -451,6 +455,7 @@ function collectAndRewriteAssets(
 
     for (const round of cloned) {
         if (shouldAbort?.()) throw new Error("conversation export cancelled during asset collection");
+        const rewrittenPaths = new Map<string, string>();
         round.mediaAttachments = round.mediaAttachments.map((uri, index) => {
             if (shouldAbort?.()) throw new Error("conversation export cancelled during media asset collection");
             const sourcePath = pathFromUriOrPath(uri);
@@ -466,6 +471,10 @@ function collectAndRewriteAssets(
                 ? copyAsset(sourcePath, descriptor, exportDir, budget, shouldAbort)
                 : writeInlineImageAsset(uri, descriptor, exportDir, budget, shouldAbort);
             assets.push(copied);
+            if (copied.relativePath) {
+                rewrittenPaths.set(uri, copied.relativePath);
+                if (sourcePath) rewrittenPaths.set(sourcePath, copied.relativePath);
+            }
             if (copied.warning) warnings.push(`R${round.roundIndex} 图片附件：${copied.warning}`);
             return copied.relativePath || uri;
         });
@@ -482,12 +491,34 @@ function collectAndRewriteAssets(
                 stepIndex: attachment.stepIndex,
             }, exportDir, budget, shouldAbort);
             assets.push(copied);
+            if (copied.relativePath) {
+                if (attachment.originalPath) rewrittenPaths.set(attachment.originalPath, copied.relativePath);
+                if (attachment.tempPath) rewrittenPaths.set(attachment.tempPath, copied.relativePath);
+            }
             if (copied.warning) warnings.push(`R${round.roundIndex} ${attachment.kind === "image" ? "图片" : "文件"}附件：${copied.warning}`);
             if (copied.relativePath) {
                 if (attachment.tempPath) attachment.tempPath = copied.relativePath;
                 else attachment.originalPath = copied.relativePath;
                 attachment.exists = true;
             }
+        }
+        const rewriteText = (text: string): string => {
+            for (const [original, relative] of rewrittenPaths) {
+                const variants = new Set([original, original.replace(/\\/gu, "/"), original.replace(/\//gu, "\\")]);
+                if (path.isAbsolute(original)) variants.add(pathToFileURL(original).href);
+                for (const variant of [...variants].sort((left, right) => right.length - left.length)) text = text.split(variant).join(relative);
+            }
+            return text;
+        };
+        round.userMessage = rewriteText(round.userMessage);
+        for (const message of round.userMessages || []) {
+            message.text = rewriteText(message.text);
+            message.mediaAttachments = message.mediaAttachments?.map(uri => rewrittenPaths.get(uri) || rewriteText(uri));
+            message.attachments = message.attachments?.map(attachment => ({
+                ...attachment,
+                originalPath: attachment.originalPath ? rewriteText(attachment.originalPath) : undefined,
+                tempPath: attachment.tempPath ? rewriteText(attachment.tempPath) : undefined,
+            }));
         }
     }
 
@@ -530,6 +561,19 @@ function formatRoundForExport(
         }
         if (!selected.size) return "";
         return formatRoundForMessageRoles(round, depth, extraTypes, selected, compactionMode, { subagentSource: true }).text;
+    }
+    const subagents = getRoundSubagentSummaries(round);
+    if (subagents.length && (!roleFilter.size || roleFilter.has("subagent"))) {
+        const selected = new Set<ConversationMessageRole>(roleFilter.size ? roleFilter : ["user", "system", "assistant", "tool"]);
+        selected.delete("subagent");
+        const body = selected.size ? formatRoundForMessageRoles(round, depth, extraTypes, selected, compactionMode) : `## 轮次 ${round.roundIndex}`;
+        const replies = subagents.map(subagent => [
+            `##### ${subagent.nickname || "subagent"} · ${subagent.threadId || "unknown"}`,
+            subagent.status ? `状态：${subagent.status}` : "",
+            subagent.summary || "",
+            depth === "full" ? subagent.prompt || "" : "",
+        ].filter(Boolean).join("\n\n"));
+        return `${body}\n\n#### 🤝 子代理线程\n\n${replies.join("\n\n")}`;
     }
     return roleFilter.size > 0
         ? formatRoundForMessageRoles(round, depth, extraTypes, roleFilter, compactionMode)
@@ -683,7 +727,7 @@ async function streamCachedFullMarkdown(
         await write(`${buildMarkdownHeader(options, warnings, `${cached.roundIndexBounds?.first || 1}-${cached.roundIndexBounds?.last ?? cached.roundCount}`, cached.roundCount, true)}\n`);
         for (const round of cached.rounds) {
             throwIfExportAborted(options, `cache round ${round.roundIndex}`);
-            const materialized = await materializeRoundAttachments([round], options.conversationId, {
+            const materialized = await materializeRoundAttachments([filterRoundAttachmentsForRoles(round, roleFilter, options.sourceMetadata?.isSubagent)], options.conversationId, {
                 shouldAbort: () => Boolean(options.isCancelled?.() || options.isSettled?.()),
             });
             if (materialized.truncated > 0) warnings.push(`${materialized.truncated} 个内联图片超过 materialize 预算，未生成导出图片`);
@@ -783,7 +827,7 @@ export async function exportConversation(options: ConversationExportOptions): Pr
         warnings.push(...selected.warnings);
 
         throwIfExportAborted(options, "attachment materialization");
-        const materialized = await materializeRoundAttachments(selected.rounds, options.conversationId, {
+        const materialized = await materializeRoundAttachments(selected.rounds.map(round => filterRoundAttachmentsForRoles(round, normalizeMessageRoles(options.messageRoles), options.sourceMetadata?.isSubagent)), options.conversationId, {
             shouldAbort: () => Boolean(options.isCancelled?.() || options.isSettled?.()),
         });
         if (materialized.truncated > 0) warnings.push(`${materialized.truncated} 个内联图片超过 materialize 预算，未生成导出图片`);
@@ -863,7 +907,7 @@ export async function exportConversation(options: ConversationExportOptions): Pr
         stats: {
             markdownChars,
             markdownBytes: fs.statSync(markdownPath).size,
-            assetsCopied: assets.filter(asset => asset.exportPath).length,
+            assetsCopied: new Set(assets.flatMap(asset => asset.exportPath ? [asset.exportPath] : [])).size,
             assetsSkipped: assets.filter(asset => asset.warning && !asset.exportPath).length,
             embeddedPdfAttachments,
         },
@@ -889,7 +933,7 @@ export async function exportConversation(options: ConversationExportOptions): Pr
             totalStepsKnown: options.totalStepsKnown,
             markdownChars,
             markdownBytes: fs.statSync(markdownPath).size,
-            assetsCopied: assets.filter(asset => asset.exportPath).length,
+            assetsCopied: new Set(assets.flatMap(asset => asset.exportPath ? [asset.exportPath] : [])).size,
             assetsSkipped: assets.filter(asset => asset.warning && !asset.exportPath).length,
             embeddedPdfAttachments,
         },
