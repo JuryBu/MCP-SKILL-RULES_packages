@@ -3,6 +3,8 @@
 > 本文档由 ls-tools 插件的反向工程经验整理而成，供 MCP 开发 AI 理解 LS 进程机制。
 > 最后更新：2026-03-18
 
+模型入口说明于2026-11-13更新；其余生命周期章节保留旧版原理与历史实测范围。
+
 ---
 
 ## 1. LS 进程是什么
@@ -104,17 +106,23 @@ Body: JSON payload
 | `GetCascadeTrajectorySteps` | 获取对话的详细步骤（重量级，按 ~5MB 分页） | `{cascadeId, stepOffset}` |
 | `GetModelResponse` | 调用 AI 模型生成回复（可指定模型） | `{model, prompt}` |
 
-### 4.4 与 Codex 双链路的关系
+### 4.4 与模型桥的关系
 
 `web-fetcher` 里的网页抓取、截图、交互、文件转换主链仍然是本地浏览器与本地文件能力。
 
-只有 `ai_summary` 这类“对网页内容再做模型总结”的路径，会额外依赖模型链路。当前已扩展为双链路：
+`ai_summary` 和 `web_inspect(ai_review)` 额外依赖模型调用，统一使用 `modelChain`，旧 `chain` 参数继续兼容：
 
-- `chain="antigravity"`：继续使用本文描述的 LS `GetModelResponse`
-- `chain="codex"`：改走 Codex CLI 模型桥
-- `chain="auto"`：按当前宿主优先，本地链路优先
+- `modelChain="antigravity"`：App 在线时纯文字优先新版 Hub／旧 LS；App 离线且文本带 `schema` 时使用隔离的 ACP `cli-agent`（0图），无 `schema` 的轻量纯文字继续使用 `cli-ls`；图片使用原有 CLI 图片入口
+- `modelChain="codex"` 或 `"claude-code"`：分别使用现有 CLI 模型桥，当前 CC 桥只传文字
+- `modelChain="auto"`：保持 Antigravity→Codex；CC 仅在显式启用自动后备时加入末尾
 
-因此，LS 对 `web-fetcher` 的作用范围已经收缩为“可选模型后端之一”，不再代表整个工具的唯一宿主依赖。
+agent 兼容到 `cli-ls` 时，必须同时确认未提交、结果为 `not-started` 或明确 `unsupported`，并且 `safeToFallback=true`。认证、准入、额度、拒绝、取消及未知结果停止后备；已经提交的原请求保留结果与费用状态。
+
+清理未确认时，即使生成尚未提交也停止入口续选。`WEB_FETCHER_LS_MODEL` 的既有显式模型选择同时适用于App离线的schema ACP文字入口。
+
+2026-11-13候选08已完成无App环境的正常MCP结构化摘要和图片真实验收，两条入口均为cli-agent并正常EOF退出、清理临时目录；完整适用范围见下述模型桥文档。正式HTTP、安装和加载另行记录。
+
+现代模型目录、隔离配置、准入和取消边界见[反重力模型桥](docs/antigravity-model-bridge.md)。本文后面的同步进程发现代码保留为旧版原理参考，当前实现使用有界异步发现并校验运行身份。
 
 ### 4.3 discoverLsProcesses 参考实现
 

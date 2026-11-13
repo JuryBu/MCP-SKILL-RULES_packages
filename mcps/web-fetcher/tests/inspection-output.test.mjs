@@ -56,6 +56,8 @@ function normalizedReport({ includeFinding = false } = {}) {
     return inspector.normalizeAIReviewResponse(JSON.stringify({
         summary: "Synthetic inspection",
         aiFindings: includeFinding ? [{ description: "Synthetic finding", metadata: { screenshotPath: untrustedPath } }] : [],
+        confirmedIssues: [],
+        dismissedIssues: [],
         dismissReason: { screenshotPath: untrustedPath },
     }), {
         route: "pdf", page: 1, screenshotPath: includeFinding ? trustedPath : null,

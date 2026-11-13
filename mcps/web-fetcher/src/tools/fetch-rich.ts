@@ -16,7 +16,7 @@ import {
     SUMMARY_CHAIN_VALUES,
 } from "../constants.js";
 import { saveTempFile, generateCacheKey, splitOversizedImage } from "../temp-store.js";
-import { buildSummaryPrompt, generateSummaryText } from "../model-bridge.js";
+import { buildSummaryPrompt, generateSummaryText, type SummaryBridgeResult } from "../model-bridge.js";
 
 const FetchRichInputSchema = z.object({
     viewport: viewportSchema.optional(),
@@ -305,17 +305,20 @@ export function registerFetchRich(server: McpServer): void {
                 }
                 const compactMode = params.compact || "compact";
                 let finalContent: string;
+                let modelCall: Omit<SummaryBridgeResult, "text" | "error" | "providerLabel"> | undefined;
 
                 if (compactMode === "ai_summary") {
                     // AI Summary 模式：通过模型桥生成智能摘要
                     try {
                         const { prompt } = buildSummaryPrompt(content, sourceUrl);
                         const result = await generateSummaryText(prompt, modelChain);
+                        const { text: _text, error: _error, providerLabel: _providerLabel, ...state } = result;
+                        modelCall = state;
                         if (result.text && result.providerLabel && result.chainUsed) {
                             const ratio = ((1 - result.text.length / content.length) * 100).toFixed(0);
-                            finalContent = `🤖 AI 摘要 (by ${result.providerLabel})\n\n${result.text}\n\n---\n🔗 使用链路: ${result.chainUsed}\n📊 原文 ${content.length} 字 → 摘要 ${result.text.length} 字 (压缩 ${ratio}%)`;
+                            finalContent = `🤖 AI 摘要 (by ${result.providerLabel})\n\n${result.text}${result.cleanup?.warnings.length ? `\n⚠️ CLI 清理: ${result.cleanup.warnings.join("；")}` : ""}\n\n---\n🔗 使用链路: ${result.chainUsed}${result.transport ? ` / ${result.transport}` : ""}${result.modelUsed ? ` / ${result.modelUsed}` : ""}\n📊 原文 ${content.length} 字 → 摘要 ${result.text.length} 字 (压缩 ${ratio}%)`;
                         } else {
-                            finalContent = `⚠️ AI Summary 不可用（modelChain=${modelChain}），已降级为 compact${result.error ? `\n📋 ${result.error}` : ""}\n\n${compactContent(content, "compact")}`;
+                            finalContent = `⚠️ AI Summary 不可用（modelChain=${modelChain}），已降级为 compact${result.error ? `\n📋 ${result.error}` : ""}\n🧭 模型调用状态: ${JSON.stringify(modelCall)}\n\n${compactContent(content, "compact")}`;
                         }
                     } catch (err) {
                         console.error(`[web-fetcher] fetch-rich AI Summary 失败: ${err instanceof Error ? err.message : err}`);
@@ -334,6 +337,7 @@ export function registerFetchRich(server: McpServer): void {
                             `  片 ${i + 1}/${splitResult.paths.length} (${splitResult.sizes[i]} KB): ${p}`
                         ).join("\n");
                         return appendTiming({
+                            ...(modelCall ? { _meta: { modelCall } } : {}),
                             content: [{
                                 type: "text" as const,
                                 text: `📐 ${splitResult.description}${pageInfo} + 文本提取完成 [${compactMode}]\n\n${fileList}\n\n使用 view_file 按顺序查看截图\n\n${finalContent}`,
@@ -341,6 +345,7 @@ export function registerFetchRich(server: McpServer): void {
                         }, startTime, browserManager.lastRetryCount);
                     }
                     return appendTiming({
+                        ...(modelCall ? { _meta: { modelCall } } : {}),
                         content: [{
                             type: "text" as const,
                             text: `截图 (${splitResult.sizes[0]} KB)${pageInfo} + 文本提取完成 [${compactMode}]\n截图: ${splitResult.paths[0]} (用 view_file 查看)\n\n${finalContent}`,
@@ -348,6 +353,7 @@ export function registerFetchRich(server: McpServer): void {
                     }, startTime, browserManager.lastRetryCount);
                 } else {
                     return appendTiming({
+                        ...(modelCall ? { _meta: { modelCall } } : {}),
                         content: [
                             { type: "text" as const, text: `截图 (${sizeKB} KB)${pageInfo} + 文本提取完成 [${compactMode}]\n\n${finalContent}` },
                             ...await inlineImageContent(screenshotBuffer, `截图${pageInfo}`),

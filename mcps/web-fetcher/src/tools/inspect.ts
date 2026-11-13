@@ -25,7 +25,7 @@ import {
     extractDomStructure,
 } from "../inspector/dom-inspector.js";
 import { extractEpubStructure } from "../ebook/epub.js";
-import type { AIReviewReport, InspectResult, PageStructure } from "../inspector/types.js";
+import type { AIReviewModelCall, AIReviewReport, InspectResult, PageStructure } from "../inspector/types.js";
 import { inspectionContent } from "../inspection-output.js";
 import { runBackgroundWork } from '../background-tasks.js';
 
@@ -467,7 +467,8 @@ async function runDetection(route: InspectRoute, params: NormalizedInspectInput)
     return emptyDetection(route, params.mode);
 }
 
-async function runAIReview(route: InspectRoute, params: NormalizedInspectInput, progress?: BackgroundTaskProgress): Promise<AIReviewReport> {
+async function runAIReview(route: InspectRoute, params: NormalizedInspectInput, progress?: BackgroundTaskProgress, signal?: AbortSignal): Promise<AIReviewReport> {
+    signal?.throwIfAborted();
     if (route === "ebook") {
         const structure = await getStructure(route, params);
         return {
@@ -492,7 +493,11 @@ async function runAIReview(route: InspectRoute, params: NormalizedInspectInput, 
     const pages = structure.map(page => page.page);
     progress && (progress.total = pages.length);
     const reports: AIReviewReport[] = [];
+    let generationStopped = false;
     for (let index = 0; index < pages.length; index += params.batchSize) {
+        signal?.throwIfAborted();
+        throwIfRequestExpired();
+        if (generationStopped) break;
         const batch = pages.slice(index, index + params.batchSize);
         const batchReports = await Promise.all(batch.map(async pageNumber => {
             const pageStructure = structure.find(page => page.page === pageNumber);
@@ -500,17 +505,28 @@ async function runAIReview(route: InspectRoute, params: NormalizedInspectInput, 
             const pageIssues = detection.issues.filter(issue => issue.page === pageNumber);
             const screenshot = await captureReviewScreenshot(route, params.url, pageNumber, params.scale, params.viewport);
             const screenshotPath = screenshot?.path ?? null;
+            signal?.throwIfAborted();
+            throwIfRequestExpired();
+            if (generationStopped) return null;
+            if (!screenshotPath) {
+                generationStopped = true;
+                return aiReviewError(route, `第 ${pageNumber} 页截图不可用，未提交模型审查`);
+            }
             const readinessNote = screenshot?.note;
             const prompt = buildAIReviewPrompt(route, params.url, pageNumber, pageStructure, pageIssues, screenshotPath)
                 + (readinessNote ? `\n截图完整性警告：${readinessNote}。不要把未完成加载当成确定的设计缺陷。` : "");
             const model = await generateModelText({
                 prompt,
+                purpose: "visual-review",
                 chain: params.modelChain,
                 timeoutMs: AI_REVIEW_TIMEOUT_MS,
                 schema: aiReviewSchema(),
                 schemaName: "ai-review",
-                imagePaths: screenshotPath ? [screenshotPath] : [],
+                imagePaths: [screenshotPath],
+                signal,
             });
+            signal?.throwIfAborted();
+            if (!model.text && model.fallbackAllowed === false) generationStopped = true;
             const report = normalizeAIReviewResponse(model.text, {
                 route,
                 page: pageNumber,
@@ -518,13 +534,30 @@ async function runAIReview(route: InspectRoute, params: NormalizedInspectInput, 
                 chainUsed: model.chainUsed,
                 providerLabel: model.providerLabel,
                 error: model.error,
+                modelCall: {
+                    page: pageNumber,
+                    chainUsed: model.chainUsed,
+                    transport: model.transport,
+                    modelUsed: model.modelUsed,
+                    outcome: model.outcome,
+                    submitted: model.submitted,
+                    outcomeUnknown: model.outcomeUnknown,
+                    fallbackAllowed: model.fallbackAllowed,
+                    ...(model.cleanup ? { cleanup: model.cleanup } : {}),
+                },
                 knownIssues: pageIssues,
             });
+            if (report.error) generationStopped = true;
+            if (model.cleanup?.warnings.length) report.summary += `\n⚠️ CLI 清理: ${model.cleanup.warnings.join("；")}`;
             if (readinessNote) report.summary += `\n⚠️ ${readinessNote}`;
             if (progress) progress.completed += 1;
             return report;
         }));
         reports.push(...batchReports.filter((report): report is AIReviewReport => report !== null));
+    }
+
+    if (generationStopped && reports.length < pages.length) {
+        reports.push(aiReviewError(route, `模型请求已停止，剩余${pages.length - reports.length}页未审查；请核对原始错误和生成状态后再安排新任务`));
     }
 
     return persistAIReviewReport(mergeAIReviewReports(reports));
@@ -575,6 +608,7 @@ function startAIReviewTask(route: InspectRoute, params: NormalizedInspectInput):
         deadlineAt: Date.now() + BACKGROUND_TASK_TIMEOUT_MS,
     };
     backgroundTasks.set(id, task);
+    const controller = new AbortController();
     let settled = false;
     let timeout: ReturnType<typeof setTimeout> | null = null;
     const settle = (status: Exclude<BackgroundTaskStatus, "running">, value: AIReviewReport | string, timedOut = false) => {
@@ -594,14 +628,16 @@ function startAIReviewTask(route: InspectRoute, params: NormalizedInspectInput):
         task.finishedAt = Date.now();
     };
     timeout = setTimeout(() => {
-        settle("error", "AI Review 后台任务超时", true);
+        controller.abort(new Error("AI Review 后台任务总期限已到"));
+        task.timedOut = true;
+        task.error = "AI Review 后台任务超时，正在结束自有操作";
     }, BACKGROUND_TASK_TIMEOUT_MS);
     timeout.unref?.();
     void (async () => {
         try {
-            settle("done", await runBackgroundWork('inspect-ai', () => runAIReview(route, params, task.progress), BACKGROUND_TASK_TIMEOUT_MS));
+            settle("done", await runBackgroundWork('inspect-ai', () => runAIReview(route, params, task.progress, controller.signal), BACKGROUND_TASK_TIMEOUT_MS, undefined, controller.signal, undefined, true));
         } catch (error) {
-            settle("error", error instanceof Error ? error.message : String(error));
+            settle("error", error instanceof Error ? error.message : String(error), task.timedOut === true);
         }
     })();
     return id;
@@ -789,6 +825,7 @@ function normalizeAIReviewResponse(text: string | null, context: {
     chainUsed: string | null;
     providerLabel: string | null;
     error?: string;
+    modelCall?: AIReviewModelCall;
     knownIssues: InspectResult["issues"];
 }): AIReviewReport {
     if (!text) {
@@ -801,10 +838,27 @@ function normalizeAIReviewResponse(text: string | null, context: {
             chainUsed: context.chainUsed,
             providerLabel: context.providerLabel,
             error: context.error ?? "AI 模型无返回",
+            ...(context.modelCall ? { modelCalls: [context.modelCall] } : {}),
         };
     }
 
     const parsed = parseJsonObject(text);
+    if (typeof parsed.summary !== "string" || !Array.isArray(parsed.aiFindings)
+        || !Array.isArray(parsed.confirmedIssues) || !Array.isArray(parsed.dismissedIssues)
+        || !parsed.dismissReason || typeof parsed.dismissReason !== "object" || Array.isArray(parsed.dismissReason)) {
+        return {
+            summary: "AI 审查返回格式不完整，本页未取得可核验报告",
+            aiFindings: [],
+            confirmedIssues: [],
+            dismissedIssues: [],
+            dismissReason: {},
+            chainUsed: context.chainUsed,
+            providerLabel: context.providerLabel,
+            error: "AI_REVIEW_INVALID_RESPONSE：保留原始回复，停止后续自动生成",
+            rawResponse: text,
+            ...(context.modelCall ? { modelCalls: [{ ...context.modelCall, outcome: "invalid-response" as const, fallbackAllowed: false }] } : {}),
+        };
+    }
     const rawFindings = Array.isArray(parsed.aiFindings) ? parsed.aiFindings : [];
     const aiFindings = rawFindings.map((finding: any) => ({
         page: Number.isFinite(Number(finding.page)) ? Number(finding.page) : context.page,
@@ -827,6 +881,7 @@ function normalizeAIReviewResponse(text: string | null, context: {
         chainUsed: context.chainUsed,
         providerLabel: context.providerLabel,
         rawResponse: text,
+        ...(context.modelCall ? { modelCalls: [context.modelCall] } : {}),
     };
 }
 
@@ -880,6 +935,7 @@ function mergeAIReviewReports(reports: AIReviewReport[]): AIReviewReport {
         chainUsed: reports.find(report => report.chainUsed)?.chainUsed ?? null,
         providerLabel: reports.find(report => report.providerLabel)?.providerLabel ?? null,
         error: errors.length ? errors.join("; ") : undefined,
+        modelCalls: reports.flatMap(report => report.modelCalls ?? []),
     };
 }
 

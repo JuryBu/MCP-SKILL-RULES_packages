@@ -185,16 +185,16 @@ web_human_browser_detach(humanSessionId="human_...", ownerId="project-a")
 `ai_summary` 与 `web_inspect(mode="ai_review")` 路径现在支持 Antigravity / Codex / Claude Code 三链路模型调用。新参数是 `modelChain`，旧参数 `chain` 保留兼容：
 
 - `modelChain="auto"`：默认值。按 `antigravity -> codex` 尝试；`WEB_FETCHER_CLAUDE_CODE_AUTO_FALLBACK=1` 时才把 `claude-code` 作为最后 fallback，避免旧请求隐性消耗 Claude Code 额度。
-- `modelChain="antigravity"`：强制走 Antigravity Language Server 的 `GetModelResponse`。
+- `modelChain="antigravity"`：固定 Antigravity 平台。App 在线时纯文字继续优先使用新版 App LS／旧 LS；App 离线时，有 `schema` 的结构化文本使用隔离的 ACP `cli-agent` 文本入口（0图），无 `schema` 的轻量纯文字保留 `cli-ls`。图片继续使用原有 CLI 图片入口。
 - `modelChain="codex"`：强制走 Codex CLI 模型桥。
 - `modelChain="claude-code"`：强制走 Claude Code CLI `claude -p` provider。
 - `modelChain` 未填写时使用 `chain`，两者都未填写时使用 `auto`。
-- `chain` 仅作为模型链路兼容参数保留，不代表数据链路，也不会引入 `dataChain`。
+- `chain` 仅作为模型调用的兼容参数，网页内容仍从指定 URL 获取。
 
 当前只有 AI Summary 总结链和 `web_inspect(mode="ai_review")` 受 `modelChain` 影响，网页抓取、截图、表格提取、交互和下载主链不变。
 这意味着 web-fetcher 不存在对话链路串线问题；只有 `outputMode="ai_summary"`、`compact="ai_summary"` 或 `mode="ai_review"` 会进入模型桥。
 
-后台 AI 任务带 deadline 与 timedOut 状态，默认 15 分钟后标记失败，不会重启或杀掉 web-fetcher 后端；可用 `WEB_FETCHER_WEB_AI_BACKGROUND_MAX_RUN_MS`、`WEB_FETCHER_INSPECT_BACKGROUND_MAX_RUN_MS` 覆盖。
+后台 AI 任务带 deadline 与 timedOut 状态，默认 15 分钟后取消自有模型操作，共享 web-fetcher 后端继续运行；可用 `WEB_FETCHER_WEB_AI_BACKGROUND_MAX_RUN_MS`、`WEB_FETCHER_INSPECT_BACKGROUND_MAX_RUN_MS` 覆盖。
 
 ```
 web_fetch_page(url, outputMode="ai_summary", modelChain="auto")  → 🤖 AI 摘要 + 完整内容临时文件
@@ -202,7 +202,8 @@ web_fetch_rich(url, compact="ai_summary", modelChain="auto")     → 截图 + �
 web_inspect(url, mode="ai_review", modelChain="auto")            → 截图/结构/几何问题 + AI 审查报告
 ```
 
-- `modelChain="auto"` 的前序链路不可用或调用失败时会继续尝试下一链路；显式指定链路失败时自动降级为 compact 模式并带出错误摘要
+- `modelChain="auto"` 保留原有外层顺序；agent 转 `cli-ls` 必须同时满足明确未提交、结果为 `not-started` 或明确 `unsupported`、`safeToFallback=true`。认证、准入、额度、拒绝、取消或未知结果均停止后备，原文仍以 compact 或完整文件保留
+- 清理未确认时，即使尚未提交生成，也停止入口续选；已有资源及其状态保留在原请求记录中
 - 典型压缩率 95%+（50000字 → 2000字）
 - Codex 侧长网页 AI Summary 建议使用后台模式，避免同步 MCP 调用超过宿主超时窗口：
 
@@ -213,11 +214,13 @@ web_fetch_page(taskId="...", waitSeconds=30)
 
 结果里会明确标出实际使用的链路，例如：
 
-- `Antigravity LS GetModelResponse`
+- `Antigravity / app-ls / MODEL_PLACEHOLDER_M318`，或 `cli-ls`、`legacy-ls`、`cli-agent` 等实际入口
 - `gpt-5.5 via Codex CLI`
 - `sonnet via Claude Code CLI`
 
-Antigravity LS 模型默认值：`WEB_FETCHER_LS_MODEL` 未设置时使用当前 GetModelResponse 实测可用的 Gemini 3.5 Flash High：`MODEL_PLACEHOLDER_M132`。默认 fallback 为 `MODEL_PLACEHOLDER_M132,MODEL_PLACEHOLDER_M20,MODEL_PLACEHOLDER_M18,MODEL_PLACEHOLDER_M16,MODEL_PLACEHOLDER_M36`，可通过 `WEB_FETCHER_LS_MODEL_FALLBACKS` 覆盖。其中 `M132/M20` 是新 Flash 高速路径，`M18` 是旧 Gemini 3 Flash 兜底，`M16/M36` 是 Gemini 3.1 Pro High/Low 兜底；复杂推理仍应优先理解为 Pro 更可靠，而不是把 Flash 的速度等同于最强推理。`MODEL_PLACEHOLDER_M47` 已返回 `unknown model key`，`MODEL_PLACEHOLDER_M37` 当前对 GetModelResponse 返回 `400 INVALID_ARGUMENT`，均不再放入默认链路。Codex 模型桥默认值：`gpt-5.5` + `model_reasoning_effort=medium` + `model_speed_tier=fast`，可覆盖环境变量：`WEB_FETCHER_CODEX_MODEL`、`WEB_FETCHER_CODEX_REASONING`、`WEB_FETCHER_CODEX_SPEED`。Claude Code CLI 默认值：`sonnet` + `--effort low`，可用 `WEB_FETCHER_CLAUDE_CODE_MODEL`、`WEB_FETCHER_CLAUDE_CODE_EFFORT`、`WEB_FETCHER_CLAUDE_CODE_TIMEOUT_MS`、`WEB_FETCHER_CLAUDE_CODE_MAX_BUDGET_USD` 覆盖；显式 `claude-code` 才主动调用，`auto` 末跳需 `WEB_FETCHER_CLAUDE_CODE_AUTO_FALLBACK=1`。
+现代 Antigravity 从当前账号的 `GetUserStatus` 目录选型，普通材料默认 Gemini 3.8 Flash High（当前为 `MODEL_PLACEHOLDER_M318`），按当次目录核验模型 ID、禁用状态及额度。`WEB_FETCHER_LS_MODEL` 可显式选择文字模型，App离线的schema ACP入口也保留这个既有配置。视觉审查自动选择可用 Argon High、其次 Carbon High，两者不可用时停止，Claude 保留显式使用。只有目录接口明确不支持的旧环境才使用原 `M132 -> M20 -> M18 -> M16 -> M36` 兼容表及 `WEB_FETCHER_LS_MODEL_FALLBACKS`，现代目录不会混入旧映射。完整入口、取消和错误边界，以及候选05图片成功、候选06 LS摘要500／结果未知、候选07未实际生成和候选08正常MCP摘要／视觉成功的实际范围，见[反重力模型桥](docs/antigravity-model-bridge.md)。
+
+Codex 模型桥默认值保持 `gpt-5.5` + `model_reasoning_effort=medium` + `model_speed_tier=fast`，可覆盖 `WEB_FETCHER_CODEX_MODEL`、`WEB_FETCHER_CODEX_REASONING`、`WEB_FETCHER_CODEX_SPEED`。Claude Code CLI 默认值保持 `sonnet` + `--effort low`，可用 `WEB_FETCHER_CLAUDE_CODE_MODEL`、`WEB_FETCHER_CLAUDE_CODE_EFFORT`、`WEB_FETCHER_CLAUDE_CODE_TIMEOUT_MS`、`WEB_FETCHER_CLAUDE_CODE_MAX_BUDGET_USD` 覆盖；`auto` 末跳仍需 `WEB_FETCHER_CLAUDE_CODE_AUTO_FALLBACK=1`。
 
 ## v7.0: 视觉检查与 AI Review
 
@@ -233,7 +236,7 @@ Antigravity LS 模型默认值：`WEB_FETCHER_LS_MODEL` 未设置时使用当前
 
 - `mode="structure"`：提取页面结构树，包含文本、边界框、层级、字体与颜色等信息。
 - `mode="detect"`：检测 `overlap`、`overflow`、`readability`、`alignment`。
-- `mode="ai_review"`：每页打包截图、结构树和几何检测结果，交给模型做审查。`modelChain="codex"` 会把截图作为多模态输入传给 Codex；`modelChain="antigravity"` 只能把截图路径、结构树和几何检测结果写入文本 prompt；`modelChain="claude-code"` 第一阶段走 Claude Code CLI 文本审查 fallback，不作为默认优先链路。
+- `mode="ai_review"`：每页打包截图、结构树和几何检测结果，缺少截图时不提交模型；Antigravity 使用 CLI 图片入口并按视觉用途选择 Argon／Carbon，Codex 使用 `-i` 传图。当前 Claude Code 桥只提供文字，图片请求在生成前明确拒绝。`modelCalls` 记录逐页实际入口、模型和提交状态。
 - `mode="all"`：一次执行结构提取、规则检测和 AI 审查。
 
 EPUB 路线是静态 ebook 结构，不创建 DOM session；`ai_review` 当前只返回静态结构说明，不执行截图型视觉审查。
@@ -265,7 +268,7 @@ web_pipeline(sessionId="session_...", ownerId="project-a", steps=[{action:"snaps
 web_close_sessions(sessionId="session_...", ownerId="project-a")
 ```
 
-`modelChain="antigravity"` 会通过 Antigravity Language Server 的 `GetModelResponse` 调用模型。该 RPC 只支持 `{model,prompt}` 纯文本请求，因此 AI Review 会把截图路径、结构树和几何检测结果写入 prompt；截图本身不会作为 `images` 多模态 payload 发送。`modelChain="codex"` 会通过 Codex CLI 模型桥调用 GPT-5.x，并用 `-i` 传入截图。
+Antigravity 的 `GetModelResponse` 仍是 `{model,prompt}` 单轮纯文字调用，客户端不附本机 RULES；有图片时会选择独立 CLI 图片能力。只读状态查询不启动 CLI，实际调用结束后清理自有 CLI，借用的 App 和其它会话保持原状。
 
 ## v5.2 新增：中国游戏社区适配 + 进程生命周期升级
 

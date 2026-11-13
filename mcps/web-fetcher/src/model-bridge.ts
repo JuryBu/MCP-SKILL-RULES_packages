@@ -1,8 +1,9 @@
-import { execFile, execFileSync, spawn, type ChildProcessWithoutNullStreams } from "child_process";
+import { execFile, spawn, type ChildProcessWithoutNullStreams } from "child_process";
 import fs from "fs";
 import os from "os";
 import path from "path";
 import { promisify } from "util";
+import { randomUUID } from "crypto";
 import {
     AI_SUMMARY_ANTIGRAVITY_LABEL,
     AI_SUMMARY_CLAUDE_CODE_LABEL,
@@ -19,7 +20,9 @@ import {
     CODEX_AI_SUMMARY_TIMEOUT,
     type SummaryChain,
 } from "./constants.js";
-import { callGetModelResponse, isLsAvailable } from "./ls-client.js";
+import { callAntigravity, isAntigravityAvailable } from "./ls-client.js";
+import type { AntigravityOutcome, AntigravityTransport } from "./antigravity-types.js";
+import { getRequestContext } from "./request-context.js";
 
 const execFileAsync = promisify(execFile);
 const CODEX_STATUS_TTL = 60 * 1000;
@@ -42,6 +45,13 @@ export interface SummaryBridgeResult {
     chainUsed: ResolvedSummaryChain | null;
     providerLabel: string | null;
     error?: string;
+    transport?: AntigravityTransport | "codex-cli" | "claude-code-cli" | null;
+    modelUsed?: string | null;
+    outcome?: AntigravityOutcome;
+    submitted?: boolean;
+    outcomeUnknown?: boolean;
+    fallbackAllowed?: boolean;
+    cleanup?: import("./antigravity-types.js").AntigravityCleanup;
 }
 
 export interface SummaryPromptInfo {
@@ -52,41 +62,40 @@ export interface SummaryPromptInfo {
 
 export interface ModelBridgeRequest {
     prompt: string;
+    purpose?: "material" | "visual-review";
     chain?: SummaryChain;
     timeoutMs?: number;
     schema?: Record<string, unknown>;
     imagePaths?: string[];
     schemaName?: string;
+    model?: string;
+    signal?: AbortSignal;
+    deadline?: number;
 }
 
 interface ProviderCallResult {
     text: string | null;
     error?: string;
+    outcome: AntigravityOutcome;
+    submitted: boolean;
+    safeToFallback: boolean;
+}
+
+function findLocalCommand(name: string): string {
+    const extensions = process.platform === "win32" ? [".cmd", ".exe", ".ps1", ""] : [""];
+    for (const directory of (process.env.PATH ?? "").split(path.delimiter).filter(Boolean)) {
+        for (const extension of extensions) {
+            const candidate = path.join(directory.replace(/^"|"$/gu, ""), `${name}${extension}`);
+            if (fs.existsSync(candidate)) return candidate;
+        }
+    }
+    return name;
 }
 
 function getCodexCommand(): string {
     if (cachedCodexCommand) return cachedCodexCommand;
 
-    if (process.platform === "win32") {
-        try {
-            const stdout = execSyncSafe("where.exe", ["codex"]);
-            const candidates = stdout
-                .split(/\r?\n/u)
-                .map((line) => line.trim())
-                .filter(Boolean);
-            const preferred = candidates.find((line) => /codex\.cmd$/iu.test(line))
-                ?? candidates.find((line) => /codex\.ps1$/iu.test(line))
-                ?? candidates.find((line) => /\\codex$/iu.test(line))
-                ?? candidates.find((line) => /codex\.exe$/iu.test(line))
-                ?? "codex";
-            cachedCodexCommand = preferred;
-            return preferred;
-        } catch {
-            // fall through
-        }
-    }
-
-    cachedCodexCommand = "codex";
+    cachedCodexCommand = findLocalCommand("codex");
     return cachedCodexCommand;
 }
 
@@ -96,35 +105,8 @@ function getClaudeCodeCommand(): string {
     }
     if (cachedClaudeCodeCommand) return cachedClaudeCodeCommand;
 
-    if (process.platform === "win32") {
-        try {
-            const stdout = execSyncSafe("where.exe", ["claude"]);
-            const candidates = stdout
-                .split(/\r?\n/u)
-                .map((line) => line.trim())
-                .filter(Boolean);
-            const preferred = candidates.find((line) => /claude\.cmd$/iu.test(line))
-                ?? candidates.find((line) => /claude\.exe$/iu.test(line))
-                ?? candidates.find((line) => /claude\.ps1$/iu.test(line))
-                ?? candidates.find((line) => /\\claude$/iu.test(line))
-                ?? "claude";
-            cachedClaudeCodeCommand = preferred;
-            return preferred;
-        } catch {
-            // fall through
-        }
-    }
-
-    cachedClaudeCodeCommand = "claude";
+    cachedClaudeCodeCommand = findLocalCommand("claude");
     return cachedClaudeCodeCommand;
-}
-
-function execSyncSafe(command: string, args: string[]): string {
-    return execFileSync(command, args, {
-        encoding: "utf-8",
-        timeout: 8000,
-        windowsHide: true,
-    });
 }
 
 function quoteForCmd(arg: string): string {
@@ -188,41 +170,42 @@ async function execClaudeCodeVersion(command: string): Promise<void> {
     });
 }
 
-function spawnCodex(command: string, args: string[]): ChildProcessWithoutNullStreams {
-    return spawnCommand(command, args);
-}
-
 function terminateChild(child: ChildProcessWithoutNullStreams): void {
-    try {
-        child.kill("SIGKILL");
-    } catch {
-        // ignore
-    }
-
     if (process.platform === "win32" && child.pid) {
         try {
-            spawn("taskkill", ["/PID", String(child.pid), "/T", "/F"], {
+            const killer = spawn("taskkill", ["/PID", String(child.pid), "/T", "/F"], {
                 stdio: "ignore",
                 windowsHide: true,
-            }).unref();
+            });
+            killer.once("error", () => child.kill());
+            killer.unref();
+            return;
         } catch {
             // ignore
         }
     }
+    try { child.kill("SIGKILL"); } catch { }
 }
 
-function extractJsonLineAgentText(stdout: string): string | null {
+function extractCodexJsonResult(stdout: string): { text: string | null; error?: string; terminalMissing?: string } {
     const lines = stdout
         .split(/\r?\n/u)
         .map((line) => line.trim())
         .filter(Boolean);
 
     let lastAgentText: string | null = null;
+    let completed = false;
+    let failure: string | undefined;
 
     for (const line of lines) {
         if (!line.startsWith("{")) continue;
         try {
             const event = JSON.parse(line);
+            if (event?.type === "turn.completed") completed = true;
+            if (event?.type === "turn.failed" || event?.type === "error") {
+                failure = typeof event.error?.message === "string" ? event.error.message
+                    : typeof event.message === "string" ? event.message : "Codex 返回失败终态";
+            }
             if (event?.type === "item.completed" && event.item?.type === "agent_message" && typeof event.item.text === "string") {
                 lastAgentText = event.item.text;
             }
@@ -231,7 +214,13 @@ function extractJsonLineAgentText(stdout: string): string | null {
         }
     }
 
-    return lastAgentText?.trim() || null;
+    if (failure !== undefined) return { text: null, error: failure || "Codex 返回失败终态" };
+    if (!completed) return { text: null, terminalMissing: "Codex CLI 未取得成功终态，生成结果待核" };
+    return { text: lastAgentText?.trim() || null };
+}
+
+function extractJsonLineAgentText(stdout: string): string | null {
+    return extractCodexJsonResult(stdout).text;
 }
 
 function extractJsonLineSummary(stdout: string): string | null {
@@ -264,6 +253,109 @@ function diagnosticSnippet(text: string): string {
         .slice(0, 600);
 }
 
+function providerFailure(error: string, submitted = false, safeToFallback = false, outcome: AntigravityOutcome = "not-started"): ProviderCallResult {
+    return { text: null, error, outcome, submitted, safeToFallback };
+}
+
+async function runProviderCommand(
+    command: string,
+    args: string[],
+    prompt: string,
+    timeoutMs: number,
+    parse: (stdout: string) => { text: string | null; error?: string; terminalMissing?: string },
+    signal?: AbortSignal,
+    env: NodeJS.ProcessEnv = process.env,
+): Promise<ProviderCallResult> {
+    if (signal?.aborted) return providerFailure("模型请求已取消", false, false, "cancelled");
+    if (timeoutMs <= 0) return providerFailure("模型请求总期限已到，尚未提交");
+    return new Promise<ProviderCallResult>((resolve) => {
+        let child: ChildProcessWithoutNullStreams;
+        try {
+            child = spawnCommand(command, args, env);
+        } catch {
+            resolve(providerFailure("模型CLI启动失败", false, true));
+            return;
+        }
+        const stdoutChunks: Buffer[] = [];
+        const stderrChunks: Buffer[] = [];
+        let outputBytes = 0;
+        let submitted = false;
+        let settled = false;
+        let stopping: ProviderCallResult | undefined;
+        let cleanupTimer: NodeJS.Timeout | undefined;
+        const finish = (result: ProviderCallResult) => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(timer);
+            if (cleanupTimer) clearTimeout(cleanupTimer);
+            signal?.removeEventListener("abort", onAbort);
+            resolve(result);
+        };
+        const stop = (result: ProviderCallResult) => {
+            if (settled || stopping) return;
+            stopping = result;
+            terminateChild(child);
+            cleanupTimer = setTimeout(() => finish({ ...result, error: `${result.error}；自有进程退出确认仍待完成` }), 2000);
+            cleanupTimer.unref();
+        };
+        const onAbort = () => stop(providerFailure("模型请求已取消", submitted, false, "cancelled"));
+        const timer = setTimeout(() => stop(providerFailure(
+            submitted ? "模型请求总期限已到，生成结果未知" : "模型请求总期限已到，尚未提交",
+            submitted,
+            false,
+            submitted ? "timeout-unknown" : "not-started",
+        )), timeoutMs);
+        signal?.addEventListener("abort", onAbort, { once: true });
+        if (signal?.aborted) onAbort();
+        const collect = (chunk: Buffer, destination: "stdout" | "stderr") => {
+            if (settled || stopping) return;
+            outputBytes += chunk.length;
+            if (outputBytes > DEFAULT_OUTPUT_LIMIT) {
+                stop(providerFailure("模型CLI输出超过保护上限，终态未完整取得", submitted, false, "invalid-response"));
+                return;
+            }
+            if (destination === "stdout") stdoutChunks.push(chunk);
+            else stderrChunks.push(chunk);
+        };
+        child.stdout.on("data", (chunk: Buffer) => collect(chunk, "stdout"));
+        child.stderr.on("data", (chunk: Buffer) => collect(chunk, "stderr"));
+        child.stdin.on("error", () => {
+            if (!stopping) stop(providerFailure("模型CLI输入连接中断，结果未知", submitted, false, "transport-unknown"));
+        });
+        child.once("error", (error: NodeJS.ErrnoException) => {
+            if (stopping) { finish(stopping); return; }
+            if (!submitted && error.code === "ENOENT") finish(providerFailure("模型CLI未安装或入口不存在", false, true));
+            else finish(providerFailure("模型CLI进程异常，结果未知", submitted, false, "transport-unknown"));
+        });
+        child.once("spawn", () => {
+            if (settled || stopping) return;
+            submitted = true;
+            child.stdin.end(prompt, "utf-8");
+        });
+        child.once("close", (code) => {
+            if (stopping) {
+                finish(stopping);
+                return;
+            }
+            const stdout = Buffer.concat(stdoutChunks).toString("utf-8");
+            const stderr = Buffer.concat(stderrChunks).toString("utf-8");
+            const parsed = parse(stdout);
+            if (code === 0 && parsed.text) {
+                finish({ text: parsed.text, outcome: "success", submitted, safeToFallback: false });
+                return;
+            }
+            const message = parsed.error || diagnosticSnippet(stderr)
+                || parsed.terminalMissing || `模型CLI退出码 ${code}`;
+            const outcome: AntigravityOutcome = /quota|credit|billing|budget|rate limit|429|额度|余额/iu.test(message)
+                ? "quota-exhausted"
+                : /not logged in|authentication|unauthorized|invalid api key|login required|登录|认证/iu.test(message)
+                    ? "auth-required"
+                    : code === 0 ? "invalid-response" : "transport-unknown";
+            finish(providerFailure(message, submitted, false, outcome));
+        });
+    });
+}
+
 function parsePositiveNumber(value: string | undefined): number | null {
     if (!value) return null;
     const parsed = Number(value);
@@ -288,17 +380,17 @@ function shouldCircuitBreakClaudeCode(message: string): boolean {
     return /invalid api key|not logged in|authentication|unauthorized|quota|credit|billing|budget|rate limit|too many requests|429/iu.test(message);
 }
 
-function extractClaudeCodeJsonResult(stdout: string): { text: string | null; error?: string; circuitBreak?: boolean } {
+function extractClaudeCodeJsonResult(stdout: string): { text: string | null; error?: string; circuitBreak?: boolean; terminalMissing?: string } {
     const cleaned = stripAnsi(stdout).trim();
     if (!cleaned) {
-        return { text: null, error: "Claude Code CLI 未输出 JSON" };
+        return { text: null, terminalMissing: "Claude Code CLI 未输出 JSON" };
     }
 
     let parsed: any;
     try {
         parsed = JSON.parse(cleaned);
     } catch {
-        return { text: null, error: "Claude Code CLI stdout 不是合法 JSON" };
+        return { text: null, terminalMissing: "Claude Code CLI stdout 不是合法 JSON" };
     }
 
     if (parsed?.is_error === true) {
@@ -308,6 +400,10 @@ function extractClaudeCodeJsonResult(stdout: string): { text: string | null; err
             error: message,
             circuitBreak: shouldCircuitBreakClaudeCode(message),
         };
+    }
+
+    if (parsed?.type !== "result" || parsed?.subtype !== "success") {
+        return { text: null, terminalMissing: "Claude Code CLI 未返回成功终态" };
     }
 
     if (parsed?.structured_output !== undefined) {
@@ -321,7 +417,7 @@ function extractClaudeCodeJsonResult(stdout: string): { text: string | null; err
         return { text: parsed.result.trim() };
     }
 
-    return { text: null, error: "Claude Code CLI JSON 缺少 result / structured_output" };
+    return { text: null, terminalMissing: "Claude Code CLI JSON 缺少 result / structured_output" };
 }
 
 async function isCodexBridgeAvailable(): Promise<boolean> {
@@ -356,30 +452,16 @@ async function isClaudeCodeBridgeAvailable(): Promise<boolean> {
     return claudeCodeAvailableCache;
 }
 
-async function isChainAvailable(chain: ResolvedSummaryChain): Promise<boolean> {
-    if (chain === "antigravity") return isLsAvailable();
-    if (chain === "codex") return isCodexBridgeAvailable();
-    if (chain === "claude-code") return isClaudeCodeBridgeAvailable();
-    return false;
-}
-
-async function resolveSummaryCandidates(requested: SummaryChain): Promise<ResolvedSummaryChain[]> {
-    if (requested !== "auto") {
-        return (await isChainAvailable(requested)) ? [requested] : [];
-    }
-
-    const candidates: ResolvedSummaryChain[] = [];
-    if (await isLsAvailable()) candidates.push("antigravity");
-    if (await isCodexBridgeAvailable()) candidates.push("codex");
-    if (shouldEnableClaudeCodeAutoFallback() && await isClaudeCodeBridgeAvailable()) {
-        candidates.push("claude-code");
-    }
+function resolveSummaryCandidates(requested: SummaryChain): ResolvedSummaryChain[] {
+    if (requested !== "auto") return [requested];
+    const candidates: ResolvedSummaryChain[] = ["antigravity", "codex"];
+    if (shouldEnableClaudeCodeAutoFallback()) candidates.push("claude-code");
     return candidates;
 }
 
-async function generateViaCodex(prompt: string, timeoutMs: number, schema?: Record<string, unknown>, imagePaths: string[] = [], schemaName = "model"): Promise<string | null> {
+async function generateViaCodex(prompt: string, timeoutMs: number, schema?: Record<string, unknown>, imagePaths: string[] = [], schemaName = "model", signal?: AbortSignal): Promise<ProviderCallResult> {
     const schemaPath = schema
-        ? path.join(os.tmpdir(), `mcp-web-fetcher-${schemaName}-schema-${process.pid}-${Date.now()}.json`)
+        ? path.join(os.tmpdir(), `mcp-web-fetcher-${schemaName.replace(/[^a-z0-9_-]/giu, "-")}-schema-${randomUUID()}.json`)
         : null;
 
     if (schemaPath && schema) {
@@ -411,53 +493,7 @@ async function generateViaCodex(prompt: string, timeoutMs: number, schema?: Reco
     args.push("-");
 
     try {
-        return await new Promise<string | null>((resolve) => {
-            const child = spawnCodex(getCodexCommand(), args);
-
-            let stdout = "";
-            let stderr = "";
-            let settled = false;
-
-            const finish = (value: string | null) => {
-                if (settled) return;
-                settled = true;
-                resolve(value);
-            };
-
-            const timer = setTimeout(() => {
-                terminateChild(child);
-                finish(null);
-            }, timeoutMs);
-
-            child.stdout.on("data", (chunk) => {
-                stdout += chunk.toString("utf-8");
-            });
-
-            child.stderr.on("data", (chunk) => {
-                stderr += chunk.toString("utf-8");
-            });
-
-            child.on("error", () => {
-                clearTimeout(timer);
-                finish(null);
-            });
-
-            child.on("close", (code) => {
-                clearTimeout(timer);
-                const text = extractJsonLineAgentText(stdout);
-                if (code === 0 && text) {
-                    finish(text);
-                    return;
-                }
-                if (stderr) {
-                    console.error(`[model-bridge] Codex bridge failed: ${stderr.split(/\r?\n/u).filter(Boolean).slice(0, 3).join(" | ")}`);
-                }
-                finish(null);
-            });
-
-            child.stdin.write(prompt, "utf-8");
-            child.stdin.end();
-        });
+        return await runProviderCommand(getCodexCommand(), args, prompt, timeoutMs, extractCodexJsonResult, signal);
     } finally {
         if (schemaPath) {
             try {
@@ -469,23 +505,23 @@ async function generateViaCodex(prompt: string, timeoutMs: number, schema?: Reco
     }
 }
 
-async function generateViaClaudeCode(prompt: string, timeoutMs: number): Promise<ProviderCallResult> {
+async function generateViaClaudeCode(prompt: string, timeoutMs: number, signal?: AbortSignal): Promise<ProviderCallResult> {
     const now = Date.now();
     if (now < claudeCodeCircuitOpenUntil) {
         console.error("[model-bridge] Claude Code CLI skipped: circuit breaker is open");
-        return { text: null, error: "Claude Code CLI 短期熔断中" };
+        return providerFailure("Claude Code CLI 短期熔断中", false, false, "rejected");
     }
 
     const maxConcurrency = getClaudeCodeMaxConcurrency();
     if (activeClaudeCodeCalls >= maxConcurrency) {
         console.error("[model-bridge] Claude Code CLI skipped: concurrency limit reached");
-        return { text: null, error: "Claude Code CLI 并发上限已满" };
+        return providerFailure("Claude Code CLI 并发上限已满", false, true);
     }
 
     const budget = parsePositiveNumber(process.env.WEB_FETCHER_CLAUDE_CODE_MAX_BUDGET_USD);
     if (process.env.WEB_FETCHER_CLAUDE_CODE_MAX_BUDGET_USD && budget === null) {
         console.error("[model-bridge] Claude Code CLI skipped: WEB_FETCHER_CLAUDE_CODE_MAX_BUDGET_USD must be a positive number");
-        return { text: null, error: "WEB_FETCHER_CLAUDE_CODE_MAX_BUDGET_USD 必须是正数" };
+        return providerFailure("WEB_FETCHER_CLAUDE_CODE_MAX_BUDGET_USD 必须是正数", false, false, "rejected");
     }
 
     const configuredTimeout = timeoutMs > CODEX_AI_SUMMARY_TIMEOUT
@@ -515,66 +551,11 @@ async function generateViaClaudeCode(prompt: string, timeoutMs: number): Promise
 
     activeClaudeCodeCalls++;
     try {
-        return await new Promise<ProviderCallResult>((resolve) => {
-            const child = spawnCommand(getClaudeCodeCommand(), args, childEnv);
-            let stdout = "";
-            let stderr = "";
-            let settled = false;
-
-            const finish = (value: ProviderCallResult) => {
-                if (settled) return;
-                settled = true;
-                resolve(value);
-            };
-
-            const timer = setTimeout(() => {
-                terminateChild(child);
-                console.error("[model-bridge] Claude Code CLI timed out");
-                finish({ text: null, error: "Claude Code CLI 调用超时" });
-            }, effectiveTimeout);
-
-            const appendWithLimit = (current: string, chunk: Buffer): string => {
-                const next = current + chunk.toString("utf-8");
-                if (next.length > DEFAULT_OUTPUT_LIMIT) {
-                    terminateChild(child);
-                    return next.slice(0, DEFAULT_OUTPUT_LIMIT);
-                }
-                return next;
-            };
-
-            child.stdout.on("data", (chunk: Buffer) => {
-                stdout = appendWithLimit(stdout, chunk);
-            });
-
-            child.stderr.on("data", (chunk: Buffer) => {
-                stderr = appendWithLimit(stderr, chunk);
-            });
-
-            child.on("error", () => {
-                clearTimeout(timer);
-                finish({ text: null, error: "Claude Code CLI 子进程启动失败" });
-            });
-
-            child.on("close", (code) => {
-                if (settled) return;
-                clearTimeout(timer);
-                const parsed = extractClaudeCodeJsonResult(stdout);
-                if (code === 0 && parsed.text) {
-                    finish({ text: parsed.text });
-                    return;
-                }
-
-                const diagnostic = parsed.error || diagnosticSnippet(stderr) || `exit code ${code}`;
-                if (parsed.circuitBreak || shouldCircuitBreakClaudeCode(diagnostic)) {
-                    claudeCodeCircuitOpenUntil = Date.now() + getClaudeCodeCircuitMs();
-                }
-                console.error(`[model-bridge] Claude Code CLI failed: ${diagnostic}`);
-                finish({ text: null, error: diagnostic });
-            });
-
-            child.stdin.write(prompt, "utf-8");
-            child.stdin.end();
-        });
+        const result = await runProviderCommand(getClaudeCodeCommand(), args, prompt, effectiveTimeout, extractClaudeCodeJsonResult, signal, childEnv);
+        if (result.error && shouldCircuitBreakClaudeCode(result.error)) {
+            claudeCodeCircuitOpenUntil = Date.now() + getClaudeCodeCircuitMs();
+        }
+        return result;
     } finally {
         activeClaudeCodeCalls = Math.max(0, activeClaudeCodeCalls - 1);
     }
@@ -584,10 +565,14 @@ export function buildSummaryPrompt(content: string, url: string): SummaryPromptI
     const titleMatch = content.match(/^#\s+(.+)$/m);
     const pageTitle = titleMatch ? titleMatch[1].trim() : url.split("/").pop() || "未知页面";
     const truncatedContent = content.slice(0, AI_SUMMARY_MAX_INPUT);
+    const summaryLength = truncatedContent.length < 2000
+        ? "通常100-300字，短材料可更短，摘要不应长于正文"
+        : "500-1000字，按正文实际信息量缩短";
     const prompt = AI_SUMMARY_PROMPT_TEMPLATE
-        .replace("{pageTitle}", pageTitle)
-        .replace("{url}", url)
-        .replace("{content}", truncatedContent);
+        .replace("{summaryLength}", summaryLength)
+        .replace("{pageTitle}", JSON.stringify(pageTitle))
+        .replace("{url}", JSON.stringify(url))
+        .replace("{content}", JSON.stringify(truncatedContent));
 
     return {
         pageTitle,
@@ -599,7 +584,8 @@ export function buildSummaryPrompt(content: string, url: string): SummaryPromptI
 export async function generateSummaryText(
     prompt: string,
     chain: SummaryChain = "auto",
-    timeoutMs: number = CODEX_AI_SUMMARY_TIMEOUT
+    timeoutMs: number = CODEX_AI_SUMMARY_TIMEOUT,
+    signal?: AbortSignal,
 ): Promise<SummaryBridgeResult> {
     const schema = {
         type: "object",
@@ -618,6 +604,8 @@ export async function generateSummaryText(
         timeoutMs,
         schema,
         schemaName: "ai-summary",
+        signal,
+        purpose: "material",
     });
     if (!result.text) return result;
     try {
@@ -638,6 +626,18 @@ function providerLabelForChain(chain: ResolvedSummaryChain): string {
 }
 
 export async function generateModelText(request: ModelBridgeRequest): Promise<SummaryBridgeResult> {
+    const startedAt = performance.now();
+    const timeoutMs = request.timeoutMs ?? CODEX_AI_SUMMARY_TIMEOUT;
+    const context = getRequestContext();
+    const signal = request.signal ?? context?.signal;
+    const deadline = Math.min(startedAt + Math.max(0, timeoutMs), request.deadline ?? Infinity, context?.deadline ?? Infinity);
+    const stopped = (): SummaryBridgeResult | null => {
+        if (signal?.aborted) return { text: null, chainUsed: null, providerLabel: null, outcome: "cancelled", submitted: false, fallbackAllowed: false, error: "模型请求已取消" };
+        if (!Number.isFinite(deadline) || performance.now() >= deadline) return { text: null, chainUsed: null, providerLabel: null, outcome: "not-started", submitted: false, fallbackAllowed: false, error: "模型请求总期限已到，尚未提交" };
+        return null;
+    };
+    const initialStop = stopped();
+    if (initialStop) return initialStop;
     const mock = process.env.WEB_FETCHER_MOCK_MODEL_RESPONSE;
     if (mock !== undefined) {
         const requested = request.chain ?? "auto";
@@ -653,70 +653,98 @@ export async function generateModelText(request: ModelBridgeRequest): Promise<Su
     }
 
     const chain = request.chain ?? "auto";
-    const timeoutMs = request.timeoutMs ?? CODEX_AI_SUMMARY_TIMEOUT;
-    const candidates = await resolveSummaryCandidates(chain);
-    if (candidates.length === 0) {
-        return {
-            text: null,
-            chainUsed: null,
-            providerLabel: null,
-            error: chain === "auto"
-                ? "Antigravity LS、Codex 模型桥与 Claude Code CLI 当前都不可用"
-                : `指定链路 ${chain} 当前不可用`,
-        };
+    const imagePaths = request.imagePaths ?? [];
+    for (const imagePath of imagePaths) {
+        try {
+            if (!fs.statSync(imagePath).isFile()) throw new Error("not a file");
+        } catch {
+            return { text: null, chainUsed: null, providerLabel: null, outcome: "rejected", submitted: false, fallbackAllowed: false, error: "图片附件不存在或无法读取，模型请求尚未提交" };
+        }
     }
+    const candidates = resolveSummaryCandidates(chain);
 
     const callResolved = async (target: ResolvedSummaryChain): Promise<SummaryBridgeResult> => {
         if (target === "antigravity") {
-            const text = await callGetModelResponse(request.prompt, undefined, timeoutMs, request.imagePaths ?? []);
+            const result = await callAntigravity({ prompt: request.prompt, model: request.model, imagePaths, schema: request.schema, deadline, signal, ...(request.purpose ? { purpose: request.purpose } : {}) });
             return {
-                text,
-                chainUsed: text ? "antigravity" : null,
-                providerLabel: text ? AI_SUMMARY_ANTIGRAVITY_LABEL : null,
-                error: text ? undefined : "Antigravity LS 模型调用失败",
+                text: result.text,
+                chainUsed: result.text ? "antigravity" : null,
+                providerLabel: result.text ? AI_SUMMARY_ANTIGRAVITY_LABEL : null,
+                error: result.error,
+                transport: result.transport,
+                modelUsed: result.model,
+                outcome: result.outcome,
+                submitted: result.submitted,
+                outcomeUnknown: result.submitted && ["transport-unknown", "timeout-unknown", "invalid-response", "cancelled"].includes(result.outcome),
+                fallbackAllowed: !request.model && result.safeToFallback,
+                ...(result.cleanup ? { cleanup: result.cleanup } : {}),
             };
         }
 
         if (target === "claude-code") {
-            const result = await generateViaClaudeCode(request.prompt, timeoutMs);
+            if (imagePaths.length > 0) return { text: null, chainUsed: null, providerLabel: null, outcome: "unsupported", submitted: false, fallbackAllowed: false, error: "当前Claude Code模型桥未提供图片传输，本次图片请求尚未提交" };
+            const result = await generateViaClaudeCode(request.prompt, Math.max(0, deadline - performance.now()), signal);
             return {
                 text: result.text,
                 chainUsed: result.text ? "claude-code" : null,
                 providerLabel: result.text ? AI_SUMMARY_CLAUDE_CODE_LABEL : null,
                 error: result.text ? undefined : `Claude Code CLI 模型调用失败${result.error ? `: ${result.error}` : ""}`,
+                transport: "claude-code-cli",
+                modelUsed: CLAUDE_CODE_AI_SUMMARY_MODEL,
+                outcome: result.outcome,
+                submitted: result.submitted,
+                outcomeUnknown: result.submitted && ["transport-unknown", "timeout-unknown", "invalid-response", "cancelled"].includes(result.outcome),
+                fallbackAllowed: result.safeToFallback,
             };
         }
 
-        const text = await generateViaCodex(
+        const result = await generateViaCodex(
             request.prompt,
-            timeoutMs,
+            Math.max(0, deadline - performance.now()),
             request.schema,
-            request.imagePaths ?? [],
+            imagePaths,
             request.schemaName,
+            signal,
         );
         return {
-            text,
-            chainUsed: text ? "codex" : null,
-            providerLabel: text ? AI_SUMMARY_CODEX_LABEL : null,
-            error: text ? undefined : "Codex 模型桥调用失败",
+            text: result.text,
+            chainUsed: result.text ? "codex" : null,
+            providerLabel: result.text ? AI_SUMMARY_CODEX_LABEL : null,
+            error: result.error,
+            transport: "codex-cli",
+            modelUsed: CODEX_AI_SUMMARY_MODEL,
+            outcome: result.outcome,
+            submitted: result.submitted,
+            outcomeUnknown: result.submitted && ["transport-unknown", "timeout-unknown", "invalid-response", "cancelled"].includes(result.outcome),
+            fallbackAllowed: result.safeToFallback,
         };
     };
 
     const errors: string[] = [];
+    let lastResult: SummaryBridgeResult | undefined;
     for (const candidate of candidates) {
-        const result = await callResolved(candidate);
+        const stop = stopped();
+        if (stop) return { ...stop, error: [errors.join("; "), stop.error].filter(Boolean).join("; ") };
+        let result: SummaryBridgeResult;
+        try {
+            result = await callResolved(candidate);
+        } catch {
+            result = { text: null, chainUsed: null, providerLabel: null, outcome: "transport-unknown", submitted: true, outcomeUnknown: true, fallbackAllowed: false, error: `${candidate}模型调用异常，结果待核` };
+        }
+        lastResult = result;
         if (result.text) {
             return result;
         }
         if (result.error) {
             errors.push(`${candidate}: ${result.error}`);
         }
-        if (chain !== "auto") {
+        if (chain !== "auto" || result.fallbackAllowed !== true) {
             return result;
         }
     }
 
     return {
+        ...lastResult,
         text: null,
         chainUsed: null,
         providerLabel: null,
@@ -731,7 +759,7 @@ export async function getModelBridgeStatus(): Promise<{
     claudeCodeAutoFallbackEnabled: boolean;
 }> {
     const [antigravityAvailable, codexAvailable, claudeCodeAvailable] = await Promise.all([
-        isLsAvailable(),
+        isAntigravityAvailable(),
         isCodexBridgeAvailable(),
         isClaudeCodeBridgeAvailable(),
     ]);

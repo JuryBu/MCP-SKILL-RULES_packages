@@ -56,7 +56,8 @@ import { desktopManager } from "./desktop/manager.js";
 import { humanBrowserManager } from "./human-browser/manager.js";
 import { installToolConcurrency } from './tool-concurrency.js';
 import { getActiveRequestCount } from './request-context.js';
-import { isLsAvailable, getLsStatus } from "./ls-client.js";
+import { getLsStatus } from "./ls-client.js";
+import { disposeAntigravityCli } from "./antigravity-cli.js";
 import { getModelBridgeStatus } from "./model-bridge.js";
 import { initializeRuntimeLifecycle, shouldExitForIdle } from './runtime-status.js';
 
@@ -68,7 +69,7 @@ const HEARTBEAT_BROWSER_TIMEOUT = 20 * 60 * 1000; // 20 分钟无活动 → 关�
 // 创建 MCP Server 实例
 const server = new McpServer({
     name: "web-fetcher-mcp-server",
-    version: "7.3.3",
+    version: "7.4.0",
 });
 
 // 注册所有工具
@@ -111,17 +112,19 @@ server.registerResource(
             "- `web_fetch_page(outputMode=\"ai_summary\")` 与 `web_fetch_rich(compact=\"ai_summary\")` 支持 `modelChain` 参数，并兼容旧 `chain` 参数。",
             "- `web_fetch_page(outputMode=\"ai_summary\", background=true)` 可把 Codex 链路摘要转入后台任务，再用 `taskId` 查询。",
             "- Codex 侧长网页 AI Summary 建议使用后台模式：`web_fetch_page(url=\"...\", outputMode=\"ai_summary\", modelChain=\"codex\", background=true)`，随后 `web_fetch_page(taskId=\"...\", waitSeconds=30-45)`。",
-            "- `web_inspect(mode=\"ai_review\")` 支持 `modelChain` 参数；Codex 链路会用 `-i` 传入截图，Antigravity LS 链路只能把截图路径、结构树与几何检测结果写入纯文本 prompt。",
+            "- `web_inspect(mode=\"ai_review\")` 的图片请求使用 Antigravity CLI 图片能力或 Codex `-i`；纯文字 GetModelResponse 不接收图片，不把截图路径当成像素输入。",
             "- `modelChain=\"auto\"`：按 `antigravity -> codex` 尝试；只有 `WEB_FETCHER_CLAUDE_CODE_AUTO_FALLBACK=1` 时才把 `claude-code` 作为最后 fallback，避免隐性消耗 Claude Code 额度。",
-            "- `modelChain=\"antigravity\"`：强制走 Antigravity Language Server 的 `GetModelResponse`。",
+            "- `modelChain=\"antigravity\"`：固定反重力平台，纯文字优先有效 App LS（新旧版本均支持）；App 不在线时，结构化摘要使用隔离 CLI 代理，普通轻量文字使用 CLI LS，有图片时使用 CLI 原生图片入口。",
             "- `modelChain=\"codex\"`：强制走 Codex CLI 模型桥。",
             "- `modelChain=\"claude-code\"`：强制走 Claude Code CLI `claude -p` provider。",
-            "- `modelChain` 未填写时使用 `chain`，两者都未填写时使用 `auto`；`chain` 仅作为模型链路兼容参数保留，不代表数据链路，也不会引入 `dataChain`。",
+            "- `modelChain` 未填写时使用 `chain`，两者都未填写时使用 `auto`；两参数只控制模型调用，web-fetcher 的网页内容仍从指定 URL 获取。",
             "- Codex 模型桥默认值：`gpt-5.5` + `model_reasoning_effort=medium` + `model_speed_tier=fast`，可用 `WEB_FETCHER_CODEX_MODEL`、`WEB_FETCHER_CODEX_REASONING`、`WEB_FETCHER_CODEX_SPEED` 覆盖。",
             "- Claude Code CLI 默认值：`sonnet` + `--effort low`；可用 `WEB_FETCHER_CLAUDE_CODE_MODEL`、`WEB_FETCHER_CLAUDE_CODE_EFFORT`、`WEB_FETCHER_CLAUDE_CODE_TIMEOUT_MS`、`WEB_FETCHER_CLAUDE_CODE_MAX_BUDGET_USD` 覆盖。",
-            "- Antigravity LS 默认 GetModelResponse 候选：`M132 -> M20 -> M18 -> M16 -> M36`。前两项是 Gemini 3.5 Flash 高速路径，后两项是 Gemini 3.1 Pro 推理兜底；`M37/M47` 不再进入默认链路。",
+            "- 现代 Antigravity 按当前账号 GetUserStatus 目录选型，普通材料默认 Gemini 3.8 Flash High（M318）；视觉审查优先可用 Argon High、其次 Carbon High，均不可用则停止。显式模型、准入与额度按当次目录核验，Claude 不进入自动常用选择。仅旧目录接口不支持时使用旧兼容表。",
+            "- 只读状态不启动 CLI，也不生成模型请求；CLI 随实际调用启动，正常结束后退出。GetModelResponse 是单轮纯文字，客户端不附本机 RULES。",
+            "- 一次总期限覆盖发现、排队、启动和生成；取消向下传递。已提交后超时、断连或终态缺失会报告结果未知，并停止原请求的自动重发；认证与额度错误同样停止后备。",
             "- 只有 AI Summary 与 AI Review 受 `modelChain` 影响；网页抓取、截图、交互主链不变。",
-            "- AI 后台任务带 deadline/timedOut：默认 15 分钟超时标记 error，不重启或杀掉 web-fetcher 后端。",
+            "- AI 后台任务带 deadline/timedOut：默认 15 分钟后取消自有模型操作，保留共享 web-fetcher 后端。AI Review 的 modelCalls 记录逐页实际 transport、modelUsed、submitted 与未知结果。",
             "",
             "## Local Document / Ebook",
             "",
@@ -137,7 +140,7 @@ server.registerResource(
             "- `mode=\"detect\"`：检测 overlap/overflow/readability/alignment。",
             "- 规则检测不是视觉验收：issue.metadata 中 confidence/assessment/evidenceKind/reasonCodes 区分已采样覆盖与几何候选。confirmed 只证明相关覆盖/测量事实，不证明设计一定错误；candidate 候选需要结合截图复核。",
             "- DOM 使用直接文字行框、绘制顺序采样与非滚动裁剪区域，正常背景/留白/滚动不再直接当成缺陷；PPTX/PDF 区分背景装饰、绘制顺序与真实内容。structure.metadata.inspectionLimitations 说明扫描、字体、复杂绘制等边界，零 issue 不等于整页已验收；DOM alignment 不跨无关布局组推断。",
-            "- `mode=\"ai_review\"`：使用截图、结构树与规则检测结果生成 AI 审查报告。注意 Antigravity LS 的 `GetModelResponse` 只接收 `{model,prompt}`，不能直接读取截图像素；需要真正多模态视觉审查时应使用 `modelChain=\"codex\"`；`modelChain=\"claude-code\"` 第一阶段作为低优先级 CLI fallback。",
+            "- `mode=\"ai_review\"`：结合截图、结构树与规则检测结果，截图缺失时不提交模型；Antigravity 图片请求与纯文字 LS 分流，CLI 无图片能力时明确返回错误。当前 Claude Code 桥只提供文字，收到图片会在生成前拒绝。",
             "- EPUB 路线第一阶段只提供静态结构；`ai_review` 返回结构说明，不执行截图型视觉审查。",
             "- `background=true` 可用于多页文档后台批量审查，再用 `web_inspect(action=\"check\", taskId=\"...\", waitSeconds=30-45)` 查询。",
             "",
@@ -235,7 +238,7 @@ server.registerResource(
         contents: [
             {
                 uri: "web-fetcher://test/hello",
-                text: "MCP Web Fetcher v7.3.3 - Resource 机制正常\n\n可用于将抓取结果存储为 resource，AI 按需读取。",
+                text: "MCP Web Fetcher v7.4.0 - Resource 机制正常\n\n可用于将抓取结果存储为 resource，AI 按需读取。",
                 mimeType: "text/plain",
             },
         ],
@@ -338,7 +341,7 @@ async function heartbeatCheck(): Promise<void> {
 
 // 启动 stdio 传输
 async function main(): Promise<void> {
-    console.error(`[web-fetcher] MCP Server v7.3.3 启动中... (ppid=${process.ppid})`);
+    console.error(`[web-fetcher] MCP Server v7.4.0 启动中... (ppid=${process.ppid})`);
     logStdinEvent("STARTED");
 
     // 清理遗留的临时目录（防止意外中断导致堆积）
@@ -353,16 +356,16 @@ async function main(): Promise<void> {
     await detectConversionTools();
 
     // AI Summary 三链路状态预热（非阻塞，不影响其他功能）
-    Promise.all([isLsAvailable(), getModelBridgeStatus()]).then(([lsAvailable, bridgeStatus]) => {
+    getModelBridgeStatus().then((bridgeStatus) => {
         const status = getLsStatus();
-        if (lsAvailable) {
+        if (status.pid) {
             console.error(`[web-fetcher] Antigravity LS 已连接 (PID: ${status.pid}, Port: ${status.port})`);
         } else {
             console.error("[web-fetcher] Antigravity LS 未发现");
         }
 
         console.error(
-            `[web-fetcher] AI Summary 模型链路状态: antigravity=${bridgeStatus.antigravityAvailable ? "ready" : "down"}, codex=${bridgeStatus.codexAvailable ? "ready" : "down"}, claude-code=${bridgeStatus.claudeCodeAvailable ? "ready" : "down"} (autoFallback=${bridgeStatus.claudeCodeAutoFallbackEnabled ? "on" : "off"})`
+            `[web-fetcher] AI Summary 模型链路状态: antigravity=${bridgeStatus.antigravityAvailable ? "entry-found" : "not-found"}, codex=${bridgeStatus.codexAvailable ? "ready" : "down"}, claude-code=${bridgeStatus.claudeCodeAvailable ? "ready" : "down"} (autoFallback=${bridgeStatus.claudeCodeAutoFallbackEnabled ? "on" : "off"})`
         );
     }).catch(() => {
         console.error("[web-fetcher] AI Summary 链路状态检测失败");
@@ -372,7 +375,7 @@ async function main(): Promise<void> {
     await server.connect(transport);
     runtimeLifecycle.ready();
 
-    console.error(`[web-fetcher] MCP Server v7.3.3 已启动，绑定父 LS PID=${process.ppid}`);
+    console.error(`[web-fetcher] MCP Server v7.4.0 已启动，绑定父 LS PID=${process.ppid}`);
     logStdinEvent(`BOUND to parent LS PID=${process.ppid}`);
 
     // === 非 LS 环境兜底超时 ===
@@ -442,6 +445,7 @@ const cleanup = async () => {
     await sessionManager.closeAll();
     await desktopManager.closeAll();
     await humanBrowserManager.closeAll();
+    await disposeAntigravityCli();
     await browserManager.shutdown();
 };
 

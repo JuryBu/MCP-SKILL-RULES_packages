@@ -108,6 +108,18 @@ export interface AIReviewFinding {
     metadata?: Record<string, InspectMetadataValue>;
 }
 
+export interface AIReviewModelCall {
+    page: number;
+    chainUsed: string | null;
+    transport?: string | null;
+    modelUsed?: string | null;
+    outcome?: string;
+    submitted?: boolean;
+    outcomeUnknown?: boolean;
+    fallbackAllowed?: boolean;
+    cleanup?: import("../antigravity-types.js").AntigravityCleanup;
+}
+
 export interface AIReviewReport {
     summary: string;
     aiFindings: AIReviewFinding[];
@@ -119,4 +131,5 @@ export interface AIReviewReport {
     providerLabel?: string | null;
     error?: string;
     rawResponse?: string;
+    modelCalls?: AIReviewModelCall[];
 }

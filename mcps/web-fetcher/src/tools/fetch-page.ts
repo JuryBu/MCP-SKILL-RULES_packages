@@ -12,7 +12,7 @@ import { extractContent, truncateContent, compactContent, cleanFooterGarbage, de
 import { pageCache } from "../cache.js";
 import { touchActivity } from "../lifecycle.js";
 import { SUMMARY_CHAIN_VALUES, SUMMARY_PREVIEW_LENGTH, TEMP_PAGE_PREFIX, appendTiming, resolveSummaryModelChain, type SummaryChain } from "../constants.js";
-import { buildSummaryPrompt, generateSummaryText } from "../model-bridge.js";
+import { buildSummaryPrompt, generateSummaryText, type SummaryBridgeResult } from "../model-bridge.js";
 import { startBackgroundTask, waitForBackgroundTask, formatBackgroundTask } from "../background-tasks.js";
 import TurndownService from "turndown";
 import { execFile } from "child_process";
@@ -173,6 +173,7 @@ export function registerFetchPage(server: McpServer): void {
             if (params.taskId) {
                 const task = await waitForBackgroundTask(params.taskId, params.waitSeconds || 0);
                 return appendTiming({
+                    ...(task?.metadata?.modelCall ? { _meta: { modelCall: task.metadata.modelCall } } : {}),
                     content: [{ type: "text" as const, text: formatBackgroundTask(task) }],
                 }, startTime);
             }
@@ -662,8 +663,13 @@ async function formatAiSummary(content: string, url: string, modelChain: Summary
     // 2. 构造统一 prompt 并通过桥接调用
     const { prompt } = buildSummaryPrompt(content, url);
     if (background) {
-        const task = startBackgroundTask("web-fetch-ai-summary", async () => {
-            const result = await generateSummaryText(prompt, modelChain, getAiSummaryBackgroundTimeoutMs());
+        const task = startBackgroundTask("web-fetch-ai-summary", async (runContext) => {
+            const result = await generateSummaryText(prompt, modelChain, getAiSummaryBackgroundTimeoutMs(), runContext.signal);
+            runContext.updateMetadata({ modelCall: {
+                chainUsed: result.chainUsed, transport: result.transport, modelUsed: result.modelUsed, outcome: result.outcome,
+                submitted: result.submitted, outcomeUnknown: result.outcomeUnknown, fallbackAllowed: result.fallbackAllowed,
+                ...(result.cleanup ? { cleanup: result.cleanup } : {}),
+            } });
             if (result.text && result.providerLabel && result.chainUsed) {
                 const summaryChars = result.text.length;
                 const ratio = ((1 - summaryChars / content.length) * 100).toFixed(0);
@@ -671,18 +677,20 @@ async function formatAiSummary(content: string, url: string, modelChain: Summary
                     `🤖 AI 摘要 (by ${result.providerLabel})`,
                     "",
                     result.text,
+                    result.cleanup?.warnings.length ? `⚠️ CLI 清理: ${result.cleanup.warnings.join("；")}` : "",
                     "",
                     "---",
                     `📄 完整内容保存于: ${filePath}`,
-                    `🔗 使用链路: ${result.chainUsed}`,
+                    `🔗 使用链路: ${result.chainUsed}${result.transport ? ` / ${result.transport}` : ""}${result.modelUsed ? ` / ${result.modelUsed}` : ""}`,
                     `📊 原文 ${content.length} 字 → 摘要 ${summaryChars} 字 (压缩 ${ratio}%)`,
                 ].join("\n");
             }
-            return [
+            throw new Error([
                 `⚠️ AI Summary 后台任务失败（modelChain=${modelChain}）`,
                 result.error ? `📋 ${result.error}` : "",
+                result.outcome ? `结果: ${result.outcome}；提交生成: ${result.submitted === true ? "是" : "否"}；结果未知: ${result.outcomeUnknown === true ? "是" : "否"}；实际入口: ${result.transport ?? "未启动"}；模型: ${result.modelUsed ?? "未选型"}` : "",
                 `📄 完整内容保存于: ${filePath}`,
-            ].filter(Boolean).join("\n");
+            ].filter(Boolean).join("\n"));
         }, {
             maxRunMs: WEB_AI_BACKGROUND_MAX_RUN_MS,
             timeoutMessage: `Web AI Summary 后台任务超时（${Math.round(WEB_AI_BACKGROUND_MAX_RUN_MS / 1000)}s）`,
@@ -703,8 +711,11 @@ async function formatAiSummary(content: string, url: string, modelChain: Summary
     }
 
     let lastAiSummaryError: string | undefined;
+    let modelCall: Omit<SummaryBridgeResult, "text" | "error" | "providerLabel"> | undefined;
     try {
         const result = await generateSummaryText(prompt, modelChain);
+        const { text: _text, error: _error, providerLabel: _providerLabel, ...state } = result;
+        modelCall = state;
 
         if (result.text && result.providerLabel && result.chainUsed) {
             // AI 摘要成功
@@ -715,14 +726,16 @@ async function formatAiSummary(content: string, url: string, modelChain: Summary
                 `🤖 AI 摘要 (by ${result.providerLabel})`,
                 "",
                 result.text,
+                result.cleanup?.warnings.length ? `⚠️ CLI 清理: ${result.cleanup.warnings.join("；")}` : "",
                 "",
                 "---",
                 `📄 完整内容保存于: ${filePath}`,
-                `🔗 使用链路: ${result.chainUsed}`,
+                `🔗 使用链路: ${result.chainUsed}${result.transport ? ` / ${result.transport}` : ""}${result.modelUsed ? ` / ${result.modelUsed}` : ""}`,
                 `📊 原文 ${content.length} 字 → 摘要 ${summaryChars} 字 (压缩 ${ratio}%)`,
             ].join("\n");
 
             return {
+                _meta: { modelCall },
                 content: [{
                     type: "text" as const,
                     text: resultText,
@@ -744,6 +757,7 @@ async function formatAiSummary(content: string, url: string, modelChain: Summary
     const fallbackText = [
         `⚠️ AI Summary 不可用（modelChain=${modelChain}），已降级为 compact 模式`,
         lastAiSummaryError ? `📋 ${lastAiSummaryError}` : "",
+        modelCall ? `🧭 模型调用状态: ${JSON.stringify(modelCall)}` : "",
         "",
         compactText,
         "",
@@ -752,6 +766,7 @@ async function formatAiSummary(content: string, url: string, modelChain: Summary
     ].filter(Boolean).join("\n");
 
     return {
+        _meta: { modelCall },
         content: [{
             type: "text" as const,
             text: fallbackText,

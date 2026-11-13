@@ -1,399 +1,456 @@
-import { execSync } from "child_process";
-import http from "http";
+import { execFile } from 'node:child_process';
+import { createHash } from 'node:crypto';
+import fs from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
+import {
+    callCliAgent,
+    isAntigravityCliInstalled,
+    withCliEndpoint,
+} from './antigravity-cli.js';
+import {
+    legacyAntigravityCatalog,
+    parseAntigravityCatalog,
+    selectAntigravityModel,
+} from './antigravity-models.js';
+import {
+    AntigravityRpcError,
+    antigravityRpcException,
+    antigravityRpcFailure,
+    callAntigravityModel,
+    callAntigravityRpc,
+    isAntigravityRpcUnsupported,
+} from './antigravity-rpc.js';
+import {
+    antigravityFailure,
+    remainingAntigravityMs,
+    type AntigravityCatalog,
+    type AntigravityEndpoint,
+    type AntigravityRequest,
+    type AntigravityResult,
+} from './antigravity-types.js';
 
-/**
- * Language Server connect-rpc 客户端（精简版）
- *
- * 从 memory-store 移植，只保留 GetModelResponse 直接模型调用能力。
- * 用于 web-fetcher 的 AI Summary 功能。
- *
- * 协议：
- *   - connect-rpc (HTTP POST + JSON)
- *   - 认证: x-codeium-csrf-token header
- *   - 端口/token: 每次 IDE 启动都变化，需动态检测
- */
-
-// ===== 类型 =====
-
-interface LsProcessInfo {
+export interface AntigravityLsProcess {
     pid: number;
-    csrfToken: string;
-    ports: number[];
+    executable: string;
+    startedAt: number;
+    commandLine: string;
+    listeners: Array<{ address: string; port: number }>;
 }
 
-interface RpcResult {
-    status: number;
-    data: any;
+interface HubFile {
+    name: string;
+    modifiedAt: number;
+    data: unknown;
 }
 
-interface GetModelResponsePayload {
-    model: string;
-    prompt: string;
+export interface AntigravityDiscoveryOptions {
+    daemonDirectory?: string;
+    inspectProcesses?: (request: AntigravityRequest) => Promise<AntigravityLsProcess[]>;
 }
 
-// 缓存：避免每次调用都重新发现进程
-let cachedLsInfo: LsProcessInfo | null = null;
-let cachedHttpPort: number | null = null;
-let cacheTimestamp = 0;
-const CACHE_TTL = 5 * 60 * 1000; // 5 分钟缓存
+export interface AntigravityClientDependencies {
+    discover: (request: AntigravityRequest) => Promise<AntigravityEndpoint[]>;
+    rpc: typeof callAntigravityRpc;
+    generate: typeof callAntigravityModel;
+    cliEndpoint: (request: AntigravityRequest,
+        work: (endpoint: AntigravityEndpoint, scopedRequest: AntigravityRequest) => Promise<AntigravityResult>) => Promise<AntigravityResult>;
+    cliAgent: (request: AntigravityRequest) => Promise<AntigravityResult>;
+    cliInstalled: () => boolean | Promise<boolean>;
+}
 
-// ===== LS 进程发现 =====
+const STATUS_TTL_MS = 15000;
+const MAX_HUB_BYTES = 32768;
+const MAX_HUB_FILES = 128;
+const LEGACY_MODELS = [
+    'MODEL_PLACEHOLDER_M132',
+    'MODEL_PLACEHOLDER_M20',
+    'MODEL_PLACEHOLDER_M18',
+    'MODEL_PLACEHOLDER_M16',
+    'MODEL_PLACEHOLDER_M36',
+];
 
-/**
- * 发现当前运行的 Language Server 进程
- * 通过 PowerShell 获取 PID、命令行参数（csrf_token）和监听端口
- */
-function discoverLsProcesses(): LsProcessInfo[] {
+function stopped(request: AntigravityRequest): AntigravityResult | null {
+    if (request.signal?.aborted) return antigravityFailure('cancelled', 'Antigravity request cancelled');
+    if (remainingAntigravityMs(request) <= 0) {
+        return antigravityFailure('not-started', 'Antigravity deadline expired before generation');
+    }
+    return null;
+}
+
+function assertActive(request: AntigravityRequest): void {
+    const failure = stopped(request);
+    if (failure) throw new AntigravityRpcError(failure.error!, failure.outcome, false, false);
+}
+
+function normalizeExecutable(executable: string): string {
+    return executable.replace(/\\/g, '/').toLowerCase();
+}
+
+function flag(commandLine: string, name: string): string | undefined {
+    const match = commandLine.match(new RegExp(`(?:^|\\s)--${name}(?:=|\\s+)(?:"([^"]*)"|'([^']*)'|(\\S+))`, 'i'));
+    return match ? match[1] ?? match[2] ?? match[3] : undefined;
+}
+
+function validProcess(processInfo: AntigravityLsProcess, modern: boolean): boolean {
+    if (!Number.isInteger(processInfo.pid) || processInfo.pid <= 0
+        || !Number.isFinite(processInfo.startedAt) || processInfo.startedAt <= 0
+        || processInfo.startedAt > Date.now() + 1000
+        || typeof processInfo.executable !== 'string' || typeof processInfo.commandLine !== 'string'
+        || !Array.isArray(processInfo.listeners)) return false;
+    const executable = normalizeExecutable(processInfo.executable);
+    const commandExecutable = processInfo.commandLine.match(/^\s*(?:"([^"]+)"|(\S+))/);
+    if (!commandExecutable || normalizeExecutable(commandExecutable[1] ?? commandExecutable[2]) !== executable) return false;
+    if (modern) {
+        return executable.endsWith('/antigravity/resources/bin/language_server.exe')
+            && flag(processInfo.commandLine, 'override_ide_name')?.toLowerCase() === 'antigravity'
+            && flag(processInfo.commandLine, 'subclient_type')?.toLowerCase() === 'hub';
+    }
+    return executable.endsWith('/language_server_windows_x64.exe')
+        && (executable.includes('/antigravity/') || flag(processInfo.commandLine, 'override_ide_name')?.toLowerCase() === 'antigravity');
+}
+
+function ownedPort(processInfo: AntigravityLsProcess, port: unknown): port is number {
+    return typeof port === 'number' && Number.isInteger(port) && port > 0 && port <= 65535
+        && processInfo.listeners.some(listener => listener && listener.address === '127.0.0.1' && listener.port === port);
+}
+
+function endpointIdentity(processInfo: AntigravityLsProcess, port: number, token: string, useHttps: boolean): string {
+    return createHash('sha256').update(JSON.stringify([
+        processInfo.pid, normalizeExecutable(processInfo.executable), processInfo.startedAt,
+        processInfo.commandLine, port, token, useHttps,
+    ])).digest('hex');
+}
+
+export function validateAntigravityHub(
+    hub: unknown,
+    fileName: string,
+    modifiedAt: number,
+    processInfo: AntigravityLsProcess,
+): AntigravityEndpoint | null {
+    if (!hub || typeof hub !== 'object' || Array.isArray(hub) || !validProcess(processInfo, true)) return null;
+    const data = hub as Record<string, unknown>;
+    if (data.pid !== processInfo.pid || typeof data.csrfToken !== 'string'
+        || !data.csrfToken || data.csrfToken.length > 4096 || /[\r\n]/.test(data.csrfToken)
+        || !Number.isFinite(modifiedAt) || modifiedAt < processInfo.startedAt - 1000
+        || modifiedAt > Date.now() + 5000 || !/^hub_\d+\.json$/.test(fileName)
+        || Number(fileName.slice(4, -5)) !== data.httpPort) return null;
+    const useHttps = !ownedPort(processInfo, data.httpPort);
+    const port = useHttps ? data.httpsPort : data.httpPort;
+    if (!ownedPort(processInfo, port)) return null;
+    return {
+        host: '127.0.0.1', port, pid: processInfo.pid, csrfToken: data.csrfToken,
+        identity: endpointIdentity(processInfo, port, data.csrfToken, useHttps),
+        transport: 'app-ls', ...(useHttps ? { useHttps: true } : {}),
+    };
+}
+
+async function readHubFiles(directory: string, request: AntigravityRequest, ports: Set<number>): Promise<HubFile[]> {
+    if (!ports.size) return [];
+    let entries;
     try {
-        const psScript = [
-            "$ProgressPreference = 'SilentlyContinue'",
-            'Get-Process -Name language_server_windows_x64 -ErrorAction SilentlyContinue | ForEach-Object {',
-            '  $id = $_.Id',
-            '  $cmd = (Get-CimInstance Win32_Process -Filter "ProcessId=$id" -ErrorAction SilentlyContinue).CommandLine',
-            '  $ports = (Get-NetTCPConnection -OwningProcess $id -State Listen -ErrorAction SilentlyContinue | Select-Object -ExpandProperty LocalPort) -join ","',
-            '  "$id|$cmd|$ports"',
-            '}',
-        ].join('\n');
-
-        // PowerShell -EncodedCommand 需要 UTF-16LE 的 Base64
-        const encodedCmd = Buffer.from(psScript, 'utf16le').toString('base64');
-
-        const stdout = execSync(`powershell -NoProfile -EncodedCommand ${encodedCmd}`, {
-            encoding: "utf-8",
-            timeout: 20000,
-            windowsHide: true,
-        }).trim();
-
-        if (!stdout) return [];
-
-        const results: LsProcessInfo[] = [];
-        for (const line of stdout.split("\n")) {
-            const trimmed = line.trim();
-            if (!trimmed) continue;
-
-            const parts = trimmed.split("|");
-            if (parts.length < 3) continue;
-
-            const pid = parseInt(parts[0], 10);
-            const cmd = parts[1];
-            const portsStr = parts[2];
-
-            if (isNaN(pid) || !cmd) continue;
-
-            // 解析 csrf_token
-            const csrfMatch = cmd.match(/--csrf_token\s+(\S+)/);
-            if (!csrfMatch) continue;
-
-            // 解析端口
-            const ports = portsStr
-                .split(",")
-                .map((p) => parseInt(p.trim(), 10))
-                .filter((p) => !isNaN(p))
-                .sort((a, b) => a - b);
-
-            if (ports.length === 0) continue;
-
-            results.push({
-                pid,
-                csrfToken: csrfMatch[1],
-                ports,
-            });
+        entries = await fs.readdir(directory, { withFileTypes: true });
+    } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') return [];
+        throw error;
+    }
+    const files: HubFile[] = [];
+    const names = entries.filter(entry => entry.isFile() && /^hub_\d+\.json$/.test(entry.name)
+        && ports.has(Number(entry.name.slice(4, -5))));
+    const metadata = await Promise.all(names.map(async entry => {
+        try {
+            const filename = path.join(directory, entry.name);
+            const info = await fs.lstat(filename);
+            return info.isFile() && info.size <= MAX_HUB_BYTES ? { filename, name: entry.name, info } : null;
+        } catch {
+            return null;
         }
-
-        return results;
-    } catch {
-        return [];
-    }
-}
-
-/**
- * 获取可用的 LS 进程（带缓存 + 自动重试）
- * 首次发现失败时等 2 秒自动重试一次
- */
-function getLsProcess(): LsProcessInfo | null {
-    const now = Date.now();
-    if (cachedLsInfo && now - cacheTimestamp < CACHE_TTL) {
-        return cachedLsInfo;
-    }
-
-    let processes = discoverLsProcesses();
-    // 首次失败时自动重试一次（PowerShell 冷启动容易首次超时）
-    if (processes.length === 0) {
-        const sleepMs = (ms: number) => { const end = Date.now() + ms; while (Date.now() < end) { /* sync sleep */ } };
-        sleepMs(2000);
-        processes = discoverLsProcesses();
-    }
-    if (processes.length === 0) return null;
-
-    cachedLsInfo = processes[0];
-    cachedHttpPort = null;
-    cacheTimestamp = now;
-    return cachedLsInfo;
-}
-
-function getLsCandidates(): LsProcessInfo[] {
-    const now = Date.now();
-    const candidates: LsProcessInfo[] = [];
-
-    if (cachedLsInfo && now - cacheTimestamp < CACHE_TTL) {
-        candidates.push(cachedLsInfo);
-    }
-
-    let discovered = discoverLsProcesses();
-    if (discovered.length === 0) {
-        const sleepMs = (ms: number) => { const end = Date.now() + ms; while (Date.now() < end) { /* sync sleep */ } };
-        sleepMs(2000);
-        discovered = discoverLsProcesses();
-    }
-
-    for (const info of discovered) {
-        if (!candidates.some((item) => item.pid === info.pid)) {
-            candidates.push(info);
+    }));
+    const candidates = metadata.filter(item => item !== null)
+        .sort((left, right) => right.info.mtimeMs - left.info.mtimeMs).slice(0, MAX_HUB_FILES);
+    for (const candidate of candidates) {
+        assertActive(request);
+        let handle;
+        try {
+            handle = await fs.open(candidate.filename, 'r');
+            const info = await handle.stat();
+            if (!info.isFile() || info.size > MAX_HUB_BYTES) continue;
+            const buffer = Buffer.alloc(MAX_HUB_BYTES + 1);
+            const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
+            if (bytesRead > MAX_HUB_BYTES) continue;
+            files.push({ name: candidate.name, modifiedAt: info.mtimeMs,
+                data: JSON.parse(buffer.subarray(0, bytesRead).toString('utf8').replace(/^\uFEFF/, '')) });
+        } catch {
+            continue;
+        } finally {
+            await handle?.close();
         }
     }
-
-    return candidates;
+    return files;
 }
 
-/**
- * 清除缓存（LS 可能已重启）
- */
-export function clearLsCache(): void {
-    cachedLsInfo = null;
-    cachedHttpPort = null;
-    cacheTimestamp = 0;
-}
-
-// ===== connect-rpc 调用 =====
-
-/**
- * 底层 HTTP POST 请求
- */
-function httpPost(
-    host: string,
-    port: number,
-    urlPath: string,
-    body: string,
-    headers: Record<string, string>,
-    timeoutMs = 15000
-): Promise<{ status: number; body: string }> {
-    return new Promise((resolve, reject) => {
-        const req = http.request(
-            {
-                hostname: host,
-                port,
-                path: urlPath,
-                method: "POST",
-                headers: {
-                    "Content-Type": "application/json",
-                    "Content-Length": Buffer.byteLength(body),
-                    ...headers,
-                },
-                timeout: timeoutMs,
-            },
-            (res) => {
-                const chunks: Buffer[] = [];
-                res.on("data", (chunk: Buffer) => chunks.push(chunk));
-                res.on("end", () => {
-                    const responseBody = Buffer.concat(chunks).toString("utf-8");
-                    resolve({ status: res.statusCode || 0, body: responseBody });
-                });
-            }
-        );
-        req.on("error", reject);
-        req.on("timeout", () => {
-            req.destroy();
-            reject(new Error("Request timeout"));
+export async function inspectAntigravityLsProcesses(
+    request: AntigravityRequest,
+    execute: typeof execFile = execFile,
+): Promise<AntigravityLsProcess[]> {
+    assertActive(request);
+    if (process.platform !== 'win32') return [];
+    const script = [
+        "$ErrorActionPreference = 'Stop'",
+        "$ProgressPreference = 'SilentlyContinue'",
+        '[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding $false',
+        "$processes = @(Get-CimInstance Win32_Process -Filter \"Name='language_server.exe' OR Name='language_server_windows_x64.exe'\" | Where-Object { $_.Name -eq 'language_server_windows_x64.exe' -or ($_.ExecutablePath -like '*\\antigravity\\resources\\bin\\language_server.exe' -and $_.CommandLine -match 'antigravity' -and $_.CommandLine -match 'hub') })",
+        "if ($processes.Count -eq 0) { Write-Output '[]'; exit }",
+        '$ids = @($processes | ForEach-Object { $_.ProcessId })',
+        '$listeners = @(Get-NetTCPConnection -State Listen -ErrorAction Stop | Where-Object { $ids -contains $_.OwningProcess })',
+        '$results = @(foreach ($item in $processes) {',
+        '  $ports = @($listeners | Where-Object { $_.OwningProcess -eq $item.ProcessId } | ForEach-Object {',
+        '    @{ address = $_.LocalAddress; port = $_.LocalPort }',
+        '  })',
+        '  @{ pid = $item.ProcessId; executable = $item.ExecutablePath; startedAt = $item.CreationDate.ToUniversalTime().ToString("o"); commandLine = $item.CommandLine; listeners = $ports }',
+        '})',
+        'ConvertTo-Json -InputObject $results -Depth 5 -Compress',
+    ].join('\n');
+    const stdout = await new Promise<string>((resolve, reject) => {
+        execute('powershell.exe', ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', script], {
+            encoding: 'utf8', windowsHide: true, timeout: Math.max(1, Math.floor(Math.min(10000, remainingAntigravityMs(request)))),
+            maxBuffer: 1024 * 1024, signal: request.signal,
+        }, (error, output) => {
+            if (!error) resolve(output);
+            else if (request.signal?.aborted) reject(new AntigravityRpcError('Antigravity discovery cancelled', 'cancelled', false, false));
+            else reject(new AntigravityRpcError(`Antigravity process discovery failed before generation (${error.killed ? 'timeout' : error.code ?? 'process-error'})`, 'not-started', false,
+                remainingAntigravityMs(request) > 0));
         });
-        req.write(body);
-        req.end();
     });
+    assertActive(request);
+    let raw: unknown;
+    try { raw = JSON.parse(stdout.replace(/^\uFEFF/, '').trim() || '[]'); }
+    catch { throw new AntigravityRpcError('Invalid process discovery response', 'not-started', false, false); }
+    const records = Array.isArray(raw) ? raw : [raw];
+    return records.filter(item => item && typeof item === 'object').map(item => ({
+        pid: item.pid, executable: item.executable, startedAt: Date.parse(item.startedAt),
+        commandLine: item.commandLine, listeners: Array.isArray(item.listeners) ? item.listeners : [],
+    }));
 }
 
-/**
- * 调用 LS 的 connect-rpc 方法
- */
-async function rpcCall(
-    lsInfo: LsProcessInfo,
-    port: number,
-    method: string,
-    payload: Record<string, unknown> = {}
-): Promise<RpcResult> {
-    const rpcPath = `/exa.language_server_pb.LanguageServerService/${method}`;
-    const body = JSON.stringify(payload);
-    const headers = {
-        "x-codeium-csrf-token": lsInfo.csrfToken,
-        "Connect-Protocol-Version": "1",
-    };
-
-    const resp = await httpPost("127.0.0.1", port, rpcPath, body, headers);
-
-    let data: any;
-    try {
-        data = resp.body ? JSON.parse(resp.body) : {};
-    } catch {
-        data = resp.body;
+export async function discoverAntigravityEndpoints(
+    request: AntigravityRequest,
+    options: AntigravityDiscoveryOptions = {},
+): Promise<AntigravityEndpoint[]> {
+    assertActive(request);
+    const processes = await (options.inspectProcesses ?? inspectAntigravityLsProcesses)(request);
+    assertActive(request);
+    const modernPorts = new Set(processes.filter(item => validProcess(item, true))
+        .flatMap(item => item.listeners.filter(listener => listener.address === '127.0.0.1').map(listener => listener.port)));
+    const hubs = await readHubFiles(options.daemonDirectory ?? path.join(os.homedir(), '.gemini', 'antigravity', 'daemon'), request, modernPorts);
+    const endpoints: AntigravityEndpoint[] = [];
+    for (const hub of hubs) {
+        for (const processInfo of processes) {
+            const endpoint = validateAntigravityHub(hub.data, hub.name, hub.modifiedAt, processInfo);
+            if (endpoint && !endpoints.some(item => item.identity === endpoint.identity)) endpoints.push(endpoint);
+        }
     }
-
-    return { status: resp.status, data };
-}
-
-/**
- * 找到 LS 的有效 HTTP 端口（通过 Heartbeat 验证）
- */
-async function findHttpPort(lsInfo: LsProcessInfo): Promise<number | null> {
-    if (cachedHttpPort) {
-        try {
-            const result = await rpcCall(lsInfo, cachedHttpPort, "Heartbeat", {});
-            if (result.status === 200) return cachedHttpPort;
-        } catch { /* fallthrough */ }
-        cachedHttpPort = null;
+    for (const processInfo of processes.sort((left, right) => right.startedAt - left.startedAt)) {
+        assertActive(request);
+        if (!validProcess(processInfo, false)) continue;
+        const token = flag(processInfo.commandLine, 'csrf_token');
+        if (!token || token.length > 4096 || /[\r\n]/.test(token)) continue;
+        const extensionPort = Number(flag(processInfo.commandLine, 'extension_server_port'));
+        const httpsPort = Number(flag(processInfo.commandLine, 'https_port'));
+        const httpPort = Number(flag(processInfo.commandLine, 'http_port'));
+        const ports = processInfo.listeners.map(listener => listener.port)
+            .filter(port => port !== extensionPort && ownedPort(processInfo, port))
+            .sort((left, right) => Number(right === httpPort) - Number(left === httpPort) || left - right);
+        for (const port of ports) {
+            const useHttps = port === httpsPort;
+            const identity = endpointIdentity(processInfo, port, token, useHttps);
+            if (endpoints.some(endpoint => endpoint.identity === identity)) continue;
+            endpoints.push({ host: '127.0.0.1', port, pid: processInfo.pid, csrfToken: token, identity,
+                transport: 'legacy-ls', ...(useHttps ? { useHttps: true } : {}) });
+        }
     }
-
-    for (const port of lsInfo.ports) {
-        try {
-            const result = await rpcCall(lsInfo, port, "Heartbeat", {});
-            if (result.status === 200) {
-                cachedHttpPort = port;
-                return port;
-            }
-        } catch { /* try next */ }
-    }
-
-    return null;
-}
-
-// ===== GetModelResponse — 直接模型调用 =====
-
-/** Antigravity GetModelResponse 默认模型：当前实测 Gemini 3.5 Flash (High)。 */
-const AI_SUMMARY_MODEL = process.env.WEB_FETCHER_LS_MODEL || "MODEL_PLACEHOLDER_M132";
-
-/** Antigravity GetModelResponse 默认 fallback：新 Flash 优先，复杂推理兜底到 Pro。 */
-const DEFAULT_LS_MODEL_FALLBACKS = [
-    "MODEL_PLACEHOLDER_M132", // Gemini 3.5 Flash (High)
-    "MODEL_PLACEHOLDER_M20",  // Gemini 3.5 Flash (Medium)
-    "MODEL_PLACEHOLDER_M18",  // Gemini 3 Flash
-    "MODEL_PLACEHOLDER_M16",  // Gemini 3.1 Pro (High)
-    "MODEL_PLACEHOLDER_M36",  // Gemini 3.1 Pro (Low)
-].join(",");
-
-async function postGetModelResponse(
-    lsInfo: LsProcessInfo,
-    port: number,
-    payload: GetModelResponsePayload,
-    timeoutMs: number
-): Promise<string | null> {
-    const rpcPath = `/exa.language_server_pb.LanguageServerService/GetModelResponse`;
-    const body = JSON.stringify(payload);
-    const headers = {
-        "x-codeium-csrf-token": lsInfo.csrfToken,
-        "Connect-Protocol-Version": "1",
-    };
-
-    const resp = await httpPost("127.0.0.1", port, rpcPath, body, headers, timeoutMs);
-
-    let data: any;
-    try {
-        data = resp.body ? JSON.parse(resp.body) : {};
-    } catch {
-        return null;
-    }
-
-    if (resp.status === 200 && data?.response) {
-        return data.response;
-    }
-    return null;
+    assertActive(request);
+    return endpoints;
 }
 
 export function getLsModelCandidates(model: string): string[] {
-    const candidates = [model];
-    const fallbacks = (process.env.WEB_FETCHER_LS_MODEL_FALLBACKS || DEFAULT_LS_MODEL_FALLBACKS)
-        .split(",")
-        .map((item) => item.trim())
-        .filter(Boolean);
-    for (const fallback of fallbacks) {
-        if (!candidates.includes(fallback)) candidates.push(fallback);
+    return [...new Set([model, ...(process.env.WEB_FETCHER_LS_MODEL_FALLBACKS ?? LEGACY_MODELS.join(','))
+        .split(',').map(item => item.trim()).filter(Boolean)])];
+}
+
+function flashLevel(label: string): number {
+    const level = /^Gemini\s+3\.8\s+Flash\s*(?:\((High|Medium|Low)\)|(High|Medium|Low))$/i.exec(label);
+    return level ? ['high', 'medium', 'low'].indexOf((level[1] ?? level[2]).toLowerCase()) : -1;
+}
+
+function modernCapacityCandidates(catalog: AntigravityCatalog, selected: { id: string; label: string }): string[] {
+    const candidates = [selected.id];
+    const selectedLevel = flashLevel(selected.label);
+    if (selectedLevel < 0) return candidates;
+    for (const level of [1, 2]) {
+        if (level <= selectedLevel) continue;
+        const model = catalog.models.find(item => !item.disabled
+            && (item.quotaRemaining === undefined || item.quotaRemaining > 0) && flashLevel(item.label) === level);
+        if (model && !candidates.includes(model.id)) candidates.push(model.id);
     }
     return candidates;
 }
 
-/**
- * 调用 LS 的 GetModelResponse API 直接调用模型
- *
- * @param prompt 用户 prompt
- * @param model 模型编码，默认 Gemini 3.5 Flash (High)
- * @param timeoutMs 超时时间，默认 30s（摘要可能较长）
- * @returns 模型响应文本，或 null（LS 不可用时）
- */
-export async function callGetModelResponse(
-    prompt: string,
-    model: string = AI_SUMMARY_MODEL,
-    timeoutMs = 30000,
-    imagePaths: string[] = []
-): Promise<string | null> {
-    try {
-        if (imagePaths.length > 0) {
-            console.error("[ls-client] Antigravity GetModelResponse only supports text prompt + model; imagePaths ignored");
-        }
-        const candidates = getLsCandidates();
-        if (candidates.length === 0) return null;
-
-        for (const lsInfo of candidates) {
-            const port = await findHttpPort(lsInfo);
-            if (!port) continue;
-
-            for (const candidateModel of getLsModelCandidates(model)) {
-                const text = await postGetModelResponse(lsInfo, port, { model: candidateModel, prompt }, timeoutMs);
-                if (text) {
-                    if (candidateModel !== model) {
-                        console.error(`[ls-client] GetModelResponse model fallback: ${model} -> ${candidateModel}`);
-                    }
-                    cachedLsInfo = lsInfo;
-                    cachedHttpPort = port;
-                    cacheTimestamp = Date.now();
-                    return text;
+export function createAntigravityClient(overrides: Partial<AntigravityClientDependencies> = {}) {
+    const dependencies: AntigravityClientDependencies = {
+        discover: discoverAntigravityEndpoints, rpc: callAntigravityRpc, generate: callAntigravityModel,
+        cliEndpoint: withCliEndpoint, cliAgent: callCliAgent, cliInstalled: isAntigravityCliInstalled,
+        ...overrides,
+    };
+    let cachedEndpoint: { endpoint: AntigravityEndpoint; verifiedAt: number; accountKey?: string } | null = null;
+    const clearCache = () => { cachedEndpoint = null; };
+    const remember = (endpoint: AntigravityEndpoint, accountKey?: string) => {
+        if (endpoint.transport !== 'cli-ls') cachedEndpoint = { endpoint, verifiedAt: Date.now(), accountKey };
+    };
+    const callEndpoint = async (request: AntigravityRequest, endpoint: AntigravityEndpoint): Promise<AntigravityResult> => {
+        const interruption = stopped(request);
+        if (interruption) return { ...interruption, transport: endpoint.transport };
+        let catalog: AntigravityCatalog;
+        let protocolEndpoint = endpoint;
+        try {
+            const response = await dependencies.rpc(endpoint, 'GetUserStatus', {}, request);
+            if (isAntigravityRpcUnsupported(response)) {
+                catalog = legacyAntigravityCatalog();
+                protocolEndpoint = { ...endpoint, transport: endpoint.transport === 'cli-ls' ? 'cli-ls' : 'legacy-ls' };
+            } else {
+                const failure = antigravityRpcFailure(response, endpoint);
+                if (failure) { clearCache(); return failure; }
+                catalog = parseAntigravityCatalog(response.data);
+                if (!catalog?.modern || !Array.isArray(catalog.models) || !catalog.models.length) {
+                    clearCache();
+                    return antigravityFailure('invalid-response', 'GetUserStatus returned an invalid modern model catalog', endpoint.transport);
                 }
             }
+        } catch (error) {
+            clearCache();
+            if (error instanceof AntigravityRpcError) return antigravityRpcException(error, endpoint);
+            return antigravityFailure('invalid-response', 'GetUserStatus model catalog could not be decoded', endpoint.transport);
         }
-
-        clearLsCache();
-        return null;
-    } catch (err) {
-        console.error(`[ls-client] GetModelResponse 调用失败: ${err instanceof Error ? err.message : err}`);
-        return null;
-    }
-}
-
-/**
- * 检查 LS 是否可用（用于判断是否能使用 AI Summary）
- */
-export async function isLsAvailable(): Promise<boolean> {
-    try {
-        for (const lsInfo of getLsCandidates()) {
-            const port = await findHttpPort(lsInfo);
-            if (port !== null) {
-                cachedLsInfo = lsInfo;
-                cachedHttpPort = port;
-                cacheTimestamp = Date.now();
-                return true;
+        remember(protocolEndpoint, catalog.accountKey);
+        const interruptionAfterCatalog = stopped(request);
+        if (interruptionAfterCatalog) return { ...interruptionAfterCatalog, transport: protocolEndpoint.transport };
+        const explicitModel = request.model ?? process.env.WEB_FETCHER_LS_MODEL;
+        let selection;
+        try { selection = selectAntigravityModel(catalog, explicitModel); }
+        catch { return antigravityFailure('invalid-response', 'Antigravity model selection failed', protocolEndpoint.transport); }
+        if (selection.error) return { ...selection.error, transport: protocolEndpoint.transport };
+        if (!selection.model) return antigravityFailure('invalid-response', 'Antigravity catalog selected no model', protocolEndpoint.transport);
+        const models = explicitModel ? [selection.model.id] : catalog.modern
+            ? modernCapacityCandidates(catalog, selection.model)
+            : getLsModelCandidates(selection.model.id).filter(model => catalog.models.some(item => item.id === model && !item.disabled));
+        let result: AntigravityResult | undefined;
+        for (const model of models) {
+            const interruptionBeforeGeneration = stopped(request);
+            if (interruptionBeforeGeneration) return { ...interruptionBeforeGeneration, transport: protocolEndpoint.transport, model };
+            const candidateSelection = selectAntigravityModel(catalog, model);
+            if (candidateSelection.error) return { ...candidateSelection.error, transport: protocolEndpoint.transport };
+            try { result = await dependencies.generate(request, protocolEndpoint, model); }
+            catch { return antigravityFailure('transport-unknown', 'Antigravity generation failed; submission state unknown', protocolEndpoint.transport, model, true); }
+            const capacityRejected = result.outcome === 'rejected' && result.safeToFallback
+                && /\bno capacity available\b/i.test(result.error ?? '');
+            if (explicitModel || !result.safeToFallback || (catalog.modern ? !capacityRejected : result.outcome !== 'unsupported')) return result;
+            if (model !== models.at(-1)) {
+                console.error(`[ls-client] ${protocolEndpoint.transport} ${model} ${result.outcome}; submitted=${result.submitted}; ${result.error ?? ''}`);
             }
         }
+        return result ?? antigravityFailure('unsupported', 'No compatible legacy Antigravity model', protocolEndpoint.transport);
+    };
+    const call = async (request: AntigravityRequest): Promise<AntigravityResult> => {
+        const interruption = stopped(request);
+        if (interruption) return interruption;
+        if (typeof request.prompt !== 'string' || !request.prompt.trim()
+            || (request.model !== undefined && (typeof request.model !== 'string' || !request.model.trim()))
+            || (request.imagePaths !== undefined && (!Array.isArray(request.imagePaths)
+                || request.imagePaths.some(image => typeof image !== 'string' || !image)))) {
+            return antigravityFailure('rejected', 'Antigravity request contains invalid prompt, model, or attachments');
+        }
+        if (request.imagePaths?.length) {
+            try { return await dependencies.cliAgent(request); }
+            catch { return antigravityFailure('transport-unknown', 'Antigravity image agent failed; submission state unknown', 'cli-agent', null, true); }
+        }
+        let endpoints: AntigravityEndpoint[];
+        try { endpoints = await dependencies.discover(request); }
+        catch (error) {
+            clearCache();
+            const interruptionAfterDiscovery = stopped(request);
+            if (interruptionAfterDiscovery) return interruptionAfterDiscovery;
+            if (!(error instanceof AntigravityRpcError) || !error.safeToFallback) {
+                return antigravityFailure(error instanceof AntigravityRpcError ? error.outcome : 'not-started',
+                    'Antigravity App discovery failed before generation');
+            }
+            endpoints = [];
+        }
+        for (const endpoint of endpoints) {
+            const result = await callEndpoint(request, endpoint);
+            if (result.outcome !== 'not-started' || result.submitted || !result.safeToFallback) return result;
+        }
+        clearCache();
+        const interruptionBeforeCli = stopped(request);
+        if (interruptionBeforeCli) return interruptionBeforeCli;
+        if (request.schema) {
+            let result: AntigravityResult;
+            const configuredModel = request.model ?? process.env.WEB_FETCHER_LS_MODEL;
+            const agentRequest = configuredModel === undefined ? request : { ...request, model: configuredModel };
+            try { result = await dependencies.cliAgent(agentRequest); }
+            catch { return antigravityFailure('transport-unknown', 'Antigravity structured agent failed; submission state unknown', 'cli-agent', null, true); }
+            if (result.cleanup && !result.cleanup.confirmed) return { ...result, safeToFallback: false };
+            if (result.submitted || !result.safeToFallback || !['not-started', 'unsupported'].includes(result.outcome)) return result;
+        }
+        try { return await dependencies.cliEndpoint(request, (endpoint, scopedRequest) => callEndpoint(scopedRequest, endpoint)); }
+        catch { return antigravityFailure('transport-unknown', 'Antigravity CLI failed; submission state unknown', 'cli-ls', null, true); }
+    };
+    const available = async (): Promise<boolean> => {
+        const request: AntigravityRequest = { prompt: '', deadline: performance.now() + 5000 };
+        try {
+            for (const endpoint of await dependencies.discover(request)) {
+                try {
+                    const response = await dependencies.rpc(endpoint, 'Heartbeat', {}, request);
+                    if (response.status === 200 && !antigravityRpcFailure(response, endpoint)) {
+                        remember(endpoint);
+                        return true;
+                    }
+                } catch { continue; }
+            }
+        } catch { clearCache(); return false; }
+        clearCache();
         return false;
-    } catch {
-        return false;
-    }
+    };
+    const status = (): { available: boolean; pid?: number; port?: number } => {
+        if (!cachedEndpoint || Date.now() - cachedEndpoint.verifiedAt >= STATUS_TTL_MS) return { available: false };
+        return { available: true, pid: cachedEndpoint.endpoint.pid, port: cachedEndpoint.endpoint.port };
+    };
+    return {
+        callAntigravity: call,
+        callEndpoint,
+        isLsAvailable: available,
+        getLsStatus: status,
+        clearLsCache: clearCache,
+        isAntigravityAvailable: async () => await available() || await dependencies.cliInstalled(),
+    };
 }
 
-/**
- * 获取 LS 状态信息（用于调试/日志）
- */
-export function getLsStatus(): { available: boolean; pid?: number; port?: number } {
-    if (!cachedLsInfo) {
-        return { available: false };
-    }
-    return {
-        available: cachedHttpPort !== null,
-        pid: cachedLsInfo.pid,
-        port: cachedHttpPort ?? undefined,
-    };
+const client = createAntigravityClient();
+
+export const clearLsCache = client.clearLsCache;
+export const isLsAvailable = client.isLsAvailable;
+export const getLsStatus = client.getLsStatus;
+export const isAntigravityAvailable = client.isAntigravityAvailable;
+
+export function callAntigravity(request: AntigravityRequest): Promise<AntigravityResult> {
+    return client.callAntigravity(request);
+}
+
+export async function callGetModelResponse(
+    prompt: string,
+    model?: string,
+    timeoutMs = 30000,
+    imagePaths: string[] = [],
+): Promise<string | null> {
+    const result = await callAntigravity({ prompt, model, imagePaths, deadline: performance.now() + timeoutMs });
+    return result.outcome === 'success' ? result.text : null;
 }

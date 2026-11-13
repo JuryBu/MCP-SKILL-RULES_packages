@@ -6,8 +6,18 @@
 补充范围说明：
 
 - 本文聚焦 Antigravity Language Server 作为父进程时的生命周期与退出策略。
-- `web-fetcher` 的 `ai_summary` 模型总结链已支持 `chain="auto|antigravity|codex"` 双链路。
+- 当前模型桥使用 `modelChain="auto|antigravity|codex|claude-code"`，旧 `chain` 继续兼容，具体入口以[反重力模型桥](docs/antigravity-model-bridge.md)为准。
 - 这里讨论的升级建议主要仍对应 `chain="antigravity"` 场景；网页抓取主链和 `chain="codex"` 的模型桥不依赖本文中的 LS RPC 生命周期细节。
+
+## 当前模型入口约定（2026-11-13）
+
+App 在线时，纯文字继续优先使用新版 App LS 或旧 LS。App 离线时，请求带 `schema` 的结构化文本使用隔离工作目录与配置的 ACP `cli-agent` 文本入口，图片数为0；无 `schema` 的轻量纯文字保留按需 `cli-ls`。图片附件继续使用既有ACP图片机制。
+
+agent 只有在明确未提交、结果为 `not-started` 或明确 `unsupported`，并且 `safeToFallback=true` 时，才在原总期限内兼容到 `cli-ls`。认证、准入、额度、拒绝、取消和未知结果停止后备；不借此重新提交原未知任务。
+
+清理未确认时，即使尚未提交生成也停止入口续选。已有 `WEB_FETCHER_LS_MODEL` 配置在App离线的schema ACP文本入口继续用于显式模型选择。
+
+自有CLI结束后正常退出，借用的App和其它MCP保持运行。候选05图片成功、候选06 LS摘要500／结果未知、候选07未实际生成和候选08正常MCP摘要／视觉成功的范围，见[反重力模型桥](docs/antigravity-model-bridge.md)。以下生命周期方案保留其历史背景，正式部署、加载和正式HTTP验收分别记录。
 
 ---
 
