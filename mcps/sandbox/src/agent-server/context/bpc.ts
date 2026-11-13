@@ -4,7 +4,7 @@ import { AgentFault } from '../protocol.js';
 import type { JsonObject } from '../protocol.js';
 import type { CompactionCandidate, CompactionPort, CompactionReason, CompactionViewEstimator, ContextCapture, ContextEstimate, ContextLimits, ContextSourcePort,
     ExecutionLease, FrozenCompressionConfig, MaintenanceCallbacks, Publication, SchedulerCheckpoint, TokenCounter, CompressionModelPort, SummaryView } from './contracts.js';
-import { checkContextGate, totalContextTokens } from './budget.js';
+import { backgroundTriggerTokens, checkContextGate, totalContextTokens } from './budget.js';
 import { freezeValue, hashContext } from './config.js';
 import { contextFailure, ContextFault } from './errors.js';
 import { factsOnlyCompressionResult, generateCompaction, prepareCompaction, previewCompaction, fitCompactionSummary, validateCompressionResult, verifyManifestSources } from './compaction.js';
@@ -12,6 +12,7 @@ import type { CompactionPreview } from './compaction.js';
 import { createSourceManifest, readSelectedHistory } from './rounds.js';
 import { sealPublishedSummaryView, validatePublication } from './view.js';
 import { applyPublishedHistoryFeedback } from './feedback.js';
+import { captureCompletedFragments } from './completed-fragments.js';
 
 interface ActiveCompaction {
     candidate: CompactionCandidate;
@@ -114,7 +115,7 @@ export class ContextCompactor {
     }
 
     async preview(conversationId: string, config: FrozenCompressionConfig): Promise<CompactionPreview> {
-        return previewCompaction(await this.options.port.inspect(conversationId), config);
+        return previewCompaction(await captureCompletedFragments(this.options.port, await this.options.port.inspect(conversationId), config.policy), config);
     }
 
     async readView(conversationId: string, input?: { policy: import('./contracts.js').ContextPolicy; signal?: AbortSignal }): Promise<SummaryView> {
@@ -242,7 +243,7 @@ export class ContextCompactor {
     }
 
     async manual(input: { conversationId: string; config: FrozenCompressionConfig; budget?: JsonObject; operationId?: string }): Promise<{ preview: CompactionPreview; handle: CompactionHandle | null }> {
-        const capture = await this.options.port.inspect(input.conversationId);
+        const capture = await captureCompletedFragments(this.options.port, await this.options.port.inspect(input.conversationId), input.config.policy);
         const preview = previewCompaction(capture, input.config);
         if (!preview.roundIds.length) return { preview, handle: null };
         let execution = capture.execution;
@@ -494,7 +495,7 @@ export class ContextCompactor {
                 }
             }
             const capture = await this.options.port.inspect(input.conversationId);
-            const preview = previewCompaction(capture, input.config);
+            const preview = previewCompaction(await captureCompletedFragments(this.options.port, capture, input.config.policy), input.config);
             if (!preview.roundIds.length) throw new ContextFault('ACTIVE_ROUND_TOO_LARGE', '完整保留轮及活动轮已超过有效输入预算，当前没有可压缩的旧轮',
                 { activeRoundId: capture.activeRoundId, retainedRoundIds: preview.retainedRoundIds, keepCompleteRounds: input.config.policy.keepCompleteRounds,
                     inputTokens: gate.inputTokens, inputBudget: input.limits.inputBudget, target: input.limits.target, limits: input.limits,
@@ -527,8 +528,8 @@ export class ContextCompactor {
             && checkpoint.lastFailure.details?.rootBudgetId === input.execution.rootBudgetId) {
             return { backgroundCandidateId: this.active.get(input.conversationId)?.candidate.candidateId ?? null };
         }
-        const ratio = totalContextTokens(input.estimate) / input.limits.contextWindow;
-        if (checkContextGate(input.estimate, input.limits).allowed && ratio >= input.config.policy.bpcThreshold
+        if (checkContextGate(input.estimate, input.limits).allowed
+            && totalContextTokens(input.estimate) >= backgroundTriggerTokens(input.limits, input.config.policy)
             && checkpoint.state === 'idle' && !this.active.has(input.conversationId) && !this.starting.has(input.conversationId) && !this.recovering.has(input.conversationId)) {
             if (checkpoint.lastPublishStep !== null && input.stepSeq >= checkpoint.lastPublishStep
                 && input.stepSeq - checkpoint.lastPublishStep <= input.config.policy.immediateRetriggerSteps

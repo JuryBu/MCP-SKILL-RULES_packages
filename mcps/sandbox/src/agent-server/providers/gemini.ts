@@ -4,6 +4,7 @@ import { normalizeUsage } from '../accounting/usage.js';
 import { arrayObjects, assembleResponse, checkToolResults, freezeOwned, gateDeclaredTools, immutableJson, mediaBlock, objectValue, parseArguments, requireRoute, stringValue, validateTools, verifySnapshot } from './assemble.js';
 import { attemptTimeout, decodeResponse, endpointUrl } from './http.js';
 import { requestProviderResponse } from './streaming.js';
+import { geminiCredentialHeaders, providerRequestHeaders } from './request-identity.js';
 import type { DiscoveryPage, NativeBlock, NativeSendView, NormalizedResponse, ProviderAdapter, ProviderAttempt, ProviderProfile, RawProviderResponse, RequestSnapshot, SendContext, StopKind, ToolCall, ToolResult } from './types.js';
 
 const reserved = new Set(['model', 'contents', 'messages', 'input', 'tools', 'stream', 'systemInstruction', 'system_instruction', 'cachedContent', 'cached_content']);
@@ -14,7 +15,13 @@ function geminiContentFields(view: NativeSendView): JsonObject {
         throw new AgentFault('E_PROTOCOL_MISMATCH', 'Gemini适配器需要完整的原生contents发送视图');
     }
     validateTools(view);
-    const fields: JsonObject = { contents: view.contents };
+    const first = view.contents[0];
+    const startsWithToolCall = first.role === 'model'
+        && arrayObjects(first.parts).some(part => objectValue(part.functionCall ?? part.function_call));
+    const contents = startsWithToolCall ? [{ role: 'user', parts: [{
+        text: '[Runtime history boundary; not an original user message]\nThe retained history begins with a model tool call. Use the following original tool calls and results as context for continuing the conversation.',
+    }] }, ...view.contents] : view.contents;
+    const fields: JsonObject = { contents };
     if (view.systemInstruction) fields.systemInstruction = view.systemInstruction;
     if (view.tools?.length) fields.tools = [{ functionDeclarations: view.tools.map(tool => ({ name: tool.name,
         parametersJsonSchema: tool.parameters, ...(tool.description !== undefined ? { description: tool.description } : {}) })) }];
@@ -180,7 +187,7 @@ export class GeminiAdapter implements ProviderAdapter {
             throw new AgentFault('E_AUTH', '凭据内容无效');
         }
         const raw = await requestProviderResponse(attempt, context, { method: 'POST', url: attempt.snapshot.endpoint,
-            headers: { 'Content-Type': 'application/json', ...(context.credential ? { 'x-goog-api-key': context.credential } : {}) },
+            headers: { 'Content-Type': 'application/json', ...geminiCredentialHeaders(attempt.snapshot.profile, context.credential) },
             body: attempt.snapshot.body, timeoutMs: attemptTimeout(attempt) }, normalizeGeminiResponse, signal);
         const definitions = arrayObjects((JSON.parse(attempt.snapshot.body) as JsonObject).tools)
             .flatMap(tool => arrayObjects(tool.functionDeclarations));
@@ -197,7 +204,8 @@ export class GeminiAdapter implements ProviderAdapter {
         url.searchParams.set('pageSize', String(profile.discovery.pageSize));
         if (cursor) url.searchParams.set('pageToken', cursor);
         const raw = decodeResponse(await context.transport.request({ method: 'GET', url: url.href,
-            headers: context.credential ? { 'x-goog-api-key': context.credential } : {}, timeoutMs: 10_000, maxResponseBytes: 4 * 1024 * 1024 }, signal));
+            headers: providerRequestHeaders(profile, geminiCredentialHeaders(profile, context.credential),
+                { purpose: 'catalog', conversationId: context.conversationId }), timeoutMs: 10_000, maxResponseBytes: 4 * 1024 * 1024 }, signal));
         if (!Array.isArray(raw.json.models) || raw.json.models.some(model => !objectValue(model))) {
             throw new AgentFault('E_CATALOG_INCOMPLETE', 'Gemini目录页缺少完整models数组');
         }

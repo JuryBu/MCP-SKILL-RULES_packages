@@ -3,6 +3,7 @@ export * from './errors.js';
 export * from './config.js';
 export * from './budget.js';
 export * from './rounds.js';
+export * from './completed-fragments.js';
 export * from './sources.js';
 export * from './view.js';
 export * from './compaction.js';

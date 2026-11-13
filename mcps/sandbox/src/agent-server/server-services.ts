@@ -4,6 +4,8 @@ import { fileURLToPath } from 'node:url';
 import { homedir, tmpdir } from 'node:os';
 import { AgentFault, canonicalJson, failure, operationHash, validateParams } from './protocol.js';
 import { reconcileRunFailureView } from './run-failure-view.js';
+import { observationBytes, readBatch } from './rpc-observation.js';
+import { readAttemptArtifact, readableRunResult } from './rpc-failure-artifact.js';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { createHash, randomUUID } from 'node:crypto';
 import type { ClientIdentity, JsonObject, JsonValue, RpcResult } from './protocol.js';
@@ -19,6 +21,7 @@ import { createProviderServices } from './providers/services.js';
 import { readProviderBalance } from './providers/balance.js';
 import type { ProviderBalance } from './providers/balance.js';
 import type { CatalogPort } from './models/catalog.js';
+import { selectRequestedTools } from './models/tool-selection.js';
 import type { NormalizedResponse, ProviderProfile } from './providers/types.js';
 import type { QuotaLimitDefinition } from './accounting/budget-ledger.js';
 import type { createAgentRuntime, ExecutorContext } from './runtime.js';
@@ -148,7 +151,8 @@ export async function createAgentServices(options: ServerServiceOptions) {
     const { accountingPort, journal } = createAgentProviderPorts(options.store);
     const { profilePort } = createSqliteConfigurationPorts(options.store.persistent);
     const vault = await nativeVault(options.authority, options.store);
-    const provider = createProviderServices({ accountingPort, profilePort, catalogPort: options.catalogPort, credentialAccess: vault });
+    const provider = createProviderServices({ accountingPort, profilePort, catalogPort: options.catalogPort, credentialAccess: vault,
+        readProfileSpend: profileId => options.store.persistent.readProfileSpend(profileId) });
     const metadataAbort = new AbortController();
     const globalCommands = new GlobalCommands(options.store);
     const profiles = createProfileModelService({ profilePort, credentials: vault, catalog: provider.models,
@@ -260,7 +264,8 @@ export async function createAgentServices(options: ServerServiceOptions) {
                 const key = `${context.snapshot.conversationId}:${context.snapshot.runId}:${context.snapshot.runEpoch}:${plan.profile.revision}:${plan.profile.credentialGeneration}:${plan.modelId}:${parametersHash}:${viewHash}`;
                 let entry = tokenCounts.get(key);
                 if (!entry || Date.now() - entry.createdAt > 60_000) {
-                    const value = provider.countRequestTokens(plan.profile.profileId, plan.modelId, view, context.signal, plan.deadlineAt, plan.parameters).then(async counted => {
+                    const value = provider.countRequestTokens(plan.profile.profileId, plan.modelId, view, context.signal, plan.deadlineAt, plan.parameters,
+                        { conversationId: context.snapshot.conversationId }).then(async counted => {
                         await options.store.commitTransition({ expected: [], contents: [{ conversationId: context.snapshot.conversationId,
                             contentId: `context-count:${randomUUID()}`, kind: 'context_token_count', indexHistory: false,
                             value: { inputTokens: counted.inputTokens, raw: counted.raw, source: counted.source, viewHash } as unknown as JsonValue }] });
@@ -433,6 +438,10 @@ export async function createAgentServices(options: ServerServiceOptions) {
         const configuredRoots = context.conversationOptions.writeRoots ?? context.conversationOptions.workspaceRoots ?? [];
         if (!Array.isArray(configuredRoots) || configuredRoots.some(root => typeof root !== 'string')) throw new AgentFault('WORKSPACE_REQUIRED', '写入根须由主调用方明确配置');
         const command = context.conversationOptions.commandApproval;
+        const taskPlanWorkKind = context.conversationOptions.taskPlanWorkKind;
+        if (taskPlanWorkKind !== undefined && !['multi_step', 'simple_qa', 'single_image'].includes(String(taskPlanWorkKind))) {
+            throw new AgentFault('INVALID_PARAMS', 'taskPlanWorkKind可选multi_step、simple_qa或single_image，未指定时由主体按实际任务判断');
+        }
         return { conversationId: context.snapshot.conversationId, runId: context.snapshot.runId,
             rootRunId: String(context.snapshot.rootRunId ?? context.snapshot.runId), runEpoch: context.snapshot.runEpoch,
             roundId: context.snapshot.activeRoundId ?? context.snapshot.runId, principalId: conversation.value.principalId,
@@ -440,6 +449,7 @@ export async function createAgentServices(options: ServerServiceOptions) {
             deadlineAt: typeof context.snapshot.deadlineAt === 'string' ? context.snapshot.deadlineAt : undefined,
             policyRevision: conversation.value.policyRevision, callerHost: conversation.value.callerHost ?? undefined,
             callerConversationId: conversation.value.callerConversationId ?? undefined,
+            ...(taskPlanWorkKind !== undefined ? { taskPlanWorkKind: taskPlanWorkKind as TrustedToolContext['taskPlanWorkKind'] } : {}),
             actionId: identity?.actionId, attemptId: identity?.attemptId,
             protectedPaths,
             ...(command && typeof command === 'object' ? { command: command as TrustedToolContext['command'] } : {}),
@@ -559,6 +569,7 @@ export async function createAgentServices(options: ServerServiceOptions) {
                 taskModelRulesRef: context.conversationOptions.modelRulesRef, globalModelRulesRef: profile.globalModelRulesRef ?? null });
         }
         const { catalog, entry } = await provider.models.get(profileId, modelId);
+        const toolNames = selectRequestedTools(context.conversationOptions, profile, entry);
         const budget = context.snapshot.budget;
         const parameters = context.conversationOptions.parameters && typeof context.conversationOptions.parameters === 'object'
             ? context.conversationOptions.parameters as JsonObject : {};
@@ -581,10 +592,6 @@ export async function createAgentServices(options: ServerServiceOptions) {
         } else await accountingPort.execute({ type: 'create_budget', definition: { rootBudgetId, mode: metered ? 'metered' : budget.costMode === 'estimated' ? 'estimated' : 'hard',
             currency, maxCostMicros: typeof budget.maxCostMicros === 'number' ? budget.maxCostMicros : null,
             maxModelCalls, maxOutputTokens, deadlineAt, sourceRef: `run:${rootBudgetId}`, quotaLimitId: quotaLimitId ?? undefined } });
-        const configuredTools = context.conversationOptions.tools;
-        const toolNames = context.conversationOptions.toolsEnabled === false ? [] : Array.isArray(configuredTools)
-            ? configuredTools.filter((tool): tool is string => typeof tool === 'string')
-            : entry.tools.status === 'supported' && entry.tools.value === true ? null : [];
         if (shared && toolNames) {
             const preload: string[] = [];
             for (const name of toolNames) {
@@ -687,6 +694,7 @@ export async function createAgentServices(options: ServerServiceOptions) {
     const dispatch = async (method: string, params: Record<string, unknown>, client: ClientIdentity): Promise<RpcResult> => {
         try {
             if (closed) throw new AgentFault('INVALID_STATE', '核心正在关闭');
+            if (method === 'server.readBatch') return await readBatch(params, client, (target, query) => dispatch(target, query, client));
             if (method === 'server.info') {
                 const result = await options.runtime.dispatch(method, params, client);
                 if (!result.ok) return result;
@@ -698,8 +706,16 @@ export async function createAgentServices(options: ServerServiceOptions) {
             }
             if (method === 'runs.get') {
                 const result = await options.runtime.dispatch(method, params, client);
-                return reconcileRunFailureView(result, { readBudget: rootBudgetId => accountingPort.read(rootBudgetId),
-                    readAttempt: attemptId => journal.readAttempt(attemptId) });
+                return readableRunResult(await reconcileRunFailureView(result, { readBudget: rootBudgetId => accountingPort.read(rootBudgetId),
+                    readAttempt: attemptId => journal.readAttempt(attemptId) }));
+            }
+            if (method === 'runs.observe') {
+                const result = await options.runtime.dispatch(method, params, client);
+                if (!result.ok) return result;
+                const observed = result.data as { run: unknown };
+                const presentation = readableRunResult({ ok: true, data: observed.run }).presentation;
+                const rendered = presentation ? { ...result, presentation } : result;
+                return observationBytes(rendered) <= Number(params.maxBytes ?? 256 * 1024) ? rendered : result;
             }
             const configurationResult = await configuration.dispatch(method, params, client);
             if (configurationResult) return configurationResult;
@@ -874,14 +890,17 @@ export async function createAgentServices(options: ServerServiceOptions) {
                 }
                 const [conversationUsage, providerUsage, account] = await Promise.all([
                     options.store.persistent.readUsage({ rootBudgetIds: [...rootBudgetIds] }),
-                    options.store.persistent.readUsage(profile ? { quotaScopeId: profile.quotaScopeId } : {}),
+                    profile ? options.store.persistent.readProfileSpend(profile.profileId)
+                        : Promise.resolve({ costs: [], status: 'unknown' as const }),
                     balance?.value ?? Promise.resolve({ status: 'unsupported', source: '未选择服务商', balances: [] }),
                 ]);
                 return { ok: true, data: { asOf: new Date().toISOString(), ...(profileId ? { profileId } : {}),
                     account,
-                    conversation: conversationUsage,
-                    providerUsage: { scope: 'local_tool', costs: providerUsage.costs,
-                        amountStatus: providerUsage.amountStatus } } };
+                    conversation: { ...conversationUsage, metrics: { inputTokens: conversationUsage.metrics.input,
+                        outputTokens: conversationUsage.metrics.output, totalTokens: conversationUsage.metrics.total,
+                        cacheReadTokens: conversationUsage.metrics.cacheRead, cacheRate: conversationUsage.metrics.cacheRate } },
+                    providerUsage: { scope: 'local_tool', ...(profileId ? { profileId } : {}), costs: providerUsage.costs,
+                        amountStatus: providerUsage.status } } };
             }
             if (method === 'budgets.get') return { ok: true, data: await accountingPort.read(String(params.rootBudgetId)) };
             if (method === 'budgets.reconcileResponses') {
@@ -965,7 +984,7 @@ export async function createAgentServices(options: ServerServiceOptions) {
                     params.input as JsonValue, { profile, entry }, controller.signal);
                 controller.signal.throwIfAborted();
                 const counted = await provider.countRequestTokens(profile.profileId, modelId, view, controller.signal,
-                    deadlineAt, (selected.parameters ?? {}) as JsonObject);
+                    deadlineAt, (selected.parameters ?? {}) as JsonObject, { conversationId });
                 return { ok: true, data: { ...counted, scope: 'provided_input_only', automaticHistoryIncluded: false,
                     generationRequests: 0, historyWrites: 0, budgetMutations: 0 } as unknown as JsonValue };
                 };
@@ -973,10 +992,38 @@ export async function createAgentServices(options: ServerServiceOptions) {
                 finally { clearTimeout(timer); metadataAbort.signal.removeEventListener('abort', cancel); }
             }
             if (method === 'conversations.context') {
+                params = validateParams(method, params);
                 const allowed = await options.runtime.dispatch('conversations.get', { conversationId: params.conversationId }, client);
                 if (!allowed.ok) return allowed;
+                const conversation = allowed.data as Record<string, unknown>;
+                if (conversation.state === 'closed') {
+                    const snapshot = conversation.finalContextSnapshot as import('./rpc-observation.js').FinalContextSnapshot | undefined;
+                    if (snapshot) {
+                        const candidate = snapshot.status.candidate as { candidateId?: string } | null | undefined;
+                        if (params.candidateId && candidate?.candidateId !== params.candidateId) throw new AgentFault('CONTEXT_SOURCE_GAP',
+                            '最终上下文快照未包含指定候选，原历史与事件仍可读取', { candidateId: params.candidateId });
+                        return { ok: true, data: { ...snapshot.status, source: 'closed_context_snapshot',
+                            observedAt: snapshot.capturedAt, snapshotCursor: snapshot.eventCursor, final: true,
+                            partial: snapshot.partial, readOnly: true }, eventCursor: allowed.eventCursor };
+                    }
+                    return { ok: true, data: { conversationId: params.conversationId,
+                        history: { historyEpoch: conversation.historyEpoch, appendSeq: conversation.appendSeq, viewRevision: conversation.viewRevision },
+                        source: 'closed_conversation_metadata', final: true, partial: true, readOnly: true,
+                        unavailable: { code: 'FINAL_CONTEXT_UNAVAILABLE', message: '该旧会话没有关闭前快照，原执行、回执、事件与原文继续按原入口读取' } },
+                        eventCursor: allowed.eventCursor };
+                }
                 return { ok: true, data: await contextService.status({ conversationId: String(params.conversationId),
                     ...(typeof params.candidateId === 'string' ? { candidateId: params.candidateId } : {}) }) };
+            }
+            if (method === 'conversations.readArtifact' && String(params.artifactId).startsWith('attempt:')) {
+                params = validateParams(method, params);
+                const allowed = await options.runtime.dispatch('conversations.get', { conversationId: params.conversationId }, client);
+                if (!allowed.ok) return allowed;
+                const attemptId = String(params.artifactId).slice('attempt:'.length);
+                if (!attemptId) throw new AgentFault('INVALID_PARAMS', '原尝试引用缺少attemptId');
+                return { ok: true, data: readAttemptArtifact(await journal.readAttempt(attemptId), {
+                    conversationId: String(params.conversationId), attemptId, offset: Number(params.offset), maxBytes: Number(params.maxBytes) }),
+                    eventCursor: allowed.eventCursor };
             }
             if (method === 'conversations.readArtifact' && (String(params.artifactId).startsWith('attachment:')
                 || String(params.artifactId).startsWith('media:'))) {
@@ -1007,6 +1054,8 @@ export async function createAgentServices(options: ServerServiceOptions) {
             return options.runtime.dispatch(method, params, client);
         } catch (error) { return failure(error); }
     };
+
+    options.runtime.setFinalContextReader(async conversationId => await contextService.status({ conversationId }) as unknown as Record<string, unknown>);
 
     return { executor, dispatch, provider, profiles, tools, journal, accountingPort, media, inputAttachments, contextService, workspaceService, resolveWorkspaceContext, quiesceWorkspace, lifecycle,
         hasMetadataWrites: () => contextWriteCommands.size > 0 || restoreRuns.size > 0 || lifecycle.hasActiveWork(),
@@ -1046,7 +1095,8 @@ export async function createAgentServices(options: ServerServiceOptions) {
                             || recorded.attempt.rootBudgetId !== rootBudgetId || recorded.attempt.snapshot.actionId !== pending.actionId
                             || recorded.attempt.snapshot.conversationId !== cleanup.snapshot.conversationId
                             || recorded.attempt.snapshot.runId !== cleanup.snapshot.runId
-                            || recorded.attempt.snapshot.runEpoch !== cleanup.snapshot.runEpoch - 1) return false;
+                            || recorded.attempt.snapshot.runEpoch !== state.candidate!.snapshot.runEpoch
+                            || recorded.attempt.snapshot.runEpoch >= cleanup.snapshot.runEpoch) return false;
                     }
                 }
                 return contextService.confirmUnknownCleanup({ conversationId: cleanup.snapshot.conversationId, runId: cleanup.snapshot.runId,

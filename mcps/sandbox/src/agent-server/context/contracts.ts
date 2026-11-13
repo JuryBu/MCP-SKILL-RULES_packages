@@ -1,6 +1,6 @@
 import type { JsonObject, JsonValue } from '../protocol.js';
 import type { NativeSendView, ProviderProtocol } from '../providers/types.js';
-import type { HistoryItem, HistoryPage, HistoryQuery, ReceiptKey } from '../storage/port.js';
+import type { HistoryItem, HistoryPage, HistoryQuery, ModelStepPairing, ModelStepPairingQuery, ReceiptKey } from '../storage/port.js';
 
 export interface ContextPolicy {
     taskPlanManaged: boolean;
@@ -10,6 +10,7 @@ export interface ContextPolicy {
     bpcThreshold: number;
     hardThreshold: number;
     keepCompleteRounds: number;
+    keepCompleteSteps: number;
     deltaSteps: number;
     chunkInputTokens: number;
     referenceTokens: number;
@@ -121,6 +122,7 @@ export interface ContextVersionState {
 
 export interface ContextHistoryPort {
     readVersionState?(conversationId: string): Promise<ContextVersionState | undefined>;
+    readSemanticNodes?(conversationId: string): Promise<{ historyEpoch: number; viewRevision: number; nodes: SummaryNode[] }>;
     readHistory(query: HistoryQuery): Promise<HistoryPage>;
     readContent(conversationId: string, contentId: string): Promise<JsonValue | undefined>;
 }
@@ -363,6 +365,7 @@ export interface ContextCapture {
     historyRoot: string;
     stepSeq: number;
     activeRoundId: string | null;
+    activeCompletedPrefix?: RoundBoundary;
     rounds: RoundBoundary[];
     view: SummaryView;
     execution: ExecutionLease | null;
@@ -428,6 +431,7 @@ export interface SchedulerCheckpoint {
 }
 
 export interface CompactionPort extends ContextHistoryPort {
+    readModelStepPairings?(query: ModelStepPairingQuery): Promise<ModelStepPairing[]>;
     ensureCommunicationWindow?(input: { conversationId: string; policy: ContextPolicy; signal?: AbortSignal }): Promise<SummaryView>;
     readRequirementSourceMetadata?(input: { conversationId: string; historyEpoch: number; itemIds: string[] }): Promise<{
         historyEpoch: number; items: RequirementSourceMetadata[];

@@ -3,6 +3,7 @@ import { assembleResponse, freezeOwned, immutableJson, objectValue, stringValue 
 import { decodeResponse, responseUsage, safeTransportCause } from './http.js';
 import { ProviderStreamAssembly } from './stream-assembly.js';
 import { ProviderFault } from './types.js';
+import { providerRequestHeaders } from './request-identity.js';
 import type { HttpRequest, NormalizedResponse, ProviderAttempt, RawProviderResponse, SendContext } from './types.js';
 
 class EventStreamDecoder {
@@ -53,6 +54,8 @@ class EventStreamDecoder {
 export async function requestProviderResponse(attempt: ProviderAttempt, context: SendContext, request: HttpRequest,
     normalize: (attemptId: string, raw: RawProviderResponse) => NormalizedResponse, signal?: AbortSignal): Promise<RawProviderResponse> {
     const protocol = attempt.snapshot.profile.protocol;
+    request = { ...request, headers: providerRequestHeaders(attempt.snapshot.profile, request.headers,
+        { purpose: 'generation', conversationId: attempt.snapshot.conversationId }) };
     if (!attempt.snapshot.streaming) return decodeResponse(await context.transport.request(request, signal), protocol, request.url);
     const state = new ProviderStreamAssembly(protocol);
     let seq = 0;

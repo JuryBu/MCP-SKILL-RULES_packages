@@ -29,7 +29,7 @@ export interface CommunicationExchange {
 }
 
 export interface CommunicationGap {
-    reason: 'original_unavailable' | 'read_budget' | 'scan_limit' | 'round_origin_missing' | 'round_identity_missing';
+    reason: 'original_unavailable' | 'read_budget' | 'scan_limit' | 'round_origin_missing' | 'round_identity_missing' | 'semantic_identity_missing';
     itemId?: string;
     contentId?: string;
     code?: string;
@@ -43,6 +43,7 @@ export interface CommunicationWindow {
     entries: CommunicationExchange[];
     originStartSeq?: number;
     bootstrap?: { source: 'stored_raw_history'; throughSeq: number; requestedSize: number; pages: number;
+        grouping?: 'semantic' | 'host_round_fallback' | 'mixed';
         scannedItems: number; scannedBytes: number; readBytes: number; scanComplete: boolean; complete: boolean;
         stoppedBy: 'window_full' | 'history_exhausted' | 'scan_limit'; gaps: CommunicationGap[] };
     hash: string;
@@ -132,8 +133,21 @@ export async function bootstrapCommunicationWindow(input: {
     const retained = structuredClone(previous?.entries ?? []);
     const needed = Math.max(0, input.policy.communicationWindowSize - retained.length);
     const throughSeq = retained.length ? Math.min(input.coveredEndSeq, retained[0].firstSeq - 1) : input.coveredEndSeq;
-    const groups: { roundId: string; items: HistoryItem[]; complete: boolean }[] = [];
-    let group: { roundId: string; items: HistoryItem[]; complete: boolean } | undefined;
+    const semantic = await input.history.readSemanticNodes?.(input.conversationId);
+    if (semantic && (semantic.historyEpoch !== input.historyEpoch || semantic.viewRevision !== input.viewRevision)) {
+        throw new ContextFault('HISTORY_STALE', '首次交流窗口需要同一已发布语义视图');
+    }
+    const exchanges = new Map<string, string>();
+    for (const entry of retained) for (const roundId of entry.roundIds) exchanges.set(roundId, entry.exchangeId);
+    for (const node of semantic?.nodes ?? []) {
+        const { hash, ...content } = node;
+        if (hash !== hashContext(content)) throw new ContextFault('SOURCE_GAP', '首次交流窗口语义节点哈希不一致');
+        if (node.kind === 'batch' && node.exchangeId) for (const roundId of node.roundIds) exchanges.set(roundId, node.exchangeId);
+    }
+    const groups: { exchangeId: string; roundIds: string[]; items: HistoryItem[]; complete: boolean; semantic: boolean }[] = [];
+    let group: typeof groups[number] | undefined;
+    const retainedIds = new Set(retained.map(entry => entry.exchangeId));
+    const newGroupCount = () => groups.filter(entry => !retainedIds.has(entry.exchangeId)).length;
     let cursor: string | undefined;
     let pages = 0;
     let scannedItems = 0;
@@ -148,7 +162,7 @@ export async function bootstrapCommunicationWindow(input: {
         if (group?.items.some(item => item.role === 'user' || item.role === 'assistant')) groups.push({ ...group, complete });
         group = undefined;
     };
-    scan: while (throughSeq > 0 && groups.length < needed && scannedItems < maximumItems && scannedBytes < maximumScanBytes) {
+    scan: while (throughSeq > 0 && newGroupCount() < needed && scannedItems < maximumItems && scannedBytes < maximumScanBytes) {
         checkAbort(signal);
         const page = await input.history.readHistory({ conversationId: input.conversationId, cursor, direction: 'backward',
             view: 'raw', effectiveOnly: true, includeValues: false, throughSeq, expectedHistoryEpoch: input.historyEpoch,
@@ -163,15 +177,18 @@ export async function bootstrapCommunicationWindow(input: {
         for (const item of page.items) {
             if (!item.effective || item.view !== 'raw' || item.seq >= lastSeq || item.seq > throughSeq) throw new ContextFault('SOURCE_GAP', '首次交流窗口需要有效原文的严格倒序索引');
             lastSeq = item.seq;
-            if (item.roundId && group && item.roundId !== group.roundId) {
+            const semanticExchangeId = item.roundId ? exchanges.get(item.roundId) : undefined;
+            const exchangeId = semanticExchangeId ?? derivedContextId(['exchange', input.conversationId, input.historyEpoch, item.roundId]);
+            if (item.roundId && group && exchangeId !== group.exchangeId) {
                 finishGroup(true);
-                if (groups.length >= needed) { stoppedBy = 'window_full'; break scan; }
+                if (newGroupCount() >= needed) { stoppedBy = 'window_full'; break scan; }
             }
             if (!item.roundId) {
                 if (item.role === 'user' || item.role === 'assistant') gaps.push({ reason: 'round_identity_missing', itemId: item.itemId, contentId: item.contentId });
                 continue;
             }
-            group ??= { roundId: item.roundId, items: [], complete: false };
+            group ??= { exchangeId, roundIds: [], items: [], complete: false, semantic: Boolean(semanticExchangeId) };
+            if (!group.roundIds.includes(item.roundId)) group.roundIds.unshift(item.roundId);
             group.items.push(item);
         }
         if (!page.hasMore) { finishGroup(true); stoppedBy = 'history_exhausted'; break; }
@@ -185,12 +202,13 @@ export async function bootstrapCommunicationWindow(input: {
         gaps.push({ reason: 'original_unavailable', code: 'RAW_HISTORY_UNAVAILABLE' });
     }
     const entries: CommunicationExchange[] = [];
-    const perExchange = Math.max(1, Math.floor(input.policy.communicationTextChars / Math.max(1, groups.length + retained.length)));
-    for (const selected of groups.slice(0, needed)) {
-        const entry: CommunicationExchange = { exchangeId: derivedContextId(['exchange', input.conversationId, input.historyEpoch, selected.roundId]),
-            roundIds: [selected.roundId], firstSeq: selected.items.at(-1)!.seq, lastSeq: selected.items[0].seq, originals: [] };
+    const perExchange = Math.max(1, Math.floor(input.policy.communicationTextChars / Math.max(1, newGroupCount() + retained.length)));
+    for (const selected of groups) {
+        const entry: CommunicationExchange = { exchangeId: selected.exchangeId,
+            roundIds: selected.roundIds, firstSeq: selected.items.at(-1)!.seq, lastSeq: selected.items[0].seq, originals: [] };
         const entryGaps: CommunicationGap[] = [];
         if (!selected.complete) entryGaps.push({ reason: 'scan_limit' });
+        if (semantic && !selected.semantic) entryGaps.push({ reason: 'semantic_identity_missing' });
         if (!selected.items.some(item => item.role === 'user')) entryGaps.push({ reason: 'round_origin_missing' });
         for (const item of selected.items.filter(item => item.role === 'user' || item.role === 'assistant').reverse()) {
             checkAbort(signal);
@@ -224,9 +242,20 @@ export async function bootstrapCommunicationWindow(input: {
         if (entryGaps.length) entry.gaps = entryGaps;
         entries.push(entry);
     }
+    const combined = new Map<string, CommunicationExchange>();
+    for (const entry of [...entries, ...retained]) {
+        const existing = combined.get(entry.exchangeId);
+        if (!existing) { combined.set(entry.exchangeId, entry); continue; }
+        combined.set(entry.exchangeId, { ...existing, firstSeq: Math.min(existing.firstSeq, entry.firstSeq), lastSeq: Math.max(existing.lastSeq, entry.lastSeq),
+            roundIds: [...new Set([...existing.roundIds, ...entry.roundIds])],
+            originals: [...new Map([...existing.originals, ...entry.originals].map(part => [JSON.stringify([part.itemId, part.blockId]), part])).values()],
+            ...((existing.gaps?.length || entry.gaps?.length) ? { gaps: [...(existing.gaps ?? []), ...(entry.gaps ?? [])] } : {}) });
+    }
+    const semanticGroups = groups.filter(entry => entry.semantic).length;
     return sealWindow({ schemaVersion: 1, historyEpoch: input.historyEpoch, coveredEndSeq: input.coveredEndSeq,
-        size: input.policy.communicationWindowSize, entries: [...entries, ...retained], originStartSeq: entries.at(-1)?.firstSeq ?? previous?.originStartSeq ?? 1,
+        size: input.policy.communicationWindowSize, entries: [...combined.values()], originStartSeq: entries.at(-1)?.firstSeq ?? previous?.originStartSeq ?? 1,
         bootstrap: { source: 'stored_raw_history', throughSeq, requestedSize: input.policy.communicationWindowSize, pages,
+            grouping: semanticGroups ? semanticGroups === groups.length ? 'semantic' : 'mixed' : 'host_round_fallback',
             scannedItems, scannedBytes, readBytes, scanComplete: stoppedBy !== 'scan_limit',
             complete: stoppedBy !== 'scan_limit' && !gaps.length && entries.every(entry => !entry.gaps?.length), stoppedBy, gaps } }, input.policy.communicationTextChars);
 }

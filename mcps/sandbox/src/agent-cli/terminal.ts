@@ -1,8 +1,10 @@
 import { EventEmitter } from 'node:events';
 import { StringDecoder } from 'node:string_decoder';
 import type { Readable, Writable } from 'node:stream';
+import type { NativeConsoleViewport } from './graphics/native-console.js';
 
-export type TerminalKey = { name: string; text?: string; paste?: boolean };
+export type TerminalKey = { name: string; text?: string; paste?: boolean; source?: 'mouse'; scrollRows?: number; column?: number; row?: number };
+export interface TerminalFrameGeometry { width: number; height: number; revision: number }
 type InputStream = Readable & { isTTY?: boolean; isRaw?: boolean; setRawMode?: (raw: boolean) => unknown };
 type OutputStream = Writable & { columns?: number; rows?: number; isTTY?: boolean };
 
@@ -26,9 +28,11 @@ export class TerminalSession extends EventEmitter {
     private opened = false;
     private disposed = false;
     private editorChordUntil = 0;
+    private viewport?: NativeConsoleViewport;
+    private viewportRevision = 0;
     private chain = Promise.resolve();
     private readonly dataListener = (chunk: Buffer | string) => { this.buffer += typeof chunk === 'string' ? chunk : this.decoder.write(chunk); this.parse(); };
-    private readonly resizeListener = () => this.emit('resize');
+    private readonly resizeListener = () => { this.viewport = undefined; this.viewportRevision += 1; this.emit('resize'); };
 
     constructor(readonly input: InputStream, readonly output: OutputStream, readonly linear = false) {
         super();
@@ -36,8 +40,23 @@ export class TerminalSession extends EventEmitter {
         this.originalFlow = input.readableFlowing;
     }
 
-    get width(): number { return this.output.columns ?? 100; }
-    get height(): number { return this.output.rows ?? 32; }
+    get width(): number { return this.viewport?.columns ?? this.output.columns ?? 100; }
+    get height(): number { return this.viewport?.rows ?? this.output.rows ?? 32; }
+    frameGeometry(): TerminalFrameGeometry { return { width: this.width, height: this.height, revision: this.viewportRevision }; }
+    isCurrentGeometry(geometry: { width: number; height: number; revision?: number }): boolean {
+        return geometry.width === this.width && geometry.height === this.height && (geometry.revision === undefined || geometry.revision === this.viewportRevision);
+    }
+
+    updateViewport(viewport: NativeConsoleViewport): boolean {
+        const previous = this.viewport;
+        if (previous && JSON.stringify(previous) === JSON.stringify(viewport)) return false;
+        const resized = this.width !== viewport.columns || this.height !== viewport.rows;
+        this.viewport = { ...viewport };
+        this.viewportRevision += 1;
+        this.emit('viewport', this.viewport);
+        if (resized) this.emit('resize');
+        return true;
+    }
 
     async open(): Promise<void> {
         if (this.disposed) throw new Error('终端会话已经关闭');
@@ -48,13 +67,13 @@ export class TerminalSession extends EventEmitter {
         this.input.once('end', this.endListener);
         this.input.resume();
         this.output.on('resize', this.resizeListener);
-        if (!this.linear) await this.write('\x1b[?25l\x1b[?2004h' + '\r\n'.repeat(this.height));
+        if (!this.linear) await this.write('\x1b[?25l\x1b[?2004h\x1b[?1000h\x1b[?1006h\x1b[H\x1b[0J');
     }
 
-    write(text: string, geometry?: { width: number; height: number }): Promise<void> {
+    write(text: string, geometry?: { width: number; height: number; revision?: number }): Promise<void> {
         const writing = this.chain.then(() => new Promise<void>((resolveWrite, rejectWrite) => {
             if (this.output.destroyed) { resolveWrite(); return; }
-            if (geometry && (geometry.width !== this.width || geometry.height !== this.height)) {
+            if (geometry && !this.isCurrentGeometry(geometry)) {
                 this.emit('resize'); resolveWrite(); return;
             }
             this.output.write(text, error => error ? rejectWrite(error) : resolveWrite());
@@ -74,7 +93,7 @@ export class TerminalSession extends EventEmitter {
         this.input.setRawMode?.(this.originalRaw);
         if (this.originalFlow === false || this.originalFlow === null) this.input.pause();
         else this.input.resume();
-        if (!this.linear) await this.write('\x1b[0m\x1b[?2004l\x1b[?7h\x1b[?25h\r\n');
+        if (!this.linear) await this.write('\x1b[0m\x1b[?1006l\x1b[?1000l\x1b[?2004l\x1b[?7h\x1b[?25h\r\n');
         await this.chain;
     }
 
@@ -112,6 +131,24 @@ export class TerminalSession extends EventEmitter {
             if (this.buffer.startsWith('\x1b')) {
                 if (this.buffer.startsWith('\x1b\r')) { this.buffer = this.buffer.slice(2); this.emit('key', { name: 'alt-enter' }); continue; }
                 if (/^\x1b[mwsnrMWSNR]/.test(this.buffer)) { const name = 'alt-' + this.buffer[1].toLowerCase(); this.buffer = this.buffer.slice(2); this.emit('key', { name }); continue; }
+                const mouse = /^\x1b\[<(\d+);(\d+);(\d+)([Mm])/.exec(this.buffer);
+                if (mouse) {
+                    this.buffer = this.buffer.slice(mouse[0].length);
+                    this.mouse(Number(mouse[1]), Number(mouse[2]) - 1, Number(mouse[3]) - 1, mouse[4] === 'M');
+                    continue;
+                }
+                if (this.buffer.startsWith('\x1b[M')) {
+                    if (this.buffer.length < 6) return;
+                    this.mouse(this.buffer.charCodeAt(3) - 32, this.buffer.charCodeAt(4) - 33, this.buffer.charCodeAt(5) - 33, true);
+                    this.buffer = this.buffer.slice(6);
+                    continue;
+                }
+                const applicationKey = /^\x1bO([ABCDHF])/.exec(this.buffer);
+                if (applicationKey) {
+                    this.buffer = this.buffer.slice(applicationKey[0].length);
+                    this.emit('key', { name: ({ A: 'up', B: 'down', C: 'right', D: 'left', H: 'home', F: 'end' } as Record<string, string>)[applicationKey[1]] });
+                    continue;
+                }
                 const csi = /^\x1b\[[0-?]*[ -/]*[@-~]/.exec(this.buffer)?.[0];
                 if (csi) {
                     this.buffer = this.buffer.slice(csi.length);
@@ -142,5 +179,11 @@ export class TerminalSession extends EventEmitter {
             if (match) { this.buffer = this.buffer.slice(match.length); this.emit('key', { name: 'text', text: match }); }
             else this.buffer = this.buffer.slice(1);
         }
+    }
+
+    private mouse(button: number, column: number, row: number, pressed: boolean): void {
+        if (!pressed || (button & 64) === 0 || (button & 3) > 1 || column < 0 || row < 0) return;
+        const upward = (button & 1) === 0;
+        this.emit('key', { name: upward ? 'pageup' : 'pagedown', source: 'mouse', scrollRows: upward ? -3 : 3, column, row } satisfies TerminalKey);
     }
 }

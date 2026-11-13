@@ -5,6 +5,7 @@ import { arrayObjects, assembleResponse, freezeOwned, gateDeclaredTools, objectV
 import { CompatibleChatAdapter, normalizeChatResponse } from './compatible-chat.js';
 import { attemptTimeout, decodeResponse, endpointUrl } from './http.js';
 import { requestProviderResponse } from './streaming.js';
+import { providerRequestHeaders } from './request-identity.js';
 import type { DiscoveryPage, NativeSendView, NormalizedResponse, ProviderAdapter, ProviderAttempt, ProviderProfile, RawProviderResponse, RequestSnapshot, SendContext, ToolResult } from './types.js';
 
 function localApiBase(profile: ProviderProfile): string {
@@ -66,7 +67,7 @@ export class ProgrokAdapter implements ProviderAdapter {
     }
 
     async discover(profile: ProviderProfile, cursor: string | null, context: SendContext, signal?: AbortSignal): Promise<DiscoveryPage> {
-        const headers = localHeaders(context);
+        const headers = providerRequestHeaders(profile, localHeaders(context), { purpose: 'catalog' });
         const base = localApiBase(profile);
         const [page, languageResponse] = await Promise.all([
             this.chat.discover({ ...profile, baseUrl: base }, cursor, {

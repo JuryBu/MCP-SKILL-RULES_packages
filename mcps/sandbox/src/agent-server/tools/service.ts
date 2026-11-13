@@ -28,7 +28,8 @@ export class ToolCatalogService {
         const schema = this.router.describe(entry.name);
         const cached = this.localSchemas.get('local', entry.name)
             ?? this.localSchemas.put('local', entry.name, entry.adapterVersion, schema.parameters);
-        return { toolId: entry.toolId, schemaHash: cached.schemaHash, availability: entry.availability, reason: entry.reason, function: schema };
+        return { toolId: entry.toolId, schemaHash: entry.schemaHash ?? cached.schemaHash,
+            availability: entry.availability, reason: entry.reason, function: schema };
     }
 
     list(input: ToolCatalogListInput = {}): ToolCatalogPage {
@@ -36,7 +37,7 @@ export class ToolCatalogService {
         const offset = input.cursor ? Number(input.cursor) : 0;
         if (!Number.isInteger(limit) || limit < 1 || limit > 100 || !Number.isSafeInteger(offset) || offset < 0) throw new AgentFault('INVALID_PARAMS', '工具目录分页参数无效');
         const entries: ToolCatalogEntry[] = this.router.list().map(entry => ({ ...entry,
-            schemaHash: this.localSchemas.get('local', entry.name, entry.adapterVersion)?.schemaHash ?? entry.schemaHash }));
+            schemaHash: entry.schemaHash ?? this.localSchemas.get('local', entry.name, entry.adapterVersion)?.schemaHash ?? null }));
         let cursor: string | undefined;
         do {
             const page = this.router.shared?.list({ limit: 100, cursor, includeUnavailable: input.includeUnavailable });
@@ -52,7 +53,13 @@ export class ToolCatalogService {
         if (signal?.aborted) throw new AgentFault('TOOL_CANCELLED', '工具描述读取已取消');
         if (!input?.name || typeof input.name !== 'string') throw new AgentFault('INVALID_PARAMS', '工具描述需要明确名称');
         const local = this.router.list().find(entry => entry.name === input.name || entry.toolId === input.name);
-        if (local) return this.localDescription(local);
+        if (local) {
+            if (local.name === 'run_command' && local.availability === 'schema_pending') {
+                await this.router.checkCommandCapability();
+                return this.localDescription(this.router.list().find(entry => entry.toolId === local.toolId)!);
+            }
+            return this.localDescription(local);
+        }
         if (!this.router.shared) throw new AgentFault('TOOL_NOT_ALLOWED', '共享工具目录尚未显式装配');
         const descriptor = await this.router.shared.describe(input.name, signal);
         return { ...descriptor, availability: 'available', reason: null };

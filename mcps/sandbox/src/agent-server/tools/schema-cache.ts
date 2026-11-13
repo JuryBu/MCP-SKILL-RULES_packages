@@ -57,7 +57,7 @@ export class ToolSchemaCache {
 export function requireSupportedSchema(schema: unknown, depth = 0): void {
     if (depth > 20 || !schema || typeof schema !== 'object' || Array.isArray(schema)) throw new AgentFault('TOOL_CAPABILITY_UNVERIFIED', '工具schema超出当前校验能力');
     const object = schema as Record<string, unknown>;
-    const supported = new Set(['type', 'properties', 'required', 'additionalProperties', 'items', 'anyOf', 'oneOf', 'enum', 'const',
+    const supported = new Set(['type', 'properties', 'required', 'additionalProperties', 'items', 'anyOf', 'oneOf', 'not', 'enum', 'const',
         'description', 'title', 'default', 'examples', '$schema', 'minLength', 'maxLength', 'pattern', 'minimum', 'maximum',
         'exclusiveMinimum', 'exclusiveMaximum', 'minItems', 'maxItems', 'format']);
     for (const key of Object.keys(object)) if (!supported.has(key)) throw new AgentFault('TOOL_CAPABILITY_UNVERIFIED', '工具schema包含尚未接入的校验条件', { keyword: key });
@@ -67,12 +67,13 @@ export function requireSupportedSchema(schema: unknown, depth = 0): void {
             throw new AgentFault('TOOL_CAPABILITY_UNVERIFIED', '工具schema需要有限数值边界', { keyword });
         }
     }
-    for (const key of ['$ref', '$dynamicRef', 'allOf', 'not', 'if', 'then', 'else', 'patternProperties', 'dependentSchemas', 'unevaluatedProperties']) {
+    for (const key of ['$ref', '$dynamicRef', 'allOf', 'if', 'then', 'else', 'patternProperties', 'dependentSchemas', 'unevaluatedProperties']) {
         if (key in object) throw new AgentFault('TOOL_CAPABILITY_UNVERIFIED', '工具schema包含尚未接入的校验条件', { keyword: key });
     }
     if (object.properties && typeof object.properties === 'object') for (const child of Object.values(object.properties)) requireSupportedSchema(child, depth + 1);
     if (object.items) requireSupportedSchema(object.items, depth + 1);
     if (object.additionalProperties && typeof object.additionalProperties === 'object') requireSupportedSchema(object.additionalProperties, depth + 1);
+    if ('not' in object) requireSupportedSchema(object.not, depth + 1);
     for (const key of ['anyOf', 'oneOf']) if (Array.isArray(object[key])) for (const child of object[key]) requireSupportedSchema(child, depth + 1);
     if (typeof object.pattern === 'string' && (object.pattern.length > 256 || /[()|]|\\[1-9]/.test(object.pattern))) throw new AgentFault('TOOL_CAPABILITY_UNVERIFIED', '工具schema的文本条件超出当前有界校验范围');
 }
@@ -80,6 +81,13 @@ export function requireSupportedSchema(schema: unknown, depth = 0): void {
 export function validateToolArguments(value: unknown, schema: Record<string, unknown>, location = 'args', depth = 0): void {
     const invalid = () => { throw new AgentFault('INVALID_PARAMS', '工具参数不符合已固定的schema', { location }); };
     if (depth > 20) invalid();
+    if (schema.not && typeof schema.not === 'object') {
+        let matched = false;
+        try { validateToolArguments(value, schema.not as Record<string, unknown>, location, depth + 1); matched = true; } catch (error) {
+            if (!(error instanceof AgentFault) || error.code !== 'INVALID_PARAMS') throw error;
+        }
+        if (matched) invalid();
+    }
     if (Array.isArray(schema.anyOf)) {
         let accepted = 0;
         for (const branch of schema.anyOf) { try { validateToolArguments(value, branch as Record<string, unknown>, location, depth + 1); accepted++; } catch {} }
@@ -119,7 +127,7 @@ export function validateToolArguments(value: unknown, schema: Record<string, unk
         for (const required of (schema.required ?? []) as string[]) if (!(required in object)) invalid();
         for (const [key, child] of Object.entries(object)) {
             const childSchema = Object.hasOwn(properties, key) ? properties[key] : schema.additionalProperties;
-            if (childSchema === false || childSchema === undefined || (depth === 0 && !Object.hasOwn(properties, key))) invalid();
+            if (childSchema === false) invalid();
             if (childSchema && typeof childSchema === 'object') validateToolArguments(child, childSchema as Record<string, unknown>, `${location}.${key}`, depth + 1);
         }
     }

@@ -1,6 +1,8 @@
 import { terminalSafeText } from './renderer.js';
+export { markdownDisplayLines, compatibleEmojiText, type TranscriptDisplayOptions } from './presentation.js';
 
 export const MAX_TRANSCRIPT_CHARACTERS = 256 * 1024;
+export const TRANSCRIPT_HISTORY_LIMITS = Object.freeze({ pages: 4, itemsPerPage: 100, pageBytes: 128 * 1024, artifactReads: 4, artifactBytes: 1024 * 1024, artifactItemBytes: 512 * 1024 });
 
 export function appendTranscriptLines(previous: readonly string[], text: string, replace = false): string[] {
     const lines = [...(replace ? [] : previous), ...(!replace && previous.length ? [''] : []), ...terminalSafeText(text).split('\n')];

@@ -5,6 +5,7 @@ import { freezeOwned, sha256 } from './assemble.js';
 import { GeminiAdapter, encodeGeminiCountTokensRequest } from './gemini.js';
 import { decodeResponse, safeTransportCause } from './http.js';
 import { ProviderFault } from './types.js';
+import { geminiCredentialHeaders, providerRequestHeaders } from './request-identity.js';
 import type { CredentialAccess } from './dispatch.js';
 import type { HttpTransport, NativeSendView, ProviderProfile, RawProviderResponse } from './types.js';
 
@@ -47,7 +48,7 @@ export function createGeminiTokenCounter(options: GeminiTokenCounterOptions) {
     let closed = false;
 
     const countTokens = (profileId: string, modelId: string, view: NativeSendView, signal: AbortSignal | undefined,
-        deadlineAt: string, parameters?: JsonObject): Promise<GeminiTokenCountResult> => {
+        deadlineAt: string, parameters?: JsonObject, identity?: { conversationId: string }): Promise<GeminiTokenCountResult> => {
         if (closed) return Promise.reject(new AgentFault('E_COUNT_TOKENS_CLOSED', '计数端口已经关闭'));
         const executionDeadline = Date.parse(deadlineAt);
         if (!Number.isFinite(executionDeadline) || executionDeadline <= now()) return Promise.reject(new AgentFault('E_COUNT_TOKENS_DEADLINE', '原生计数期限已经到期或无效'));
@@ -113,7 +114,8 @@ export function createGeminiTokenCounter(options: GeminiTokenCounterOptions) {
                 const attempt = requestAttempts;
                 Object.assign(progress, { requestAttempts, phase: 'count_request' });
                 return decodeResponse(await options.transport.request({ method: 'POST', url: endpoint.href,
-                    headers: { 'Content-Type': 'application/json', ...(credential ? { 'x-goog-api-key': credential } : {}) }, body,
+                    headers: providerRequestHeaders(profile, { 'Content-Type': 'application/json', ...geminiCredentialHeaders(profile, credential) },
+                        { purpose: 'count', conversationId: identity?.conversationId }), body,
                     timeoutMs: Math.max(1, deadline - now()), maxResponseBytes: 64 * 1024,
                     onPhase: (phase, detail) => {
                         if (finished || controller.signal.aborted) return;
@@ -139,7 +141,7 @@ export function createGeminiTokenCounter(options: GeminiTokenCounterOptions) {
                         httpStatus: error instanceof ProviderFault ? error.httpStatus ?? null : null,
                         ...(cause ? { transportCause: { ...cause } } : {}) };
                     check();
-                    const transient = error instanceof ProviderFault && !['E_AUTH', 'E_QUOTA', 'E_MODEL_UNAVAILABLE', 'E_PARAMETER_INVALID', 'E_CANCELLED', 'E_RESPONSE_LIMIT'].includes(error.code)
+                    const transient = error instanceof ProviderFault && !['E_AUTH', 'E_QUOTA', 'E_MODEL_UNAVAILABLE', 'E_PROVIDER_POLICY', 'E_PARAMETER_INVALID', 'E_CANCELLED', 'E_RESPONSE_LIMIT'].includes(error.code)
                         && (['ECONNRESET', 'EPIPE', 'ETIMEDOUT', 'EAI_AGAIN', 'UND_ERR_SOCKET', 'UND_ERR_CONNECT_TIMEOUT'].includes(String(cause?.causeCode ?? cause?.code))
                             || [500, 502, 503, 504].includes(error.httpStatus ?? 0) || error.code === 'E_RATE_LIMIT' && error.retryable);
                     const wait = Math.max(250 * 2 ** (attemptCycles - 1) + Math.floor(Math.random() * 250),

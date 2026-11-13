@@ -61,6 +61,9 @@ export interface OutputArtifactStats {
     incomplete: number;
     invalid: number;
     payloadBytes: number;
+    invalidPayloadBytes: number;
+    invalidArtifacts: { artifactId: string; reason: string; payloadBytes: number }[];
+    retentionTtlMs: number;
 }
 
 function safeArtifactId(value: string): string {
@@ -313,7 +316,8 @@ export async function cleanExpiredOutputArtifacts(nowMs = Date.now(), removeInco
 }
 
 export async function getOutputArtifactStats(): Promise<OutputArtifactStats> {
-    const result: OutputArtifactStats = { runs: 0, complete: 0, incomplete: 0, invalid: 0, payloadBytes: 0 };
+    const result: OutputArtifactStats = { runs: 0, complete: 0, incomplete: 0, invalid: 0, payloadBytes: 0,
+        invalidPayloadBytes: 0, invalidArtifacts: [], retentionTtlMs: configuredTtlMs() };
     let entries: fs.Dirent[];
     try {
         entries = await fs.promises.readdir(OUTPUT_ARTIFACT_ROOT, { withFileTypes: true });
@@ -337,8 +341,16 @@ export async function getOutputArtifactStats(): Promise<OutputArtifactStats> {
             const stderrBytes = Number(manifest.files?.stderr?.rawBytes);
             if (Number.isFinite(stdoutBytes) && stdoutBytes > 0) result.payloadBytes += stdoutBytes;
             if (Number.isFinite(stderrBytes) && stderrBytes > 0) result.payloadBytes += stderrBytes;
-        } catch {
+        } catch (error) {
             result.invalid += 1;
+            let payloadBytes = 0;
+            for (const channel of ["stdout", "stderr"] as const) {
+                const file = await fs.promises.lstat(path.join(OUTPUT_ARTIFACT_ROOT, entry.name, `${channel}.bin`)).catch(() => null);
+                if (file?.isFile() && !file.isSymbolicLink()) payloadBytes += file.size;
+            }
+            result.invalidPayloadBytes += payloadBytes;
+            if (result.invalidArtifacts.length < 20) result.invalidArtifacts.push({ artifactId: entry.name,
+                reason: (error as NodeJS.ErrnoException).code === "ENOENT" ? "manifest_missing" : "manifest_unreadable", payloadBytes });
         }
     }
     return result;

@@ -62,6 +62,11 @@ export function checkContextGate(estimate: ContextEstimate, limits: ContextLimit
     return { allowed: inputTokens < limits.inputBudget, inputTokens, remaining: limits.inputBudget - inputTokens };
 }
 
+export function backgroundTriggerTokens(limits: ContextLimits, policy: ContextPolicy): number {
+    return Math.max(1, Math.min(limits.inputBudget - 1, Math.floor(policy.bpcThreshold * limits.contextWindow),
+        Math.floor(limits.inputBudget * policy.bpcThreshold / policy.hardThreshold)));
+}
+
 export interface UsageIdentity {
     attemptId: string;
     bodyHash: string;

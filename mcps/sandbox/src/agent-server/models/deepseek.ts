@@ -7,19 +7,24 @@ const contextSource = 'https://api-docs.deepseek.com/zh-cn/quick_start/pricing';
 const aliasSource = 'https://api-docs.deepseek.com/news/news260910';
 const observedAt = '2026-11-04T16:35:00.000Z';
 const documentExpiresAt = '2026-11-11T16:35:00.000Z';
+const refreshedObservedAt = '2026-11-13T04:51:00.000Z';
 const documentedModels = new Set(['deepseek-flash', 'deepseek-v4-pro', 'deepseek-v4-flash', 'deepseek-v4-flash-vision-exp']);
 
 export function enrichDeepSeekCatalogEntry(profile: ProviderProfile, entry: ModelEntry): ModelEntry {
     let endpoint: URL;
     try { endpoint = new URL(profile.baseUrl); } catch { return entry; }
     const observed = Date.parse(entry.contextWindow.observedAt);
+    const refreshed = observed >= Date.parse(refreshedObservedAt);
     if (profile.protocol !== 'compatible_chat' || endpoint.protocol !== 'https:' || endpoint.hostname !== 'api.deepseek.com'
         || endpoint.port || endpoint.username || endpoint.password || endpoint.search || endpoint.hash
         || !['', '/v1'].includes(endpoint.pathname.replace(/\/+$/, '')) || !documentedModels.has(entry.modelId)
-        || entry.routeId !== null || observed < Date.parse(observedAt) || observed >= Date.parse(documentExpiresAt)) return entry;
+        || entry.routeId !== null || observed < Date.parse(observedAt)
+        || !refreshed && observed >= Date.parse(documentExpiresAt)) return entry;
     const proof = <Value>(value: Value, sourceRef = apiSource): Evidence<Value> => ({ value, status: 'supported', source: 'official_doc', sourceRef,
-        observedAt, expiresAt: new Date(Math.min(Date.parse(entry.contextWindow.expiresAt), Date.parse(documentExpiresAt))).toISOString(),
-        scope: entry.contextWindow.scope, version: 'deepseek-doc-2026-11-05', confidence: 'declared' });
+        observedAt: refreshed ? refreshedObservedAt : observedAt,
+        expiresAt: refreshed ? entry.contextWindow.expiresAt
+            : new Date(Math.min(Date.parse(entry.contextWindow.expiresAt), Date.parse(documentExpiresAt))).toISOString(),
+        scope: entry.contextWindow.scope, version: refreshed ? 'deepseek-api-contract-reviewed-2026-11-13' : 'deepseek-doc-2026-11-05', confidence: 'declared' });
     const parameters: Record<string, Evidence<ParameterSpec>> = {
         maxOutputTokens: proof({ type: 'integer', min: 1, max: 393216, default: 4096, required: true, wirePath: 'max_tokens',
             outputLimitKind: 'all_output_tokens', outputLimitSourceRef: apiSource }),

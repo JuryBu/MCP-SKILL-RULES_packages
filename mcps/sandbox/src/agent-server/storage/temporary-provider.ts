@@ -129,6 +129,7 @@ export class AgentDispatchJournalPort implements DispatchJournalPort {
                 const fence = await this.ensureFence(attempt);
                 await this.requireLive(attempt);
                 const intent: TemporaryFinancialIntent = { ownerInstanceId: this.ownerInstanceId, financialIntentId: randomUUID(), dispatchNonce: randomUUID(),
+                    profileId: attempt.snapshot.profile.profileId,
                     attemptId: attempt.attemptId, rootBudgetId: attempt.rootBudgetId, actionId: attempt.snapshot.actionId,
                     quotaScopeId: attempt.snapshot.profile.quotaScopeId, conversationId: attempt.snapshot.conversationId,
                     runId: attempt.snapshot.runId, runEpoch: attempt.snapshot.runEpoch, historyEpoch: attempt.snapshot.historyEpoch, fenceRevision: fence.revision,

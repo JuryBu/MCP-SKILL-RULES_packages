@@ -64,11 +64,11 @@ export function createProfileModelService(options: ProfileModelServiceOptions) {
         if (method === 'models.list') return options.catalog.list(String(params.profileId), params.cursor as string | null | undefined, params.limit as number | undefined);
         if (method === 'models.get') {
             const { catalog, entry } = await options.catalog.get(String(params.profileId), String(params.modelId), params.routeId as string | null | undefined);
-            return { catalog: catalogMetadata(catalog), entry };
+            return { catalogVersion: catalog.catalogVersion, catalog: catalogMetadata(catalog), entry };
         }
         if (method === 'models.refresh') {
             const catalog = await options.refreshModels(String(params.profileId));
-            return { catalog: catalogMetadata(catalog), entryCount: catalog.entries.length };
+            return { catalogVersion: catalog.catalogVersion, catalog: catalogMetadata(catalog), entryCount: catalog.entries.length };
         }
         if (method === 'models.declare') {
             const profile = await profiles.get(String(params.profileId));

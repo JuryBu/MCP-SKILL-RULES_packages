@@ -5,13 +5,15 @@ import { isAbsolute, join, resolve } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import {
     AgentFault, METHOD_SPECS, PROTOCOL_VERSION, SERVER_VERSION, handshakePayload, operationHash,
-    type RpcResult, type ServerDescriptor,
+    type AgentError, type RpcResult, type ServerDescriptor,
 } from '../agent-server/protocol.js';
 import { RpcConnection, type RpcNotification } from './connection.js';
 import { AppliedEventCursor, type EventPage } from './events.js';
 import { getOrCreateClientId } from './identity.js';
 import { defaultDataDir } from '../agent-server/discovery.js';
 import { readArtifactBytes, type ArtifactData, type ArtifactReadOptions } from './artifacts.js';
+import type { ConversationContextSnapshot, ConversationExportOptions, ConversationExportPage, ReadBatchRequest, ReadBatchResult,
+    RunObservation, RunObservationOptions } from './observations.js';
 
 const MAX_TRACKED_COMMANDS = 1024;
 
@@ -24,6 +26,7 @@ export interface AgentClientOptions {
     startupTimeoutMs?: number;
     requestTimeoutMs?: number;
     connectionTimeoutMs?: number;
+    closeTimeoutMs?: number;
     deadlineAt?: string;
     descriptor?: ServerDescriptor;
 }
@@ -44,12 +47,29 @@ export interface ControlLease {
     expiresAt?: string;
 }
 
+export interface PendingAgentCommand {
+    method: string;
+    clientCommandId: string;
+    requestId?: string;
+    conversationId?: string;
+    serverInstanceId?: string;
+}
+
+export interface ClientCloseReport {
+    clientId: string;
+    serverInstanceId?: string;
+    released: ControlLease[];
+    retained: (ControlLease & { reason: 'disconnected' | 'command_pending' | 'deadline_expired' | 'release_failed' | 'release_unknown'; error?: AgentError })[];
+    pendingCommands: PendingAgentCommand[];
+}
+
 interface CommandRecord {
     hash: string;
     method: string;
     conversationId?: string;
     controlScope?: 'server' | 'conversation';
     clientCommandId: string;
+    requestId?: string;
     promise?: Promise<RpcResult>;
     result?: RpcResult;
     uncertain: boolean;
@@ -77,6 +97,9 @@ export class AgentClient extends EventEmitter {
     private opening: Promise<void> | null = null;
     private eventOpening: Promise<RpcConnection> | null = null;
     private disposed = false;
+    private closing = false;
+    private closingPromise: Promise<void> | null = null;
+    private closedReport: ClientCloseReport | null = null;
     private renewalTimer: NodeJS.Timeout | null = null;
     private renewalInFlight = false;
     private readonly leases = new Map<string, ControlLease>();
@@ -109,11 +132,15 @@ export class AgentClient extends EventEmitter {
         return this.control?.connected === true;
     }
 
+    get closeReport(): ClientCloseReport | null {
+        return this.closedReport ? structuredClone(this.closedReport) : null;
+    }
+
     async connect(): Promise<this> {
-        if (this.disposed) throw new AgentFault('IPC_UNAVAILABLE', '客户端已经关闭');
+        if (this.disposed || this.closing) throw new AgentFault('IPC_UNAVAILABLE', '客户端正在关闭或已经关闭');
         if (this.connected) return this;
         if (!this.opening) {
-            this.opening = this.openControl().finally(() => { this.opening = null; });
+            this.opening = this.openControlWithRecovery().finally(() => { this.opening = null; });
         }
         await this.opening;
         return this;
@@ -128,26 +155,38 @@ export class AgentClient extends EventEmitter {
     }
 
     async request<Data = unknown>(method: string, params: Record<string, unknown> = {}, options: AgentRequestOptions = {}): Promise<RpcResult<Data>> {
+        if (this.disposed || this.closing) return clientFailure(new AgentFault('IPC_UNAVAILABLE', '客户端正在关闭或已经关闭')) as RpcResult<Data>;
         const methodSpec = METHOD_SPECS[method];
         if (!methodSpec) return clientFailure(new AgentFault('METHOD_NOT_AVAILABLE', '该控制方法尚未安装', { method })) as RpcResult<Data>;
         if (!methodSpec.writes) {
             const parsed = methodSpec.schema.safeParse(params);
             if (!parsed.success) return this.invalidParams(method, parsed.error.issues) as RpcResult<Data>;
+            const startedAt = Date.now();
+            const requestId = randomUUID();
             for (let attempt = 0; ; attempt++) {
+                let connection: RpcConnection | null = null;
                 try {
                     this.remainingTimeout(this.options.connectionTimeoutMs ?? 10_000);
                     await this.connect();
+                    connection = this.control;
                     const defaultTimeoutMs = method === 'conversations.countTokens'
                         ? Math.min(125_000, Math.max(this.options.requestTimeoutMs ?? 3_000,
                             (typeof parsed.data.timeoutMs === 'number' ? parsed.data.timeoutMs : 120_000) + 5_000))
                         : method === 'events.read' && typeof parsed.data.waitMs === 'number'
                             ? Math.max(this.options.requestTimeoutMs ?? 3_000, parsed.data.waitMs + 3_000) : this.options.requestTimeoutMs ?? 3_000;
                     const timeoutMs = this.remainingTimeout(options.timeoutMs ?? defaultTimeoutMs);
-                    return await this.control!.request<Data>(method, parsed.data as Record<string, unknown>, { timeoutMs });
+                    return await connection!.request<Data>(method, parsed.data as Record<string, unknown>, { timeoutMs, id: requestId });
                 } catch (error) {
-                    if (attempt > 0 || this.disposed || this.connected || !(error instanceof AgentFault) || error.code !== 'IPC_UNAVAILABLE') {
-                        return clientFailure(error) as RpcResult<Data>;
+                    const fault = !connection && error instanceof AgentFault
+                        ? new AgentFault(error.code, error.message, { ...error.details, method, requestId }, error.mayHaveStarted, error.retryable)
+                        : this.transportFault(error, connection ? 'request' : 'connect', attempt + 1, startedAt, { method, requestId });
+                    if (attempt > 0 || !connection || this.disposed || this.closing || !this.recoverableTransport(error)) {
+                        return clientFailure(fault) as RpcResult<Data>;
                     }
+                    if (this.control === connection) this.control = null;
+                    if (typeof connection.retire === 'function') connection.retire();
+                    else connection.close();
+                    this.emit('reconnecting', { method, requestId, attempt: attempt + 1, maxAttempts: 2, code: fault.code, elapsedMs: Date.now() - startedAt });
                     try { await delay(this.remainingTimeout(25 + Math.floor(Math.random() * 75))); }
                     catch (expired) { return clientFailure(expired) as RpcResult<Data>; }
                 }
@@ -192,7 +231,7 @@ export class AgentClient extends EventEmitter {
         if (this.commands.size >= MAX_TRACKED_COMMANDS) return clientFailure(new AgentFault('BACKPRESSURE', '未确认命令达到客户端保留上限，请先查询原回执', {
             maxTrackedCommands: MAX_TRACKED_COMMANDS,
         }, false, true)) as RpcResult<Data>;
-        const record: CommandRecord = { hash, method, conversationId, clientCommandId, uncertain: false, submitted: false,
+        const record: CommandRecord = { hash, method, conversationId, clientCommandId, requestId: randomUUID(), uncertain: false, submitted: false,
             ...(businessParams.scope === 'server' || businessParams.scope === 'conversation' ? { controlScope: businessParams.scope } : {}) };
         this.commands.set(commandKey, record);
         record.promise = this.sendCommand(record, businessParams, options).then(result => {
@@ -266,6 +305,22 @@ export class AgentClient extends EventEmitter {
         }, { timeoutMs: Math.max(this.options.requestTimeoutMs ?? 3_000, (options.waitMs ?? 0) + 3_000) });
     }
 
+    async observeRun(conversationId: string, runId: string, options: RunObservationOptions = {}, requestOptions: AgentRequestOptions = {}): Promise<RpcResult<RunObservation>> {
+        return this.request<RunObservation>('runs.observe', { conversationId, runId, ...options }, requestOptions);
+    }
+
+    async readBatch(requests: ReadBatchRequest[], options: { maxBytes?: number } = {}, requestOptions: AgentRequestOptions = {}): Promise<RpcResult<ReadBatchResult>> {
+        return this.request<ReadBatchResult>('server.readBatch', { requests, ...options }, requestOptions);
+    }
+
+    async readContext(conversationId: string, options: { candidateId?: string } = {}, requestOptions: AgentRequestOptions = {}): Promise<RpcResult<ConversationContextSnapshot>> {
+        return this.request<ConversationContextSnapshot>('conversations.context', { conversationId, ...options }, requestOptions);
+    }
+
+    async exportConversation(conversationId: string, options: ConversationExportOptions = {}, requestOptions: AgentRequestOptions = {}): Promise<RpcResult<ConversationExportPage>> {
+        return this.request<ConversationExportPage>('conversations.export', { conversationId, ...options }, requestOptions);
+    }
+
     async readArtifact(conversationId: string, artifactId: string, options: ArtifactReadOptions = {}): Promise<RpcResult<ArtifactData>> {
         try { return { ok: true, data: await readArtifactBytes(this, conversationId, artifactId, options) }; }
         catch (error) { return clientFailure(error) as RpcResult<ArtifactData>; }
@@ -313,9 +368,47 @@ export class AgentClient extends EventEmitter {
     }
 
     async close(): Promise<void> {
-        this.disposed = true;
+        if (!this.closingPromise) this.closingPromise = this.closeOwnedConnections();
+        return this.closingPromise;
+    }
+
+    private async closeOwnedConnections(): Promise<void> {
+        this.closing = true;
         if (this.renewalTimer) clearInterval(this.renewalTimer);
         this.renewalTimer = null;
+        const report: ClientCloseReport = { clientId: this.clientId, ...(this.server?.serverInstanceId ? { serverInstanceId: this.server.serverInstanceId } : {}),
+            released: [], retained: [], pendingCommands: [] };
+        const connection = this.control;
+        const configuredTimeout = this.options.closeTimeoutMs ?? Math.min(this.options.requestTimeoutMs ?? 3_000, 3_000);
+        const closeDeadline = Date.now() + (Number.isSafeInteger(configuredTimeout) && configuredTimeout > 0 ? Math.min(configuredTimeout, 10_000) : 3_000);
+        for (const lease of [...this.leases.values()]) {
+            if (!connection?.connected) { report.retained.push({ ...lease, reason: 'disconnected' }); continue; }
+            const pending = [...this.commands.values()].some(command => command.submitted && (command.promise || command.uncertain)
+                && !['server.renewControl', 'server.releaseControl'].includes(command.method)
+                && command.controlLeaseId === lease.controlLeaseId && command.controlEpoch === lease.controlEpoch);
+            if (pending) { report.retained.push({ ...lease, reason: 'command_pending' }); continue; }
+            let timeoutMs: number;
+            try { timeoutMs = this.remainingTimeout(Math.max(1, closeDeadline - Date.now())); }
+            catch { report.retained.push({ ...lease, reason: 'deadline_expired' }); continue; }
+            if (Date.now() >= closeDeadline) { report.retained.push({ ...lease, reason: 'deadline_expired' }); continue; }
+            const clientCommandId = randomUUID();
+            const requestId = randomUUID();
+            const params = { scope: lease.scope, ...(lease.conversationId ? { conversationId: lease.conversationId } : {}),
+                controlLeaseId: lease.controlLeaseId, controlEpoch: lease.controlEpoch, clientCommandId };
+            const command: CommandRecord = { hash: operationHash('server.releaseControl', params), method: 'server.releaseControl',
+                conversationId: lease.conversationId, clientCommandId, requestId, uncertain: false, submitted: true,
+                serverInstanceId: this.server?.serverInstanceId, controlLeaseId: lease.controlLeaseId, controlEpoch: lease.controlEpoch };
+            const key = `${lease.conversationId ?? 'server'}\0${clientCommandId}`;
+            this.commands.set(key, command);
+            let result: RpcResult;
+            try { result = await connection.request('server.releaseControl', params, { writes: true, timeoutMs, id: requestId }); }
+            catch (error) { result = clientFailure(error, true); }
+            command.result = result;
+            command.uncertain = result.error?.mayHaveStarted === true && !result.receiptId;
+            if (result.ok) report.released.push({ ...lease });
+            else report.retained.push({ ...lease, reason: command.uncertain ? 'release_unknown' : 'release_failed', ...(result.error ? { error: result.error } : {}) });
+        }
+        this.disposed = true;
         this.control?.close();
         this.eventConnection?.close();
         for (const connection of this.connections) connection.close();
@@ -323,7 +416,37 @@ export class AgentClient extends EventEmitter {
         this.control = null;
         this.eventConnection = null;
         this.leases.clear();
-        this.commands.clear();
+        for (const [key, command] of this.commands) {
+            if (command.submitted && (command.uncertain || command.promise)) report.pendingCommands.push({ method: command.method,
+                clientCommandId: command.clientCommandId, ...(command.requestId ? { requestId: command.requestId } : {}),
+                ...(command.conversationId ? { conversationId: command.conversationId } : {}), ...(command.serverInstanceId ? { serverInstanceId: command.serverInstanceId } : {}) });
+            else this.commands.delete(key);
+        }
+        this.closedReport = report;
+        this.emit('closed', this.closeReport);
+    }
+
+    private async openControlWithRecovery(): Promise<void> {
+        const startedAt = Date.now();
+        for (let attempt = 1; ; attempt++) {
+            try { await this.openControl(); return; }
+            catch (error) {
+                const fault = this.transportFault(error, 'connect', attempt, startedAt);
+                if (attempt >= 2 || this.disposed || this.closing || !this.recoverableTransport(error)) throw fault;
+                this.emit('reconnecting', { operationPhase: 'connect', attempt, maxAttempts: 2, code: fault.code, elapsedMs: Date.now() - startedAt });
+                await delay(this.remainingTimeout(25 + Math.floor(Math.random() * 75)));
+            }
+        }
+    }
+
+    private recoverableTransport(error: unknown): boolean {
+        return error instanceof AgentFault && !error.mayHaveStarted && ['IPC_UNAVAILABLE', 'IPC_TIMEOUT'].includes(error.code);
+    }
+
+    private transportFault(error: unknown, operationPhase: string, attempt: number, startedAt: number, details: Record<string, unknown> = {}): AgentFault {
+        return new AgentFault(error instanceof AgentFault ? error.code : 'IPC_UNAVAILABLE', error instanceof Error ? error.message : 'Agent客户端连接失败',
+            { ...(error instanceof AgentFault ? error.details : {}), ...details, operationPhase, attempt, maxAttempts: 2, elapsedMs: Date.now() - startedAt },
+            error instanceof AgentFault && error.mayHaveStarted, error instanceof AgentFault && error.retryable);
     }
 
     private async openControl(): Promise<void> {
@@ -336,9 +459,9 @@ export class AgentClient extends EventEmitter {
                 ...(this.options.deadlineAt ? { deadlineAt: this.options.deadlineAt } : {}),
             });
         }
-        if (this.disposed) throw new AgentFault('IPC_UNAVAILABLE', '客户端在服务发现期间已关闭');
+        if (this.disposed || this.closing) throw new AgentFault('IPC_UNAVAILABLE', '客户端在服务发现期间已关闭');
         if (!this.clientId) this.clientId = await getOrCreateClientId(this.dataDir, this.options.clientName ?? 'cli');
-        if (this.disposed) throw new AgentFault('IPC_UNAVAILABLE', '客户端已经关闭');
+        if (this.disposed || this.closing) throw new AgentFault('IPC_UNAVAILABLE', '客户端已经关闭');
         const descriptor = this.server;
         if (descriptor.protocolVersion !== PROTOCOL_VERSION) throw new AgentFault('PROTOCOL_MISMATCH', 'Agent Server主协议版本不兼容');
         const descriptorDataDir = resolve(descriptor.dataDir);
@@ -354,7 +477,7 @@ export class AgentClient extends EventEmitter {
             this.emit('eventsDisconnected', new AgentFault('IPC_UNAVAILABLE', '核心实例已重启，保留原任务与事件游标'));
         }
         const connection = await this.openAuthenticated('control');
-        if (this.disposed) {
+        if (this.disposed || this.closing) {
             connection.close();
             throw new AgentFault('IPC_UNAVAILABLE', '客户端在认证期间已关闭');
         }
@@ -457,13 +580,16 @@ export class AgentClient extends EventEmitter {
                 outgoing.controlLeaseId = lease.controlLeaseId;
                 outgoing.controlEpoch = lease.controlEpoch;
             }
+            if (this.disposed || this.closing) return clientFailure(new AgentFault('IPC_UNAVAILABLE', '客户端收尾中，业务命令尚未提交', { clientCommandId: record.clientCommandId }));
             const timeoutMs = this.remainingTimeout(options.timeoutMs ?? this.options.requestTimeoutMs ?? 3_000);
             sent = true;
             record.submitted = true;
             record.serverInstanceId = this.server?.serverInstanceId;
             record.controlLeaseId = typeof outgoing.controlLeaseId === 'string' ? outgoing.controlLeaseId : undefined;
             record.controlEpoch = typeof outgoing.controlEpoch === 'number' ? outgoing.controlEpoch : undefined;
-            const result = await (renewalConnection ?? this.control)!.request(record.method, outgoing, { writes: true, timeoutMs });
+            const result = await (renewalConnection ?? this.control)!.request(record.method, outgoing, { writes: true, timeoutMs, id: record.requestId });
+            if (result.error) result.error = { ...result.error, details: { ...result.error.details, clientCommandId: record.clientCommandId,
+                requestId: record.requestId, method: record.method, ...(record.conversationId ? { conversationId: record.conversationId } : {}) } };
             const scope = outgoing.scope === 'server' ? 'server' : 'conversation';
             const currentLease = this.leases.get(this.leaseKey(scope, record.conversationId));
             const currentRenewal = !options.connectedOnly || renewalConnection === this.control
@@ -477,13 +603,13 @@ export class AgentClient extends EventEmitter {
         } catch (error) {
             if (!sent || !(error instanceof AgentFault) || !error.mayHaveStarted) return clientFailure(error, sent);
             record.uncertain = true;
-            if (options.recoverReceipt === false || this.disposed) return this.unknownReceipt(record, error.message);
+            if (options.recoverReceipt === false || this.disposed || this.closing) return this.unknownReceipt(record, error.message, error.code);
             return this.recoverCommand(record);
         }
     }
 
     private async recoverCommand(record: CommandRecord): Promise<RpcResult> {
-        if (this.disposed) return this.unknownReceipt(record, '客户端已关闭');
+        if (this.disposed || this.closing) return this.unknownReceipt(record, '客户端正在关闭或已经关闭');
         const result = await this.getReceipt(record.clientCommandId, record.conversationId);
         if (!result.ok) return this.unknownReceipt(record, result.error?.message ?? '原回执暂不可取');
         const data = result.data;
@@ -507,6 +633,7 @@ export class AgentClient extends EventEmitter {
     }
 
     private captureLease(data: unknown, params: Record<string, unknown>, method: string): void {
+        if (this.disposed || this.closing) return;
         if (method === 'server.shutdown') {
             this.leases.clear(); this.stopUnusedRenewal(); return;
         }
@@ -563,10 +690,11 @@ export class AgentClient extends EventEmitter {
         }));
     }
 
-    private unknownReceipt(record: CommandRecord, reason: string): RpcResult {
+    private unknownReceipt(record: CommandRecord, reason: string, sourceCode?: string): RpcResult {
         return clientFailure(new AgentFault('RECEIPT_UNKNOWN', '原写命令的回执待确认，请查询原命令，避免重复提交', {
-            clientCommandId: record.clientCommandId, method: record.method,
+            clientCommandId: record.clientCommandId, requestId: record.requestId, method: record.method,
             ...(record.conversationId ? { conversationId: record.conversationId } : {}), reason,
+            ...(sourceCode ? { sourceCode } : {}),
             recoveryMethod: 'server.getReceipt',
         }, true, true));
     }

@@ -104,7 +104,7 @@ function patchContent(before: Buffer, patch: ParsedPatchFileInput, maximum: numb
         const oldBytes = encodePatchText(patch.oldText, 'oldText');
         const newBytes = encodePatchText(patch.newText, 'newText');
         const first = text.indexOf(patch.oldText);
-        if (first < 0) throw new AgentFault('PATCH_TEXT_NOT_FOUND', 'oldText未在当前文件中精确出现，请重新读取并提供完整原文，或用appendText追加；文件保持原样');
+        if (first < 0) throw new AgentFault('PATCH_TEXT_NOT_FOUND', 'oldText未在当前文件中精确出现，请核对指定目标路径并重新读取当前完整原文，再提交精确替换；文件保持原样');
         const second = text.indexOf(patch.oldText, first + 1);
         if (second >= 0) throw new AgentFault('PATCH_TEXT_NOT_UNIQUE', 'oldText出现多处，请增加前后文使原文唯一；文件保持原样', {
             matchCountAtLeast: 2, matches: [patchLocation(text, first), patchLocation(text, second)],

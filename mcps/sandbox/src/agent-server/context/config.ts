@@ -6,7 +6,7 @@ import { ContextFault } from './errors.js';
 export const DEFAULT_CONTEXT_POLICY: Readonly<ContextPolicy> = Object.freeze({
     taskPlanManaged: false, communicationWindowSize: 10, communicationTextChars: 64 * 1024,
     localContextWindowTokens: null,
-    bpcThreshold: 0.68, hardThreshold: 0.90, keepCompleteRounds: 2, deltaSteps: 2,
+    bpcThreshold: 0.68, hardThreshold: 0.90, keepCompleteRounds: 2, keepCompleteSteps: 2, deltaSteps: 2,
     chunkInputTokens: 16_000, referenceTokens: 1_000, readFrameBytes: 256 * 1024,
     stableHeadBatches: 2, stableTailBatches: 1, middleSkeletonBatches: 20,
     foldAfterBatches: 24, maxActiveNodes: 8, cooldownMs: 180_000,

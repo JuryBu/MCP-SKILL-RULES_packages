@@ -4,7 +4,16 @@ import { fileURLToPath } from 'node:url';
 import type { RasterFrame } from './sixel-raster.js';
 
 export interface NativeImageRectangle { column: number; row: number; columns: number; rows: number }
-export interface NativeGraphicsEvent { type: string; [key: string]: unknown }
+export interface NativeConsoleViewport { top: number; left: number; columns: number; rows: number; bufferColumns: number; bufferRows: number }
+export interface NativeGraphicsEvent { type: string; viewport?: NativeConsoleViewport; [key: string]: unknown }
+
+export function validNativeViewport(value: unknown): value is NativeConsoleViewport {
+    if (!value || typeof value !== 'object') return false;
+    const viewport = value as NativeConsoleViewport;
+    return ['top', 'left', 'columns', 'rows', 'bufferColumns', 'bufferRows'].every(key => Number.isInteger(viewport[key as keyof NativeConsoleViewport]))
+        && viewport.top >= 0 && viewport.left >= 0 && viewport.columns > 0 && viewport.rows > 0
+        && viewport.left + viewport.columns <= viewport.bufferColumns && viewport.top + viewport.rows <= viewport.bufferRows;
+}
 
 export function encodeNativeFrame(frame: RasterFrame, rectangle: NativeImageRectangle, reanchor = false): string {
     if (!Number.isInteger(frame.width) || !Number.isInteger(frame.height) || frame.width < 1 || frame.height < 1
@@ -19,9 +28,22 @@ export function encodeNativeFrame(frame: RasterFrame, rectangle: NativeImageRect
 export class NativeConsoleGraphics {
     private child?: ChildProcessWithoutNullStreams;
     private ready = false;
+    private frameBoundaries = false;
+    private textMetricsReady = false;
+    private pendingText?: string;
+    private measuredText = '';
+    private measurementId = 0;
+    private measurementPending = false;
+    private measurementTimer?: NodeJS.Timeout;
     private closing = false;
     private pending?: string;
     private output = '';
+    private readonly eventCounts = new Map<string, number>();
+    private lastEvent?: NativeGraphicsEvent;
+    private lastEventAt?: number;
+    private viewport?: NativeConsoleViewport;
+    private visible?: boolean;
+    private hiddenReason?: string;
     constructor(private readonly onEvent: (event: NativeGraphicsEvent) => void = () => {},
         private readonly executable = fileURLToPath(new URL('../../native/agent-graphics.exe', import.meta.url))) {}
 
@@ -38,7 +60,20 @@ export class NativeConsoleGraphics {
             while ((newline = this.output.indexOf('\n')) >= 0) {
                 const line = this.output.slice(0, newline); this.output = this.output.slice(newline + 1);
                 try { const event = JSON.parse(line) as NativeGraphicsEvent;
-                    if (event.type === 'ready') { this.ready = true; if (this.pending) { const pending = this.pending; this.pending = undefined; this.write(pending); } }
+                    if (event.type === 'ready') { this.ready = true; this.frameBoundaries = Array.isArray(event.capabilities) && event.capabilities.includes('text-frame'); this.textMetricsReady = Array.isArray(event.capabilities) && event.capabilities.includes('text-metrics'); if (this.pendingText !== undefined) { const text = this.pendingText; this.pendingText = undefined; this.measureText(text); } if (this.pending) { const pending = this.pending; this.pending = undefined; this.write(pending); } }
+                    if (event.type === 'text-metrics' && (!event.characterWidths || typeof event.characterWidths !== 'object' || Array.isArray(event.characterWidths) || Object.keys(event.characterWidths).length > 4096 || Object.values(event.characterWidths).some(width => width !== 1 && width !== 2))) throw new Error('Invalid native character widths');
+                    if (event.type === 'text-metrics' && event.requestId === this.measurementId) { this.measurementPending = false; if (this.measurementTimer) clearTimeout(this.measurementTimer); this.measurementTimer = undefined; event.measurementCompleted = true; }
+                    if (event.viewport !== undefined && !validNativeViewport(event.viewport)) throw new Error('Invalid native console viewport');
+                    if (event.viewport) {
+                        if (this.viewport && event.viewport.columns === this.viewport.columns && event.viewport.rows === this.viewport.rows
+                            && event.viewport.bufferColumns === this.viewport.bufferColumns && event.viewport.bufferRows === this.viewport.bufferRows) event.scrollRows = event.viewport.top - this.viewport.top;
+                        this.viewport = { ...event.viewport };
+                    }
+                    if (event.type === 'hidden') { this.visible = false; this.hiddenReason = String(event.reason ?? 'unknown'); }
+                    if (event.type === 'visible') { this.visible = true; this.hiddenReason = undefined; }
+                    const diagnostic = event.type + (typeof event.reason === 'string' ? ':' + event.reason : '');
+                    if (this.eventCounts.has(diagnostic) || this.eventCounts.size < 32) this.eventCounts.set(diagnostic, (this.eventCounts.get(diagnostic) ?? 0) + 1);
+                    this.lastEvent = event; this.lastEventAt = Date.now();
                     this.onEvent(event);
                     if (event.type === 'unavailable') this.close();
                 } catch { this.close(); }
@@ -47,7 +82,7 @@ export class NativeConsoleGraphics {
         child.stdin.on('error', () => this.close());
         child.stderr.resume();
         child.on('error', error => { this.onEvent({ type: 'unavailable', message: error.message }); this.close(); });
-        child.on('exit', (code, signal) => { this.ready = false; this.closing = true; this.child = undefined; this.onEvent({ type: 'exit', code, signal }); });
+        child.on('exit', (code, signal) => { this.ready = false; this.visible = false; this.closing = true; this.child = undefined; this.onEvent({ type: 'exit', code, signal }); });
         return true;
     }
 
@@ -60,9 +95,41 @@ export class NativeConsoleGraphics {
 
     hide(): void { this.pending = undefined; if (this.ready) this.write('{"type":"hide"}\n'); }
 
+    measureText(text: string): boolean {
+        if (this.closing) return false;
+        const value = text.slice(0, 16384);
+        if (!this.ready) { this.pendingText = value; return false; }
+        if (!this.textMetricsReady) return true;
+        if (value === this.measuredText) return !this.measurementPending;
+        const requestId = this.measurementId + 1;
+        if (!this.write(JSON.stringify({ type: 'measure-text', text: value, requestId }) + '\n')) return false;
+        this.measurementId = requestId; this.measurementPending = true;
+        if (!this.measurementTimer) {
+            this.measurementTimer = setTimeout(() => {
+                this.measurementTimer = undefined;
+                if (!this.measurementPending || this.closing) return;
+                this.measurementPending = false;
+                this.onEvent({ type: 'unavailable', message: '原生字格测量回执超时，恢复字符画面' });
+                this.close();
+            }, 1500);
+            this.measurementTimer.unref();
+        }
+        this.measuredText = value;
+        return false;
+    }
+
+    beginFrame(): boolean { return this.ready && this.frameBoundaries && this.write('{"type":"paint-begin"}\n'); }
+    endFrame(): boolean { return this.ready && this.frameBoundaries && this.write('{"type":"paint-end"}\n'); }
+    diagnostics(): { ready: boolean; closing: boolean; frameBoundaries: boolean; visible?: boolean; hiddenReason?: string; viewport?: NativeConsoleViewport; lastEvent?: NativeGraphicsEvent; lastEventAt?: number; counts: Record<string, number> } {
+        return { ready: this.ready, closing: this.closing, frameBoundaries: this.frameBoundaries, visible: this.visible, hiddenReason: this.hiddenReason, viewport: this.viewport ? { ...this.viewport } : undefined,
+            lastEvent: this.lastEvent ? { ...this.lastEvent } : undefined, lastEventAt: this.lastEventAt, counts: Object.fromEntries(this.eventCounts) };
+    }
+
     close(): void {
         if (this.closing) return;
-        this.closing = true; this.pending = undefined;
+        if (this.measurementTimer) clearTimeout(this.measurementTimer);
+        this.measurementTimer = undefined; this.measurementPending = false;
+        this.closing = true; this.pending = undefined; this.pendingText = undefined;
         const child = this.child;
         if (!child) return;
         if (!child.stdin.destroyed) child.stdin.end('{"type":"close"}\n');

@@ -19,6 +19,8 @@ import { createGeminiTokenCounter } from './gemini-count-tokens.js';
 import { ProviderDispatcher } from './dispatch.js';
 import type { CredentialAccess, DispatchJournalPort, DispatchOptions } from './dispatch.js';
 import { FetchTransport } from './http.js';
+import { assertProfileCanSend } from '../profiles/dispatch-policy.js';
+import type { ProfileSpend } from '../profiles/dispatch-policy.js';
 import type { HttpTransport, NativeSendView, ProviderAdapter, ProviderProtocol, RequestSnapshot, RequestVersions } from './types.js';
 
 export interface ProviderServiceOptions {
@@ -28,6 +30,7 @@ export interface ProviderServiceOptions {
     credentialAccess?: CredentialAccess;
     transport?: HttpTransport;
     now?: () => number;
+    readProfileSpend?: (profileId: string) => Promise<ProfileSpend>;
 }
 
 export interface PrepareProviderRequest {
@@ -78,6 +81,7 @@ export function createProviderServices(options: ProviderServiceOptions) {
     const prepare = async (input: PrepareProviderRequest): Promise<{ adapter: ProviderAdapter; snapshot: RequestSnapshot; upperBound: UpperBound; missingPricing: string[] }> => {
         const profile = await profiles.get(input.profileId);
         if (!profile) throw new AgentFault('E_PROFILE_NOT_FOUND', 'API配置不存在或已停用');
+        assertProfileCanSend(profile, profile.dispatchPolicy?.maxCumulativeCost ? await options.readProfileSpend?.(profile.profileId) : undefined, now());
         const adapter = adapterFor(profile.protocol);
         const { catalog, entry } = await models.get(input.profileId, input.modelId, input.routeId ?? null);
         if (catalog.profileRevision !== profile.revision || Date.parse(catalog.expiresAt) <= now()) {
@@ -149,10 +153,11 @@ export function createProviderServices(options: ProviderServiceOptions) {
     };
 
     const createDispatcher = (journal: DispatchJournalPort, overrides: Omit<DispatchOptions, 'journal' | 'transport' | 'credentials'> = {}) =>
-        new ProviderDispatcher({ journal, transport, credentials: options.credentialAccess, now, ...overrides });
+        new ProviderDispatcher({ journal, transport, credentials: options.credentialAccess, now,
+            readProfileForDispatch: profileId => profiles.get(profileId), readProfileSpend: options.readProfileSpend, ...overrides });
 
     const countRequestTokens = async (profileId: string, modelId: string, view: NativeSendView,
-        signal: AbortSignal | undefined, deadlineAt: string, parameters: JsonObject) => {
+        signal: AbortSignal | undefined, deadlineAt: string, parameters: JsonObject, identity?: { conversationId: string }) => {
         const profile = await profiles.get(profileId);
         if (!profile) throw new AgentFault('E_PROFILE_NOT_FOUND', 'API配置不存在或已停用');
         const { catalog, entry } = await models.get(profileId, modelId);
@@ -160,7 +165,7 @@ export function createProviderServices(options: ProviderServiceOptions) {
             throw new AgentFault('E_CAPABILITY_UNKNOWN', '计数目录与当前API配置版本不同或已过期');
         }
         return tokenCounter.countTokens(profileId, modelId, view, signal, deadlineAt,
-            resolveParameters(entry, profile, parameters, now()));
+            resolveParameters(entry, profile, parameters, now()), identity);
     };
 
     let closing: Promise<void> | undefined;

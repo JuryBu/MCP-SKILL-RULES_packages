@@ -16,6 +16,7 @@ import { settlementForResponse } from '../accounting/settlement.js';
 import { failureHasExecutionEvidence, failureUsageResponse, nextProviderUsageRevision, preserveKnownProviderCharges, settlementForFailure } from '../providers/failure-accounting.js';
 import { readUsageSummary } from './usage.js';
 import type { UsageQuery, UsageSummary } from './usage.js';
+import { indexProfileAttempt, readProfileSpend } from './profile-spend.js';
 
 interface JournalEvent {
     event: AgentEvent;
@@ -41,6 +42,8 @@ export class ProviderTransactions {
     readAccounting(rootBudgetId: string): BudgetView { return this.accounting.read(rootBudgetId); }
 
     readUsage(query: UsageQuery): UsageSummary { return readUsageSummary(this.database, query); }
+
+    readProfileSpend(profileId: string, currency?: string) { return readProfileSpend(this.database, this.files, profileId, currency); }
 
     readAttempt(attemptId: string): PersistedProviderAttempt | undefined {
         const row = this.row(attemptId);
@@ -91,6 +94,7 @@ export class ProviderTransactions {
             this.database.prepare('INSERT INTO provider_attempt_journal (attempt_id,root_budget_id,intent_hash,attempt_object_hash,snapshot_object_hash,upper_bound_json,state,dispatch_granted,updated_at) VALUES (?,?,?,?,?,?,?,?,?)')
                 .run(attempt.attemptId, attempt.rootBudgetId, intentHash, savedAttempt.hash, snapshot.hash,
                     canonicalJson(upperBound), 'dispatching', 1, event.event.occurredAt);
+            indexProfileAttempt(this.database, attempt, upperBound.currency);
             this.reference(attempt, 'snapshot', snapshot.hash);
             this.reference(attempt, 'attempt', savedAttempt.hash);
             this.commitEvent(event);

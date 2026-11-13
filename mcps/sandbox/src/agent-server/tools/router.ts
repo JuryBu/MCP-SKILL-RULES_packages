@@ -113,7 +113,9 @@ export class ToolRouter {
     }
 
     modelSchemaHashesFor(trustedContext: ToolExecutionContext): Readonly<Record<string, string>> {
-        return this.shared?.modelSchemaHashes(this.bind(trustedContext)) ?? Object.freeze({});
+        const context = this.bind(trustedContext);
+        return Object.freeze({ ...Object.fromEntries(this.list().map(entry => [entry.name, entry.schemaHash!])),
+            ...this.shared?.modelSchemaHashes(context) });
     }
 
     setDelegation(delegation: DelegationTools | undefined): void {
@@ -142,7 +144,8 @@ export class ToolRouter {
             modelEffect: 'none', resourceKind: schema.name === 'run_command' ? 'process' : null,
             schemaHash: createHash('sha256').update(canonicalJson(schema.parameters)).digest('hex'), adapterVersion: '1',
             availability: isHistoryRecallTool(schema.name) && !this.historyAvailable(schema.name) ? 'unavailable' : schema.name === 'run_command' && !(this.commandCapability?.available === true
-                && this.commandCapability.commandCapability === 'cooperative_windows_job') ? 'unavailable' : 'available',
+                && this.commandCapability.commandCapability === 'cooperative_windows_job') ? this.commandCapability ? 'unavailable' : 'schema_pending' : 'available',
+            schemaStatus: 'verified',
             reason: isHistoryRecallTool(schema.name) && !this.historyAvailable(schema.name)
                 ? this.history ? '历史有用命中的持久反馈端口尚未接入' : 'Core历史查回端口尚未接入'
                 : schema.name === 'run_command' ? this.commandCapability?.reason ?? '命令执行器尚待按需检查；正常命令遵守当前任务与工作区规则' : null }));
@@ -174,6 +177,14 @@ export class ToolRouter {
         execution.pending.add(pending);
         try { return await pending; }
         finally { execution.pending.delete(pending); }
+    }
+
+    isIndependentRead(name: string, args: unknown, context: ToolExecutionContext): boolean {
+        if (!args || typeof args !== 'object' || Array.isArray(args) || context.signal.aborted
+            || context.approvalRequiredTools?.some(tool => tool === name || `local.${tool}` === name || tool === `local.${name}`)) return false;
+        const localName = name.startsWith('local.') ? name.slice(6) : name;
+        if (['read_file', 'list_files', 'history_read', 'history_search', 'task_plan_read', 'tool_catalog'].includes(localName)) return true;
+        return this.shared?.isIndependentRead(name, args as Record<string, unknown>) === true;
     }
 
     private runKey(context: BoundToolContext): string { return JSON.stringify([context.conversationId, context.runId, context.runEpoch]); }
@@ -315,7 +326,10 @@ export class ToolRouter {
             else if (this.fileOperations.handles(localName)) data = await this.fileOperations.execute(localName, args, context,
                 createHash('sha256').update(canonicalJson({ name, args })).digest('hex'));
             else if (localName === 'list_files') data = await this.listFiles(localArgumentSchemas.list_files.parse(args), context);
-            else data = await this.commands.execute(localArgumentSchemas.run_command.parse(args), context, this.resources);
+            else {
+                if (!this.commandCapability) await this.checkCommandCapability();
+                data = await this.commands.execute(localArgumentSchemas.run_command.parse(args), context, this.resources);
+            }
             return { ok: true, data, disposition: 'completed' };
         } catch (error) {
             const result = this.errorResult(error, context ?? bound);

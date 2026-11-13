@@ -12,6 +12,7 @@ import type { Evidence, EvidenceScope } from './evidence.js';
 import { catalogLayers, composeCatalogEntries, effectiveCatalog } from './catalog-layers.js';
 import type { CatalogSourceScope } from './catalog-layers.js';
 import { normalizeDocumentedMetadata } from './metadata.js';
+import { catalogState } from './catalog-state.js';
 
 export interface ParameterSpec {
     type: 'number' | 'integer' | 'string' | 'boolean' | 'object' | 'array';
@@ -32,6 +33,8 @@ export interface ModelEntry {
     protocol: ProviderProtocol;
     routeId: string | null;
     contextWindow: Evidence<number>;
+    maxInputTokens?: Evidence<number>;
+    thinking?: Evidence<boolean>;
     maxOutputTokens: Evidence<number>;
     inputModalities: Evidence<string[]>;
     outputModalities: Evidence<string[]>;
@@ -106,12 +109,13 @@ export function validateModelEntry(entry: ModelEntry, profile: ProviderProfile):
     }
     const scope = modelScope(profile, entry.modelId, entry.routeId);
     const evidence = [entry.contextWindow, entry.maxOutputTokens, entry.inputModalities, entry.outputModalities,
-        entry.tools, entry.streaming, entry.pricing, ...Object.values(entry.parameters)];
+        entry.tools, entry.streaming, entry.pricing, ...Object.values(entry.parameters),
+        ...(entry.maxInputTokens ? [entry.maxInputTokens] : []), ...(entry.thinking ? [entry.thinking] : [])];
     for (const item of evidence) {
         validateEvidence<unknown>(item);
         if (canonicalJson(item.scope) !== canonicalJson(scope)) throw new AgentFault('E_EVIDENCE_SCOPE', '目录条目的证据范围不匹配');
     }
-    for (const item of [entry.contextWindow, entry.maxOutputTokens]) {
+    for (const item of [entry.contextWindow, entry.maxOutputTokens, ...(entry.maxInputTokens ? [entry.maxInputTokens] : [])]) {
         if (item.status === 'supported' && (!Number.isSafeInteger(item.value) || Number(item.value) < 1)) throw new AgentFault('E_MODEL_INVALID', '模型限制必须为正整数');
     }
     for (const item of [entry.inputModalities, entry.outputModalities]) {
@@ -119,7 +123,7 @@ export function validateModelEntry(entry: ModelEntry, profile: ProviderProfile):
             throw new AgentFault('E_MODEL_INVALID', '模型模态声明必须为非空字符串数组');
         }
     }
-    for (const item of [entry.tools, entry.streaming]) if (item.status === 'supported' && typeof item.value !== 'boolean') throw new AgentFault('E_MODEL_INVALID', '模型能力开关必须为布尔值');
+    for (const item of [entry.tools, entry.streaming, ...(entry.thinking ? [entry.thinking] : [])]) if (item.status === 'supported' && typeof item.value !== 'boolean') throw new AgentFault('E_MODEL_INVALID', '模型能力开关必须为布尔值');
     if (entry.pricing.status === 'supported') validatePrice(entry.pricing.value!, Date.parse(entry.pricing.observedAt));
     for (const item of Object.values(entry.parameters)) {
         if (item.status !== 'supported') continue;
@@ -149,20 +153,23 @@ export class ModelCatalog {
         return { catalog, entry };
     }
 
-    async list(profileId: string, cursor: string | null = null, limit = 50): Promise<{ catalogVersion: string | null; entries: ModelEntry[]; nextCursor: string | null }> {
+    async list(profileId: string, cursor: string | null = null, limit = 50): Promise<{ catalogVersion: string | null; entries: ModelEntry[]; nextCursor: string | null;
+        catalog: ReturnType<typeof catalogState> }> {
         if (!Number.isSafeInteger(limit) || limit < 1 || limit > 200) throw new AgentFault('INVALID_PARAMS', '目录页大小须为1至200');
         const stored = await this.port.read(profileId);
         const catalog = stored ? effectiveCatalog(stored, this.now()) : null;
         const index = cursor === null ? 0 : Number(cursor);
         if (!Number.isSafeInteger(index) || index < 0 || (cursor !== null && String(index) !== cursor)) throw new AgentFault('E_CURSOR_INVALID', '目录游标无效');
         const entries = catalog?.entries.slice(index, index + limit) ?? [];
-        return { catalogVersion: catalog?.catalogVersion ?? null, entries, nextCursor: catalog && index + limit < catalog.entries.length ? String(index + limit) : null };
+        return { catalogVersion: catalog?.catalogVersion ?? null, catalog: catalogState(catalog, this.now()), entries,
+            nextCursor: catalog && index + limit < catalog.entries.length ? String(index + limit) : null };
     }
 
     async declare(profile: ProviderProfile, entry: ModelEntry, expectedCatalogVersion: string | null): Promise<CatalogSnapshot> {
         validateModelEntry(entry, profile);
         const evidence: Evidence<unknown>[] = [entry.contextWindow, entry.maxOutputTokens, entry.inputModalities, entry.outputModalities,
-            entry.tools, entry.streaming, entry.pricing, ...Object.values(entry.parameters)];
+            entry.tools, entry.streaming, entry.pricing, ...Object.values(entry.parameters),
+            ...(entry.maxInputTokens ? [entry.maxInputTokens] : []), ...(entry.thinking ? [entry.thinking] : [])];
         const pendingEvidence = [...evidence];
         let checkedEvidence = 0;
         while (pendingEvidence.length) {
@@ -370,9 +377,10 @@ export function validateCapabilities(entry: ModelEntry, profile: ProviderProfile
     }
     if (input.usesTools && !requireEvidence(entry.tools, scope, now)) throw new AgentFault('E_PARAMETER_UNSUPPORTED', '模型未支持工具调用');
     const context = requireEvidence(entry.contextWindow, scope, now);
+    const inputMaximum = entry.maxInputTokens ? requireEvidence(entry.maxInputTokens, scope, now) : context;
     const maximum = resolveRuntimeOutputBudget(entry, profile, input.maxOutputTokens, now);
     if (![input.inputTokenUpperBound, input.maxOutputTokens, context, maximum].every(value => Number.isSafeInteger(value) && value >= 0)
-        || input.maxOutputTokens < 1 || input.maxOutputTokens > maximum
+        || input.maxOutputTokens < 1 || input.maxOutputTokens > maximum || input.inputTokenUpperBound > inputMaximum
         || (entry.contextLimitMode === 'separate' ? input.inputTokenUpperBound > context : input.inputTokenUpperBound + input.maxOutputTokens > context)) {
         throw new AgentFault('E_CONTEXT_LIMIT', '完整请求与最大输出超过已核实的模型限制');
     }

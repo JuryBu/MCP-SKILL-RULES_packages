@@ -1,6 +1,7 @@
 import type { CommandExecution } from './commands.js';
 import { humanJson } from './presentation.js';
 import { runFailureLines } from './run-view.js';
+import { agentResultMarkdown, resultPresentationText, rpcFailureLines } from '../agent-client/results.js';
 
 export function graphicsSummary(graphics: 'none' | 'blocks' | 'sixel' | 'kitty' | 'native', color: boolean): string {
     if (graphics === 'none' || !color) return '纯文字';
@@ -45,15 +46,20 @@ export function workspaceUpdateLines(source: unknown): string[] {
 }
 
 export function interactiveResultLines(execution: CommandExecution, options: { raw?: boolean; titleHint?: string } = {}): string[] {
+    if (options.raw) return humanJson(execution.result).split('\n');
+    if (!execution.result.ok) return rpcFailureLines(execution.result);
+    if (resultPresentationText(execution.result)) return agentResultMarkdown(execution.method ?? '', execution.result).split('\n');
     const readable = new Set(['conversations.create', 'conversations.get', 'conversations.close', 'conversations.reopen', 'conversations.update']);
     if (!options.raw && readable.has(execution.method ?? '')) {
         const summary = conversationSummary(execution.result.data, options.titleHint);
         if (summary) return summary;
     }
     const data = record(execution.result.data);
+    if (!options.raw && (['runs.observe', 'server.readBatch', 'conversations.export', 'conversations.readHistory', 'events.read'].includes(execution.method ?? '')
+        || execution.method?.endsWith('.list'))) return agentResultMarkdown(execution.method ?? '', execution.result).split('\n');
     if (!options.raw && execution.method === 'runs.get') {
         const failure = runFailureLines(data);
-        if (failure.length) return failure;
+        if (failure.length) return ['查询已完成，目标执行未完成', ...failure];
     }
     if (!options.raw && execution.method?.startsWith('profiles.')) {
         const profile = record(data.profile ?? data);

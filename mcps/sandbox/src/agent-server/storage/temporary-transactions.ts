@@ -4,6 +4,7 @@ import type { UpperBound } from '../accounting/budget-ledger.js';
 import type { SqlDatabase, SqlRow } from './internal.js';
 import { AccountingTransactions } from './accounting.js';
 import { sha256 } from './objects.js';
+import { indexTemporaryProfileAttempt } from './profile-spend.js';
 import { exactFields, financialId, validateTemporaryFence, validateTemporaryIntent, validateTemporarySettlement,
     validateTemporaryUpperBound } from './temporary-finance.js';
 import type { TemporaryFeeCommand, TemporaryFeeFailure, TemporaryFeeResult, TemporaryFeeSettlement,
@@ -97,6 +98,7 @@ export class TemporaryFeeTransactions {
                 .run(intent.attemptId, intent.rootBudgetId, intent.ownerInstanceId, intent.conversationId, intent.runId,
                     intent.runEpoch, intent.historyEpoch, intent.financialIntentId, intent.dispatchNonce,
                     canonicalJson(intent), canonicalJson(upperBound), 'dispatching', new Date().toISOString());
+            indexTemporaryProfileAttempt(this.database, intent, upperBound.currency);
             return { status: 'send' };
         });
     }

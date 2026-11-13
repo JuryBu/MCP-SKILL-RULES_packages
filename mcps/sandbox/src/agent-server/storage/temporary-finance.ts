@@ -16,6 +16,7 @@ export interface TemporaryFinancialIntent {
     historyEpoch: number;
     fenceRevision: number;
     foregroundCallFloor?: 1;
+    profileId?: string;
 }
 
 export interface TemporaryRunFence {
@@ -95,8 +96,14 @@ function epoch(value: unknown): void {
 export function validateTemporaryIntent(intent: TemporaryFinancialIntent): void {
     exactFields(intent, ['ownerInstanceId', 'financialIntentId', 'dispatchNonce', 'attemptId', 'rootBudgetId', 'actionId',
         'quotaScopeId', 'conversationId', 'runId', 'runEpoch', 'historyEpoch', 'fenceRevision',
+        ...(Object.hasOwn(intent, 'profileId') ? ['profileId'] : []),
         ...(Object.hasOwn(intent, 'foregroundCallFloor') ? ['foregroundCallFloor'] : [])]);
     for (const [key, value] of Object.entries(intent)) if (key === 'runEpoch' || key === 'historyEpoch' || key === 'fenceRevision') epoch(value);
+    else if (key === 'profileId') {
+        if (typeof value !== 'string' || !value || value.length > 512) {
+            throw new AgentFault('TEMPORARY_FINANCE_INVALID', '临时费用的Profile身份无效');
+        }
+    }
     else if (key === 'foregroundCallFloor') {
         if (value !== 1) throw new AgentFault('TEMPORARY_FINANCE_INVALID', '后台费用意图保留次数只能为1');
     }

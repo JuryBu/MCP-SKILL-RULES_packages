@@ -3,11 +3,15 @@ import { AgentFault } from '../protocol.js';
 import type { AgentError } from '../protocol.js';
 import type { UpperBound } from '../accounting/budget-ledger.js';
 import type { NormalizedUsage } from '../accounting/usage.js';
+import { normalizeScopedProviderUsage } from '../accounting/usage.js';
 import { freezeOwned, prepareAttempt } from './assemble.js';
 import { attemptTimeout, safeTransportCause } from './http.js';
 import { ProviderFault } from './types.js';
 import { sharedQuotaScheduler } from './quota.js';
 import { failureHasExecutionEvidence } from './failure-accounting.js';
+import { assertProfileCanSend } from '../profiles/dispatch-policy.js';
+import type { ProfileSpend } from '../profiles/dispatch-policy.js';
+import type { ProviderProfile } from './types.js';
 import type { QuotaScheduler } from './quota.js';
 import type { Acceptance, HttpTransport, LookupResult, NormalizedResponse, ProviderAdapter, ProviderAttempt, ProviderPartial, RawProviderResponse, RequestSnapshot } from './types.js';
 
@@ -43,6 +47,8 @@ export interface DispatchOptions {
     sleep?: (milliseconds: number, signal?: AbortSignal) => Promise<void>;
     quotaScheduler?: QuotaScheduler;
     onPartial?: (attempt: ProviderAttempt, partial: ProviderPartial) => void | Promise<void>;
+    readProfileForDispatch?: (profileId: string) => Promise<ProviderProfile | null>;
+    readProfileSpend?: (profileId: string) => Promise<ProfileSpend>;
 }
 
 export function abortableSleep(milliseconds: number, signal?: AbortSignal): Promise<void> {
@@ -61,7 +67,18 @@ function asProviderFault(error: unknown): ProviderFault {
         { acceptance: 'unknown', phase: 'dispatching', transportCause: safeTransportCause(error) });
 }
 
+function identifyFailure(fault: ProviderFault, attempt: ProviderAttempt): ProviderFault {
+    return new ProviderFault(fault.code, fault.message, { acceptance: fault.acceptance, phase: fault.phase,
+        httpStatus: fault.httpStatus, nativeCode: fault.nativeCode, nativeReason: fault.nativeReason,
+        transportCause: fault.transportCause, transportPhase: fault.transportPhase, retryAfterMs: fault.retryAfterMs,
+        retryable: fault.retryable, rawResponse: fault.rawResponse,
+        partialResponse: fault.partialResponse ? { ...fault.partialResponse, usage: normalizeScopedProviderUsage(fault.partialResponse.usage, attempt.snapshot.endpoint) } : undefined,
+        usage: fault.usage ? normalizeScopedProviderUsage(fault.usage, attempt.snapshot.endpoint) : undefined,
+        attemptId: attempt.attemptId, actionId: attempt.snapshot.actionId });
+}
+
 function routeChecked(snapshot: RequestSnapshot, response: NormalizedResponse): NormalizedResponse {
+    response = freezeOwned({ ...response, usage: normalizeScopedProviderUsage(response.usage, snapshot.endpoint) });
     const policy = snapshot.profile.routePolicy;
     const wrongModel = response.modelId !== null && !policy.allowedModels.includes(response.modelId);
     const wrongRoute = response.routeId !== null && policy.allowedRoutes.length > 0 && !policy.allowedRoutes.includes(response.routeId);
@@ -83,6 +100,13 @@ export class ProviderDispatcher {
         if (!Number.isSafeInteger(this.maxAttempts) || this.maxAttempts < 1 || this.maxAttempts > 3) {
             throw new AgentFault('E_ATTEMPT_LIMIT', '同一动作提交上限必须为一至三次');
         }
+    }
+
+    private async checkProfile(snapshot: RequestSnapshot): Promise<void> {
+        const profile = this.options.readProfileForDispatch ? await this.options.readProfileForDispatch(snapshot.profile.profileId) : snapshot.profile;
+        if (!profile) throw new ProviderFault('E_PROFILE_DISABLED', '此API配置已在本地停用', { acceptance: 'not_sent' });
+        const spend = profile.dispatchPolicy?.maxCumulativeCost ? await this.options.readProfileSpend?.(profile.profileId) : undefined;
+        assertProfileCanSend(profile, spend, this.now());
     }
 
     private async recordFailure(attempt: ProviderAttempt, failure: RecordedFailure): Promise<void> {
@@ -126,6 +150,7 @@ export class ProviderDispatcher {
             onPartial?: (attempt: ProviderAttempt, partial: ProviderPartial) => void | Promise<void> }): Promise<NormalizedResponse> {
         adapter.validate(snapshot);
         for (let index = 0; index < this.maxAttempts; index++) {
+            await this.checkProfile(snapshot);
             const attempt = prepareAttempt(snapshot, rootBudgetId, index === 0 ? options.attemptId : undefined);
             if (options.signal?.aborted) throw new ProviderFault('E_CANCELLED', '请求发送前已取消', { acceptance: 'not_sent' });
             attemptTimeout(attempt, this.now());
@@ -148,7 +173,8 @@ export class ProviderDispatcher {
                     const expiry = upperBound.expiresAt ?? snapshot.pricingSnapshot?.expiresAt ?? snapshot.price?.expiresAt;
                     if (expiry && Date.parse(expiry) <= this.now()) throw new ProviderFault('E_PRICE_UNKNOWN', '实际发送前费用上界已过期', { acceptance: 'not_sent' });
                     adapterEntered = true;
-                    return adapter.send(attempt, { transport: trackedTransport, credential, onPartial: async partial => {
+                    await this.checkProfile(snapshot);
+                    return adapter.send(attempt, { transport: trackedTransport, credential, conversationId: snapshot.conversationId, onPartial: async partial => {
                         await this.options.journal.recordPartial?.(attempt, partial);
                         await options.onPartial?.(attempt, partial);
                         await this.options.onPartial?.(attempt, partial);
@@ -160,10 +186,10 @@ export class ProviderDispatcher {
                     response = await this.options.credentials.withCredential(profile.credentialRef, snapshot.credentialGeneration, send);
                 } else response = await send();
             } catch (error) {
-                const fault = error instanceof ProviderFault ? error : !transportEntered
+                const fault = identifyFailure(error instanceof ProviderFault ? error : !transportEntered
                     ? new ProviderFault(error instanceof AgentFault ? error.code : adapterEntered ? 'E_TRANSPORT_UNSENT' : 'E_SECRET_BACKEND', '请求发送前的准备未完成',
                         { acceptance: 'not_sent', phase: 'prepared', transportPhase: 'preflight', transportCause: safeTransportCause(error) })
-                    : asProviderFault(error);
+                    : asProviderFault(error), attempt);
                 await this.recordFailure(attempt, { error: { ...fault.toJSON(), actionId: snapshot.actionId, attemptId: attempt.attemptId },
                     acceptance: fault.acceptance, ...(fault.rawResponse ? { rawResponse: fault.rawResponse } : {}),
                     ...(fault.partialResponse ? { partialResponse: fault.partialResponse } : {}), ...(fault.usage ? { usage: fault.usage } : {}) });

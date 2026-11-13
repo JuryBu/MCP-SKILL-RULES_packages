@@ -17,6 +17,12 @@ const profileSchema = z.object({
         requireParameters: z.boolean().optional(), allowFallbacks: z.literal(false), evidenceRef: z.string().min(1) }).strict(),
     parameterDefaults: z.record(z.unknown()), discovery: z.object({ enabled: z.boolean(), pageSize: z.number().int().min(1).max(1000) }).strict(),
     remoteRetention: z.enum(['disabled', 'allowed']), globalModelRulesRef: z.string().nullable(), compressionModelRef: z.string().nullable(),
+    information: z.object({ source: z.string().max(2048).optional(), purpose: z.string().max(2048).optional(),
+        notes: z.string().max(8192).optional(), lastTestedAt: z.string().datetime({ offset: true }).nullable().optional(),
+        updatedAt: z.string().datetime({ offset: true }).optional() }).strict().optional(),
+    dispatchPolicy: z.object({ enabled: z.boolean().optional(), expiresAt: z.string().datetime({ offset: true }).nullable().optional(),
+        maxCumulativeCost: z.object({ currency: z.string().regex(/^[A-Z]{3}$/),
+            amountMicros: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER) }).strict().optional() }).strict().optional(),
 }).strict();
 
 export function validateProfile(profile: unknown): ProviderProfile {

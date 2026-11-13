@@ -4,6 +4,9 @@ import path from "path";
 import { buildAntigravityCliEnvironment, spawnPowerShellScript, withAntigravityCliLease } from "./agy-runtime.js";
 import { councilRuntimeDirectory } from "./paths.js";
 import { councilArtifactPath, registerCouncilArtifact } from "./artifact-store.js";
+import { resolveAntigravityCliModel } from "../ls-client.js";
+import { AntigravityCallError } from "../antigravity-model-catalog.js";
+import { runAntigravityAgentCli } from "../antigravity-agent-cli.js";
 
 const INDEX_START = "<<<COUNCIL_INDEX>>>";
 const INDEX_END = "<<<END_COUNCIL_INDEX>>>";
@@ -120,21 +123,17 @@ function splitCsvEnv(name: string, fallback: string[]): string[] {
     return items.length > 0 ? items : fallback;
 }
 
-function antigravityAttempts(filePath: string, notes: string[], onProgress?: (message: string) => void): string[] {
+async function antigravityAttempts(filePath: string, notes: string[], onProgress?: (message: string) => void, signal?: AbortSignal): Promise<string[]> {
     const newEnv = process.env.SANDBOX_COUNCIL_ANTIGRAVITY_INDEX_MODELS;
     const oldEnv = process.env.SANDBOX_COUNCIL_GEMINI_INDEX_MODELS;
-    const ext = path.extname(filePath).toLowerCase();
-    const multimodal = [".pdf", ".png", ".jpg", ".jpeg", ".gif", ".webp", ".mp4", ".mov", ".mkv", ".avi", ".webm"].includes(ext);
-    const defaults = multimodal
-        ? ["Gemini 3.5 Flash (High)", "Gemini 3.1 Pro (Low)", "Gemini 3.5 Flash (Medium)"]
-        : ["Gemini 3.5 Flash (Low)", "Gemini 3.5 Flash (Medium)", "Gemini 3.1 Pro (Low)"];
+    const defaults = ["default"];
     const rawModels = newEnv ? splitCsvEnv("SANDBOX_COUNCIL_ANTIGRAVITY_INDEX_MODELS", defaults) : oldEnv ? splitCsvEnv("SANDBOX_COUNCIL_GEMINI_INDEX_MODELS", defaults) : defaults;
     if (!newEnv && oldEnv) {
         const warning = "弃用环境变量 SANDBOX_COUNCIL_GEMINI_INDEX_MODELS 已映射到 Antigravity CLI；请迁移到 SANDBOX_COUNCIL_ANTIGRAVITY_INDEX_MODELS。";
         notes.push(warning);
         onProgress?.(warning);
     }
-    return rawModels.map((model) => LEGACY_MODEL_LABELS[model.toLowerCase()] || model);
+    return await Promise.all(rawModels.map(model => resolveAntigravityCliModel(LEGACY_MODEL_LABELS[model.toLowerCase()] || model, signal)));
 }
 
 function codexAttempts(): Array<{ model: string; reasoning: string }> {
@@ -256,7 +255,7 @@ function buildAntigravityScript(promptPath: string, artifactPath: string, model:
     const addDirArgs = addDirs.map((dir) => `--add-dir ${psSingleQuoted(dir)}`).join(" ");
     return [
         `$prompt = ${psSingleQuoted(prompt)}`,
-        `& ${psSingleQuoted(command)} -p $prompt --dangerously-skip-permissions --model ${psSingleQuoted(model)} ${addDirArgs}`,
+        `& ${psSingleQuoted(command)} -p $prompt --dangerously-skip-permissions${model ? ` --model ${psSingleQuoted(model)}` : ""} ${addDirArgs}`,
         "exit $LASTEXITCODE",
     ].join("\n");
 }
@@ -289,27 +288,42 @@ async function runAntigravityIndexer(request: BuildCouncilFileIndexRequest): Pro
     const exhaustedModels = new Set<string>();
     const command = resolveAntigravityCommand(request);
     const timeoutMs = request.timeoutMs ?? DEFAULT_TIMEOUT_MS;
-    const models = antigravityAttempts(request.filePath, notes, request.onProgress);
+    const deadline = Date.now() + timeoutMs;
+    request = { ...request, signal: request.signal ? AbortSignal.any([request.signal, AbortSignal.timeout(Math.max(1, timeoutMs))]) : AbortSignal.timeout(Math.max(1, timeoutMs)) };
+    const models = await antigravityAttempts(request.filePath, notes, request.onProgress, request.signal);
     const childEnvironment = buildAntigravityCliEnvironment();
     notes.push(...childEnvironment.diagnostics);
     for (const model of models) {
         if (exhaustedModels.has(model)) continue;
         for (let retry = 1; retry <= ATTEMPTS_PER_MODEL; retry += 1) {
+            const remaining = deadline - Date.now();
+            if (remaining <= 0) throw new AntigravityCallError("Antigravity 索引总期限已用完",
+                { transport: "cli-agent", submitted: false, outcomeUnknown: false, safeToFallback: false, kind: "not-started" });
             const artifactPath = buildArtifactPath(request.filePath, "antigravity", `${model}_try${retry}`, request.runId);
             const promptPath = `${artifactPath}.prompt.txt`;
             const logBase = `${artifactPath}.run`;
+            let submitted = false;
             try {
                 fs.writeFileSync(promptPath, buildIndexPrompt({ ...request, artifactPath, cli: "antigravity" }), "utf-8");
                 request.onProgress?.(`正在用 Antigravity CLI 索引文件 ${path.basename(request.filePath)}：model=${model}, attempt=${retry}`);
-                const result = await withAntigravityCliLease(request.signal, async () => await spawnPowerShellScript(
+                const result = await withAntigravityCliLease(request.signal, async () => {
+                    const budget = deadline - Date.now();
+                    if (budget <= 0) throw new AntigravityCallError("Antigravity 索引等待租约时用完总期限",
+                        { transport: "cli-agent", submitted: false, outcomeUnknown: false, safeToFallback: false, kind: "not-started" });
+                    submitted = true;
+                    return await runAntigravityAgentCli(
                     buildAntigravityScript(promptPath, artifactPath, model, command, authorizedDirectories(request.filePath, promptPath, artifactPath, request.imagePaths || [])),
                     cwd,
                     logBase,
-                    { timeoutMs, signal: request.signal, env: childEnvironment.env, diagnostics: childEnvironment.diagnostics, earlyFailure: (stderr) => classifyAntigravityFailure(stderr) === "terminal" ? redactSensitive(clip(stderr, 320)) : undefined },
-                ));
-                if (result.aborted) throw Object.assign(new Error("CLI 索引已中止"), { name: "AbortError" });
-                if (result.timedOut) throw new CliIndexerFailure("Antigravity CLI 索引超时", "timeout");
+                    { timeoutMs: budget, signal: request.signal, env: childEnvironment.env, diagnostics: childEnvironment.diagnostics, earlyFailure: (stderr) => classifyAntigravityFailure(stderr) === "terminal" ? redactSensitive(clip(stderr, 320)) : undefined },
+                ); });
+                if (result.aborted) throw new AntigravityCallError("Antigravity CLI 索引已中止，保留原请求状态",
+                    { transport: "cli-agent", submitted: true, outcomeUnknown: true, safeToFallback: false,
+                        kind: request.signal?.reason?.name === "TimeoutError" ? "timeout-unknown" : "cancelled" });
+                if (result.timedOut) throw new AntigravityCallError("Antigravity CLI 索引超时，保留原结果并停止自动重发",
+                    { transport: "cli-agent", submitted: true, outcomeUnknown: true, safeToFallback: false, kind: "timeout-unknown" });
                 if (result.earlyFailureReason) throw new CliIndexerFailure(`Antigravity CLI terminal failure: ${result.earlyFailureReason}`, "terminal");
+                if (result.exitCode !== 0) throw new Error(`Antigravity CLI 索引失败 exit=${result.exitCode}`);
                 const text = validateArtifact(artifactPath);
                 const stderr = redactSensitive(readClip(result.stderrPath, 900).trim());
                 return {
@@ -325,6 +339,7 @@ async function runAntigravityIndexer(request: BuildCouncilFileIndexRequest): Pro
                     ],
                 };
             } catch (error) {
+                if (error instanceof AntigravityCallError && !error.safeToFallback) throw error;
                 if (isAbortError(error) || request.signal?.aborted) throw error;
                 const stderr = redactSensitive(readClip(`${logBase}.stderr.txt`, 900).trim());
                 const message = redactSensitive(error instanceof Error ? error.message : String(error));
@@ -333,6 +348,13 @@ async function runAntigravityIndexer(request: BuildCouncilFileIndexRequest): Pro
                     ? detectedKind
                     : error instanceof CliIndexerFailure ? error.kind : detectedKind;
                 notes.push(`antigravity model=${model} attempt=${retry} failed (${kind}): ${message}${stderr ? ` | stderr: ${stderr}` : ""}`);
+                if (submitted) {
+                    const auth = /authentication|not logged|未登录|认证/iu.test(`${message}\n${stderr}`);
+                    const notStarted = /command not found|not recognized|ENOENT/iu.test(`${message}\n${stderr}`);
+                    throw new AntigravityCallError(notes.join("\n"), { transport: "cli-agent", model, submitted: !notStarted,
+                        outcomeUnknown: !auth && kind !== "capacity" && !notStarted, safeToFallback: notStarted,
+                        kind: auth ? "auth-required" : kind === "capacity" ? "quota-exhausted" : notStarted ? "not-started" : "transport-unknown" });
+                }
                 request.onProgress?.(`Antigravity CLI 索引失败，准备降级/重试：model=${model}, reason=${clip(message, 180)}`);
                 if (kind === "terminal") throw new Error(notes.join("\n"));
                 if (kind === "capacity") {
@@ -407,6 +429,7 @@ function structuredCodexFallbackEnabled(): boolean {
 
 export async function buildCouncilFileIndex(request: BuildCouncilFileIndexRequest): Promise<CouncilCliIndexResult> {
     if (request.signal?.aborted) throw Object.assign(new Error("CLI 索引已中止"), { name: "AbortError" });
+    const deadline = Date.now() + (request.timeoutMs ?? DEFAULT_TIMEOUT_MS);
     const preferredCli = request.preferredCli === "gemini" ? "antigravity" : request.preferredCli;
     const plan: CouncilIndexerCli[] = isPptxFile(request.filePath)
         ? ["antigravity"]
@@ -419,12 +442,17 @@ export async function buildCouncilFileIndex(request: BuildCouncilFileIndexReques
     for (const cli of plan) {
         try {
             request.onProgress?.(`开始 ${cli === "antigravity" ? "Antigravity CLI" : "Codex CLI"} 文件索引：${path.basename(request.filePath)}`);
-            const result = cli === "antigravity" ? await runAntigravityIndexer(request) : await runCodexIndexer(request);
+            const remaining = deadline - Date.now();
+            if (remaining <= 0) throw new AntigravityCallError("文件索引总期限已用完",
+                { submitted: false, outcomeUnknown: false, safeToFallback: false, kind: "not-started" });
+            const nextRequest = { ...request, timeoutMs: remaining };
+            const result = cli === "antigravity" ? await runAntigravityIndexer(nextRequest) : await runCodexIndexer(nextRequest);
             if (cli === "codex" && allowsStructuredCodexFallback(request.filePath)) {
                 result.notes.unshift("结构化文件已启用 SANDBOX_COUNCIL_STRUCTURED_CODEX_FALLBACK=1，Codex CLI 作为最后兜底运行");
             }
             return result;
         } catch (error) {
+            if (error instanceof AntigravityCallError && !error.safeToFallback) throw error;
             if (isAbortError(error) || request.signal?.aborted) throw error;
             failures.push(`${cli}: ${redactSensitive(error instanceof Error ? error.message : String(error))}`);
             request.onProgress?.(`${cli === "antigravity" ? "Antigravity CLI" : "Codex CLI"} 文件索引整体失败，切换下一条索引链路：${path.basename(request.filePath)}`);

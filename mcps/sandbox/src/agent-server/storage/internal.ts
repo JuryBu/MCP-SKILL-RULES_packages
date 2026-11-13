@@ -10,6 +10,7 @@ export interface SqlStatement {
     run(...values: SqlValue[]): { changes: number | bigint; lastInsertRowid: number | bigint };
     get(...values: SqlValue[]): SqlRow | undefined;
     all(...values: SqlValue[]): SqlRow[];
+    iterate?(...values: SqlValue[]): IterableIterator<SqlRow>;
 }
 
 export interface SqlDatabase {

@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { createRequire } from 'node:module';
 import { z } from 'zod';
 import { PROVIDER_RPC_SIGNATURES } from './profiles/rpc-signatures.js';
 import { WORKSPACE_RPC_METHOD_SPECS } from './workspace/rpc-signatures.js';
@@ -7,10 +8,12 @@ import { MODULE_RPC_SPECS as CONFIGURATION_RPC_SPECS } from './configuration/rpc
 import { CONVERSATION_LIFECYCLE_RPC_METHOD_SPECS } from './conversation-lifecycle/rpc-signatures.js';
 
 export const PROTOCOL_VERSION = 1;
-export const SERVER_VERSION = '0.1.0';
+export const SERVER_VERSION = (createRequire(import.meta.url)('../../package.json') as { version: string }).version;
 export const MAX_FRAME_BYTES = 1024 * 1024;
 export const DEFAULT_PAGE_SIZE = 50;
 export const MAX_PAGE_SIZE = 200;
+export const MAX_READ_BATCH_REQUESTS = 16;
+export const MAX_OBSERVATION_BYTES = 512 * 1024;
 
 export type JsonValue = null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue };
 export type JsonObject = { [key: string]: JsonValue };
@@ -39,6 +42,7 @@ export interface RpcResult<Data = unknown> {
     error?: AgentError;
     receiptId?: string;
     eventCursor?: string;
+    presentation?: { format: 'markdown'; text: string };
 }
 
 export interface AgentEvent {
@@ -166,6 +170,7 @@ const conversationFields = { conversationId: identifier };
 const runFields = { ...conversationFields, runId: identifier, expectedRunEpoch: revision.optional() };
 const pageFields = { cursor: z.string().max(2048).optional(), limit: z.number().int().min(1).max(MAX_PAGE_SIZE).optional() };
 const content = z.object({ text: z.string().max(MAX_FRAME_BYTES).default(''), references: z.array(z.unknown()).max(100).optional() }).strict();
+export const readBatchItemSchema = z.object({ method: identifier, params: z.record(z.unknown()).optional() }).strict();
 export const retainPolicySchema = z.object({ mode: z.enum(['temporary', 'ttl', 'archive']),
     ttlDurationMs: z.number().int().min(60_000).max(365 * 24 * 60 * 60 * 1000).optional() }).strict()
     .superRefine((policy, context) => {
@@ -186,6 +191,8 @@ function spec(shape: z.ZodRawShape, writes: boolean, scope: MethodSpec['scope'],
 
 export const METHOD_SPECS: Record<string, MethodSpec> = {
     'server.info': spec({}, false, 'none', '查看核心版本、能力及运行情况'),
+    'server.readBatch': spec({ requests: z.array(z.unknown()).min(1).max(MAX_READ_BATCH_REQUESTS),
+        maxBytes: z.number().int().min(16 * 1024).max(MAX_OBSERVATION_BYTES).optional() }, false, 'none', '有界批量查询明确只读方法，每项独立校验并保留原错误'),
     'server.claimControl': spec({ ...commandFields, scope: z.enum(['server', 'conversation']), conversationId: identifier.optional(), takeover: z.boolean().optional() }, true, 'none', '取得或明确接管控制租约'),
     'server.renewControl': spec({ ...commandFields, ...controlFields, scope: z.enum(['server', 'conversation']), conversationId: identifier.optional() }, true, 'none', '续原控制租约'),
     'server.releaseControl': spec({ ...commandFields, ...controlFields, scope: z.enum(['server', 'conversation']), conversationId: identifier.optional() }, true, 'none', '释放原控制租约'),
@@ -201,7 +208,9 @@ export const METHOD_SPECS: Record<string, MethodSpec> = {
     'conversations.update': spec({ ...conversationFields, ...commandFields, ...controlFields, expectedRevision: revision, options: z.record(z.unknown()) }, true, 'conversation', '更新下一请求使用的配置'),
     'conversations.close': spec({ ...conversationFields, ...commandFields, ...controlFields, reason: z.string().max(2048).optional() }, true, 'conversation', '关闭会话并回收派生资源'),
     'conversations.reopen': spec({ ...conversationFields, ...commandFields, ...controlFields }, true, 'conversation', '重开未过期持久会话'),
-    'conversations.readHistory': spec({ ...conversationFields, ...pageFields, startRound: revision.optional(), endRound: revision.optional(), maxBytes: z.number().int().min(1).max(512 * 1024).optional() }, false, 'conversation', '有界读取原始历史'),
+    'conversations.readHistory': spec({ ...conversationFields, ...pageFields, startRound: revision.optional(), endRound: revision.optional(), direction: z.enum(['forward', 'backward']).optional(), maxBytes: z.number().int().min(1).max(512 * 1024).optional() }, false, 'conversation', '有界读取原始历史，可从最近记录向前读取'),
+    'conversations.export': spec({ ...conversationFields, ...pageFields, startRound: revision.optional(), endRound: revision.optional(),
+        maxBytes: z.number().int().min(4096).max(MAX_OBSERVATION_BYTES).optional() }, false, 'conversation', '分页导出可读Markdown，保留原文、压缩与工具标记及原件引用，不写文件'),
     'conversations.context': spec({ ...conversationFields, candidateId: identifier.optional() }, false, 'conversation', '查看上下文水位、压缩状态，或按原candidateId查看候选'),
     'conversations.countTokens': spec({ ...conversationFields, input: z.object({ text: z.string().max(512 * 1024).optional(),
         references: z.array(z.record(z.unknown())).max(32).optional() }).strict(),
@@ -226,6 +235,9 @@ export const METHOD_SPECS: Record<string, MethodSpec> = {
     'runs.startInteractive': spec({ ...conversationFields, ...commandFields, ...controlFields, input: content, options: z.record(z.unknown()).optional() }, true, 'conversation', '人工CLI开始对话，记录用量和费用，无强制金额上限'),
     'usage.overview': spec({ conversationId: identifier.optional(), profileId: identifier.optional() }, false, 'none', '查询当前对话实际用量与供应商可取得的余额'),
     'runs.get': spec({ ...conversationFields, runId: identifier }, false, 'conversation', '查询原执行状态'),
+    'runs.observe': spec({ ...conversationFields, runId: identifier, afterCursor: z.string().max(2048).optional(),
+        limit: z.number().int().min(1).max(MAX_PAGE_SIZE).optional(),
+        maxBytes: z.number().int().min(4096).max(MAX_OBSERVATION_BYTES).optional() }, false, 'conversation', '在同一事件水位读取原执行、可见正文和有界事件页'),
     'runs.list': spec({ ...conversationFields, ...pageFields }, false, 'conversation', '分页查询执行记录'),
     'runs.cancel': spec({ ...runFields, ...commandFields, ...controlFields, reason: z.string().max(2048).optional(), acknowledgeUnknown: z.literal(true).optional() }, true, 'conversation', '取消原执行；显式acknowledgeUnknown只结束已清理的本地等待，原结果及费用未知继续保留'),
     'runs.interrupt': spec({ ...runFields, ...commandFields, ...controlFields, reason: z.string().max(2048).optional() }, true, 'conversation', '中断至可恢复安全位置'),

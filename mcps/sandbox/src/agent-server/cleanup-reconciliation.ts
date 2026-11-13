@@ -17,10 +17,21 @@ export interface CleanupReconciliationPorts {
     releaseContext(input: RunCleanupInput): Promise<boolean>;
 }
 
+export function isReleasedUnknownWait(snapshot: Partial<RunSnapshot>): boolean {
+    return snapshot.kind === 'task' && snapshot.state === 'cancelled' && snapshot.stopTarget === 'cancelled'
+        && snapshot.stopReason === 'SERVER_CLOSED' && snapshot.cleanupState === 'released'
+        && snapshot.internalOwnCleanupState === 'released' && snapshot.resultStatus === 'unknown' && snapshot.effectState === 'unknown'
+        && Number.isSafeInteger(snapshot.runEpoch) && Number(snapshot.runEpoch) > 1
+        && (snapshot.rootRunId == null || snapshot.rootRunId === snapshot.runId);
+}
+
 export function isStoppedUnknownWait(snapshot: Partial<RunSnapshot>): boolean {
-    return snapshot.kind === 'task' && snapshot.state === 'cancelled' && snapshot.cleanupState === 'unconfirmed'
-        && snapshot.stopTarget === 'cancelled' && ['BUDGET_EXCEEDED', 'runs.cancel'].includes(String(snapshot.stopReason))
-        && ['cancelled', 'unknown'].includes(String(snapshot.resultStatus)) && Number.isSafeInteger(snapshot.runEpoch)
+    if (isReleasedUnknownWait(snapshot)) return true;
+    const cancelled = snapshot.state === 'cancelled' && snapshot.stopTarget === 'cancelled'
+        && ['BUDGET_EXCEEDED', 'runs.cancel'].includes(String(snapshot.stopReason)) && ['cancelled', 'unknown'].includes(String(snapshot.resultStatus));
+    const paused = snapshot.state === 'paused' && snapshot.stopTarget === 'paused'
+        && snapshot.resultStatus === 'unknown' && snapshot.effectState === 'unknown';
+    return snapshot.kind === 'task' && (cancelled || paused) && snapshot.cleanupState === 'unconfirmed' && Number.isSafeInteger(snapshot.runEpoch)
         && Number(snapshot.runEpoch) > 1 && (snapshot.rootRunId == null || snapshot.rootRunId === snapshot.runId);
 }
 
@@ -38,9 +49,11 @@ async function hasStoppedUnknownAttempt(input: RunCleanupInput, ports: CleanupRe
             || recorded.state !== 'unknown' || recorded.attempt.rootBudgetId !== rootBudgetId
             || recorded.attempt.snapshot.conversationId !== input.snapshot.conversationId
             || recorded.attempt.snapshot.runId !== input.snapshot.runId
-            || recorded.attempt.snapshot.runEpoch !== input.snapshot.runEpoch - 1
+            || !Number.isSafeInteger(recorded.attempt.snapshot.runEpoch) || recorded.attempt.snapshot.runEpoch < 1
+            || (input.snapshot.state === 'paused' || isReleasedUnknownWait(input.snapshot) ? recorded.attempt.snapshot.runEpoch >= input.snapshot.runEpoch
+                : recorded.attempt.snapshot.runEpoch !== input.snapshot.runEpoch - 1)
             || !recorded.failure || !['accepted', 'unknown'].includes(recorded.failure.acceptance)) return false;
-        matched = true;
+        matched ||= isReleasedUnknownWait(input.snapshot) || recorded.attempt.snapshot.runEpoch === input.snapshot.runEpoch - 1;
     }
     return matched;
 }

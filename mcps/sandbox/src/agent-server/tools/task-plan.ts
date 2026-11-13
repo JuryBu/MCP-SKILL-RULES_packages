@@ -33,7 +33,7 @@ async function current(context: BoundToolContext): Promise<void> {
 export class TaskPlanTools {
     readonly fileOperations: WorkspaceFileOperations;
     readonly maximumBytes: number;
-    readonly tools = structuredClone(TASK_PLAN_TOOLS).map(tool => ({ ...tool, description: `${tool.description} The main task model may add or reorder steps. Ask the initiator before removing confirmed goals or lowering acceptance criteria. The compression model never edits these files.` }));
+    readonly tools = structuredClone(TASK_PLAN_TOOLS).map(tool => ({ ...tool, description: `${tool.description} The main task model may add or reorder steps. Ask the initiator before removing confirmed goals or lowering acceptance criteria. The compression model never edits these files. Before marking a task complete, read back its specified outputs and record actual verification results and unfinished items. Completion claims must cite actual tool receipts or readback results; keep unchecked work pending.` }));
 
     constructor(readonly options: TaskPlanToolsOptions) {
         this.fileOperations = new WorkspaceFileOperations(options);
@@ -56,9 +56,10 @@ export class TaskPlanTools {
         pathIdentity(context.roots[0]);
         await current(context);
         const identity = /^[a-zA-Z0-9_-]{1,128}$/.test(context.conversationId) ? context.conversationId : hash(context.conversationId);
-        const workKind = typeof this.options.workKind === 'function' ? await this.options.workKind(context) : this.options.workKind ?? 'simple_qa';
+        const workKind = context.taskPlanWorkKind ?? (typeof this.options.workKind === 'function'
+            ? await this.options.workKind(context) : this.options.workKind);
         return { conversationId: context.conversationId, taskId: context.rootRunId,
-            directory: `plans/sandbox-agent-${identity}`, workKind };
+            directory: `plans/sandbox-agent-${identity}`, ...(workKind !== undefined ? { workKind } : {}) };
     }
 
     private filePath(relativePath: string, context: BoundToolContext): string {

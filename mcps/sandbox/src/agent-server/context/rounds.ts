@@ -27,11 +27,13 @@ export function selectCompactionRounds(capture: ContextCapture, policy: ContextP
     }
     if (capture.view.historyEpoch !== capture.historyEpoch || capture.view.revision !== capture.viewRevision
         || capture.view.coveredEndSeq > capture.appendSeq) throw new ContextFault('PARENT_STALE', '摘要视图与当前历史索引不一致');
+    const prefix = capture.activeCompletedPrefix;
     const complete = rounds.filter(round => round.complete && round.roundId !== capture.activeRoundId);
-    const retainedIds = new Set(complete.slice(Math.max(0, complete.length - policy.keepCompleteRounds)).map(round => round.roundId));
-    if (capture.activeRoundId) retainedIds.add(capture.activeRoundId);
+    const retainedIds = new Set((prefix ? [] : complete.slice(Math.max(0, complete.length - policy.keepCompleteRounds))).map(round => round.roundId));
+    if (capture.activeRoundId && !prefix) retainedIds.add(capture.activeRoundId);
     const targets: RoundBoundary[] = [];
-    for (const round of rounds) {
+    for (const original of rounds) {
+        const round = original.roundId === capture.activeRoundId && prefix ? prefix : original;
         if (round.lastSeq <= capture.view.coveredEndSeq) continue;
         if (round.firstSeq <= capture.view.coveredEndSeq) throw new ContextFault('SOURCE_GAP', '已有压缩游标切断了完整轮次', { roundId: round.roundId });
         if (retainedIds.has(round.roundId) || !round.complete || round.nativePairing !== 'complete') break;
@@ -40,11 +42,18 @@ export function selectCompactionRounds(capture: ContextCapture, policy: ContextP
     const targetIds = new Set(targets.map(round => round.roundId));
     const first = targets.length ? rounds.findIndex(round => round.roundId === targets[0].roundId) : -1;
     const references = [rounds[first - 1]].filter((round): round is RoundBoundary => Boolean(round) && !targetIds.has(round.roundId));
-    return { targets, retained: rounds.filter(round => !targetIds.has(round.roundId) && round.lastSeq > capture.view.coveredEndSeq), references };
+    const retained = rounds.flatMap(round => {
+        if (round.lastSeq <= capture.view.coveredEndSeq) return [];
+        if (!targetIds.has(round.roundId)) return [round];
+        if (!prefix || round.roundId !== prefix.roundId) return [];
+        const consumed = new Set(prefix.itemIds);
+        return [{ ...round, firstSeq: prefix.lastSeq + 1, itemIds: round.itemIds.filter(itemId => !consumed.has(itemId)) }];
+    });
+    return { targets, retained, references };
 }
 
 export async function readSelectedHistory(port: ContextHistoryPort, capture: ContextCapture, rounds: RoundBoundary[], maxBytes: number,
-    signal?: AbortSignal): Promise<HistoryItem[]> {
+    signal?: AbortSignal, includeValues = true): Promise<HistoryItem[]> {
     if (!rounds.length) return [];
     const expected = new Map(rounds.flatMap(round => round.itemIds.map(itemId => [itemId, round] as const)));
     const selected = new Map<string, HistoryItem>();
@@ -56,7 +65,7 @@ export async function readSelectedHistory(port: ContextHistoryPort, capture: Con
     do {
         checkAbort(signal);
         const page = await port.readHistory({ conversationId: capture.conversationId, cursor, limit: 50, maxBytes,
-            direction: 'forward', view: 'raw', effectiveOnly: true, expectedHistoryEpoch: capture.historyEpoch,
+            direction: 'forward', view: 'raw', effectiveOnly: true, includeValues, expectedHistoryEpoch: capture.historyEpoch,
             throughSeq: capture.appendSeq, ...(numbered ? { startRound: Math.min(...roundNumbers), endRound: Math.max(...roundNumbers) } : {}) });
         if (page.historyEpoch !== capture.historyEpoch || page.appendSeq !== capture.appendSeq) {
             throw new ContextFault('HISTORY_STALE', '来源历史页与冻结版本或追加上限不一致');

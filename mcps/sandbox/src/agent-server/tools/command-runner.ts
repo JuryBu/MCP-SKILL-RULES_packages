@@ -12,6 +12,8 @@ import type { BoundToolContext } from './types.js';
 import { withDeclaredCommandWrites } from '../workspace/command-writes.js';
 import type { DeclaredCommandWorkspace } from '../workspace/command-writes.js';
 import { createWindowsJobLaunch, hasWindowsJobRunner, readWindowsJobMetadata, WindowsJobLaunchError } from '../../windows-job-runner.js';
+import { decodeCommandOutput } from './command-output.js';
+import type { CommandOutputEncoding } from './command-output.js';
 
 export const COMMAND_AUTHORIZATION_BOUNDARY = Object.freeze({ enabled: true,
     mode: 'cooperative_windows_job', strongOsIsolationRequired: false,
@@ -26,6 +28,7 @@ export interface RestrictedCommandArguments {
     maxMemoryMB: number;
     maxOutputBytes: number;
     writeSet?: string[];
+    outputEncoding?: CommandOutputEncoding;
 }
 
 export interface CommandCapability {
@@ -78,6 +81,9 @@ export function validateOrdinaryCommand(args: RestrictedCommandArguments, contex
         || !Number.isSafeInteger(args.maxMemoryMB) || args.maxMemoryMB < 16 || args.maxMemoryMB > 4096
         || !Number.isSafeInteger(args.maxOutputBytes) || args.maxOutputBytes < 1 || args.maxOutputBytes > 1048576
         || Buffer.byteLength(args.stdin ?? '') > 16384) throw new AgentFault('INVALID_PARAMS', '命令参数或预算超出支持范围', { commandStarted: false });
+    if (args.outputEncoding !== undefined && !['auto', 'utf8', 'gb18030', 'utf16le'].includes(args.outputEncoding)) {
+        throw new AgentFault('INVALID_PARAMS', '输出编码需要auto、utf8、gb18030或utf16le', { commandStarted: false });
+    }
     try {
         assertNotProtected(args.application, context);
         requirePolicy({ kinds: ['process', 'network'], writePaths: [args.cwd, ...(args.writeSet ?? [])] }, context);
@@ -212,8 +218,11 @@ export class RestrictedCommandRunner {
         if (!receipt.terminalConfirmed || receipt.cleanupState !== 'released') throw new AgentFault('RESOURCE_RELEASE_PENDING',
             '原命令终态待核对，已保存有界输出和原资源回执，停止自动重发，请按原动作查询',
             { ...resourceReceipt.evidence, requestId: resourceId, manualReviewRequired: true, stopAutomaticRetry: true }, receipt.mayHaveStarted === true);
-        return { ...receipt, stdout: Buffer.from(receipt.stdoutBase64, 'base64').toString('utf8'),
-            stderr: Buffer.from(receipt.stderrBase64, 'base64').toString('utf8'), coverage: {
+        const { text: stdout, ...stdoutDecoding } = decodeCommandOutput(receipt.stdoutBase64, args.outputEncoding);
+        const { text: stderr, ...stderrDecoding } = decodeCommandOutput(receipt.stderrBase64, args.outputEncoding);
+        return { ...receipt, stdout, stderr,
+            outputDecoding: { stdout: stdoutDecoding, stderr: stderrDecoding,
+                originalEncoding: 'base64', note: 'candidate为候选编码；核对程序实际编码后可直接重解原Base64字节，保留原命令回执。' }, coverage: {
                 roots: [...context.roots], include: args.writeSet ?? [], restoreSupport: 'external_untracked',
                 processEvidenceScope: receipt.processEvidenceScope,
                 unknownEffects: ['普通命令内部文件操作遵守当前任务规则，已声明写集合以外的改动不自动撤回', '联网产生的远端效果'],

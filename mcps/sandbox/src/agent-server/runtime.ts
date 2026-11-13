@@ -10,7 +10,7 @@ import type { ContentWrite, InteractionData, ReceiptKey, RetentionSweepResult, S
 import { ExecutionRegistry, SerialScheduler } from './scheduler.js';
 import { isTerminal, requireRunEpoch, transitionRun, validateBudget } from './state-machine.js';
 import { recoverRun } from './recovery.js';
-import { isStoppedUnknownWait } from './cleanup-reconciliation.js';
+import { isReleasedUnknownWait, isStoppedUnknownWait } from './cleanup-reconciliation.js';
 import { ProviderFault } from './providers/types.js';
 import type { Acceptance, NormalizedResponse, ProviderProtocol, ToolCall, ToolResult } from './providers/types.js';
 import type { HistoryPage, HistoryQuery } from './storage/port.js';
@@ -23,6 +23,9 @@ import type { ContextFailure, ExecutionLease, FrozenCompressionConfig } from './
 import { InternalChildren, childAllocation, childLinks, rememberChildChange } from './delegation/runtime-children.js';
 import { permissionConfiguration } from './security/configuration-policy.js';
 import { TemporaryCreateCommands, TEMPORARY_CLOSE_RECOVERY_MS, TEMPORARY_METADATA_SWEEP_MS } from './temporary-create-command.js';
+import { finalContextSnapshot, observationBytes, readBatch, runObservation } from './rpc-observation.js';
+import type { FinalContextSnapshot } from './rpc-observation.js';
+import { readCompressionExport, renderHistoryExport } from './rpc-history-export.js';
 
 export interface ConversationData extends Record<string, unknown> {
     conversationId: string;
@@ -50,6 +53,7 @@ export interface ConversationData extends Record<string, unknown> {
     closeCleanupCompleted: boolean;
     temporaryCreateCommandExpiresAt?: string;
     temporaryMetadataExpiresAt?: string;
+    finalContextSnapshot?: FinalContextSnapshot;
 }
 
 export interface RunData extends RunSnapshot {
@@ -305,6 +309,7 @@ export function createAgentRuntime(options: AgentRuntimeOptions = {}) {
     let approvalLedger = options.approvalLedger;
     let pendingTools = options.pendingTools;
     let accountingPort = options.accountingPort;
+    let finalContextReader: ((conversationId: string) => Promise<Record<string, unknown>>) | undefined;
     let internalChildren: InternalChildren;
     let historyReader: Pick<StorePort, 'readHistory'> = store;
     let accepting = true;
@@ -640,7 +645,12 @@ export function createAgentRuntime(options: AgentRuntimeOptions = {}) {
 
     async function endUnknownWait(conversation: StoreRecord<ConversationData>, record: StoreRecord<RunData>, command: CommandContext): Promise<RpcResult> {
         const run = record.value;
-        if (conversation.value.activeRunId !== run.runId) throw new AgentFault('INVALID_STATE', '当前会话已由另一项执行占用，请查询原执行');
+        if (conversation.value.activeRunId !== run.runId && !(conversation.value.activeRunId === null && isReleasedUnknownWait(run))) {
+            throw new AgentFault('INVALID_STATE', '当前会话已由另一项执行占用，请查询原执行');
+        }
+        if (isReleasedUnknownWait(run) && [...executionConversations.values()].includes(run.conversationId)) {
+            throw new AgentFault('RUN_BUSY', '当前会话仍有实际本地执行，保留原候选');
+        }
         if (executions.has(run.runId) || scheduled.has(run.runId) || executionConversations.has(run.runId)
             || cleanupTimers.has(run.runId) || maintenanceLeases.has(run.runId) || maintenanceCleanups.has(run.runId)
             || workspaceStops.has(run.conversationId)) throw new AgentFault('RUN_BUSY', '原执行仍有实际本地工作，暂时保留等待');
@@ -656,7 +666,8 @@ export function createAgentRuntime(options: AgentRuntimeOptions = {}) {
         if (!['no_resources_created', 'resources_released'].includes(cleanup)) {
             throw new AgentFault('CLEANUP_UNCONFIRMED', '原本地资源仍未确认释放，原结果及费用未知继续保留');
         }
-        const next = transitionRun(run, 'cancelled', { runEpoch: run.runEpoch + 1, phase: null,
+        const ending = run.state === 'paused' ? transitionRun(run, 'stopping') : run;
+        const next = transitionRun(ending, 'cancelled', { runEpoch: run.runEpoch + 1, phase: null,
             resultStatus: 'unknown', effectState: 'unknown', cleanupState: 'released', internalOwnCleanupState: 'released',
             activeInputId: null, pendingInteractionIds: [], continuationInteractionId: null, stopTarget: null,
             stopReason: 'CALLER_ENDED_UNKNOWN_WAIT', resumeRequired: false, updatedAt: timestamp(now()),
@@ -889,6 +900,12 @@ export function createAgentRuntime(options: AgentRuntimeOptions = {}) {
             } catch (error) { await recordCleanupFailure(conversationId, 'contents', error); return false; }
             for (const [subscriptionId, subscription] of subscriptions) if (subscription.conversationId === conversationId) subscriptions.delete(subscriptionId);
         } else {
+            if (finalContextReader) {
+                let status: Record<string, unknown>;
+                try { status = await finalContextReader(conversationId); }
+                catch (error) { status = { conversationId, unavailable: failure(error).error, snapshotUnavailable: true }; }
+                conversation.value.finalContextSnapshot = finalContextSnapshot(status, timestamp(now()), eventCursor(conversation.value));
+            }
             conversation.value.state = 'closed';
             conversation.value.cleanupState = 'released';
             conversation.value.cleanupError = null;
@@ -1676,6 +1693,7 @@ export function createAgentRuntime(options: AgentRuntimeOptions = {}) {
     });
 
     async function read(method: string, params: Record<string, unknown>, client: ClientIdentity): Promise<RpcResult> {
+        if (method === 'server.readBatch') return readBatch(params, client, (target, query) => read(target, query, client));
         if (method === 'conversations.prepareTemporaryCreate') return { ok: true, data: temporaryCreateCommands.issue(client, now()) };
         if (method === 'server.info') return { ok: true, data: { protocolVersion: PROTOCOL_VERSION, serverVersion: SERVER_VERSION,
             capabilities: { ...store.capabilities, executor: Boolean(executor), automaticModelExecution: false }, accepting,
@@ -1717,6 +1735,39 @@ export function createAgentRuntime(options: AgentRuntimeOptions = {}) {
             const run = await getRun(value.conversationId, String(params.runId));
             return { ok: true, data: { ...await displayedRun(run.value), revision: run.revision }, eventCursor: eventCursor(value) };
         }
+        if (method === 'runs.observe') {
+            const record = await getRun(value.conversationId, String(params.runId));
+            const run = { ...await displayedRun(record.value), revision: record.revision };
+            const snapshotCursor = eventCursor(value);
+            const afterSeq = parseEventCursor(params.afterCursor as string | undefined, value);
+            const maxBytes = Number(params.maxBytes ?? 256 * 1024);
+            const observedAt = timestamp(now());
+            const base = runObservation({ run, events: [], snapshotCursor, nextCursor: eventCursor(value, afterSeq), hasMore: false, observedAt });
+            const remaining = maxBytes - observationBytes({ ok: true, data: base, eventCursor: snapshotCursor }) - 512;
+            if (remaining < 2) throw new AgentFault('FRAME_TOO_LARGE', '执行元数据超过观察预算，请增大maxBytes');
+            const page = await store.readEvents({ conversationId: value.conversationId, afterSeq,
+                limit: Number(params.limit ?? 100), maxBytes: Math.floor(remaining / 2) });
+            const events = page.items.filter(event => BigInt(event.eventSeq) <= BigInt(value.eventSeq));
+            const nextSeq = events.at(-1)?.eventSeq ?? afterSeq;
+            const hasMore = BigInt(nextSeq) < BigInt(value.eventSeq);
+            let resultText: string | undefined;
+            let resultPartial = false;
+            if (run.resultContentId && isTerminal(run) && !hasMore) {
+                const chunk = await store.readArtifact({ conversationId: value.conversationId, artifactId: run.resultContentId,
+                    offset: 0, maxBytes: Math.max(1, Math.floor(remaining / 2)) });
+                resultPartial = !chunk.complete;
+                if (chunk.complete) {
+                    const original = JSON.parse(Buffer.from(chunk.dataBase64, 'base64').toString('utf8'));
+                    if (typeof original === 'string') resultText = original;
+                    else if (original && typeof original.text === 'string') resultText = original.text;
+                }
+            }
+            const nextCursor = eventCursor(value, nextSeq);
+            const result = { ok: true, data: runObservation({ run, events, snapshotCursor, nextCursor,
+                hasMore, observedAt, resultText, resultPartial }), eventCursor: snapshotCursor };
+            if (observationBytes(result) > maxBytes) throw new AgentFault('FRAME_TOO_LARGE', '观察页超过返回预算，请减少limit');
+            return result;
+        }
         if (method === 'runs.list' || method === 'inputs.list') {
             const page = await store.listRecords({ kind: method === 'runs.list' ? 'run' : 'input', conversationId: value.conversationId,
                 cursor: params.cursor as string | undefined, limit: Number(params.limit ?? 50) });
@@ -1731,9 +1782,37 @@ export function createAgentRuntime(options: AgentRuntimeOptions = {}) {
         if (method === 'conversations.readHistory') {
             const page = await historyReader.readHistory({ conversationId: value.conversationId, cursor: params.cursor as string | undefined,
                 limit: Number(params.limit ?? 50), maxBytes: Number(params.maxBytes ?? 256 * 1024),
+                direction: params.direction === 'backward' ? 'backward' : 'forward',
                 ...(params.startRound !== undefined ? { startRound: Number(params.startRound) } : {}),
                 ...(params.endRound !== undefined ? { endRound: Number(params.endRound) } : {}), view: 'raw', effectiveOnly: false });
             return { ok: true, data: page, eventCursor: eventCursor(value) };
+        }
+        if (method === 'conversations.export') {
+            const maxBytes = Number(params.maxBytes ?? 256 * 1024);
+            const page = await historyReader.readHistory({ conversationId: value.conversationId, cursor: params.cursor as string | undefined,
+                limit: Number(params.limit ?? 50), maxBytes: Math.max(1, Math.floor((maxBytes - 2048) / 3)), includeValues: false,
+                ...(params.startRound !== undefined ? { startRound: Number(params.startRound) } : {}),
+                ...(params.endRound !== undefined ? { endRound: Number(params.endRound) } : {}), view: 'all', effectiveOnly: false });
+            const truncatedContentIds: string[] = [];
+            let remaining = Math.floor(maxBytes / 3);
+            for (const item of page.items) {
+                if (remaining < 1) { truncatedContentIds.push(item.contentId); continue; }
+                const chunk = await store.readArtifact({ conversationId: value.conversationId, artifactId: item.contentId,
+                    offset: 0, maxBytes: Math.min(remaining, 64 * 1024) });
+                remaining -= Math.min(chunk.totalBytes, Math.min(remaining, 64 * 1024));
+                if (!chunk.complete) { truncatedContentIds.push(item.contentId); continue; }
+                item.value = JSON.parse(Buffer.from(chunk.dataBase64, 'base64').toString('utf8')) as JsonValue;
+            }
+            const snapshotCursor = eventCursor(value);
+            const data = renderHistoryExport(page, { conversationId: value.conversationId,
+                snapshotCursor, observedAt: timestamp(now()), truncatedContentIds });
+            const compression = !params.cursor ? await readCompressionExport(store, { conversationId: value.conversationId,
+                viewRevision: value.viewRevision, maxBytes: Math.max(1, Math.floor(maxBytes / 6)) }) : null;
+            const result = { ok: true, data: { ...data, compression,
+                markdown: [compression?.markdown, data.markdown].filter(Boolean).join('\n\n'),
+                partial: data.partial || compression?.partial === true }, eventCursor: snapshotCursor };
+            if (observationBytes(result) > maxBytes) throw new AgentFault('FRAME_TOO_LARGE', '可读历史页超过返回预算，请减少limit');
+            return result;
         }
         if (method === 'conversations.readArtifact') {
             const chunk = await store.readArtifact({ conversationId: value.conversationId, artifactId: String(params.artifactId),
@@ -1892,6 +1971,7 @@ export function createAgentRuntime(options: AgentRuntimeOptions = {}) {
             checkExpiry(conversation.value);
             if (conversation.value.state !== 'closed' || conversation.value.activeRunId) throw new AgentFault('INVALID_STATE', '会话未完成关闭和清理');
             conversation.value.state = 'open';
+            delete conversation.value.finalContextSnapshot;
             return commit(conversation, [], [{ type: 'conversation.reopened', payload: {} }], { ...conversation.value, revision: conversation.revision + 1 }, command);
         }
         if (method === 'runs.start' || method === 'runs.startInteractive') return startRun(conversation, command);
@@ -2328,6 +2408,10 @@ export function createAgentRuntime(options: AgentRuntimeOptions = {}) {
                 if (closed || !accepting) throw new AgentFault('INVALID_STATE', '核心关闭期间无法更换账本读取端口');
                 accountingPort = next;
             });
+        },
+        setFinalContextReader: (reader: ((conversationId: string) => Promise<Record<string, unknown>>) | undefined): void => {
+            if (closed || !accepting) throw new AgentFault('INVALID_STATE', '核心关闭期间无法更换最终上下文读取入口');
+            finalContextReader = reader;
         },
         applyRetentionSweep,
         hasActiveWork: async (): Promise<boolean> => {

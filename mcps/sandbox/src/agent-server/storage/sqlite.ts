@@ -316,6 +316,10 @@ export class SqliteStore implements StorePort {
         return this.request('accounting.usage', query);
     }
 
+    readProfileSpend(profileId: string, currency?: string): Promise<import('./profile-spend.js').ProfileSpendSummary> {
+        return this.request('accounting.profileSpend', { profileId, currency });
+    }
+
     prepareProviderAttempt(attempt: ProviderAttempt, upperBound: UpperBound): Promise<PreparedDispatch> {
         return this.request('provider.prepareAttempt', { attempt, upperBound }, true);
     }

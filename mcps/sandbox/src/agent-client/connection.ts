@@ -31,6 +31,7 @@ export class RpcConnection extends EventEmitter {
     private fragments: Buffer[] = [];
     private frameBytes = 0;
     private closed = true;
+    private retiring = false;
     private readonly decoder = new TextDecoder('utf-8', { fatal: true });
 
     constructor(readonly endpoint: string, readonly defaultTimeoutMs = 3_000) {
@@ -43,6 +44,7 @@ export class RpcConnection extends EventEmitter {
 
     async open(timeoutMs = 10_000): Promise<void> {
         if (this.connected) return;
+        this.retiring = false;
         const socket = createConnection(this.endpoint);
         this.socket = socket;
         this.closed = false;
@@ -81,7 +83,7 @@ export class RpcConnection extends EventEmitter {
     }
 
     async request<Data = unknown>(method: string, params: Record<string, unknown> = {}, options: RequestOptions = {}): Promise<RpcResult<Data>> {
-        if (!this.connected || !this.socket) throw new AgentFault('IPC_UNAVAILABLE', '控制连接尚未建立');
+        if (!this.connected || !this.socket || this.retiring) throw new AgentFault('IPC_UNAVAILABLE', '控制连接尚未建立或正在收尾');
         const id = options.id ?? randomUUID();
         if (this.pending.has(id)) throw new AgentFault('INVALID_PARAMS', '传输请求ID正在使用');
         const request: RpcRequest = { jsonrpc: '2.0', id, method, params };
@@ -99,6 +101,7 @@ export class RpcConnection extends EventEmitter {
         return new Promise<RpcResult<Data>>((resolve, reject) => {
             const timer = setTimeout(() => {
                 this.pending.delete(id);
+                this.finishRetirement();
                 reject(new AgentFault(options.writes ? 'RECEIPT_UNKNOWN' : 'IPC_TIMEOUT',
                     options.writes ? '写命令回执尚未确认，请按原命令ID查询' : '读取请求等待超时', {
                         method, timeoutMs, ...(typeof params.clientCommandId === 'string' ? { clientCommandId: params.clientCommandId } : {}),
@@ -117,6 +120,15 @@ export class RpcConnection extends EventEmitter {
 
     close(): void {
         this.fail(new AgentFault('IPC_UNAVAILABLE', '客户端已断开控制连接'));
+    }
+
+    retire(): void {
+        this.retiring = true;
+        this.finishRetirement();
+    }
+
+    private finishRetirement(): void {
+        if (this.retiring && this.pending.size === 0) this.close();
     }
 
     private receive(chunk: Buffer): void {
@@ -181,6 +193,7 @@ export class RpcConnection extends EventEmitter {
                 method: pending.method,
             }, pending.writes));
         }
+        this.finishRetirement();
     }
 
     private fail(error: AgentFault): void {

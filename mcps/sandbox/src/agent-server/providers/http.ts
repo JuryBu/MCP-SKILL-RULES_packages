@@ -4,6 +4,7 @@ import { objectValue, stringValue } from './assemble.js';
 import { normalizeProgrokUsage, normalizeUsage } from '../accounting/usage.js';
 import { ProviderFault } from './types.js';
 import { createProviderNetwork, ProviderNetworkError } from './network.js';
+import { SANDBOX_AGENT_USER_AGENT } from './request-identity.js';
 import type { ProviderNetwork, ProviderNetworkOptions } from './network.js';
 import type { HttpRequest, HttpResponse, HttpTransport, ProviderAttempt, ProviderProtocol, RawProviderResponse, TransportCause, TransportPhase } from './types.js';
 
@@ -104,7 +105,9 @@ export class FetchTransport implements HttpTransport {
             if (Date.now() >= deadlineAt) throw new ProviderFault('E_DEADLINE', '网络准备完成前已到请求期限', { acceptance: 'not_sent', transportPhase });
             transportPhase = 'fetch_invoked';
             try { request.onPhase?.(transportPhase, { route: network.routeFor(request.url) }); } catch {}
-            const response = await network.fetch(request.url, { method: request.method, headers: request.headers,
+            const outgoingHeaders = { ...Object.fromEntries(Object.entries(request.headers).filter(([name]) => name.toLowerCase() !== 'user-agent')),
+                'User-Agent': SANDBOX_AGENT_USER_AGENT };
+            const response = await network.fetch(request.url, { method: request.method, headers: outgoingHeaders,
                 body: request.body, signal: controller.signal, redirect: 'error' });
             status = response.status;
             response.headers.forEach((value, name) => {
@@ -200,6 +203,17 @@ function modelUnavailableReason(httpStatus: number, native: JsonObject | null): 
     return undefined;
 }
 
+function providerPolicyReason(httpStatus: number, native: JsonObject | null): string | undefined {
+    if (![400, 403, 451].includes(httpStatus) || !native) return undefined;
+    const code = `${stringValue(native.code) ?? ''} ${stringValue(native.type) ?? ''}`;
+    const message = (stringValue(native.message) ?? '').slice(0, 4096);
+    if (/unsupported_country|region_restricted|country_region_territory|geographic_restriction|location_not_supported/i.test(code)
+        || /(?:not (?:available|supported)|unavailable|restricted|blocked).{0,80}(?:your (?:region|country|location)|(?:in|from) (?:this|your|the current) (?:region|country|location))|(?:your (?:region|country|location)|(?:current|account) region).{0,80}(?:not supported|restricted|blocked|unavailable)/i.test(message)) {
+        return 'provider_region_restriction';
+    }
+    return undefined;
+}
+
 export function responseUsage(protocol: ProviderProtocol, json: JsonObject): import('../accounting/usage.js').NormalizedUsage {
     return protocol === 'progrok' ? normalizeProgrokUsage(json.usage)
         : normalizeUsage(protocol, protocol === 'gemini' ? json.usageMetadata : json.usage);
@@ -244,14 +258,16 @@ export function decodeResponse(response: HttpResponse, protocol?: ProviderProtoc
     const quota = httpStatus === 402 || /insufficient_quota|insufficient_balance|billing_hard_limit|quota_exceeded|credit_balance_exhausted|(?:organization|project)_(?:spend|usage)_limit_exceeded/i.test(nativeCode ?? '');
     const retryAfterMs = parseRetryAfter(response.headers['retry-after']);
     const temporary = !quota && knownTemporaryRejection(protocol, endpoint, httpStatus, nativeCode, native, retryAfterMs);
-    const nativeReason = modelUnavailableReason(httpStatus, native);
-    const code = quota ? 'E_QUOTA' : nativeReason ? 'E_MODEL_UNAVAILABLE' : [401, 403].includes(httpStatus) ? 'E_AUTH' : httpStatus === 429 ? 'E_RATE_LIMIT' : temporary ? 'E_PROVIDER_TEMPORARY'
+    const policyReason = providerPolicyReason(httpStatus, native);
+    const nativeReason = policyReason ?? modelUnavailableReason(httpStatus, native);
+    const code = quota ? 'E_QUOTA' : policyReason ? 'E_PROVIDER_POLICY' : nativeReason ? 'E_MODEL_UNAVAILABLE' : [401, 403].includes(httpStatus) ? 'E_AUTH' : httpStatus === 429 ? 'E_RATE_LIMIT' : temporary ? 'E_PROVIDER_TEMPORARY'
         : [400, 404, 405, 413, 422].includes(httpStatus) ? 'E_PARAMETER_INVALID' : 'E_RESULT_UNKNOWN';
     const executionEvidence = json.usage != null || json.usageMetadata != null
         || (Array.isArray(json.output) && json.output.length > 0) || (Array.isArray(json.candidates) && json.candidates.length > 0)
         || (Array.isArray(json.choices) && json.choices.length > 0);
-    const rejected = !executionEvidence && ([400, 401, 402, 403, 404, 405, 410, 413, 422].includes(httpStatus) || temporary) && native !== null;
-    const summary = nativeReason === 'model_unavailable_for_new_users' ? '供应商当前未向新用户提供所选模型，请核对账户可用性与目录'
+    const rejected = !executionEvidence && ([400, 401, 402, 403, 404, 405, 410, 413, 422, 451].includes(httpStatus) || temporary) && native !== null;
+    const summary = policyReason ? '供应商限制了当前账号或地区的访问，请在服务商控制台核对地区与账号条件'
+        : nativeReason === 'model_unavailable_for_new_users' ? '供应商当前未向新用户提供所选模型，请核对账户可用性与目录'
         : nativeReason === 'model_account_access_unavailable' ? '当前账户或项目无权使用所选模型，请核对账户可用性'
         : nativeReason ? '供应商未找到所选模型或不支持该模型操作，请核对最新目录与账户可用性' : '供应商请求未成功';
     throw new ProviderFault(code, `${summary}（HTTP ${httpStatus}），原始响应已保留`,

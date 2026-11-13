@@ -4,6 +4,7 @@ import { normalizeUsage } from '../accounting/usage.js';
 import { arrayObjects, assembleResponse, checkToolResults, freezeOwned, gateDeclaredTools, immutableJson, mediaBlock, objectValue, requireRoute, stringValue, validateTools, verifySnapshot } from './assemble.js';
 import { attemptTimeout, decodeResponse, endpointUrl } from './http.js';
 import { requestProviderResponse } from './streaming.js';
+import { providerRequestHeaders } from './request-identity.js';
 import type { DiscoveryPage, NativeBlock, NativeSendView, NormalizedResponse, ProviderAdapter, ProviderAttempt, ProviderProfile, RawProviderResponse, RequestSnapshot, SendContext, StopKind, ToolCall, ToolResult } from './types.js';
 
 const reserved = new Set(['model', 'messages', 'input', 'contents', 'tools', 'stream', 'system', 'headers']);
@@ -91,7 +92,8 @@ export class AnthropicAdapter implements ProviderAdapter {
         url.searchParams.set('limit', String(profile.discovery.pageSize));
         if (cursor) url.searchParams.set('after_id', cursor);
         const raw = decodeResponse(await context.transport.request({ method: 'GET', url: url.href, timeoutMs: 10_000, maxResponseBytes: 4 * 1024 * 1024,
-            headers: { 'anthropic-version': '2023-06-01', ...(context.credential ? { 'x-api-key': context.credential } : {}) } }, signal));
+            headers: providerRequestHeaders(profile, { 'anthropic-version': '2023-06-01', ...(context.credential ? { 'x-api-key': context.credential } : {}) },
+                { purpose: 'catalog', conversationId: context.conversationId }) }, signal));
         if (!Array.isArray(raw.json.data) || raw.json.data.some(value => !objectValue(value))) throw new AgentFault('E_CATALOG_INCOMPLETE', 'Anthropic模型目录缺少完整data数组');
         const hasMore = raw.json.has_more === true;
         const nextCursor = hasMore ? stringValue(raw.json.last_id) : null;

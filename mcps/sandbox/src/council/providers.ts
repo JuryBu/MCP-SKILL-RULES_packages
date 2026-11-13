@@ -2,7 +2,9 @@ import fs from "fs";
 import os from "os";
 import path from "path";
 import { randomUUID } from "node:crypto";
-import { callGetModelResponseDetailed } from "../ls-client.js";
+import { callGetModelResponseDetailed, resolveAntigravityCliModel } from "../ls-client.js";
+import { AntigravityCallError, readAntigravityCatalogFixture } from "../antigravity-model-catalog.js";
+import { runAntigravityAgentCli } from "../antigravity-agent-cli.js";
 import { callCodexText } from "../model-bridge.js";
 import { callClaudeCodeText, claudeCodeOptionsFromParams } from "../claude-code-bridge.js";
 import { callProgrokAPI } from "../grok-bridge.js";
@@ -71,10 +73,10 @@ function getCompatibleAntigravityCliModelEnv(primary: string, legacy: string, fa
 const DEFAULT_ANTIGRAVITY_CLI_MODEL = getCompatibleAntigravityCliModelEnv(
     "SANDBOX_COUNCIL_ANTIGRAVITY_CLI_MODEL",
     "SANDBOX_COUNCIL_GEMINI_CLI_MODEL",
-    "Gemini 3.1 Pro (High)",
+    "default",
 );
 const DEFAULT_CLAUDE_CODE_MODEL = process.env.SANDBOX_COUNCIL_CLAUDE_CODE_MODEL || process.env.SANDBOX_CLAUDE_CODE_MODEL || "sonnet";
-const DEFAULT_ANTIGRAVITY_MODEL = process.env.SANDBOX_COUNCIL_ANTIGRAVITY_MODEL || process.env.SANDBOX_LS_MODEL || "MODEL_PLACEHOLDER_M132";
+const DEFAULT_ANTIGRAVITY_MODEL = process.env.SANDBOX_COUNCIL_ANTIGRAVITY_MODEL || process.env.SANDBOX_LS_MODEL || "default";
 const DEFAULT_CODEX_MODEL = "gpt-5.4";
 const DEFAULT_CODEX_MINI_MODEL = "gpt-5.4-mini";
 const DEFAULT_GROK_MODEL = process.env.SANDBOX_COUNCIL_GROK_MODEL || process.env.SANDBOX_PROGROK_MODEL || "grok-4.5";
@@ -373,6 +375,7 @@ function getDefaultFallbackConfigs(config: CouncilModelConfig): CouncilModelConf
     config = normalizeCouncilModelConfig(config);
     if (config.provider === "antigravityCli") {
         if (!DEFAULT_ANTIGRAVITY_CLI_FALLBACKS_ENABLED) return [];
+        if (readAntigravityCatalogFixture()) return [];
         const model = getDefaultModel(config);
         const baseParams = withoutFallbackParams(config.params) || {};
         const chain = getCompatibleAntigravityCliModelEnv(
@@ -531,6 +534,7 @@ async function withSourceLimit<T>(config: CouncilModelConfig, fn: () => Promise<
 }
 
 function isRetryableError(err: unknown): boolean {
+    if (err instanceof AntigravityCallError) return err.retryable;
     if (err instanceof ProviderFault && (err.acceptance === "accepted" || err.acceptance === "unknown")) return false;
     if (err && typeof err === "object") {
         const providerErr = err as ProviderError;
@@ -576,6 +580,7 @@ async function withRetry<T>(config: CouncilModelConfig, fn: () => Promise<T>): P
         }
     }
     const message = lastErr instanceof Error ? lastErr.message : String(lastErr);
+    if (lastErr instanceof AntigravityCallError) throw lastErr;
     if (lastErr instanceof ProviderFault) throw lastErr;
     const wrapped = new Error(retries > 0 ? `${message} (attempts=${attempts}/${retries + 1})` : message) as ProviderError;
     wrapped.retryable = isRetryableError(lastErr);
@@ -810,16 +815,19 @@ function buildAntigravityCliScript(promptPath: string, artifactPath: string, mod
     const prompt = `Read and follow the full UTF-8 instructions in ${promptPath}. Write the final sandbox_council response to ${artifactPath}. Do not print the full response to stdout.`;
     return [
         `$prompt = ${psSingleQuoted(prompt)}`,
-        `& ${psSingleQuoted(command)} -p $prompt --dangerously-skip-permissions --model ${psSingleQuoted(model)}${addDirs.map((dir) => ` --add-dir ${psSingleQuoted(dir)}`).join("")}`,
+        `& ${psSingleQuoted(command)} -p $prompt --dangerously-skip-permissions${model ? ` --model ${psSingleQuoted(model)}` : ""}${addDirs.map((dir) => ` --add-dir ${psSingleQuoted(dir)}`).join("")}`,
         "exit $LASTEXITCODE",
     ].join("\n");
 }
 
 function createAntigravityCliError(message: string): ProviderError {
-    const error = new Error(redactSensitiveText(message)) as ProviderError;
-    error.retryable = /model capacity|RESOURCE_EXHAUSTED|MODEL_CAPACITY_EXHAUSTED|timeout|超时|未返回文本|未找到新旧响应标记|未写入响应文件|调用失败 exit=/iu.test(message)
-        && !/authentication|required|workspace path rejected|terminal attachment|not recognized|not found/iu.test(message);
-    return error;
+    const quota = /model capacity|RESOURCE_EXHAUSTED|MODEL_CAPACITY_EXHAUSTED|quota/iu.test(message);
+    const auth = /authentication required|not logged|认证|未登录/iu.test(message);
+    const notStarted = /command not found|not recognized|ENOENT|workspace path rejected|terminal attachment/iu.test(message);
+    const timedOut = /timeout|超时/iu.test(message);
+    return new AntigravityCallError(redactSensitiveText(message), { transport: "cli-agent", submitted: !notStarted,
+        outcomeUnknown: !notStarted && !quota && !auth, safeToFallback: notStarted,
+        kind: notStarted ? "not-started" : auth ? "auth-required" : quota ? "quota-exhausted" : timedOut ? "timeout-unknown" : "transport-unknown" });
 }
 
 async function callAntigravityCliText(
@@ -831,7 +839,12 @@ async function callAntigravityCliText(
     runId?: string,
 ): Promise<ProviderCallResult> {
     assertProviderNotAborted(signal);
-    const model = getDefaultModel(config);
+    const deadline = Date.now() + timeoutMs;
+    signal = signal ? AbortSignal.any([signal, AbortSignal.timeout(Math.max(1, timeoutMs))]) : AbortSignal.timeout(Math.max(1, timeoutMs));
+    if (imagePaths.length && !config.supportsVision) throw new AntigravityCallError("Antigravity 图片请求需要显式启用 supportsVision，尚未提交请求",
+        { transport: "cli-agent", submitted: false, outcomeUnknown: false, safeToFallback: false, kind: "rejected" });
+    loadImages(imagePaths, Boolean(config.supportsVision), config.provider);
+    const model = await resolveAntigravityCliModel(getDefaultModel(config), signal, deadline);
     const command = getStringParam(config.params, "command") || getStringParam(config.params, "cli") || getCompatibleEnv(
         "SANDBOX_COUNCIL_ANTIGRAVITY_CLI_COMMAND",
         "SANDBOX_COUNCIL_GEMINI_CLI_COMMAND",
@@ -853,7 +866,11 @@ async function callAntigravityCliText(
     fs.writeFileSync(promptPath, promptFile, "utf-8");
     try {
         const childEnvironment = buildAntigravityCliEnvironment();
-        const result = await withAntigravityCliLease(signal, async () => await spawnPowerShellScript(
+        const result = await withAntigravityCliLease(signal, async () => {
+            const remaining = deadline - Date.now();
+            if (remaining <= 0) throw new AntigravityCallError("Antigravity CLI 等待租约时用完总期限",
+                { transport: "cli-agent", submitted: false, outcomeUnknown: false, safeToFallback: false, kind: "not-started" });
+            return await runAntigravityAgentCli(
             buildAntigravityCliScript(promptPath, artifactPath, model, command, [...new Set([
                 path.dirname(promptPath),
                 path.dirname(artifactPath),
@@ -861,29 +878,28 @@ async function callAntigravityCliText(
             ])]),
             cwd,
             `${base}.run`,
-            { timeoutMs, signal, env: childEnvironment.env, diagnostics: childEnvironment.diagnostics, earlyFailure: getEarlyCliFailureReason },
-        ));
-        if (result.aborted) throw makeProviderAbortError();
+            { timeoutMs: remaining, signal, env: childEnvironment.env, diagnostics: childEnvironment.diagnostics, earlyFailure: getEarlyCliFailureReason },
+        ); });
+        if (result.aborted) throw new AntigravityCallError("Antigravity CLI 调用已取消，保留原请求状态",
+            { transport: "cli-agent", submitted: true, outcomeUnknown: true, safeToFallback: false, kind: signal.reason?.name === "TimeoutError" ? "timeout-unknown" : "cancelled" });
         if (result.earlyFailureReason) {
             const stderr = readClip(result.stderrPath, 1200).trim();
             throw createAntigravityCliError(`${result.earlyFailureReason}${stderr ? `: ${stderr}` : ""}`);
         }
         if (result.timedOut) {
-            try {
-                const text = readAntigravityCliArtifact(artifactPath);
-                return { provider: config.provider, model, text };
-            } catch {
-                // Fall through to the timeout error with stdout/stderr paths.
-            }
             throw createAntigravityCliError(`Antigravity CLI 调用超时 (${timeoutMs}ms) stdout=${redactSensitiveText(result.stdoutPath)} stderr=${redactSensitiveText(result.stderrPath)}`);
         }
-        if (result.exitCode !== 0 && !fs.existsSync(artifactPath)) {
+        if (result.exitCode !== 0) {
             const stderr = readClip(result.stderrPath, 1200).trim();
             const failureReason = getEarlyCliFailureReason(stderr);
             throw createAntigravityCliError(`${failureReason || `Antigravity CLI 调用失败 exit=${result.exitCode}`}${stderr ? `: ${stderr}` : ""}`);
         }
-        const text = readAntigravityCliArtifact(artifactPath);
-        return { provider: config.provider, model, text };
+        let text: string;
+        try { text = readAntigravityCliArtifact(artifactPath); } catch (error) {
+            throw createAntigravityCliError(error instanceof Error ? error.message : String(error));
+        }
+        return { provider: config.provider, model: model || "cli-default", text,
+            metadata: { transport: "cli-agent", submitted: true, outcomeUnknown: false, safeToFallback: false, kind: "success" } };
     } finally {
         if (runId) {
             for (const artifact of [promptPath, artifactPath, `${base}.run.ps1`, `${base}.run.stdout.txt`, `${base}.run.stderr.txt`]) {
@@ -921,6 +937,8 @@ export async function callCouncilModel(
         return councilApiResult(config.provider, response.modelId ?? config.model ?? "profile-default", response, runId);
     }
     const candidates = [config, ...getFallbackConfigs(config)].map(normalizeCouncilModelConfig);
+    const antigravityDeadline = config.provider === "antigravity" || config.provider === "antigravityCli"
+        ? Date.now() + (getNumberParam(config.params, "timeoutMs") ?? getNumberParam(config.params, "modelTimeoutMs") ?? timeoutMs) : undefined;
     const errors: string[] = [];
     for (let index = 0; index < candidates.length; index++) {
         const candidate = candidates[index];
@@ -930,7 +948,10 @@ export async function callCouncilModel(
         try {
             return await withSourceLimit(candidate, () => withRetry(candidate, () => {
                 assertProviderNotAborted(signal);
-                return callCouncilModelOnce(candidate, prompt, imagePaths, candidateTimeoutMs, signal, runId);
+                const remaining = antigravityDeadline === undefined ? candidateTimeoutMs : Math.min(candidateTimeoutMs, antigravityDeadline - Date.now());
+                if (remaining <= 0) throw new AntigravityCallError("Antigravity 调用总期限已用完",
+                    { submitted: false, outcomeUnknown: false, safeToFallback: false, kind: "not-started" });
+                return callCouncilModelOnce(candidate, prompt, imagePaths, remaining, signal, runId);
             }));
         } catch (err) {
             const message = err instanceof Error ? err.message : String(err);
@@ -962,12 +983,19 @@ async function callCouncilModelOnce(
     const images = loadImages(imagePaths, Boolean(config.supportsVision), config.provider);
 
     if (config.provider === "antigravity") {
-        const result = await callGetModelResponseDetailed(model, prompt, timeoutMs);
-        if (result.text) return { provider: config.provider, model, text: result.text };
-        const err = new Error(result.error || "Antigravity LS 模型调用失败") as ProviderError;
-        err.timedOut = result.timedOut === true;
-        err.retryable = err.timedOut;
-        throw err;
+        if (imagePaths.length) {
+            if (!config.supportsVision) throw new AntigravityCallError("Antigravity 图片请求需要显式启用 supportsVision，尚未提交请求",
+                { submitted: false, outcomeUnknown: false, safeToFallback: false, kind: "rejected" });
+            return await callAntigravityCliText({ ...config, provider: "antigravityCli" }, prompt, imagePaths, timeoutMs, signal, runId);
+        }
+        const result = await callGetModelResponseDetailed(model, prompt, timeoutMs, signal);
+        if (result.text) return { provider: config.provider, model: result.model || model, text: result.text,
+            metadata: { transport: result.transport, submitted: result.submitted, outcomeUnknown: result.outcomeUnknown,
+                safeToFallback: result.safeToFallback, kind: result.kind } };
+        throw new AntigravityCallError(result.error || "Antigravity LS 模型调用失败", {
+            transport: result.transport, model: result.model, submitted: result.submitted === true,
+            outcomeUnknown: result.outcomeUnknown === true, safeToFallback: result.safeToFallback === true, kind: result.kind || "not-started",
+        }, { cause: result });
     }
 
     if (config.provider === "codex") {

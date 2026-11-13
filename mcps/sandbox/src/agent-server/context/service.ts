@@ -1,5 +1,5 @@
 import { setTimeout as waitForAppend } from 'node:timers/promises';
-import { canonicalJson } from '../protocol.js';
+import { AgentFault, canonicalJson } from '../protocol.js';
 import type { JsonObject, JsonValue } from '../protocol.js';
 import type { ExecutorContext } from '../runtime.js';
 import type { ExecutionPlan, PreparedExecutionView } from '../execution.js';
@@ -14,7 +14,9 @@ import { hashBytes, hashContext, validateContextPolicy } from './config.js';
 import { checkAbort, ContextFault } from './errors.js';
 import { hasNativeSignature, renderSummaryView } from './view.js';
 import { estimateNativeTextView, validateContextEstimateForView } from './input-estimate.js';
-import { appendNativeHistoryView, freezeNativeHistoryView } from './native-view-build.js';
+import { freezeNativeHistoryView } from './native-view-build.js';
+import { appendTransferredHistory, preflightHistoryTransfer, validateHistoryTransferBoundary } from '../providers/history-transfer.js';
+import type { HistoryExchange, HistoryTransfer } from '../providers/history-transfer.js';
 import { historicalToolGroup } from './history-tool-outcomes.js';
 import type { HistoricalToolResultResolver } from './history-tool-outcomes.js';
 import type { NativeHistoryAdapter } from './native-view-build.js';
@@ -64,6 +66,8 @@ export interface ContextBuildViewInput {
     injectSummary?: (view: NativeSendView, text: string) => NativeSendView | Promise<NativeSendView>;
     readItem?: (item: HistoryItem, bounds: { maxReadBytes: number; signal: AbortSignal }) => Promise<JsonValue>;
     nativeCompatible?: (source: { protocol: string; model: string | null; signed: boolean }, target: { protocol: string; model: string }) => boolean;
+    targetEndpoint?: string;
+    resolveHistoryIdentity?: (item: HistoryItem, response: NormalizedResponse) => Promise<{ modelId: string | null; endpoint?: string }>;
     estimateView?: ContextViewEstimator;
     compression?: Omit<ContextStepInput, 'conversationId' | 'estimate'>;
     readTailReuse?: 'offer' | 'consume';
@@ -90,6 +94,7 @@ export interface ContextBuildViewResult {
     estimate: ContextEstimate;
     nativeReplayHash: string;
     attachmentManifestHash: string;
+    historyTransferProvenance: HistoryTransfer['provenance'][];
     history: { historyEpoch: number; appendSeq: number; viewRevision: number; firstSeq: number | null; lastSeq: number | null;
         loadedItems: number; pages: number; completeTail: true };
     summary: { coveredEndSeq: number; textHash: string; tokens: number };
@@ -400,11 +405,13 @@ export class ContextService {
         const rawTail = selected.reverse();
         const attachmentManifest: { itemId: string; objectHash: string; references?: JsonValue; nativeMedia?: JsonValue }[] = [];
         let view = await (input.injectSummary ?? injectSummaryText)(structuredClone(input.baseView), rendered.text);
+        const historyTransferProvenance: HistoryTransfer['provenance'][] = [];
         let pending: { item: HistoryItem; content: Record<string, unknown>; response: NormalizedResponse; results: ToolResult[] } | null = null;
         const flush = async (finalTail = false) => {
             if (!pending) return;
             const { item, content, response, results } = pending;
             if (!response.complete || !Array.isArray(response.replayMessages)) throw new ContextFault('NATIVE_PAIRING', '历史模型往返缺少完整原生replayMessages', { itemId: item.itemId });
+            let nativeResults: ToolResult[] = [];
             if (response.toolCalls.length) {
                 const group = input.resolveHistoricalToolResults
                     ? historicalToolGroup(input.conversationId, item, content, response, results, input.context.signal) : null;
@@ -428,13 +435,32 @@ export class ContextService {
                     }
                     stableResults.push((previous ?? await this.options.preserveToolResult(identity, result)).sent);
                 }
-                const nativeResults = input.renderToolResults ? await input.renderToolResults(view, stableResults) : stableResults;
-                view = appendNativeHistoryView(input.adapter, view, response, nativeResults);
+                nativeResults = input.renderToolResults ? await input.renderToolResults(view, stableResults) : stableResults;
             }
             else {
                 if (results.length) throw new ContextFault('NATIVE_PAIRING', '无工具调用的原生响应带了工具结果');
-                view = appendMessages(view, response.replayMessages);
             }
+            const identity = input.resolveHistoryIdentity ? await input.resolveHistoryIdentity(item, response)
+                : { modelId: typeof content.requestModelId === 'string' ? content.requestModelId : response.modelId,
+                    ...(typeof content.requestEndpoint === 'string' ? { endpoint: content.requestEndpoint } : {}) };
+            const sourceProtocol = typeof content.protocol === 'string' ? content.protocol : item.providerProtocol ?? '';
+            if (!['compatible_chat', 'progrok', 'gemini', 'anthropic', 'openai_responses'].includes(sourceProtocol)) {
+                throw new ContextFault('PROTOCOL_INCOMPATIBLE', '历史原生协议缺少可核实的发送适配', { itemId: item.itemId, sourceProtocol });
+            }
+            const exchange: HistoryExchange = { itemId: item.itemId, sourceProtocol: sourceProtocol as HistoryExchange['sourceProtocol'],
+                sourceModelId: identity.modelId, ...(identity.endpoint ? { sourceEndpoint: identity.endpoint } : {}), response, results: nativeResults };
+            const target = { protocol: input.adapter.protocol, modelId: input.modelId, ...(input.targetEndpoint ? { endpoint: input.targetEndpoint } : {}) };
+            const preflight = preflightHistoryTransfer([exchange], target);
+            if (!preflight.allowed) throw new AgentFault(preflight.issues[0].code, preflight.issues[0].reason,
+                { target: preflight.target, issues: preflight.issues, checkedItems: preflight.checkedItems });
+            if (input.nativeCompatible && !input.nativeCompatible({ protocol: sourceProtocol, model: identity.modelId,
+                signed: hasNativeSignature(response.replayMessages) || response.blocks.some(block => typeof block.thoughtSignature === 'string') },
+            { protocol: input.adapter.protocol, model: input.modelId })) {
+                throw new ContextFault('PROTOCOL_INCOMPATIBLE', '调用方的历史兼容检查尚未通过', { itemId: item.itemId });
+            }
+            const transferred = appendTransferredHistory(input.adapter, view, exchange, input.modelId, input.targetEndpoint);
+            view = transferred.view;
+            historyTransferProvenance.push(transferred.provenance);
             pending = null;
         };
         for (const item of rawTail) {
@@ -453,12 +479,6 @@ export class ContextService {
                 const nativeMedia = response.blocks.filter(block => ['image', 'audio', 'video', 'file', 'native_unknown'].includes(block.type))
                     .map(block => ({ type: block.type, nativeRef: block.nativeRef, sha256: block.sha256 ?? null, mime: block.mime ?? null, uri: block.uri ?? null }));
                 if (nativeMedia.length) attachmentManifest.push({ itemId: item.itemId, objectHash: item.objectRef.hash, nativeMedia });
-                const source = { protocol: typeof content.protocol === 'string' ? content.protocol : item.providerProtocol ?? '',
-                    model: response.modelId, signed: hasNativeSignature(response.replayMessages) || response.blocks.some(block => typeof block.thoughtSignature === 'string') };
-                const target = { protocol: input.adapter.protocol, model: input.modelId };
-                const compatible = input.nativeCompatible ? input.nativeCompatible(source, target)
-                    : source.protocol === target.protocol && (!source.signed || source.model === target.model);
-                if (!compatible) throw new ContextFault('PROTOCOL_INCOMPATIBLE', '历史原生响应协议或签名模型需要兼容确认', { itemId: item.itemId });
                 pending = { item, content: content!, response, results: [] };
             } else if (content?.kind === 'tool' && objectValue(content.result)) {
                 if (!pending || pending.item.stepId !== item.stepId || pending.item.roundId !== item.roundId) {
@@ -468,6 +488,7 @@ export class ContextService {
             } else throw new ContextFault('PROTOCOL_INCOMPATIBLE', '历史项目缺少可重放的原生类型', { itemId: item.itemId, kind: item.kind });
         }
         await flush(true);
+        validateHistoryTransferBoundary(view, historyTransferProvenance);
         const dynamic = typeof input.dynamicContext === 'function' ? await input.dynamicContext() : input.dynamicContext;
         if (dynamic) view = appendDynamicContext(view, dynamic);
         if (Buffer.byteLength(canonicalJson(view)) > maxViewBytes) throw new ContextFault('INPUT_BUDGET', '完整原生发送视图超过明确内存预算', { maxViewBytes });
@@ -480,6 +501,7 @@ export class ContextService {
             history: metadata, pages: capturedPages, values, bytes: capturedPageBytes + restoredSourceBytes });
         return { view, estimate, nativeReplayHash: hashContext(rawTail.map(item => [item.itemId, item.objectRef.hash])),
             attachmentManifestHash: hashContext(attachmentManifest),
+            historyTransferProvenance,
             history: { ...metadata, firstSeq: rawTail[0]?.seq ?? null, lastSeq: rawTail.at(-1)?.seq ?? null, loadedItems: rawTail.length, pages, completeTail: true },
             summary: { coveredEndSeq, textHash: rendered.hash, tokens: rendered.tokens } };
     }

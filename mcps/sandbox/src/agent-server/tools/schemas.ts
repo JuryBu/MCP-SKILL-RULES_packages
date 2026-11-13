@@ -44,7 +44,7 @@ export const localArgumentSchemas = {
     run_command: z.object({ application: filePath, args: z.array(z.string().max(32768)).max(256).default([]), cwd: filePath,
         stdin: z.string().max(16384).optional(), timeoutMs: z.number().int().min(100).max(3600000).default(30000),
         maxMemoryMB: z.number().int().min(16).max(4096).default(256), maxOutputBytes: z.number().int().min(1024).max(1048576).default(262144),
-        writeSet: z.array(filePath).max(200).optional() }).strict(),
+        writeSet: z.array(filePath).max(200).optional(), outputEncoding: z.enum(['auto', 'utf8', 'gb18030', 'utf16le']).optional() }).strict(),
     tool_catalog: z.object({ query: z.string().max(256).optional(), cursor: z.string().max(32).optional(),
         limit: z.number().int().min(1).max(100).default(24) }).strict(),
     tool_describe: z.object({ name: z.string().min(1).max(256) }).strict(),
@@ -73,14 +73,16 @@ export const MODEL_FUNCTION_SCHEMAS: readonly ModelFunctionSchema[] = [
         parameters: { type: 'object', additionalProperties: false, required: ['path'], properties: {
             path: stringPath, limit: { type: 'integer', minimum: 1, maximum: 200 }, cursor: { type: 'string' },
         } } },
-    { type: 'function', name: 'run_command', description: '执行普通程序及明确参数，工作目录和声明写集合须在获准工作区；遵守当前任务规则，不得读取控制凭据或修改控制文件。危险动作先交主调用方批准。Windows Job限制整树内存、超时和输出，取消或结束回收派生进程；命中本机禁止操作时暂停并停止自动重试。',
+    { type: 'function', name: 'run_command', description: '执行普通程序及明确参数，工作目录和声明写集合须在获准工作区；遵守当前任务规则，不得读取控制凭据或修改控制文件。危险动作先交主调用方批准。Windows Job限制整树内存、超时和输出，取消或结束回收派生进程；命中本机禁止操作时暂停并停止自动重试。输出保留原始Base64及解码来源，候选编码按outputDecoding核对。PATH查询覆盖当前进程PATH，查询已安装环境可用tool_catalog(query=environment)发现sandbox_status。',
         parameters: { type: 'object', additionalProperties: false, required: ['application', 'cwd'], properties: {
             application: stringPath, args: { type: 'array', items: { type: 'string' }, maxItems: 256 }, cwd: stringPath,
             stdin: { type: 'string' }, timeoutMs: { type: 'integer', minimum: 100, maximum: 3600000 },
             maxMemoryMB: { type: 'integer', minimum: 16, maximum: 4096 }, maxOutputBytes: { type: 'integer', minimum: 1024, maximum: 1048576 },
             writeSet: { type: 'array', items: stringPath, maxItems: 200, description: '已知会修改的文件，未覆盖效果在回执中单列' },
+            outputEncoding: { type: 'string', enum: ['auto', 'utf8', 'gb18030', 'utf16le'],
+                description: 'auto先严格UTF-8，Windows旧编码作为候选并标明来源；已知程序编码时明确选择，原始Base64保留' },
         } } },
-    { type: 'function', name: 'tool_catalog', description: '分页查找本任务可用的本地及共享MCP工具短目录；query按名称、服务和用途匹配，不加载参数定义，也不调用外部模型。先查目录，再按需tool_describe或tool_load。',
+    { type: 'function', name: 'tool_catalog', description: '分页查找本任务可见的本地及共享MCP工具短目录；query按名称、服务、用途和中英别名匹配，无匹配时自动回退完整可见目录的有界页，沿nextCursor继续。不加载参数定义，也不调用外部模型。schema_pending表示已配置待核，按需tool_describe或tool_load核对，实际可发布选择见publication。',
         parameters: { type: 'object', additionalProperties: false, properties: {
             query: { type: 'string', maxLength: 256, description: '可选的名称、服务或用途关键词' },
             cursor: { type: 'string', maxLength: 32 }, limit: { type: 'integer', minimum: 1, maximum: 100 },

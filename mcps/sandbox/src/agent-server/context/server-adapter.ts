@@ -13,6 +13,7 @@ import { ProviderFault } from '../providers/types.js';
 import type { UpperBound } from '../accounting/budget-ledger.js';
 import type { PersistedProviderAttempt } from '../storage/provider-journal.js';
 import { StoreCompactionPort } from '../storage/context-port.js';
+import { modelStepPairing } from '../storage/model-step-pairing.js';
 import { assertContextDispatchFence, contextCandidateKey, contextContent, contextRootBudgetId, contextRunKey, contextStateKey, ContextTransactions, nextContextRecord } from '../storage/context-transactions.js';
 import type { ContextCandidateData, ContextStateData } from '../storage/context-transactions.js';
 import { ContextService, appendPlainUser, injectSummaryText } from './service.js';
@@ -399,7 +400,18 @@ export function createContextServerAdapter(options: ContextServerAdapterOptions)
         const value = Reflect.get(target, property, target);
         return typeof value === 'function' ? value.bind(target) : value;
     } });
-    const compactionPort = new StoreCompactionPort(controlStore, { now, maxCachedConversations: maximumConversations });
+    const compactionPort: StoreCompactionPort & Required<Pick<import('./contracts.js').CompactionPort, 'readSemanticNodes' | 'readModelStepPairings'>> = Object.assign(
+        new StoreCompactionPort(controlStore, { now, maxCachedConversations: maximumConversations }), {
+        readSemanticNodes: async (conversationId: string) => {
+            const capture = await compactionPort.inspect(conversationId);
+            return { historyEpoch: capture.historyEpoch, viewRevision: capture.viewRevision, nodes: capture.view.nodes };
+        },
+        readModelStepPairings: async (query: import('../storage/port.js').ModelStepPairingQuery) => {
+            if (controlStore.readModelStepPairings) return controlStore.readModelStepPairings(query);
+            return Promise.all(query.stepIds.map(async stepId => modelStepPairing((await controlStore.getRecord({
+                conversationId: query.conversationId, kind: 'step', id: stepId }))?.value)));
+        },
+    });
     const compressionModel = new ProviderCompressionModelPort(options);
     const sourcePorts = new Map<string, ContextSourcePort>();
     const projectionCache = new ArtifactProjectionCache(options.maxSourceCacheBytes);
@@ -528,10 +540,20 @@ export function createContextServerAdapter(options: ContextServerAdapterOptions)
             const taskPlan = await options.readTaskPlan?.(context, plan);
             return [existing, taskPlan ? renderTaskPlanSnapshot(taskPlan) : ''].filter(Boolean).join('\n\n');
     };
+    const historyIdentity = () => async (item: import('../storage/port.js').HistoryItem, response: NormalizedResponse) => {
+        const original = await options.journal.readAttempt(response.attemptId);
+        if (!original) return { modelId: null };
+        if (original.attempt.attemptId !== response.attemptId || item.attemptId && item.attemptId !== response.attemptId) {
+            throw new ContextFault('SOURCE_GAP', '历史原请求与响应或历史条目attempt不同', { itemId: item.itemId, attemptId: response.attemptId });
+        }
+        return { modelId: original.attempt.snapshot.modelId, endpoint: original.attempt.snapshot.endpoint };
+    };
     const prepareView = service.createPrepareView(async (context, plan, input) => {
         const binding = await bind(context, plan);
         const overrides = await options.resolveView?.(context, plan, input) ?? {};
         return { ...overrides, dynamicContext: taskPlanDynamicContext(overrides, context, plan), readTailReuse: 'consume', policy: binding.config.policy,
+            targetEndpoint: overrides.targetEndpoint ?? plan.adapter.endpoint(plan.profile, plan.modelId),
+            resolveHistoryIdentity: overrides.resolveHistoryIdentity ?? historyIdentity(),
             resolveHistoricalToolResults: overrides.resolveHistoricalToolResults ?? createHistoricalToolResultResolver(options.store),
             readItem: overrides.readItem ?? ((item, bounds) => item.value !== undefined ? Promise.resolve(item.value) : readHistoryArtifact(options.store,
                 { conversationId: context.snapshot.conversationId, item, maxReadBytes: bounds.maxReadBytes, signal: bounds.signal,
@@ -551,6 +573,8 @@ export function createContextServerAdapter(options: ContextServerAdapterOptions)
         const overrides = await options.resolveView?.(context, plan, input) ?? {};
         try {
             const viewInput = { ...overrides, dynamicContext: taskPlanDynamicContext(overrides, context, plan), readTailReuse: 'offer' as const, conversationId: context.snapshot.conversationId, context, adapter: plan.adapter,
+                targetEndpoint: overrides.targetEndpoint ?? plan.adapter.endpoint(plan.profile, plan.modelId),
+                resolveHistoryIdentity: overrides.resolveHistoryIdentity ?? historyIdentity(),
                 resolveHistoricalToolResults: overrides.resolveHistoricalToolResults ?? createHistoricalToolResultResolver(options.store),
                 readItem: overrides.readItem ?? ((item, bounds) => item.value !== undefined ? Promise.resolve(item.value) : readHistoryArtifact(options.store,
                     { conversationId: context.snapshot.conversationId, item, maxReadBytes: bounds.maxReadBytes, signal: bounds.signal,

@@ -38,6 +38,8 @@ export interface ProviderProfile {
     remoteRetention: 'disabled' | 'allowed';
     globalModelRulesRef: string | null;
     compressionModelRef: string | null;
+    information?: { source?: string; purpose?: string; notes?: string; lastTestedAt?: string | null; updatedAt?: string };
+    dispatchPolicy?: { enabled?: boolean; expiresAt?: string | null; maxCumulativeCost?: { currency: string; amountMicros: number } };
 }
 
 export interface FunctionTool {
@@ -212,6 +214,7 @@ export interface HttpTransport {
 export interface SendContext {
     transport: HttpTransport;
     credential?: string;
+    conversationId?: string;
     onPartial?: (partial: ProviderPartial) => void | Promise<void>;
 }
 
@@ -263,6 +266,8 @@ export class ProviderFault extends AgentFault {
             httpStatus: options.httpStatus, nativeCode: options.nativeCode, nativeReason: options.nativeReason, retryAfterMs: options.retryAfterMs,
             ...(options.transportCause ? { transportCause: { ...options.transportCause } } : {}),
             ...(options.transportPhase ? { transportPhase: options.transportPhase } : {}),
+            ...(options.rawResponse ? { originalResponse: { available: true, attemptId: options.attemptId ?? null,
+                source: 'provider_attempt.rawResponse', httpStatus: options.rawResponse.httpStatus } } : {}),
             ...(options.attemptId ? { attemptId: options.attemptId } : {}), ...(options.actionId ? { actionId: options.actionId } : {}) },
         options.acceptance === 'accepted' || options.acceptance === 'unknown', options.retryable ?? false);
         this.name = 'ProviderFault';

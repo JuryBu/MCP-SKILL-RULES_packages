@@ -2,7 +2,8 @@ import { spawn, spawnSync } from "child_process";
 import fs from "fs";
 import os from "os";
 import path from "path";
-import { callGetModelResponse, initParentLs, isLsReady } from "./ls-client.js";
+import { callGetModelResponseDetailed, initParentLs, isAntigravityAvailable } from "./ls-client.js";
+import { AntigravityCallError, type AntigravityOutcome } from "./antigravity-model-catalog.js";
 import { isAntigravityLS } from "./lifecycle.js";
 import { callClaudeCodeText, claudeCodeOptionsFromParams, isClaudeCodeCliAvailable } from "./claude-code-bridge.js";
 import {
@@ -16,7 +17,7 @@ import {
 export type ModelChain = "auto" | "grok" | "antigravity" | "codex" | "claude-code" | "cc";
 export type ResolvedModelChain = "grok" | "antigravity" | "codex" | "claude-code";
 
-interface BridgeResult {
+interface BridgeResult extends Partial<AntigravityOutcome> {
     chainUsed: ResolvedModelChain;
     text: string;
 }
@@ -32,7 +33,7 @@ interface CodexBridgeCandidate {
     speed?: string;
 }
 
-const LS_AUTO_MODEL = process.env.SANDBOX_LS_MODEL || "MODEL_PLACEHOLDER_M132";
+const LS_AUTO_MODEL = process.env.SANDBOX_LS_MODEL || "default";
 const CODEX_MODEL = process.env.SANDBOX_CODEX_MODEL || "gpt-5.5";
 const CODEX_REASONING = process.env.SANDBOX_CODEX_REASONING || "medium";
 const CODEX_SPEED_TIER = process.env.SANDBOX_CODEX_SPEED || "fast";
@@ -312,14 +313,9 @@ export async function isCodexCliAvailable(): Promise<boolean> {
 }
 
 async function resolveModelChain(requested: ModelChain): Promise<ResolvedModelChain> {
-    const hostIsAntigravity = await isAntigravityLS();
     const normalized = requested === "cc" ? "claude-code" : requested;
 
     if (normalized === "antigravity") {
-        await initParentLs();
-        if (!isLsReady()) {
-            throw new Error("Antigravity 链路不可用：未发现可连接的 LS 进程");
-        }
         return "antigravity";
     }
 
@@ -341,9 +337,9 @@ async function resolveModelChain(requested: ModelChain): Promise<ResolvedModelCh
         return "claude-code";
     }
 
-    if (hostIsAntigravity) {
+    if (await isAntigravityLS()) {
         await initParentLs();
-        if (isLsReady()) return "antigravity";
+        if (isAntigravityAvailable()) return "antigravity";
     }
 
     if (await isCodexCliAvailable()) {
@@ -351,7 +347,7 @@ async function resolveModelChain(requested: ModelChain): Promise<ResolvedModelCh
     }
 
     await initParentLs();
-    if (isLsReady()) return "antigravity";
+    if (isAntigravityAvailable()) return "antigravity";
 
     throw new Error("auto 链路解析失败：LS 不可用，codex CLI 也不可用");
 }
@@ -646,6 +642,7 @@ export async function callModelBridge(
     timeoutMs: number,
     params?: Record<string, unknown>
 ): Promise<BridgeResult> {
+    const startedAt = Date.now();
     const signal = params?.signal instanceof AbortSignal ? params.signal : undefined;
     if (signal?.aborted) {
         throw new Error("模型调用已取消：background abort");
@@ -653,11 +650,21 @@ export async function callModelBridge(
     const chainUsed = await resolveModelChain(chain);
 
     if (chainUsed === "antigravity") {
-        const text = await callGetModelResponse(LS_AUTO_MODEL, prompt, timeoutMs, signal);
-        if (!text) {
-            throw new Error("Antigravity 链路模型调用失败");
+        if (Array.isArray(params?.imagePaths) && params.imagePaths.length) throw new AntigravityCallError("Antigravity 纯 LS 入口只接收文字，图片请使用启用 supportsVision 的 Council CLI 入口",
+            { submitted: false, outcomeUnknown: false, safeToFallback: false, kind: "rejected" });
+        const remaining = timeoutMs - (Date.now() - startedAt);
+        if (remaining <= 0) throw new AntigravityCallError("Antigravity 发现阶段已用完总期限",
+            { submitted: false, outcomeUnknown: false, safeToFallback: false, kind: "not-started" });
+        const model = getStringParam(params, "model", "lsModel") || LS_AUTO_MODEL;
+        const result = await callGetModelResponseDetailed(model, prompt, remaining, signal);
+        if (!result.text) {
+            throw new AntigravityCallError(result.error || "Antigravity 链路模型调用失败", {
+                transport: result.transport, model: result.model, submitted: result.submitted === true,
+                outcomeUnknown: result.outcomeUnknown === true, safeToFallback: result.safeToFallback === true, kind: result.kind || "not-started",
+            }, { cause: result });
         }
-        return { chainUsed, text };
+        return { chainUsed, text: result.text, transport: result.transport, model: result.model,
+            submitted: result.submitted, outcomeUnknown: result.outcomeUnknown, safeToFallback: result.safeToFallback, kind: result.kind };
     }
 
     if (chainUsed === "claude-code") {

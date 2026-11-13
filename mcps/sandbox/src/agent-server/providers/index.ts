@@ -10,3 +10,5 @@ export * from './quota.js';
 export * from './openai-responses.js';
 export * from './anthropic.js';
 export * from './progrok.js';
+export * from './history-transfer.js';
+export * from './request-identity.js';

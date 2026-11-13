@@ -17,7 +17,7 @@ import type { ModelStepPairing } from './port.js';
 import { MAX_MODEL_STEP_PAIRINGS, modelStepPairing } from './model-step-pairing.js';
 import { measureCanonicalJsonBytes } from '../media/temporary-budget.js';
 import { MAX_WRITE_BATCH } from './internal.js';
-import { isStoppedUnknownWait } from '../cleanup-reconciliation.js';
+import { isReleasedUnknownWait, isStoppedUnknownWait } from '../cleanup-reconciliation.js';
 import { bootstrapCommunicationWindow, communicationNeedsBootstrap, renderCommunicationWindow } from '../context/communication-window.js';
 import type { CommunicationWindow } from '../context/communication-window.js';
 import { createArtifactHistorySourcePort } from '../context/artifact-source.js';
@@ -180,24 +180,46 @@ export class StoreCompactionPort implements CompactionPort {
             const conversation = await port.getRecord(contextConversationKey(input.conversationId));
             const run = await port.getRecord(contextRunKey(input.conversationId, input.runId));
             const stopped = run ? isStoppedUnknownWait(run.value) : false;
+            const released = run ? isReleasedUnknownWait(run.value) : false;
             if (!conversation || !['open', 'closing'].includes(String(conversation.value.state))
-                || conversation.value.activeRunId !== input.runId || !run || run.value.state !== 'outcome_unknown' && !stopped
+                || (conversation.value.activeRunId !== input.runId && !(released && conversation.value.activeRunId === null))
+                || !run || run.value.state !== 'outcome_unknown' && !stopped
                 || run.value.conversationId !== input.conversationId || run.value.runId !== input.runId
                 || !Number.isSafeInteger(input.runEpoch) || run.value.runEpoch !== input.runEpoch
                 || typeof input.rootBudgetId !== 'string' || !input.rootBudgetId
                 || contextRootBudgetId(run) !== input.rootBudgetId) return false;
             const state = await this.transactions.readState(input.conversationId, port);
             const execution = state.value.execution;
-            const sourceRunEpoch = input.runEpoch - (stopped ? 1 : 0);
+            const restartReason = run.value.stopReason === 'RESTART_RECONCILIATION_REQUIRED';
+            const restarted = restartReason && run.value.state === 'outcome_unknown' && input.runEpoch > 1
+                && run.value.cleanupState === 'unconfirmed' && run.value.effectState === 'unknown' && run.value.resultStatus === 'unknown';
+            if (restartReason && !restarted) return false;
+            let sourceRunEpoch = input.runEpoch - (stopped || restarted ? 1 : 0);
             const ownedExecution = execution !== null && execution.conversationId === input.conversationId && execution.runId === input.runId
                 && execution.runEpoch === sourceRunEpoch && execution.rootBudgetId === input.rootBudgetId
                 && execution.kind === run.value.kind;
             if (state.value.candidateId === null) return execution === null || ownedExecution;
-            if (!ownedExecution) return false;
+            if (!ownedExecution && !released) return false;
             const candidateRecord = await port.getRecord<ContextCandidateData>(contextCandidateKey(input.conversationId, state.value.candidateId));
             if (!candidateRecord || !['unknown', 'failed', 'cancelled', 'discarded', 'published'].includes(candidateRecord.value.state)) return false;
             const candidate = await this.transactions.readObject<CompactionCandidate>(input.conversationId,
                 candidateRecord.value.contentId, candidateRecord.value.contentHash);
+            if (released) {
+                sourceRunEpoch = candidate.snapshot.runEpoch;
+                if (!Number.isSafeInteger(sourceRunEpoch) || sourceRunEpoch < 1 || sourceRunEpoch >= input.runEpoch) return false;
+                if (execution !== null) {
+                    if (execution.conversationId !== input.conversationId) return false;
+                    if (execution.runId === input.runId) {
+                        if (execution.runEpoch !== sourceRunEpoch || execution.rootBudgetId !== input.rootBudgetId || execution.kind !== run.value.kind) return false;
+                    } else {
+                        const owner = await port.getRecord(contextRunKey(input.conversationId, execution.runId));
+                        if (!owner || owner.value.runEpoch !== execution.runEpoch || contextRootBudgetId(owner) !== execution.rootBudgetId
+                            || !['succeeded', 'failed', 'cancelled'].includes(String(owner.value.state))
+                            || !['not_needed', 'released'].includes(String(owner.value.cleanupState))
+                            || owner.value.internalOwnCleanupState !== 'released' || !['none', 'confirmed'].includes(String(owner.value.effectState))) return false;
+                    }
+                }
+            }
             if (candidate.state !== candidateRecord.value.state || candidate.state === 'unknown' && !candidate.pendingRequest
                 || candidate.snapshot.runId !== input.runId || candidate.snapshot.runEpoch !== sourceRunEpoch
                 || candidate.snapshot.execution.conversationId !== input.conversationId || candidate.snapshot.execution.runId !== input.runId

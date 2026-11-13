@@ -38,6 +38,16 @@ export interface ToolDelivery extends Record<string, unknown> {
     sent: ToolResult;
 }
 
+interface StoredToolDelivery extends Record<string, unknown> {
+    schemaVersion: 2;
+    identity: ToolDeliveryIdentity;
+    source: ToolDeliverySource;
+    receivedHash: string;
+    sentHash: string;
+    shortened: boolean;
+    sentArtifact: { artifactId: string; sha256: string; byteLength: number };
+}
+
 function deliveryKey(identity: ToolDeliveryIdentity): StoreKey {
     if (!identity.conversationId || !identity.runId || !identity.stepId || !identity.callId
         || !Number.isSafeInteger(identity.runEpoch) || identity.runEpoch < 1) {
@@ -86,6 +96,12 @@ export function projectToolDelivery(received: ToolResult, source: ToolDeliverySo
         for (const key of ['stdout', 'stderr', 'output', 'text', 'log']) {
             if (typeof object[key] === 'string') object[key] = shorten(object[key] as string);
         }
+        const rawFields = ['stdoutBase64', 'stderrBase64'].filter(key => typeof object[key] === 'string' && (object[key] as string).length > maxTextChars);
+        if (rawFields.length) {
+            for (const key of rawFields) delete object[key];
+            object.rawBytesSource = { artifactId: source.artifactId, sha256: source.sha256, byteLength: source.byteLength, fields: rawFields };
+            shortened = true;
+        }
         for (const key of ['data', 'result']) if (object[key] !== undefined) object[key] = project(object[key], depth + 1);
         if (Array.isArray(object.content)) object.content = object.content.map(block => {
             if (!block || typeof block !== 'object' || Array.isArray(block) || block.type !== 'text' || typeof block.text !== 'string') return block;
@@ -99,10 +115,42 @@ export function projectToolDelivery(received: ToolResult, source: ToolDeliverySo
 
 export function createToolDeliveryStore(store: Pick<StorePort, 'getRecord' | 'commitTransition' | 'readArtifact'>) {
     const pending = new Map<string, { receivedHash: string; completion: Promise<ToolDelivery> }>();
+    const readSent = async (identity: ToolDeliveryIdentity, reference: StoredToolDelivery['sentArtifact']): Promise<ToolResult> => {
+        if (!reference?.artifactId || !/^[a-f0-9]{64}$/.test(reference.sha256)
+            || !Number.isSafeInteger(reference.byteLength) || reference.byteLength < 1) throw new ContextFault('SOURCE_GAP', '工具发送正文引用无效');
+        const parts: Buffer[] = [];
+        let offset = 0;
+        for (;;) {
+            const page = await store.readArtifact({ conversationId: identity.conversationId, artifactId: reference.artifactId, offset, maxBytes: 64 * 1024 });
+            const bytes = Buffer.from(page.dataBase64, 'base64');
+            if (page.artifactId !== reference.artifactId || page.sha256 !== reference.sha256 || page.totalBytes !== reference.byteLength
+                || page.offset !== offset || !bytes.length || offset + bytes.length > reference.byteLength) {
+                throw new ContextFault('SOURCE_GAP', '工具发送正文分片与冻结引用不同');
+            }
+            parts.push(bytes);
+            offset += bytes.length;
+            if (page.complete) {
+                if (offset !== reference.byteLength || page.nextOffset !== null) throw new ContextFault('SOURCE_GAP', '工具发送正文终段长度无效');
+                break;
+            }
+            if (page.nextOffset !== offset) throw new ContextFault('SOURCE_GAP', '工具发送正文分页没有连续推进');
+        }
+        const bytes = Buffer.concat(parts, reference.byteLength);
+        if (hashBytes(bytes) !== reference.sha256) throw new ContextFault('SOURCE_GAP', '工具发送正文哈希与冻结版本不同');
+        try { return JSON.parse(bytes.toString('utf8')) as ToolResult; }
+        catch { throw new ContextFault('SOURCE_GAP', '工具发送正文缺少完整JSON'); }
+    };
     const read = async (identity: ToolDeliveryIdentity, received?: ToolResult): Promise<ToolDelivery | null> => {
-        const record = await store.getRecord<ToolDelivery>(deliveryKey(identity));
+        const record = await store.getRecord<ToolDelivery | StoredToolDelivery>(deliveryKey(identity));
         if (!record) return null;
-        const delivery = record.value;
+        const stored = record.value;
+        if (stored.schemaVersion !== 1 && stored.schemaVersion !== 2) throw new ContextFault('SOURCE_GAP', '工具发送状态版本无效');
+        if (hashContext(stored.identity) !== hashContext(identity)) throw new ContextFault('SOURCE_GAP', '工具发送状态与原调用身份不同');
+        if (stored.schemaVersion === 2 && stored.sentArtifact?.sha256 !== stored.sentHash) throw new ContextFault('SOURCE_GAP', '工具发送正文引用与发送哈希不同');
+        const delivery: ToolDelivery = stored.schemaVersion === 2
+            ? { schemaVersion: 1, identity: stored.identity, source: stored.source, receivedHash: stored.receivedHash,
+                sentHash: stored.sentHash, shortened: stored.shortened, sent: await readSent(identity, stored.sentArtifact) }
+            : stored;
         if (delivery.schemaVersion !== 1 || hashContext(delivery.identity) !== hashContext(identity)
             || delivery.sent.callId !== identity.callId || delivery.sentHash !== hashContext(delivery.sent)
             || !delivery.source || delivery.source.receivedComplete !== true || delivery.source.sha256 !== delivery.receivedHash
@@ -155,9 +203,15 @@ export function createToolDeliveryStore(store: Pick<StorePort, 'getRecord' | 'co
         const projected = projectToolDelivery(transformed, source, policy);
         const delivery: ToolDelivery = { schemaVersion: 1, identity: structuredClone(identity), source, receivedHash,
             sentHash: hashContext(projected.sent), shortened: projected.shortened, sent: projected.sent };
+        const sentArtifact = { artifactId: delivery.sentHash === receivedHash ? artifactId : `context:tool-sent:${hashContext(identity)}:${delivery.sentHash}`,
+            sha256: delivery.sentHash, byteLength: Buffer.byteLength(canonicalJson(delivery.sent)) };
+        const stored: StoredToolDelivery = { schemaVersion: 2, identity: delivery.identity, source, receivedHash,
+            sentHash: delivery.sentHash, shortened: delivery.shortened, sentArtifact };
         const key = deliveryKey(identity);
         try {
-            await store.commitTransition({ expected: [{ key, revision: null }], records: [{ key, revision: 1, value: delivery }] });
+            await store.commitTransition({ expected: [{ key, revision: null }], records: [{ key, revision: 1, value: stored }],
+                ...(delivery.sentHash === receivedHash ? {} : { contents: [{ conversationId: identity.conversationId,
+                    contentId: sentArtifact.artifactId, kind: 'context_tool_sent', value: structuredClone(delivery.sent) as unknown as JsonValue, indexHistory: false }] }) });
         } catch (error) {
             const committed = await read(identity, received);
             if (committed) return committed;

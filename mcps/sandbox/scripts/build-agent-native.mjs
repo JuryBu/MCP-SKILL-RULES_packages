@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { mkdirSync, readFileSync, writeFileSync, statSync, renameSync, existsSync } from 'node:fs';
+import { mkdirSync, readFileSync, writeFileSync, statSync, renameSync, existsSync, rmdirSync } from 'node:fs';
 import { dirname, join, resolve, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
@@ -45,4 +45,5 @@ for (const item of artifacts) renameSync(join(pendingRoot, item.path.split('/').
 const pendingManifest = join(pendingRoot, 'manifest.json');
 writeFileSync(pendingManifest, JSON.stringify(manifest, null, 2));
 renameSync(pendingManifest, join(outputRoot, 'agent-native-manifest.json'));
+rmdirSync(pendingRoot);
 process.stdout.write(JSON.stringify({ type: 'agent-native-built', manifest: relative(packageRoot, join(outputRoot, 'agent-native-manifest.json')), artifacts: artifacts.length }) + '\n');

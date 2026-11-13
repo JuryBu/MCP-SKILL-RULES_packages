@@ -159,6 +159,14 @@ async function buildOverview() {
     lines.push("");
     lines.push(`临时文件: ${tempStats.count} 个 | ${formatBytes(tempStats.totalBytes)}`);
     lines.push(`输出 artifact: ${outputArtifacts.runs} 个（完整 ${outputArtifacts.complete} / 未完成 ${outputArtifacts.incomplete} / 无效 ${outputArtifacts.invalid}）| payload ${formatBytes(outputArtifacts.payloadBytes)}`);
+    lines.push(`输出保存: 完成后 ${outputArtifacts.retentionTtlMs / 3_600_000} 小时，到期由半小时清理任务处理`);
+    if (outputArtifacts.invalid > 0) {
+        lines.push(`  ${outputArtifacts.invalid} 个旧输出缺少可读登记，已保留；已知输出 ${formatBytes(outputArtifacts.invalidPayloadBytes)}`);
+        for (const artifact of outputArtifacts.invalidArtifacts.slice(0, 5)) {
+            lines.push(`  ${artifact.artifactId}: ${artifact.reason === "manifest_missing" ? "缺少manifest.json" : "manifest.json无法读取"}`);
+        }
+        if (outputArtifacts.invalid > 5) lines.push(`  另有 ${outputArtifacts.invalid - 5} 个，目录保留供核查`);
+    }
 
     return {
         content: [{ type: "text" as const, text: lines.join("\n") }],

@@ -8,7 +8,7 @@ export interface TaskPlanScope {
     conversationId: string;
     taskId: string;
     directory: string;
-    workKind: TaskPlanWorkKind;
+    workKind?: TaskPlanWorkKind;
 }
 
 export interface TaskPlanFile {
@@ -21,7 +21,7 @@ export interface TaskPlanSnapshot {
     scope: TaskPlanScope;
     task: TaskPlanFile | null;
     plan: TaskPlanFile | null;
-    planRequired: boolean;
+    planRequired: boolean | null;
 }
 
 export interface TaskPlanFilesPort {
@@ -40,7 +40,7 @@ export function taskPlanReadyForTakeover(snapshot?: TaskPlanSnapshot | null): bo
 }
 
 function scopePaths(scope: TaskPlanScope) {
-    if (!scope.conversationId || !scope.taskId || !['simple_qa', 'single_image', 'multi_step'].includes(scope.workKind)
+    if (!scope.conversationId || !scope.taskId || scope.workKind !== undefined && !['simple_qa', 'single_image', 'multi_step'].includes(scope.workKind)
         || !scope.directory || scope.directory.startsWith('/') || /^[A-Za-z]:/.test(scope.directory)
         || scope.directory.includes('\\') || scope.directory.split('/').some(part => !part || part === '.' || part === '..')) {
         throw new ContextFault('CONFIG_INVALID', 'Task/Plan需要明确任务身份及批准工作区内的相对目录');
@@ -73,7 +73,7 @@ export function createTaskPlanWorkspaceAdapter(port: TaskPlanFilesPort, maximumB
         const [task, plan] = await Promise.all([port.read({ scope, path: paths.task, signal }), port.read({ scope, path: paths.plan, signal })]);
         checkAbort(signal);
         return { scope: structuredClone(scope), task: verifyFile(task, paths.task, maximumBytes),
-            plan: verifyFile(plan, paths.plan, maximumBytes), planRequired: scope.workKind === 'multi_step' };
+            plan: verifyFile(plan, paths.plan, maximumBytes), planRequired: scope.workKind === undefined ? null : scope.workKind === 'multi_step' };
     };
     const write = async (scope: TaskPlanScope, input: { document: 'task' | 'plan'; text: string; expectedSha256: string | null }, signal?: AbortSignal): Promise<TaskPlanFile> => {
         checkAbort(signal);
@@ -109,6 +109,7 @@ export function renderTaskPlanSnapshot(snapshot: TaskPlanSnapshot): string {
     const ready = taskPlanReadyForTakeover(snapshot);
     return ['The main task model exclusively owns workspace Task/Plan files and all task states. Compression never creates, edits or resolves task records, including before entity files exist.',
         'Simple QA and single-image work may finish directly. Multi-step work requires a workspace plan before implementation; update it as verified work changes.',
+        ...(snapshot.planRequired === null ? ['Task complexity has not been preclassified. The main model decides from the actual request: establish workspace Task/Plan files before multi-step work; simple questions and single-image requests may proceed directly.'] : []),
         `Task=${snapshot.scope.taskId}; taskStateOwner=main_model; legacyRequirementsReadOnly=true; taskPlanManaged=${ready}; planRequired=${snapshot.planRequired}; planPresent=${Boolean(snapshot.plan)}; tools=task_plan_read/task_plan_write`,
         ...(!ready ? ['Preserved unfinished requirements remain handoff material until readable, non-empty Task.md and Plan.md originals are established and checked by the main model. For multi-step work, reconcile those requirements with the workspace files before taking over their state.'] : []),
         ...(snapshot.planRequired && !snapshot.plan ? ['Create Plan.md using task_plan_write before multi-step implementation tools.'] : []),

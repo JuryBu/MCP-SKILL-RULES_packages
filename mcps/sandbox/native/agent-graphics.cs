@@ -5,6 +5,7 @@ using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.Drawing.Imaging;
 using System.IO;
+using System.Globalization;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
@@ -26,6 +27,10 @@ internal static class AgentGraphics
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)] static extern IntPtr CreateFile(string name, uint access, uint share, IntPtr security, uint creation, uint flags, IntPtr template);
     [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr handle);
     [DllImport("kernel32.dll")] static extern bool GetConsoleScreenBufferInfo(IntPtr output, out BufferInfo info);
+    [DllImport("kernel32.dll", SetLastError = true)] static extern IntPtr CreateConsoleScreenBuffer(uint access, uint share, IntPtr security, uint flags, IntPtr data);
+    [DllImport("kernel32.dll")] static extern bool SetConsoleCursorPosition(IntPtr output, Coord position);
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode)] static extern bool WriteConsoleW(IntPtr output, string text, uint length, out uint written, IntPtr reserved);
+    [DllImport("kernel32.dll")] static extern uint GetConsoleOutputCP();
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode)] static extern bool GetCurrentConsoleFontEx(IntPtr output, bool maximum, ref FontInfo info);
     [DllImport("kernel32.dll")] static extern bool GetConsoleSelectionInfo(out SelectionInfo info);
     [DllImport("kernel32.dll")] static extern uint GetConsoleProcessList([Out] uint[] processes, uint count);
@@ -46,6 +51,44 @@ internal static class AgentGraphics
     static TextWriter Output;
     static void Emit(object value) { lock (Output) { Output.WriteLine(Json.Serialize(value)); Output.Flush(); } }
 
+    internal sealed class TextMeasurer : IDisposable
+    {
+        readonly IntPtr console;
+        IntPtr probe = new IntPtr(-1);
+        string signature, lastText = "";
+        readonly Dictionary<string, int> widths = new Dictionary<string, int>();
+        readonly Queue<string> order = new Queue<string>();
+        int cachedCharacters;
+        public TextMeasurer(IntPtr output) { console = output; }
+        public Dictionary<string, int> Widths { get { return new Dictionary<string, int>(widths); } }
+        public bool Update(string text)
+        {
+            if (text != null) lastText = text.Length > 16384 ? text.Substring(0, 16384) : text;
+            FontInfo font = new FontInfo { Size = (uint)Marshal.SizeOf(typeof(FontInfo)) }; BufferInfo buffer;
+            if (!GetCurrentConsoleFontEx(console, false, ref font) || !GetConsoleScreenBufferInfo(console, out buffer)) return false;
+            string next = font.Face + ":" + font.FontSize.X + ":" + font.FontSize.Y + ":" + font.Family + ":" + font.Weight + ":" + GetConsoleOutputCP() + ":" + buffer.Size.X + ":" + (buffer.Window.Right - buffer.Window.Left) + ":" + (buffer.Window.Bottom - buffer.Window.Top);
+            bool changed = next != signature;
+            if (changed) { Dispose(); signature = next; widths.Clear(); order.Clear(); cachedCharacters = 0; }
+            var elements = StringInfo.GetTextElementEnumerator(lastText);
+            int measured = 0;
+            while (elements.MoveNext()) {
+                string character = elements.GetTextElement();
+                if (character.Length > 64 || character.Length == 1 && character[0] < 128 || char.IsControl(character, 0) || widths.ContainsKey(character)) continue;
+                if (measured++ >= 2048) break;
+                if (probe == new IntPtr(-1)) probe = CreateConsoleScreenBuffer(0xC0000000, 3, IntPtr.Zero, 1, IntPtr.Zero);
+                if (probe == new IntPtr(-1)) return changed;
+                uint written; BufferInfo after;
+                if (!SetConsoleCursorPosition(probe, new Coord()) || !WriteConsoleW(probe, character, (uint)character.Length, out written, IntPtr.Zero) || written != character.Length || !GetConsoleScreenBufferInfo(probe, out after)) continue;
+                int width = after.Cursor.X;
+                if (width != 1 && width != 2) continue;
+                while (widths.Count >= 2048 || cachedCharacters + character.Length > 8192) { string expired = order.Dequeue(); widths.Remove(expired); cachedCharacters -= expired.Length; }
+                widths[character] = width; order.Enqueue(character); cachedCharacters += character.Length; changed = true;
+            }
+            return changed;
+        }
+        public void Dispose() { if (probe != new IntPtr(-1)) CloseHandle(probe); probe = new IntPtr(-1); }
+    }
+
     sealed class Surface : Control
     {
         readonly IntPtr host;
@@ -60,12 +103,13 @@ internal static class AgentGraphics
     static bool IsActualParent(int processId) { IntPtr snapshot = CreateToolhelp32Snapshot(2, 0); if (snapshot == new IntPtr(-1)) return false; try { ProcessEntry entry = new ProcessEntry { Size = (uint)Marshal.SizeOf(typeof(ProcessEntry)) }; if (!Process32First(snapshot, ref entry)) return false; do { if (entry.ProcessId == (uint)Process.GetCurrentProcess().Id) return entry.ParentProcessId == (uint)processId; } while (Process32Next(snapshot, ref entry)); return false; } finally { CloseHandle(snapshot); } }
     [STAThread] static int Main(string[] arguments)
     {
-        Output = Console.Out;
-        TextReader input = Console.In;
+        Output = new StreamWriter(Console.OpenStandardOutput(), new UTF8Encoding(false));
+        TextReader input = new StreamReader(Console.OpenStandardInput(), new UTF8Encoding(false));
         Surface surface = null;
         IntPtr console = new IntPtr(-1);
         System.Windows.Forms.Timer timer = null;
         IntPtr ownedHost = IntPtr.Zero;
+        TextMeasurer textMeasurer = null;
         try
         {
             if (arguments.Length != 2 || arguments[0] != "--parent-pid") throw new ArgumentException("Expected --parent-pid PID");
@@ -79,43 +123,61 @@ internal static class AgentGraphics
             if (clientCount > clients.Length || Array.IndexOf(clients, (uint)parentId) < 0) throw new InvalidOperationException("Parent console identity mismatch");
             IntPtr host = GetConsoleWindow();
             StringBuilder className = new StringBuilder(128); GetClassName(host, className, className.Capacity);
-            if (host == IntPtr.Zero || !IsWindowVisible(host) || className.ToString() != "ConsoleWindowClass") throw new InvalidOperationException("Visible classic Conhost required; pseudoconsole uses terminal image protocol");
+            if (host == IntPtr.Zero || !IsWindow(host) || className.ToString() != "ConsoleWindowClass") throw new InvalidOperationException("Classic Conhost required; pseudoconsole uses terminal image protocol");
             ownedHost = host;
             SetThreadDpiAwarenessContext(GetWindowDpiAwarenessContext(host));
             console = CreateFile("CONOUT$", 0x80000000, 3, IntPtr.Zero, 3, 0, IntPtr.Zero);
             if (console == new IntPtr(-1)) throw new InvalidOperationException("Console geometry unavailable");
+            textMeasurer = new TextMeasurer(console);
             surface = new Surface(host); surface.CreateControl(); IntPtr surfaceHandle = surface.Handle;
             EnableWindow(surfaceHandle, false);
             int column = 0, row = 0, columns = 0, rows = 0, anchorTop = -1, anchorLeft = -1;
-            string previousGeometry = null, hiddenReason = null;
-            bool closed = false;
-            Action<string> hide = reason => { ShowWindow(surfaceHandle, 0); if (hiddenReason != reason) { hiddenReason = reason; RedrawWindow(host, IntPtr.Zero, IntPtr.Zero, 0x0105); Emit(new { type = "hidden", reason = reason }); } };
+            string previousGeometry = null, previousViewport = null, hiddenReason = null;
+            bool closed = false, visible = false, paintDirty = false, textPainting = false, requestedHidden = false;
+            Stopwatch paintClock = new Stopwatch();
+            Action<string> hide = reason => {
+                if (visible) { ShowWindow(surfaceHandle, 0); visible = false; RedrawWindow(host, IntPtr.Zero, IntPtr.Zero, 0x0101); }
+                if (hiddenReason != reason) { hiddenReason = reason; Emit(new { type = "hidden", reason = reason }); }
+            };
             Action refresh = () => {
                 if (closed) return;
                 if (parent.HasExited || parent.StartTime.ToUniversalTime().Ticks != parentStarted || !IsWindow(host)) { closed = true; Application.ExitThread(); return; }
                 BufferInfo buffer; FontInfo font = new FontInfo { Size = (uint)Marshal.SizeOf(typeof(FontInfo)) }; Rect client; SelectionInfo selection;
                 if (!IsWindowVisible(host) || !GetConsoleScreenBufferInfo(console, out buffer) || !GetCurrentConsoleFontEx(console, false, ref font) || !GetClientRect(host, out client)) { hide("geometry-unavailable"); return; }
-                if (surface.Frame == null || columns < 1 || rows < 1) { hide("no-frame"); return; }
+                if (textMeasurer.Update(null)) Emit(new { type = "text-metrics", characterWidths = textMeasurer.Widths });
+                int viewportColumns = buffer.Window.Right - buffer.Window.Left + 1, viewportRows = buffer.Window.Bottom - buffer.Window.Top + 1;
+                string viewport = buffer.Window.Top + "," + buffer.Window.Left + "," + viewportColumns + "," + viewportRows + "," + buffer.Size.X + "," + buffer.Size.Y;
+                if (viewport != previousViewport) {
+                    previousViewport = viewport;
+                    Emit(new { type = "viewport", viewport = new { top = buffer.Window.Top, left = buffer.Window.Left, columns = viewportColumns, rows = viewportRows, bufferColumns = buffer.Size.X, bufferRows = buffer.Size.Y } });
+                }
+                if (surface.Frame == null || columns < 1 || rows < 1) { hide(requestedHidden ? "requested" : "no-frame"); return; }
                 if (GetConsoleSelectionInfo(out selection) && selection.Flags != 0) { hide("selection"); return; }
                 if (buffer.Window.Top != anchorTop || buffer.Window.Left != anchorLeft) { hide("viewport-scrolled"); return; }
-                int viewportColumns = buffer.Window.Right - buffer.Window.Left + 1, viewportRows = buffer.Window.Bottom - buffer.Window.Top + 1;
                 int cellWidth = viewportColumns > 0 ? (int)Math.Round((double)client.Right / viewportColumns) : 0;
                 int cellHeight = viewportRows > 0 ? client.Bottom / viewportRows : 0;
                 int left = column * cellWidth, top = row * cellHeight, width = columns * cellWidth, height = rows * cellHeight;
                 if (cellWidth < 1 || cellHeight < 1 || left < 0 || top < 0 || left + width > client.Right || top + height > client.Bottom) { hide("rectangle-outside-client"); return; }
-                int cursorColumn = buffer.Cursor.X - buffer.Window.Left, cursorRow = buffer.Cursor.Y - buffer.Window.Top;
-                if (cursorColumn >= column && cursorColumn < column + columns && cursorRow >= row && cursorRow < row + rows) { hide("cursor-inside-image"); return; }
+                if (textPainting && paintClock.ElapsedMilliseconds < 1000) return;
+                if (textPainting) { textPainting = false; Emit(new { type = "paint-timeout", reason = "text-frame-not-finished" }); }
                 string geometry = left + "," + top + "," + width + "," + height;
-                SetWindowPos(surfaceHandle, IntPtr.Zero, left, top, width, height, 0x0054);
-                ShowWindow(surfaceHandle, 4); surface.Invalidate(); surface.Update(); hiddenReason = null;
-                if (geometry != previousGeometry) { previousGeometry = geometry; Emit(new { type = "geometry", left = left, top = top, width = width, height = height, cellWidth = cellWidth, cellHeight = cellHeight, logicalFontWidth = font.FontSize.X, logicalFontHeight = font.FontSize.Y, clientWidth = client.Right, clientHeight = client.Bottom, viewportColumns = viewportColumns, viewportRows = viewportRows, viewportTop = buffer.Window.Top, viewportLeft = buffer.Window.Left }); }
+                if (geometry != previousGeometry) {
+                    SetWindowPos(surfaceHandle, IntPtr.Zero, left, top, width, height, 0x0014); paintDirty = true;
+                    previousGeometry = geometry; Emit(new { type = "geometry", left = left, top = top, width = width, height = height, cellWidth = cellWidth, cellHeight = cellHeight, logicalFontWidth = font.FontSize.X, logicalFontHeight = font.FontSize.Y, clientWidth = client.Right, clientHeight = client.Bottom, viewportColumns = viewportColumns, viewportRows = viewportRows, viewportTop = buffer.Window.Top, viewportLeft = buffer.Window.Left });
+                }
+                if (!visible) { ShowWindow(surfaceHandle, 4); visible = true; paintDirty = true; Emit(new { type = "visible", recoveredFrom = hiddenReason }); }
+                hiddenReason = null;
+                if (paintDirty) { surface.Invalidate(); surface.Update(); paintDirty = false; }
             };
             Action<string> message = line => {
                 try {
                     var command = Json.Deserialize<Dictionary<string, object>>(line);
                     string type = (string)command["type"];
+                    if (type == "measure-text") { textMeasurer.Update((string)command["text"]); Emit(new { type = "text-metrics", characterWidths = textMeasurer.Widths, requestId = command.ContainsKey("requestId") ? command["requestId"] : null }); return; }
                     if (type == "close") { closed = true; Application.ExitThread(); return; }
-                    if (type == "hide") { columns = 0; hide("requested"); return; }
+                    if (type == "paint-begin") { textPainting = true; paintClock.Restart(); return; }
+                    if (type == "paint-end") { textPainting = false; paintDirty = surface.Frame != null; refresh(); return; }
+                    if (type == "hide") { columns = 0; requestedHidden = true; hide("requested"); return; }
                     if (type != "frame") throw new ArgumentException("Unknown graphics message");
                     int width = Number(command, "width"), height = Number(command, "height");
                     int nextColumn = Number(command, "column"), nextRow = Number(command, "row"), nextColumns = Number(command, "columns"), nextRows = Number(command, "rows");
@@ -125,7 +187,7 @@ internal static class AgentGraphics
                     Bitmap bitmap = new Bitmap(width, height, PixelFormat.Format32bppArgb);
                     BitmapData data = bitmap.LockBits(new Rectangle(0, 0, width, height), ImageLockMode.WriteOnly, PixelFormat.Format32bppArgb);
                     try { Marshal.Copy(pixels, 0, data.Scan0, pixels.Length); } finally { bitmap.UnlockBits(data); }
-                    Bitmap previous = surface.Frame; surface.Frame = bitmap; if (previous != null) previous.Dispose();
+                    Bitmap previous = surface.Frame; surface.Frame = bitmap; paintDirty = true; requestedHidden = false; if (previous != null) previous.Dispose();
                     column = nextColumn; row = nextRow; columns = nextColumns; rows = nextRows;
                     BufferInfo buffer; if (!GetConsoleScreenBufferInfo(console, out buffer)) throw new InvalidOperationException("Console viewport unavailable");
                     if (anchorTop < 0 || (command.ContainsKey("reanchor") && Convert.ToBoolean(command["reanchor"]))) { anchorTop = buffer.Window.Top; anchorLeft = buffer.Window.Left; }
@@ -135,11 +197,11 @@ internal static class AgentGraphics
             };
             timer = new System.Windows.Forms.Timer { Interval = 60 }; timer.Tick += (sender, eventArgs) => refresh(); timer.Start();
             Thread reader = new Thread(() => { try { string line; while ((line = input.ReadLine()) != null) { if (line.Length > 6 * 1024 * 1024) break; string captured = line; surface.BeginInvoke(new Action(() => message(captured))); } } catch (Exception) { } finally { try { surface.BeginInvoke(new Action(() => Application.ExitThread())); } catch (Exception) { } } }); reader.IsBackground = true; reader.Start();
-            Emit(new { type = "ready", hostHwnd = host.ToInt64(), surfaceHwnd = surfaceHandle.ToInt64(), parentPid = parentId, helperPid = Process.GetCurrentProcess().Id, hostClass = className.ToString(), inputDisabled = true });
+            Emit(new { type = "ready", protocolVersion = 2, capabilities = new string[] { "viewport", "text-frame", "text-metrics" }, hostHwnd = host.ToInt64(), surfaceHwnd = surfaceHandle.ToInt64(), parentPid = parentId, helperPid = Process.GetCurrentProcess().Id, hostClass = className.ToString(), inputDisabled = true });
             Application.Run();
             return 0;
         }
         catch (Exception error) { Emit(new { type = "unavailable", message = error.Message }); return 2; }
-        finally { if (timer != null) timer.Dispose(); if (surface != null) surface.Dispose(); if (ownedHost != IntPtr.Zero && IsWindow(ownedHost)) RedrawWindow(ownedHost, IntPtr.Zero, IntPtr.Zero, 0x0105); if (console != new IntPtr(-1)) CloseHandle(console); FreeConsole(); Emit(new { type = "closed" }); }
+        finally { if (textMeasurer != null) textMeasurer.Dispose(); if (timer != null) timer.Dispose(); if (surface != null) surface.Dispose(); if (ownedHost != IntPtr.Zero && IsWindow(ownedHost)) RedrawWindow(ownedHost, IntPtr.Zero, IntPtr.Zero, 0x0105); if (console != new IntPtr(-1)) CloseHandle(console); FreeConsole(); Emit(new { type = "closed" }); }
     }
 }

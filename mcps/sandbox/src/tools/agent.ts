@@ -95,6 +95,17 @@ export async function handleAgentCall(input: unknown): Promise<RpcResult> {
     }
 }
 
+export function presentAgentResult(result: RpcResult) {
+    const data = result.data && typeof result.data === 'object' ? result.data as Record<string, unknown> : undefined;
+    const presentation = result.presentation?.text ?? (!result.ok ? `### 调用未完成\n\n${result.error?.message ?? '请查看原始错误。'}` : undefined);
+    const fields = { queryOk: result.ok, ...(data?.state !== undefined ? { executionState: data.state } : {}),
+        ...(data?.resultStatus !== undefined ? { resultStatus: data.resultStatus } : {}),
+        ...(data?.runId !== undefined ? { runId: data.runId } : {}),
+        ...(!result.ok && result.error ? { error: result.error } : {}) };
+    const text = presentation ? `${presentation}\n\n\`\`\`json\n${JSON.stringify(fields)}\n\`\`\`` : JSON.stringify(result);
+    return { content: [{ type: 'text' as const, text }], structuredContent: { ...result }, isError: !result.ok };
+}
+
 export function registerAgent(server: McpServer): void {
     const description = '外部API模型会话入口，与人工sandbox_agent CLI共用独立Agent Server。'
         + '用户指定或任务确需外部模型时使用；普通辅助继续使用宿主原生子代理和工具。callerHost/callerConversationId显式标识外部主调用方，params.conversationId标识Agent会话。'
@@ -107,8 +118,7 @@ export function registerAgent(server: McpServer): void {
     const handler = async (params: unknown) => {
         touchActivity();
         const result = await handleAgentCall(params);
-        return { content: [{ type: 'text' as const, text: JSON.stringify(result) }],
-            structuredContent: { ...result }, isError: !result.ok };
+        return presentAgentResult(result);
     };
     const compatible = server as unknown as {
         registerTool?: (name: string, config: { description: string; inputSchema: typeof AgentParamsSchema;

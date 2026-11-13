@@ -4,6 +4,7 @@ import type { StoreCompactionPort } from '../storage/context-port.js';
 import type { CompactionCandidate, CompressionModelPort, ContextCapture, ContextEstimate, ContextEstimateBasis, ContextFailure, ContextTokenCountEvidence, ConversationContextLimits, FrozenCompressionConfig, SchedulerCheckpoint } from './contracts.js';
 import type { CompactionPreview } from './compaction.js';
 import { previewCompaction } from './compaction.js';
+import { captureCompletedFragments } from './completed-fragments.js';
 import { validateContextPolicy } from './config.js';
 import { ContextFault } from './errors.js';
 import type { ContextService } from './service.js';
@@ -106,6 +107,8 @@ export function createContextServerControls(options: {
         }
         if (!configuration && !unavailable) unavailable = { code: 'CONTEXT_CONFIG_REQUIRED', message: '当前会话尚未选择可用模型' };
         const config = configuration?.config;
+        const policy = config?.policy ?? validateContextPolicy();
+        const previewCapture = await captureCompletedFragments(options.port, capture, policy);
         const measured = options.readMeasurement(input.conversationId);
         const estimate = measured?.historyEpoch === capture.historyEpoch && measured.appendSeq === capture.appendSeq
             && measured.viewRevision === capture.viewRevision && measured.configFingerprint === config?.configFingerprint ? measured : null;
@@ -124,7 +127,7 @@ export function createContextServerControls(options: {
                 modelId: config.model.model, modelFingerprint: config.modelFingerprint, configFingerprint: config.configFingerprint,
                 policy: config.policy, limits: configuration.limits } : null,
             estimate: estimate ? structuredClone(estimate) : null, estimateConfidence: estimate?.confidence ?? 'unknown',
-            preview: previewCompaction(capture, { policy: config?.policy ?? validateContextPolicy() }), unavailable };
+            preview: previewCompaction(previewCapture, { policy }), unavailable };
     };
 
     const compact = async (input: ContextServerCompactInput): Promise<ContextServerCompactResult> => {

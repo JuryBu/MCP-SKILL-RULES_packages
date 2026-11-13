@@ -32,6 +32,9 @@ export interface TrustedToolContext {
     protectedPaths?: readonly string[];
     approvalId?: string;
     approvalRequiredTools?: readonly string[];
+    modelToolNames?: readonly string[] | null;
+    allowInternalDelegation?: boolean;
+    taskPlanWorkKind?: 'simple_qa' | 'single_image' | 'multi_step';
     deadlineAt?: string;
     pendingExecution?: { pendingToolId: string; claimToken: string };
     command?: {
@@ -86,7 +89,8 @@ export interface ToolCatalogEntry {
     resourceKind: string | null;
     schemaHash: string | null;
     adapterVersion: string;
-    availability: 'available' | 'unavailable' | 'disabled';
+    availability: 'available' | 'schema_pending' | 'unavailable' | 'disabled';
+    schemaStatus?: 'pending' | 'verified' | 'unsupported';
     reason: string | null;
 }
 

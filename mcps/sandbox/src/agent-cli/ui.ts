@@ -6,31 +6,33 @@ import { parseArguments, parseJsonObject, tokenizeCommand, usage, type ParsedArg
 import { COMMAND_SPECS, commandEffect, executeCommand, parseBudget, parseCommand, renderHelp, supportsServerSecretImport, type CommandExecution, type CommandSpec } from './commands.js';
 import { DraftBuffer, readCommandInput } from './input.js';
 import { TerminalSession, terminalGraphicsHost, type TerminalKey } from './terminal.js';
-import { TerminalRenderer, cleanText, terminalSafeText, visibleWidth, wrapText, type TerminalView } from './renderer.js';
+import { TerminalRenderer, cleanText, terminalSafeText, visibleWidth, wrapText, layoutDraftInput, type TerminalView } from './renderer.js';
 import { cancelExecution, ConversationMonitor, eventText, resolveRunResult } from './watch.js';
 import { decodeArtifactJson } from '../agent-client/artifacts.js';
 import type { CliStreams } from './main.js';
 import type { MascotState } from './graphics/assets.js';
 import { editDraftText } from './editor.js';
-import { artifactMetadata, formatExecutionText, humanJson } from './presentation.js';
+import { artifactMetadata, formatExecutionText, humanJson, markdownDisplayLines } from './presentation.js';
 import { conversationSummary, graphicsSummary, interactiveResultLines, profileCatalogRefreshLines, workspaceUpdateLines } from './ui-results.js';
 import { prepareCliInputReferences } from './references.js';
 import { readConfigurationCliPreferences, refreshSavedProfileCatalog } from './configuration-commands.js';
 import type { AmbiguousWidth } from './configuration-width.js';
 import { directoryPage, filePreview } from './selection.js';
-import { usageOverviewLines, type UsageOverview } from './usage-view.js';
-import { appendTranscriptLines, historyMessage, modelHistoryText } from './history-view.js';
+import type { UsageOverview } from './usage-view.js';
+import { appendTranscriptLines, historyMessage, modelHistoryText, TRANSCRIPT_HISTORY_LIMITS } from './history-view.js';
 import { FolderPickerError, pickDirectory } from './folder-picker.js';
 import { PartialAnswerBuffer, type PartialAnswerState } from './partial-answer.js';
 import { runFailureLines } from './run-view.js';
 import { NativeConsoleGraphics, type NativeGraphicsEvent } from './graphics/native-console.js';
+import { chatUsageLines, declaredParameterFields, detailedUsageLines, groupProviderProfiles, idleAppearance, localTime, modelToolSupport, optionalDateTime, projectFromOptions, protocolLabel, readParameterValues, type CliPreparation, type CliProject, type CliProviderGroup } from './ui-workflow.js';
 
 type MenuItem = { label: string; detail?: string; action: () => void | Promise<void>; disabled?: string };
-type Menu = { title: string; items: MenuItem[]; index: number; startup?: boolean; query?: string; commandMenu?: boolean; sourceItems?: MenuItem[]; context?: string[]; contextOffset?: number };
+type Menu = { title: string; items: MenuItem[]; index: number; startup?: boolean; query?: string; commandMenu?: boolean; sourceItems?: MenuItem[]; context?: string[]; contextOffset?: number; back?: () => void | Promise<void> };
 type Field = { key: string; label: string; defaultValue?: string; choices?: string[]; hidden?: boolean; sensitive?: boolean; required?: boolean; preserveWhitespace?: boolean;
     validate?: (text: string, values: Readonly<Record<string, string>>) => string | undefined };
-type Form = { title: string; fields: Field[]; index: number; values: Record<string, string>; draft: DraftBuffer; complete: (values: Record<string, string>) => Promise<void> };
-type PendingDraft = { commandId: string; conversationId: string; revision: number; draft: DraftBuffer; text?: string };
+type Form = { title: string; fields: Field[]; index: number; values: Record<string, string>; draft: DraftBuffer; complete: (values: Record<string, string>) => Promise<void>; back?: () => void | Promise<void>; error?: string };
+type InputHistoryEntry = { text: string; conversationId: string; references?: unknown[]; inputMode?: 'queue' | 'steer' };
+type PendingDraft = { commandId: string; conversationId: string; revision: number; draft: DraftBuffer; text?: string; historyEntry?: InputHistoryEntry };
 
 function rows(data: unknown): Record<string, unknown>[] {
     if (Array.isArray(data)) return data as Record<string, unknown>[];
@@ -71,7 +73,7 @@ export class InteractiveCli {
     private transcript: string[] = [];
     private transcriptFollow = true;
     private detailsOffset = 0;
-    private detailCache?: { source: string[]; width: number; ambiguousWidth?: AmbiguousWidth; lines: string[] };
+    private detailCache?: { source: string[]; width: number; ambiguousWidth?: AmbiguousWidth; emojiFallback?: boolean; lines: string[] };
     private state: MascotState = 'idle';
     private stateStartedAt = Date.now();
     private status = '空闲 · 草稿可直接输入';
@@ -92,8 +94,12 @@ export class InteractiveCli {
     private renderInFlight = false;
     private renderAgain = false;
     private animationTimer?: NodeJS.Timeout;
+    private appearanceTimer?: NodeJS.Timeout;
+    private lastUserActivityAt = Date.now();
+    private lastReplyFinishedAt = 0;
+    private lastFinishedActivityRun?: string;
     private readonly startedAt = Date.now();
-    private readonly history: { text: string; conversationId: string }[] = [];
+    private readonly history: InputHistoryEntry[] = [];
     private historyIndex = -1;
     private interruptCount = 0;
     private lastOutputRun?: string;
@@ -113,13 +119,24 @@ export class InteractiveCli {
     private selectedModel?: string;
     private selectedProfileLabel?: string;
     private modelSetting?: 'default' | 'compression';
+    private selectingModel = false;
+    private conversationCompression = false;
+    private pendingCreationArguments?: string[];
+    private readonly pendingSessionCloses = new Map<string, { commandId: string; result?: RpcResult }>();
+    private lastOperationReceipt?: CommandExecution;
+    private lastFailure?: RpcResult;
+    private readonly controlEvents: { asOf: string; event: unknown }[] = [];
     private newSelection: { profileId?: string; modelId?: string } = {};
     private selectionTarget: 'conversation' | 'new' = 'conversation';
     private setupContinuation?: () => Promise<void>;
-    private creation?: { mode: string; title: string; roots: string[]; ttl?: string };
+    private creation?: CliPreparation;
+    private project: CliProject;
+    private providerGroup?: CliProviderGroup;
+    private projectConversationsOnly = false;
     private readonly withoutKey = new Set<string>();
     private readonly pendingSecrets = new Map<string, string>();
     private readonly profileCatalogRefreshes = new Map<string, Record<string, unknown>>();
+    private readonly catalogAutoRefreshes = new Set<string>();
     private usageScope = '';
     private usageOverview?: UsageOverview;
     private usageState = '用量正在加载';
@@ -149,7 +166,14 @@ export class InteractiveCli {
     private editorAbort?: AbortController;
     private switching = false;
     private readonly signalHandler = () => { void this.finish(143); };
-    private readonly lostControl = (event: { message?: string }) => { this.log(event.message ?? '控制权已失效'); this.status = '控制待申请 · 接管须明确确认'; this.scheduleRender(); };
+    private readonly lostControl = (event: { message?: string; lease?: { scope?: string; conversationId?: string } }) => {
+        this.controlEvents.push({ asOf: new Date().toISOString(), event: structuredClone(event) });
+        if (this.controlEvents.length > 20) this.controlEvents.shift();
+        if (this.conversation && event.lease?.scope === 'conversation' && event.lease.conversationId === this.conversation.conversationId) {
+            this.observing = true; this.status = '只读观察 · /run control可申请继续编辑';
+        }
+        this.scheduleRender();
+    };
 
     constructor(readonly initial: ParsedArguments, readonly client: AgentClient, readonly streams: CliStreams) {
         const options = initial.options;
@@ -164,6 +188,7 @@ export class InteractiveCli {
         this.selectedProfile = typeof options.profile === 'string' ? options.profile : undefined;
         this.selectedModel = typeof options.model === 'string' ? options.model : undefined;
         this.newSelection = { profileId: this.selectedProfile, modelId: this.selectedModel };
+        this.project = projectFromOptions({ writeRoots: options['write-root'] }, streams.cwd ?? process.cwd());
         try { this.budget = parseBudget(initial); } catch {}
     }
 
@@ -188,17 +213,14 @@ export class InteractiveCli {
                 if (!['archive', 'temporary', 'ttl'].includes(String(this.initial.options.mode))) throw usage('--mode可选archive|temporary|ttl');
                 await this.newConversation(String(this.initial.options.mode));
             }
-            else if (this.menu?.startup) {
-                const profiles = await this.client.request('profiles.list', { limit: 1 });
-                if (profiles.ok && !rows(profiles.data).length) await this.newConversation('archive');
-                else this.showStartup();
-            }
+            else if (this.menu?.startup) this.showStartup();
             void this.refreshUsage(true);
             this.usageTimer = setInterval(() => { void this.refreshUsage(); }, 15_000);
             this.usageTimer.unref();
             this.scheduleRender();
         }).catch(error => { this.connection = this.client.connected ? 'Agent Server已连接' : '连接失败'; this.showError(clientFailure(error)); });
         this.animate();
+        this.scheduleAppearanceDeadline();
         return new Promise<number>(resolveQuit => { this.quitResolve = resolveQuit; });
     }
 
@@ -250,6 +272,8 @@ export class InteractiveCli {
 
     private async handleKey(key: TerminalKey): Promise<void> {
         if (this.disposed || this.editing) return;
+        if (key.name !== 'eof') this.noteUserActivity();
+        if (this.form && ['text', 'backspace', 'delete', 'up', 'down'].includes(key.name)) this.form.error = undefined;
         if (this.pickerAbort) { if (['escape', 'interrupt', 'eof'].includes(key.name)) this.pickerAbort.abort(); return; }
         if (key.name === 'eof') { await this.quit(valueObject(this.conversation?.retention).mode !== 'temporary'); return; }
         if (key.name === 'interrupt') {
@@ -262,9 +286,14 @@ export class InteractiveCli {
             this.scheduleRender(); return;
         }
         if (key.name === 'escape') {
-            if (this.form) { this.clearFormSecrets(this.form); this.form = undefined; this.log('表单已关闭，原草稿仍保留'); }
-            else { this.menu = undefined; this.commandDraft = undefined; }
-            this.setupContinuation = undefined; this.selectionTarget = 'conversation'; this.modelSetting = undefined;
+            const overlay = Boolean(this.form || this.menu || this.commandDraft);
+            const back = this.form?.back ?? this.menu?.back;
+            if (this.form) { this.clearFormSecrets(this.form); this.form = undefined; }
+            this.menu = undefined; this.commandDraft = undefined;
+            if (back) await back();
+            else if (this.creation) await this.creationMenu();
+            else if (!this.conversation) this.showStartup();
+            else if (!overlay) this.sessionNavigationMenu();
             this.scheduleRender(); return;
         }
         if (key.paste) {
@@ -277,7 +306,7 @@ export class InteractiveCli {
             if (key.name === 'alt-m') this.modelMenu();
             else if (key.name === 'alt-w') await this.workspaceMenu();
             else if (key.name === 'alt-s') this.settingsMenu();
-            else if (key.name === 'alt-n') await this.newConversation('archive');
+            else if (key.name === 'alt-n') this.conversationModeMenu();
             else if (key.name === 'alt-r') await this.listConversations();
             else return;
             this.scheduleRender(); return;
@@ -293,7 +322,9 @@ export class InteractiveCli {
             this.scheduleRender(); return;
         }
         if (this.menu) {
-            if ((key.name === 'pageup' || key.name === 'pagedown') && this.menu.context) {
+            if ((key.name === 'pageup' || key.name === 'pagedown') && key.source === 'mouse') {
+                this.menu.index = Math.max(0, Math.min(this.menu.items.length - 1, this.menu.index + (key.scrollRows ?? (key.name === 'pageup' ? -3 : 3))));
+            } else if ((key.name === 'pageup' || key.name === 'pagedown') && this.menu.context) {
                 const offset = (this.menu.contextOffset ?? 0) + (key.name === 'pageup' ? -3 : 3);
                 this.menu.contextOffset = Math.max(0, Math.min(Math.max(0, this.menuContextLines().length - 3), offset));
             } else if (key.name === 'up' || key.name === 'down') {
@@ -336,6 +367,7 @@ export class InteractiveCli {
         } else if (key.name === 'left') target.move(-1);
         else if (key.name === 'right') target.move(1);
         else if (key.name === 'home') target.home();
+        else if (key.name === 'end' && !target.text && !this.form && !this.commandDraft) { this.scrollDetails(Number.MAX_SAFE_INTEGER); }
         else if (key.name === 'end') target.end();
         else if (key.name === 'backspace') target.erase(true);
         else if (key.name === 'delete') target.erase(false);
@@ -345,10 +377,8 @@ export class InteractiveCli {
         else if (key.name === 'newline') target.insert('\n');
         else if (key.name === 'menu') this.showCommands();
         else if (key.name === 'pageup' || key.name === 'pagedown') {
-            const { pageRows, maxOffset } = this.detailPage();
-            this.detailsOffset = Math.max(0, Math.min(maxOffset, Math.min(maxOffset, this.detailsOffset) + (key.name === 'pageup' ? -pageRows : pageRows)));
-            if (this.partialVisible) this.partialFollow = key.name === 'pagedown' && this.detailsOffset === maxOffset;
-            else if (!this.details.length && this.transcript.length) this.transcriptFollow = key.name === 'pagedown' && this.detailsOffset === maxOffset;
+            const { pageRows } = this.detailPage();
+            this.scrollDetails(key.scrollRows ?? (key.name === 'pageup' ? -pageRows : pageRows));
         }
         else if (key.name === 'tab') {
             if (this.form?.fields[this.form.index].key === 'path') await this.completePath(this.form);
@@ -362,7 +392,8 @@ export class InteractiveCli {
                 target.replace(values[(index + (key.name === 'up' ? -1 : 1) + values.length) % values.length]);
             } else if (!target.text || this.historyIndex >= 0) {
                 this.historyIndex = Math.max(-1, Math.min(this.history.length - 1, this.historyIndex + (key.name === 'up' ? 1 : -1)));
-                target.replace(this.historyIndex < 0 ? '' : this.history[this.history.length - 1 - this.historyIndex].text);
+                if (this.historyIndex < 0) { target.replace(''); if (target === this.draft) target.references = []; }
+                else this.restoreInputHistory(this.history[this.history.length - 1 - this.historyIndex], target);
             }
         } else if (key.name === 'history') this.showInputHistory();
         else if (key.name === 'editor') await this.editDraft();
@@ -377,25 +408,58 @@ export class InteractiveCli {
     }
 
     private showStartup(): void {
+        if (this.conversation) { this.sessionNavigationMenu(); return; }
         if (this.terminal.linear) {
             this.menu = undefined;
-            this.details = ['开始工作 · 线性文字模式', '/new：选择服务商、模型与工作区后开聊', '/sessions：查看已有会话', '/profile list：配置服务商与模型', '/help：查看实际命令', '/terminal set enterBehavior newline：Enter换行，/send发送'];
+            this.details = [`项目：${this.project.name}`, `工作目录：${this.project.roots[0]}`, '/new：选择保存方式、API Key和模型后开聊', '/back：返回项目 · /close：关闭当前对话 · /quit：退出应用', '/providers：管理API与Key · /sessions：查看已有对话'];
             return;
         }
-        this.menu = { title: '开始工作', index: 0, startup: true, items: [
-            { label: '新建归档会话', detail: '保留原文和恢复资料', action: () => this.newConversation('archive') },
-            { label: '已有会话', action: () => this.listConversations() },
-            { label: '新建临时会话', detail: '关闭即清除内容', action: () => this.newConversation('temporary') },
-            { label: '新建限时会话', detail: '显式填写保存时长', action: () => this.newConversation('ttl') },
-            { label: '服务商与API', action: () => this.listProfiles() },
-            { label: '模型、用量与设置', action: () => this.modelMenu() },
-            { label: '命令与帮助', action: () => this.showCommands() },
+        this.menu = { title: '项目与对话 · ' + this.project.name, index: 0, startup: true, context: [`工作目录：${this.project.roots[0]}`, '选择目录后，新对话仅在确认的目录范围内工作'], items: [
+            { label: '新建对话', detail: '选择临时或归档，再选API Key与模型', action: () => this.conversationModeMenu() },
+            { label: '这个项目的对话', action: async () => { this.projectConversationsOnly = true; await this.listConversations(); } },
+            { label: '选择另一个项目目录', action: () => this.selectProjectDirectory() },
+            { label: '项目名称', detail: this.project.name, action: () => this.openForm('项目名称', [{ key: 'name', label: '项目名称', defaultValue: this.project.name, required: true }], async values => { this.project.name = values.name; this.showStartup(); }, () => this.showStartup()) },
+            { label: 'API与Key管理', detail: '编辑、轮换和刷新目录在这里', action: async () => { this.selectionTarget = 'conversation'; this.modelSetting = undefined; this.selectingModel = false; await this.listProfiles(); } },
+            { label: '退出应用', action: () => this.showQuit() },
         ] };
+    }
+
+    private conversationModeMenu(): void {
+        this.menu = { title: '新对话 · 保存方式', index: 0, context: [`项目：${this.project.name}`, `工作目录：${this.project.roots[0]}`], back: () => this.cancelCreation(), items: [
+            { label: '临时对话', detail: '关闭后清除正文和本对话草稿', action: () => this.newConversation('temporary') },
+            { label: '归档对话', detail: '返回项目后可继续打开', action: () => this.newConversation('archive') },
+            { label: '限时保存', detail: '按指定时长保留', action: () => this.newConversation('ttl') },
+            { label: '返回项目', action: () => this.cancelCreation() },
+        ] };
+        this.scheduleRender();
+    }
+
+    private cancelCreation(): void {
+        this.creation = undefined; this.setupContinuation = undefined; this.providerGroup = undefined;
+        this.selectionTarget = 'conversation'; this.modelSetting = undefined; this.selectingModel = false;
+        this.showStartup();
+    }
+
+    private async selectProjectDirectory(): Promise<void> {
+        if (this.conversation) { this.sessionNavigationMenu(() => this.selectProjectDirectory()); return; }
+        await this.browseDirectory(this.project.roots[0], async path => {
+            this.project = projectFromOptions({ writeRoots: [path] }, this.streams.cwd ?? process.cwd());
+            this.creation = undefined; this.setupContinuation = undefined; this.selectionTarget = 'conversation';
+            this.showStartup();
+        });
+        if (this.menu) this.menu.back = () => this.showStartup();
     }
 
     private showCommands(query = ''): void {
         if (this.terminal.linear) { this.menu = undefined; this.details = renderHelp(query || undefined).split('\n'); this.detailsOffset = 0; return; }
         const shortcuts: MenuItem[] = [
+            { label: '/new', detail: '在当前项目新建临时或归档对话', action: () => this.conversationModeMenu() },
+            { label: '/sessions', detail: '查看、打开已有对话', action: () => this.listConversations() },
+            { label: '/models', detail: '选择当前主模型与本对话压缩模型', action: () => this.modelMenu() },
+            { label: '/connect', detail: '独立管理服务商、API和Key', action: () => this.executeLine('/connect') },
+            { label: '/back', detail: '返回项目，应用继续运行', action: () => this.sessionNavigationMenu() },
+            { label: '/close', detail: '关闭当前对话并返回项目', action: () => this.sessionNavigationMenu(undefined, true) },
+            { label: '/exit', detail: '退出整个应用', action: () => this.showQuit() },
             { label: '/model', detail: '当前对话的服务商、模型与参数', action: () => this.modelMenu() },
             { label: '/providers', detail: '新增、编辑服务商和遮挡Key', action: async () => { this.selectionTarget = 'conversation'; await this.listProfiles(); } },
             { label: '/workspace', detail: '目录浏览、补全与多个可写根', action: () => this.workspaceMenu() },
@@ -410,7 +474,7 @@ export class InteractiveCli {
             label: '/' + spec.name, detail: `${spec.name === 'rpc' ? '按实际方法核对 · 高级操作' : spec.name === 'session mode' ? '预览只读，确认时修改保存状态' : spec.mutates ? '修改状态' : '只读/本地'} · ${spec.summary}`, disabled: spec.availability().available ? undefined : spec.availability().reason,
             action: async () => {
                 if (['send', 'input current', 'input next'].includes(spec.name)) { await this.sendDraft(spec.name === 'input current' ? 'steer' : 'queue'); return; }
-                if (spec.name === 'conversation create') { await this.newConversation('archive'); return; }
+                if (spec.name === 'conversation create') { this.conversationModeMenu(); return; }
                 if (['help', 'model', 'queue', 'artifact list', 'run control', 'quit', 'clear', 'editor', 'reconnect', 'terminal show', 'compact'].includes(spec.name)) { await this.executeLine('/' + spec.name); return; }
                 this.commandForm(spec);
             },
@@ -449,8 +513,23 @@ export class InteractiveCli {
     }
 
     private showInputHistory(): void {
-        this.menu = { title: '本次人工输入历史', index: 0, items: [...this.history].reverse().map(entry => ({ label: cleanText(entry.text), action: () => { this.draft.replace(entry.text); } })) };
+        this.menu = { title: '选择要回填的输入', index: 0, items: [...this.history].reverse().map(entry => ({ label: cleanText(entry.text), detail: `${entry.references?.length ?? 0}份材料 · ${entry.inputMode === 'steer' ? '补充当前轮' : '新消息或排队'}`, action: () => this.restoreInputHistory(entry) })) };
         if (!this.menu.items.length) this.menu.items.push({ label: '本次还没有已确认的人工输入', action: () => { this.menu = undefined; } });
+    }
+
+    private restoreInputHistory(entry: InputHistoryEntry, target = this.draft): void {
+        target.replace(entry.text);
+        target.references = structuredClone(entry.references ?? []);
+        target.inputMode = entry.inputMode ?? 'queue';
+        this.referencePreparations.delete(target);
+        if (target === this.draft) {
+            this.details = ['已回填所选输入 · 仍可修改后发送', entry.text, ...target.references.map(reference => {
+                const value = valueObject(reference);
+                return '材料：' + String(value.displayName ?? value.path ?? value.source ?? value.sourceId ?? value.referenceId ?? reference);
+            })];
+            this.detailsOffset = 0; this.detailCache = undefined;
+        }
+        this.scheduleRender();
     }
 
     private completeCommand(draft: DraftBuffer): void {
@@ -459,10 +538,10 @@ export class InteractiveCli {
         else this.showCommands(draft.text.replace(/^\//, ''));
     }
 
-    private openForm(title: string, fields: Field[], complete: Form['complete']): void {
+    private openForm(title: string, fields: Field[], complete: Form['complete'], back?: Form['back']): void {
         this.menu = undefined;
         const draft = new DraftBuffer(fields[0]?.sensitive); draft.replace(fields[0]?.defaultValue ?? '');
-        this.form = { title, fields, index: 0, values: {}, draft, complete };
+        this.form = { title, fields, index: 0, values: {}, draft, complete, back };
         this.scheduleRender();
     }
 
@@ -470,10 +549,11 @@ export class InteractiveCli {
         const form = this.form!;
         const field = form.fields[form.index];
         const text = field.preserveWhitespace ? form.draft.text : form.draft.text.trim();
-        if (field.required && !text.trim()) { this.log('请填写' + field.label); return; }
-        if (field.choices && !field.choices.includes(text)) { this.log('可选：' + field.choices.join(' / ')); return; }
+        if (field.required && !text.trim()) { form.error = '请填写' + field.label; this.scheduleRender(); return; }
+        if (field.choices && !field.choices.includes(text)) { form.error = '可选：' + field.choices.join(' / '); this.scheduleRender(); return; }
         const problem = field.validate?.(text, { ...form.values, [field.key]: text });
-        if (problem) { this.log(problem); this.scheduleRender(); return; }
+        if (problem) { form.error = problem; this.scheduleRender(); return; }
+        form.error = undefined;
         form.values[field.key] = text;
         form.index += 1;
         if (form.index < form.fields.length) {
@@ -492,6 +572,7 @@ export class InteractiveCli {
             form.index = form.fields.length - 1;
             form.draft = new DraftBuffer(form.fields[form.index].sensitive);
             form.draft.replace(form.fields[form.index].sensitive ? '' : form.values[form.fields[form.index].key] ?? '');
+            form.error = this.lastFailure?.error?.message;
             this.form = form;
         }
     }
@@ -501,46 +582,120 @@ export class InteractiveCli {
     }
 
     private async newConversation(mode: string): Promise<void> {
-        const configuredRoots = Array.isArray(this.initial.options['write-root']) ? this.initial.options['write-root'] : [];
-        this.creation = { mode, title: String(this.initial.options.title ?? ''), roots: configuredRoots.length ? [...configuredRoots] : [this.streams.cwd ?? process.cwd()] };
+        if (this.conversation) { this.sessionNavigationMenu(() => this.newConversation(mode)); return; }
+        this.creation = { mode, title: String(this.initial.options.title ?? ''), roots: [...this.project.roots], projectName: this.project.name, parameters: {} };
+        this.newSelection = { profileId: typeof this.initial.options.profile === 'string' ? this.initial.options.profile : undefined,
+            modelId: typeof this.initial.options.model === 'string' ? this.initial.options.model : undefined };
         this.selectionTarget = 'new'; this.modelSetting = undefined;
+        this.providerGroup = undefined;
         this.setupContinuation = async () => { await this.creationMenu(); };
-        await this.listProfiles();
+        if (this.newSelection.profileId && this.newSelection.modelId) await this.creationMenu();
+        else await this.listProfiles();
     }
 
     private async creationMenu(): Promise<void> {
         if (!this.creation) return;
         const creation = this.creation;
-        this.menu = { title: '新对话 · 工作区与保存', index: 0, context: [
-            `模型：${this.newSelection.modelId ?? '待选择'}`,
-            `工作目录：${creation.roots[0]}`,
-            `允许写入：${creation.roots.join('；')}`,
+        if (!this.newSelection.profileId || !this.newSelection.modelId) { await this.listProfiles(); return; }
+        const selected = { ...this.newSelection };
+        const [read, modelRead] = await Promise.all([
+            this.client.request<Record<string, unknown>>('profiles.get', { profileId: selected.profileId }),
+            this.client.request<Record<string, unknown>>('models.get', { profileId: selected.profileId, modelId: selected.modelId }),
+        ]);
+        if (this.creation !== creation) return;
+        const profile = read.ok ? valueObject(read.data?.profile ?? read.data) : {};
+        const tools = modelToolSupport(modelRead.ok ? valueObject(modelRead.data?.entry ?? modelRead.data) : undefined);
+        const compression = creation.compression?.modelId ?? (creation.compression === null ? selected.modelId : profile.compressionModelRef ?? selected.modelId);
+        const mode = ({ archive: '归档对话', temporary: '临时对话 · 关闭后清除', ttl: '限时保存' } as Record<string, string>)[creation.mode];
+        this.menu = { title: creation.toolsEnabled === false ? '确认后开始普通聊天' : tools.supported ? '确认后开始聊天' : tools.label, index: 0, back: () => this.listProfiles(), context: [
+            `${creation.projectName} · ${mode}`,
+            `Key：${profile.label ?? selected.profileId} · ${creation.toolsEnabled === false ? '普通聊天 · 工具已关闭' : tools.label}`,
+            `主模型：${selected.modelId} · 压缩模型：${compression}`,
         ], items: [
-            { label: '开始聊天', detail: '已选配置保存到新对话，输入草稿保留', action: () => this.createSelectedConversation() },
-            { label: '选择工作目录', detail: creation.roots[0], action: () => this.browseDirectory(creation.roots[0], async path => { creation.roots[0] = path; await this.creationMenu(); }) },
-            { label: '添加可写目录', action: () => this.browseDirectory(creation.roots[0], async path => { if (!creation.roots.includes(path)) creation.roots.push(path); await this.creationMenu(); }) },
-            { label: '标题（可选）', detail: creation.title || '留空后采用首条消息', action: () => this.openForm('对话标题 · 可留空', [{ key: 'title', label: '标题', defaultValue: creation.title }], async values => { creation.title = values.title; await this.creationMenu(); }) },
-            { label: '保存方式', detail: ({ archive: '归档 · 可随时重开', temporary: '临时 · 退出后清除', ttl: '限时' } as Record<string, string>)[creation.mode], action: () => {
-                this.menu = { title: '保存方式', index: 0, items: ['archive', 'temporary', 'ttl'].map(mode => ({ label: ({ archive: '归档保存', temporary: '临时保存', ttl: '限时保存' } as Record<string, string>)[mode], action: async () => {
-                    creation.mode = mode;
-                    if (mode === 'ttl') this.openForm('限时保存', [{ key: 'ttl', label: '保留时长，例如2h或7d', defaultValue: creation.ttl ?? '7d', required: true }], async values => { creation.ttl = values.ttl; await this.creationMenu(); });
-                    else await this.creationMenu();
-                } })) };
-            } },
-            { label: '重新选择服务商与模型', action: () => this.listProfiles() },
+            { label: '开始聊天', detail: '工作目录：' + creation.roots[0], disabled: creation.toolsEnabled !== false && !tools.supported ? tools.reason : undefined, action: () => this.createSelectedConversation() },
+            ...(!tools.supported ? [{ label: '刷新模型能力', detail: '重新读取模型目录，不发送聊天请求', action: async () => { const refreshed = await this.perform(['model', 'refresh', '--profile', selected.profileId!]); if (refreshed?.result.ok) await this.creationMenu(); } }] : []),
+            ...(!tools.supported && creation.toolsEnabled !== false ? [{ label: '仅普通聊天（关闭工具）', detail: '需要明确确认，文件任务继续保留在草稿', action: () => this.confirmPlainChat() }] : []),
+            { label: '主模型', detail: selected.modelId, action: async () => { this.modelSetting = undefined; await this.listModels(selected.profileId); } },
+            { label: '压缩模型', detail: String(compression), action: () => this.preparationCompressionMenu() },
+            { label: '模型参数', detail: '仅显示当前模型有依据的档位与范围，默认值可直接使用', action: () => this.parameterForm() },
+            { label: '名称、目录与保存选项', detail: creation.title || '名称留空后采用首条消息', action: () => this.creationAdvancedMenu() },
+            { label: '返回选择API Key', action: () => this.providerGroup ? this.listProviderKeys(this.providerGroup) : this.listProfiles() },
         ] };
         this.scheduleRender();
+    }
+
+    private preparationCompressionMenu(): void {
+        if (!this.creation || !this.newSelection.profileId) return;
+        this.menu = { title: '压缩模型 · 只整理本对话的上下文', index: 0, back: () => this.creationMenu(), items: [
+            { label: '沿用这个Key的压缩设置', action: async () => { this.creation!.compression = undefined; await this.creationMenu(); } },
+            { label: '使用本对话主模型', action: async () => { this.creation!.compression = null; await this.creationMenu(); } },
+            { label: '从这个Key可用的模型中选择', action: async () => { this.modelSetting = 'compression'; await this.listModels(this.newSelection.profileId); } },
+            { label: '选择其他服务商或Key', action: async () => { this.modelSetting = 'compression'; await this.listProfiles(); } },
+            { label: '压缩模型参数', detail: '仅显示这个压缩模型支持的参数', action: () => this.parameterForm('compression') },
+        ] };
+    }
+
+    private creationAdvancedMenu(): void {
+        const creation = this.creation;
+        if (!creation) return;
+        this.menu = { title: '新对话选项', index: 0, back: () => this.creationMenu(), context: [`工作目录：${creation.roots[0]}`, `允许写入：${creation.roots.join('；')}`], items: [
+            { label: '对话名称', detail: creation.title || '采用首条消息', action: () => this.openForm('对话名称', [{ key: 'title', label: '名称 · 可留空', defaultValue: creation.title }], async values => { creation.title = values.title; await this.creationMenu(); }, () => this.creationMenu()) },
+            { label: '工作目录', action: () => this.browseDirectory(creation.roots[0], async path => { creation.roots = [path, ...creation.roots.slice(1).filter(root => root !== path)]; await this.creationMenu(); }) },
+            { label: '添加可写目录', action: () => this.browseDirectory(creation.roots[0], async path => { if (!creation.roots.includes(path)) creation.roots.push(path); await this.creationMenu(); }) },
+            ...(creation.mode === 'ttl' ? [{ label: '保留时长', detail: creation.ttl ?? '7d', action: () => this.openForm('限时保存', [{ key: 'ttl', label: '保留时长，例如2h或7d', defaultValue: creation.ttl ?? '7d', required: true }], async values => { creation.ttl = values.ttl; await this.creationMenu(); }, () => this.creationMenu()) }] : []),
+            { label: '返回确认', action: () => this.creationMenu() },
+        ] };
+    }
+
+    private confirmPlainChat(): void {
+        this.menu = { title: '确认仅使用普通聊天', index: 0, context: [
+            '这次选择会关闭文件读写、命令执行和其它工具。',
+            '当前草稿会保留；文件任务需要切换到已确认支持工具的模型。',
+        ], items: [
+            { label: '返回选择支持工具的模型', action: () => this.creation ? this.creationMenu() : this.modelMenu() },
+            { label: '确认仅普通聊天', action: async () => {
+                if (this.creation) { this.creation.toolsEnabled = false; await this.creationMenu(); }
+                else if (await this.updateConversationOptions({ toolsEnabled: false })) { this.menu = undefined; this.log('已选择普通聊天，草稿保留，按Enter发送'); }
+            } },
+        ] };
+        this.scheduleRender();
+    }
+
+    private async requireModelTools(profileId: string, modelId: string): Promise<boolean> {
+        const read = await this.client.request<Record<string, unknown>>('models.get', { profileId, modelId });
+        if (!read.ok) { this.showError(read); return false; }
+        const support = modelToolSupport(valueObject(read.data?.entry ?? read.data));
+        if (support.supported) return true;
+        this.menu = { title: support.label, index: 0, context: [support.reason, '消息尚未发送，草稿和附件保留。'], items: [
+            { label: '刷新模型能力', detail: '只读取目录，不发送聊天请求', action: async () => {
+                const refreshed = await this.perform(['model', 'refresh', '--profile', profileId]);
+                if (refreshed?.result.ok && await this.requireModelTools(profileId, modelId)) {
+                    if (this.creation) await this.creationMenu(); else { this.menu = undefined; this.log('工具能力已确认，按Enter发送保留的草稿'); }
+                }
+            } },
+            { label: '选择其他模型', action: () => this.listModels(profileId) },
+            { label: '仅普通聊天（关闭工具）', action: () => this.confirmPlainChat() },
+            { label: '返回并保留草稿', action: () => { this.menu = undefined; } },
+        ] };
+        this.scheduleRender();
+        return false;
     }
 
     private async createSelectedConversation(): Promise<void> {
         const creation = this.creation;
         if (!creation || !this.newSelection.profileId || !this.newSelection.modelId) { await this.listProfiles(); return; }
+        if (!this.pendingCreationArguments && creation.toolsEnabled !== false && !await this.requireModelTools(this.newSelection.profileId, this.newSelection.modelId)) return;
         const draft = this.draft;
         const args = ['conversation', 'create', '--mode', creation.mode, '--profile', this.newSelection.profileId, '--model', this.newSelection.modelId];
+        const compressionModelSelection = creation.compression === null ? { profileId: this.newSelection.profileId, modelId: this.newSelection.modelId } : creation.compression;
+        args.push('--params', JSON.stringify({ options: { projectName: creation.projectName, workingDirectory: creation.roots[0], parameters: creation.parameters, toolsEnabled: creation.toolsEnabled !== false,
+            ...(compressionModelSelection ? { compressionModelSelection } : {}) } }));
         if (creation.title) args.push('--title', creation.title);
         for (const root of creation.roots) args.push('--write-root', root);
         if (creation.mode === 'ttl') args.push('--ttl', creation.ttl ?? '7d');
-        const execution = await this.perform(args);
+        const execution = await this.perform(this.pendingCreationArguments ?? args);
+        if (execution?.result.error?.mayHaveStarted) this.pendingCreationArguments ??= [...args];
+        else this.pendingCreationArguments = undefined;
         if (execution?.result.ok) {
             if (draft.text || draft.references.length) this.draft = draft;
             this.creation = undefined; this.setupContinuation = undefined; this.selectionTarget = 'conversation';
@@ -566,7 +721,9 @@ export class InteractiveCli {
                 } catch { conversations[index] = { ...conversation, metadataUnavailable: true }; }
             }
         }));
-        const items: MenuItem[] = conversations.map(conversation => {
+        const selectedProjectRoot = resolve(this.project.roots[0]).toLowerCase();
+        const shown = this.projectConversationsOnly ? conversations.filter(conversation => conversation.metadataUnavailable || resolve(projectFromOptions(conversation.options, this.streams.cwd ?? process.cwd()).roots[0]).toLowerCase() === selectedProjectRoot) : conversations;
+        const items: MenuItem[] = shown.map(conversation => {
             const options = valueObject(conversation.options);
             const roots = Array.isArray(options.writeRoots) ? options.writeRoots.map(String) : [];
             const selection = valueObject(options.modelSelection);
@@ -575,8 +732,9 @@ export class InteractiveCli {
                 action: () => this.openConversation(String(conversation.conversationId)) };
         });
         if (page.nextCursor) items.push({ label: '下一页', action: () => this.listConversations(String(page.nextCursor)) });
-        items.push({ label: '返回启动菜单', action: () => this.showStartup() });
-        this.menu = { title: '已有会话', index: 0, items };
+        if (this.projectConversationsOnly) items.push({ label: '查看所有项目的对话', action: async () => { this.projectConversationsOnly = false; await this.listConversations(); } });
+        items.push({ label: this.conversation ? '返回当前对话' : '返回项目', action: () => { if (this.conversation) this.menu = undefined; else this.showStartup(); } });
+        this.menu = { title: this.projectConversationsOnly ? this.project.name + ' · 对话' : '所有项目的对话', index: 0, items, back: () => { if (!this.conversation) this.showStartup(); } };
     }
 
     private async openConversation(conversationId: string, observe = this.initial.options.observe === true, preserveDetails = false): Promise<void> {
@@ -659,6 +817,7 @@ export class InteractiveCli {
 
     private restoreSelection(conversation: Record<string, unknown>): void {
         const options = valueObject(conversation.options);
+        this.project = projectFromOptions(options, this.streams.cwd ?? process.cwd());
         const selection = valueObject(options.modelSelection);
         this.selectedProfile = typeof options.profileId === 'string' ? options.profileId : typeof selection.profileId === 'string' ? selection.profileId : undefined;
         this.selectedModel = typeof options.modelId === 'string' ? options.modelId : typeof selection.modelId === 'string' ? selection.modelId : undefined;
@@ -666,29 +825,43 @@ export class InteractiveCli {
     }
 
     private async restoreTranscript(conversationId: string, viewEpoch = this.viewEpoch, cursor?: string): Promise<void> {
-        const result = await this.client.request<Record<string, unknown>>('conversations.readHistory', { conversationId, limit: 20, maxBytes: 128 * 1024, ...(cursor ? { cursor } : {}) });
-        if (viewEpoch !== this.viewEpoch || this.disposed || this.conversation?.conversationId !== conversationId) return;
-        if (!result.ok || !result.data) { this.showError(result, false); return; }
-        const page = result.data;
-        const sections: string[] = [];
+        const sections: { seq: number; role: string; text: string }[] = [];
+        let nextCursor = cursor;
+        let hasMore = false;
+        let artifactReads = 0;
+        let artifactBytes = TRANSCRIPT_HISTORY_LIMITS.artifactBytes;
         let omitted = 0;
-        for (const item of rows(page)) {
-            if (!['user', 'assistant'].includes(String(item.role))) continue;
-            let entry = item;
-            if (item.value === undefined && typeof item.contentId === 'string') {
-                const bytes = Number(valueObject(item.objectRef).rawBytes);
-                if (bytes > 256 * 1024 || !this.client.readArtifact) { omitted += 1; continue; }
-                const artifact = await this.client.readArtifact(conversationId, item.contentId, { maxTotalBytes: 256 * 1024 });
-                if (viewEpoch !== this.viewEpoch || this.disposed) return;
-                if (!artifact.ok || !artifact.data) { omitted += 1; continue; }
-                entry = { ...item, value: decodeArtifactJson(artifact.data) };
+        const seenCursors = new Set<string>();
+        for (let pageIndex = 0; pageIndex < TRANSCRIPT_HISTORY_LIMITS.pages; pageIndex += 1) {
+            const result = await this.client.request<Record<string, unknown>>('conversations.readHistory', { conversationId, direction: 'backward', limit: TRANSCRIPT_HISTORY_LIMITS.itemsPerPage, maxBytes: TRANSCRIPT_HISTORY_LIMITS.pageBytes, ...(nextCursor ? { cursor: nextCursor } : {}) });
+            if (viewEpoch !== this.viewEpoch || this.disposed || this.conversation?.conversationId !== conversationId) return;
+            if (!result.ok || !result.data) { this.showError(result, false); return; }
+            const page = result.data;
+            for (const item of rows(page)) {
+                if (!['user', 'assistant'].includes(String(item.role))) continue;
+                let entry = item;
+                if (item.value === undefined && typeof item.contentId === 'string') {
+                    const bytes = Number(valueObject(item.objectRef).rawBytes);
+                    if (!Number.isFinite(bytes) || bytes < 1 || bytes > artifactBytes || bytes > TRANSCRIPT_HISTORY_LIMITS.artifactItemBytes || artifactReads >= TRANSCRIPT_HISTORY_LIMITS.artifactReads || !this.client.readArtifact) { omitted += 1; continue; }
+                    artifactReads += 1; artifactBytes -= bytes;
+                    const artifact = await this.client.readArtifact(conversationId, item.contentId, { maxTotalBytes: bytes });
+                    if (viewEpoch !== this.viewEpoch || this.disposed || this.conversation?.conversationId !== conversationId) return;
+                    if (!artifact.ok || !artifact.data) { omitted += 1; continue; }
+                    entry = { ...item, value: decodeArtifactJson(artifact.data) };
+                }
+                const text = historyMessage(entry);
+                if (text) sections.push({ seq: Number(item.seq) || 0, role: String(item.role), text });
             }
-            const text = historyMessage(entry);
-            if (text) sections.push(text);
+            hasMore = page.hasMore === true;
+            const previousCursor = nextCursor;
+            nextCursor = hasMore && typeof page.nextCursor === 'string' ? page.nextCursor : undefined;
+            if (!nextCursor || nextCursor === previousCursor || seenCursors.has(nextCursor)) break;
+            seenCursors.add(nextCursor);
+            if (sections.some(section => section.role === 'user') && sections.some(section => section.role === 'assistant')) break;
         }
-        this.historyCursor = typeof page.nextCursor === 'string' ? page.nextCursor : undefined;
-        if (sections.length) await this.printTranscript(sections.join('\n\n'), !cursor);
-        if (omitted || page.hasMore) this.log(`${omitted ? omitted + '条较长原文尚未载入 · ' : ''}${page.hasMore ? '/history继续读取本次历史下一页' : '/history查看原文页'}`);
+        this.historyCursor = nextCursor;
+        if (sections.length) await this.printTranscript(sections.sort((left, right) => left.seq - right.seq).map(section => section.text).join('\n\n'), true);
+        if (omitted || hasMore) this.log(`${omitted ? omitted + '条原文受本次读取预算限制 · ' : ''}${hasMore ? '当前显示最近可用正文，/history读取更早记录' : '/history查看原文页'}`);
     }
 
     private async refreshUsage(force = false): Promise<void> {
@@ -716,18 +889,30 @@ export class InteractiveCli {
         if (!METHOD_SPECS['profiles.list']) { this.showError({ ok: false, error: { code: 'METHOD_NOT_AVAILABLE', message: '服务商配置能力尚未安装', retryable: false, mayHaveStarted: false } }); return; }
         const result = await this.client.request('profiles.list', { limit: 20, ...(cursor ? { cursor } : {}) });
         if (!result.ok) { this.showError(result); return; }
-        const choosing = this.selectionTarget === 'new' || this.modelSetting !== undefined;
-        const items: MenuItem[] = rows(result.data).map(value => {
-            const profile = valueObject(value.profile ?? value);
-            return { label: String(profile.label ?? '服务商'), detail: `${profile.protocol} · ${profile.credentialRef ? 'Key已配置 · ********' : '尚未配置Key'}`, action: async () => {
-                if (choosing) await this.chooseProfile(profile);
-                else this.profileMenu(profile);
-            } };
-        });
-        items.unshift({ label: '添加服务商/API', action: () => this.addProfile() });
+        const choosing = this.selectionTarget === 'new' || this.modelSetting !== undefined || this.selectingModel;
+        const profiles = rows(result.data).map(value => valueObject(value.profile ?? value));
+        const items: MenuItem[] = groupProviderProfiles(profiles).map(group => ({ label: group.label, detail: `${protocolLabel(group.protocol)} · ${group.profiles.length}个Key配置`, action: () => this.listProviderKeys(group) }));
+        items.push({ label: '添加服务商/API', action: () => this.addProfile() });
         const page = valueObject(result.data);
         if (page.nextCursor) items.push({ label: '下一页服务商', action: () => this.listProfiles(String(page.nextCursor)) });
-        this.menu = { title: choosing ? '选择服务商 · 只影响确认后的配置' : '服务商与Key · 浏览保持原选择', index: 0, items };
+        items.push({ label: choosing && this.creation ? '取消新建，返回项目' : '返回', action: () => {
+            if (this.creation) { this.creation = undefined; this.setupContinuation = undefined; this.selectionTarget = 'conversation'; this.modelSetting = undefined; }
+            if (!this.conversation) this.showStartup();
+        } });
+        this.menu = { title: choosing ? '选择API服务商' : 'API与Key管理', index: 0, items, back: () => this.creation ? this.conversationModeMenu() : this.conversation ? this.settingsMenu() : this.showStartup() };
+    }
+
+    private async listProviderKeys(group: CliProviderGroup): Promise<void> {
+        this.providerGroup = group;
+        const choosing = this.selectionTarget === 'new' || this.modelSetting !== undefined || this.selectingModel;
+        const items: MenuItem[] = group.profiles.map(profile => ({ label: String(profile.label ?? '未命名Key'), detail: profile.credentialRef ? 'Key已保存 · ********' : '需要填写Key', action: () => {
+            if (choosing) return this.chooseProfile(profile);
+            this.profileMenu(profile);
+        } }));
+        items.push({ label: '新增一个Key配置', detail: '用名称区分用途，已有Key保持原样', action: () => this.profileForm({ label: group.label, protocol: group.protocol, url: group.baseUrl }) });
+        items.push({ label: '返回服务商', action: () => this.listProfiles() });
+        this.menu = { title: `${group.label} · ${choosing ? '选择API Key' : '管理Key'}`, index: 0, context: [group.baseUrl || protocolLabel(group.protocol)], items, back: () => this.listProfiles() };
+        this.scheduleRender();
     }
 
     private addProfile(): void {
@@ -743,7 +928,7 @@ export class InteractiveCli {
 
     private profileForm(preset: { label: string; protocol: string; url: string }, profile?: Record<string, unknown>): void {
         this.openForm('添加服务商/API（保存不发送模型请求）', [
-            { key: 'label', label: '服务商名称', defaultValue: String(profile?.label ?? preset.label), required: true },
+            { key: 'label', label: '这个Key的名称或用途', defaultValue: String(profile?.label ?? preset.label), required: true },
             { key: 'url', label: 'API地址', defaultValue: String(profile?.baseUrl ?? preset.url), required: true, validate: text => { try { return ['http:', 'https:'].includes(new URL(text).protocol) ? undefined : '地址需以https://或http://开头'; } catch { return '请填写完整API地址'; } } },
         ], async values => {
             const args = profile ? ['profile', 'edit', String(profile.profileId), '--label', values.label, '--base-url', values.url, '--revision', String(profile.revision)]
@@ -762,6 +947,8 @@ export class InteractiveCli {
         this.menu = { title: String(profile.label ?? profileId), index: 0, items: [
             { label: '为当前对话选择模型', action: () => this.chooseProfile(profile) },
             { label: '编辑名称与API地址', action: () => this.profileForm({ label: String(profile.label), protocol: String(profile.protocol), url: String(profile.baseUrl) }, profile) },
+            { label: '来源、用途与备注（可选）', detail: String(valueObject(profile.information).purpose ?? '保存这份Key配置的说明'), action: () => this.profileInformationForm(profile) },
+            { label: '停止新请求的条件（可选）', detail: valueObject(profile.dispatchPolicy).enabled === false ? '当前已停发新请求' : '日期与累计费用均可留空', action: () => this.profileDispatchPolicyForm(profile) },
             { label: profile.credentialRef ? '更新/轮换Key · 全程遮挡' : '填写Key · 全程遮挡', action: () => this.keyForm(profile) },
             { label: '从私有文件导入API Key（仅服务端读取）', disabled: supportsServerSecretImport() ? undefined : '服务端文件导入隐藏通道尚未安装', action: () => {
                 this.openForm('服务端隐藏Key导入', [
@@ -790,6 +977,52 @@ export class InteractiveCli {
             { label: '刷新模型目录（明确联网）', action: async () => { await this.perform(['model', 'refresh', '--profile', profileId]); await this.listModels(profileId); } },
             { label: '返回服务商列表', action: () => this.listProfiles() },
         ] };
+    }
+
+    private async saveProfileDetails(profile: Record<string, unknown>, patch: Record<string, unknown>): Promise<void> {
+        const read = await this.client.request<Record<string, unknown>>('profiles.get', { profileId: profile.profileId });
+        if (!read.ok || !read.data) { this.showError(read); return; }
+        const current = valueObject(read.data.profile ?? read.data);
+        for (const key of Object.keys(patch)) {
+            if (current.revision !== profile.revision && canonicalJson(current[key] ?? null) !== canonicalJson(profile[key] ?? null)) {
+                this.showError({ ok: false, error: { code: 'PROFILE_CHANGED', message: '这部分配置已在其它入口更新，请重新打开后核对再保存', retryable: false, mayHaveStarted: false } }); return;
+            }
+        }
+        const result = await this.perform(['profile', 'put', '--params', JSON.stringify({ profile: { ...current, ...patch }, expectedRevision: current.revision })]);
+        if (result?.result.ok) {
+            const data = valueObject(result.result.data);
+            this.profileMenu(valueObject(data.profile ?? { ...current, ...patch }));
+        }
+    }
+
+    private profileInformationForm(profile: Record<string, unknown>): void {
+        const information = valueObject(profile.information);
+        this.openForm('这份Key配置的说明 · 全部可选', [
+            { key: 'source', label: '来源 · 例如官方申请或资料链接', defaultValue: String(information.source ?? '') },
+            { key: 'purpose', label: '用途', defaultValue: String(information.purpose ?? '') },
+            { key: 'notes', label: '备注 · Ctrl+J可换行', defaultValue: String(information.notes ?? ''), preserveWhitespace: true },
+            { key: 'tested', label: '手工记录的核验时间 · 本机时间，如2026-11-20 18:00，可留空', defaultValue: String(information.lastTestedAt ?? ''), validate: text => { try { optionalDateTime(text); return undefined; } catch (error) { return error instanceof Error ? error.message : '请核对时间'; } } },
+        ], async values => {
+            const next: Record<string, unknown> = { updatedAt: new Date().toISOString() };
+            for (const key of ['source', 'purpose', 'notes']) if (values[key]) next[key] = values[key];
+            next.lastTestedAt = optionalDateTime(values.tested);
+            await this.saveProfileDetails(profile, { information: next });
+        }, () => this.profileMenu(profile));
+    }
+
+    private profileDispatchPolicyForm(profile: Record<string, unknown>): void {
+        const policy = valueObject(profile.dispatchPolicy);
+        const cost = valueObject(policy.maxCumulativeCost);
+        this.openForm('停止新请求的条件 · 留空即不设置该项', [
+            { key: 'enabled', label: '是否允许发送新请求', choices: ['启用', '停发'], defaultValue: policy.enabled === false ? '停发' : '启用', required: true },
+            { key: 'expires', label: '停止发送时间 · 本机时间，如2026-11-20 18:00，留空不限', defaultValue: String(policy.expiresAt ?? ''), validate: text => { try { optionalDateTime(text); return undefined; } catch (error) { return error instanceof Error ? error.message : '请核对时间'; } } },
+            { key: 'cost', label: '累计费用停止额 · 币种单位，留空不设置', defaultValue: typeof cost.amountMicros === 'number' ? String(cost.amountMicros / 1_000_000) : '', validate: text => { try { if (text) amountMicros(text); return undefined; } catch (error) { return error instanceof Error ? error.message : '请核对金额'; } } },
+            { key: 'currency', label: '累计费用币种 · 设置金额时使用，例如USD或CNY', defaultValue: String(cost.currency ?? 'USD'), validate: (text, values) => values.cost && !/^[A-Za-z]{3}$/.test(text) ? '请填写三字母币种' : undefined },
+        ], async values => {
+            const dispatchPolicy = { enabled: values.enabled === '启用', expiresAt: optionalDateTime(values.expires),
+                ...(values.cost ? { maxCumulativeCost: { currency: values.currency.toUpperCase(), amountMicros: amountMicros(values.cost) } } : {}) };
+            await this.saveProfileDetails(profile, { dispatchPolicy });
+        }, () => this.profileMenu(profile));
     }
 
     private async chooseProfile(profile: Record<string, unknown>): Promise<void> {
@@ -838,12 +1071,14 @@ export class InteractiveCli {
             if (!result.error?.mayHaveStarted) this.pendingSecrets.delete(profileId);
             if (!result.ok) {
                 this.busy = false;
+                this.status = result.error?.message ?? 'Key保存未完成，请检查后重试';
                 this.log('Key保存未完成 · ' + (result.error?.code ?? '连接中断'));
                 if (result.error?.mayHaveStarted) this.keyForm(profile, after);
                 else await this.listProfiles();
                 return;
             }
             this.pendingSecrets.delete(profileId);
+            this.status = 'Key已保存，可以选择模型';
             this.log('Key已保存 · ********');
             try {
                 const refreshed = await refreshSavedProfileCatalog(this.client, result);
@@ -859,18 +1094,37 @@ export class InteractiveCli {
         const result = await this.client.request('models.list', { profileId, limit: 20, ...(cursor ? { cursor } : {}) });
         if (!result.ok) { this.showError(result); return; }
         const page = valueObject(result.data);
-        const items: MenuItem[] = rows(page).map(model => ({ label: String(model.displayName ?? model.modelId), detail: String(model.modelId), action: () => {
-            this.menu = { title: '确认模型选择', index: 0, context: [String(model.displayName ?? model.modelId), this.modelSetting === 'compression' ? '用于整理上下文，主模型保持原样' : this.selectionTarget === 'new' ? '用于待创建的新对话' : '仅改变当前对话后续请求'], items: [
+        const catalog = valueObject(page.catalog);
+        const freshness = String(catalog.freshness ?? page.freshness ?? (!page.catalogVersion && !rows(page).length ? 'missing' : 'unknown'));
+        const refreshKey = profileId;
+        if (!cursor && ['missing', 'expired', 'future'].includes(freshness) && !this.catalogAutoRefreshes.has(refreshKey)) {
+            this.catalogAutoRefreshes.add(refreshKey);
+            if (this.catalogAutoRefreshes.size > 100) this.catalogAutoRefreshes.delete(this.catalogAutoRefreshes.values().next().value!);
+            const refreshed = await this.perform(['model', 'refresh', '--profile', profileId]);
+            if (refreshed?.result.ok) { await this.listModels(profileId); return; }
+        }
+        const items: MenuItem[] = rows(page).filter(model => model.retired !== true).map(model => ({ label: String(model.displayName ?? model.modelId), detail: `${model.modelId} · ${modelToolSupport(model).label}`, action: () => {
+            if (this.creation) return this.selectModel(profileId, String(model.modelId));
+            this.menu = { title: '确认模型选择', index: 0, context: [String(model.displayName ?? model.modelId), modelToolSupport(model).label, this.modelSetting === 'compression' ? '用于整理上下文，主模型保持原样' : this.selectionTarget === 'new' ? '用于待创建的新对话' : '仅改变当前对话后续请求'], items: [
                 { label: '确认使用', action: () => this.selectModel(profileId, String(model.modelId)) },
                 { label: '返回列表', action: () => this.listModels(profileId) },
             ] };
         } }));
         if (page.nextCursor) items.push({ label: '下一页模型', action: () => this.listModels(profileId, String(page.nextCursor)) });
         items.push({ label: '联网读取/刷新模型目录', detail: '使用已保存Key查询列表，不发送模型任务', action: async () => { const result = await this.perform(['model', 'refresh', '--profile', profileId]); if (result?.result.ok) await this.listModels(profileId); } });
+        items.push({ label: '目录时间与模型能力来源', action: () => {
+            this.details = [`目录状态：${({ current: '当前有效', expired: '已过期', future: '记录时间超前', missing: '尚无目录', unknown: '时间信息不完整' } as Record<string, string>)[freshness] ?? freshness}`,
+                `获取时间：${localTime(catalog.observedAt)}`, `有效期：${localTime(catalog.expiresAt)}`,
+                ...rows(page).flatMap(model => [String(model.displayName ?? model.modelId) + (model.retired ? '（已退役）' : ''),
+                    ...['contextWindow', 'maxOutputTokens', 'pricing', 'tools', 'streaming'].flatMap(name => { const evidence = valueObject(model[name]); return Object.keys(evidence).length ? [`${name}：${evidence.status ?? '未知'} · ${evidence.source ?? '来源未记录'} · ${evidence.sourceRef ?? ''} · ${localTime(evidence.observedAt)}`] : []; })])];
+            this.detailsOffset = 0; this.detailCache = undefined;
+        } });
         items.push({ label: '手工输入精确模型ID', action: () => this.openForm('选择模型', [{ key: 'model', label: '精确模型ID', required: true }], async values => {
             await this.selectModel(profileId, values.model);
         }) });
-        this.menu = { title: '选择模型 · ' + profileId, index: 0, items };
+        this.menu = { title: this.modelSetting === 'compression' ? '选择压缩模型' : '选择主模型', index: 0,
+            context: [({ current: '目录当前有效', expired: '目录已过期，可刷新后继续', future: '目录时间超前，请核对', missing: '正在准备模型目录', unknown: '目录时间可在详情查看' } as Record<string, string>)[freshness] ?? freshness],
+            items, back: () => this.creation && this.newSelection.modelId ? this.creationMenu() : this.providerGroup ? this.listProviderKeys(this.providerGroup) : this.listProfiles() };
     }
 
     private async selectModel(profileId: string, modelId: string): Promise<void> {
@@ -879,15 +1133,24 @@ export class InteractiveCli {
         const profile = valueObject(read.data.profile ?? read.data);
         const policy = valueObject(profile.routePolicy);
         const allowed = Array.isArray(policy.allowedModels) ? policy.allowedModels as string[] : [];
-        const patch: Record<string, unknown> = this.modelSetting === 'compression' ? { compressionModelRef: modelId }
+        const patch: Record<string, unknown> = this.creation || this.conversationCompression && this.modelSetting === 'compression' ? {} : this.modelSetting === 'compression' ? { compressionModelRef: modelId }
             : this.modelSetting === 'default' || !profile.defaultModel ? { defaultModel: modelId } : {};
         if (!allowed.includes(modelId)) patch.routePolicy = { ...policy, allowedModels: [...allowed, modelId], version: randomUUID() };
         if (Object.keys(patch).length) {
             const applied = await this.perform(['profile', 'put', '--params', JSON.stringify({ profile: { ...profile, ...patch }, expectedRevision: profile.revision })]);
             if (!applied?.result.ok) return;
         }
+        if (this.creation && this.modelSetting === 'compression') {
+            this.creation.compression = { profileId, modelId }; this.modelSetting = undefined;
+            await this.creationMenu(); return;
+        }
+        if (this.conversationCompression && this.modelSetting === 'compression' && this.conversation) {
+            if (!await this.updateConversationOptions({ compressionModelSelection: { profileId, modelId } })) return;
+            this.conversationCompression = false; this.modelSetting = undefined; this.settingsMenu(); return;
+        }
         if (this.modelSetting) { this.log(this.modelSetting === 'compression' ? '压缩模型已保存' : '服务商默认模型已保存'); this.modelSetting = undefined; this.settingsMenu(); return; }
         if (this.selectionTarget === 'new') {
+            if (this.creation && (this.newSelection.profileId !== profileId || this.newSelection.modelId !== modelId)) this.creation.parameters = {};
             this.newSelection = { profileId, modelId };
             if (this.setupContinuation) await this.setupContinuation();
             return;
@@ -898,29 +1161,32 @@ export class InteractiveCli {
             const snapshot = await this.client.request<Record<string, unknown>>('conversations.get', { conversationId: this.conversation.conversationId });
             if (snapshot.ok && snapshot.data) this.conversation = snapshot.data;
         }
-        this.selectedProfile = profileId; this.selectedModel = modelId;
+        this.selectedProfile = profileId; this.selectedModel = modelId; this.selectingModel = false;
         this.selectedProfileLabel = String(profile.label ?? '服务商');
         this.usageOverview = undefined; this.usageLoadedAt = 0; void this.refreshUsage(true);
         this.log('已选择模型 ' + modelId); this.menu = undefined;
     }
 
     private modelMenu(): void {
-        this.selectionTarget = 'conversation'; this.modelSetting = undefined;
+        if (!this.conversation) { if (this.creation) void this.creationMenu(); else this.conversationModeMenu(); return; }
+        this.selectionTarget = 'conversation'; this.modelSetting = undefined; this.selectingModel = false; this.conversationCompression = false;
         this.menu = { title: '当前对话 · 模型与参数', index: 0, items: [
-            { label: '选择服务商与模型', action: () => this.listProfiles() },
+            { label: '选择服务商与模型', action: async () => { this.selectingModel = true; await this.listProfiles(); } },
             { label: '本对话模型参数', detail: '推理强度、温度与输出长度；留空沿服务商有效值', action: () => this.parameterForm() },
             { label: '主模型与压缩模型设置', action: () => this.settingsMenu() },
-            { label: '用量、缓存率与余额来源', action: async () => { await this.refreshUsage(true); this.details = usageOverviewLines(this.usageOverview, this.usageState); } },
+            { label: '用量、缓存率与余额来源', action: async () => { await this.refreshUsage(true); this.details = detailedUsageLines(this.usageOverview, this.usageState); } },
             { label: '返回聊天', action: () => {} },
         ] };
     }
 
     private settingsMenu(): void {
-        this.selectionTarget = 'conversation'; this.modelSetting = undefined;
+        if (this.creation) { void this.creationMenu(); return; }
+        this.selectionTarget = 'conversation'; this.modelSetting = undefined; this.selectingModel = false; this.conversationCompression = false;
         const menu: Menu = { title: '设置 · 主模型与压缩模型', index: 0, context: [`当前对话主模型：${this.selectedModel ?? '尚未选择'}`, '压缩模型按服务商设置保存；留空沿核心已定选择规则'], items: [
-            { label: '切换当前对话主模型', action: () => this.listProfiles() },
+            { label: '切换当前对话主模型', action: async () => { this.selectingModel = true; await this.listProfiles(); } },
             { label: '服务商默认主模型', action: async () => { this.modelSetting = 'default'; await this.listProfiles(); } },
-            { label: '当前服务商的压缩模型', action: async () => { this.modelSetting = 'compression'; await this.listModels(this.selectedProfile); } },
+            { label: '本对话压缩模型', detail: '只修改当前对话，服务商默认值保持原样', action: async () => { this.modelSetting = 'compression'; this.conversationCompression = true; await this.listModels(this.selectedProfile); } },
+            { label: '本对话压缩模型参数', action: () => this.parameterForm('compression') },
             { label: '当前对话参数', action: () => this.parameterForm() },
             { label: '服务商、API地址与遮挡Key', action: () => this.listProfiles() },
             { label: '终端、换行与动画', action: () => this.executeLine('/terminal show') },
@@ -929,46 +1195,58 @@ export class InteractiveCli {
         if (this.selectedProfile) void this.client.request<Record<string, unknown>>('profiles.get', { profileId: this.selectedProfile }).then(result => {
             if (this.menu !== menu || !result.ok || !result.data) return;
             const profile = valueObject(result.data.profile ?? result.data);
-            menu.context = [`当前主模型：${this.selectedModel ?? '未选择'}`, `默认主模型：${profile.defaultModel ?? '未指定'}`, `压缩模型：${profile.compressionModelRef ?? '沿核心选择规则'}`]; this.scheduleRender();
+            const options = valueObject(this.conversation?.options);
+            const compression = valueObject(options.compressionModelSelection).modelId ?? valueObject(options.compressionModel).modelId ?? (typeof options.compressionModel === 'string' ? options.compressionModel : undefined);
+            menu.context = [`当前主模型：${this.selectedModel ?? '未选择'}`, `默认主模型：${profile.defaultModel ?? '未指定'}`, `本对话压缩模型：${compression ?? profile.compressionModelRef ?? this.selectedModel ?? '沿核心选择规则'}`]; this.scheduleRender();
         }).catch(() => {});
     }
 
-    private async parameterForm(): Promise<void> {
-        if (!this.conversation || !this.selectedProfile || !this.selectedModel) { this.log('先为当前对话选择模型'); return; }
-        const result = await this.client.request<Record<string, unknown>>('models.get', { profileId: this.selectedProfile, modelId: this.selectedModel });
+    private async parameterForm(target: 'main' | 'compression' = 'main'): Promise<void> {
+        const creation = this.creation;
+        let profileId = creation ? this.newSelection.profileId : this.selectedProfile;
+        let modelId = creation ? this.newSelection.modelId : this.selectedModel;
+        if (!profileId || !modelId) { this.log('选择主模型后即可调整它支持的参数'); return; }
+        const options = valueObject(this.conversation?.options);
+        let configured: Record<string, unknown> = {};
+        if (target === 'compression') {
+            configured = creation ? valueObject(creation.compression) : valueObject(options.compressionModelSelection ?? options.compressionModel);
+            const read = await this.client.request<Record<string, unknown>>('profiles.get', { profileId });
+            if (!read.ok) { this.showError(read); return; }
+            const profile = valueObject(read.data?.profile ?? read.data);
+            profileId = typeof configured.profileId === 'string' ? configured.profileId : profileId;
+            modelId = typeof configured.modelId === 'string' ? configured.modelId : creation?.compression === null ? modelId
+                : !creation && typeof options.compressionModel === 'string' ? options.compressionModel
+                : typeof profile.compressionModelRef === 'string' ? profile.compressionModelRef : modelId;
+        }
+        const result = await this.client.request<Record<string, unknown>>('models.get', { profileId, modelId });
         if (!result.ok || !result.data) { this.showError(result); return; }
         const entry = valueObject(result.data.entry ?? result.data);
-        const declared = valueObject(entry.parameters);
-        const current = valueObject(valueObject(this.conversation.options).parameters);
-        const fields: Field[] = [];
-        for (const [key, label] of [['reasoningEffort', '推理强度'], ['temperature', '温度'], ['maxOutputTokens', '最大输出token']] as const) {
-            const definition = valueObject(valueObject(declared[key]).value);
-            if (!Object.keys(definition).length) continue;
-            const choices = Array.isArray(definition.enum) ? ['', ...definition.enum.map(String)] : undefined;
-            fields.push({ key, label: label + '（留空使用有效默认值）', defaultValue: current[key] === undefined ? '' : String(current[key]), choices,
-                validate: text => {
-                    if (!text || choices) return undefined;
-                    const number = Number(text);
-                    if (!Number.isFinite(number) || definition.type === 'integer' && !Number.isSafeInteger(number)) return '请填写有效数字';
-                    if (typeof definition.min === 'number' && number < definition.min || typeof definition.max === 'number' && number > definition.max) return `请按模型支持范围填写：${definition.min ?? '不限'}～${definition.max ?? '不限'}`;
-                    return undefined;
-                } });
+        const inherited = profileId === (creation ? this.newSelection.profileId : this.selectedProfile) && modelId === (creation ? this.newSelection.modelId : this.selectedModel)
+            ? creation?.parameters ?? valueObject(options.parameters) : {};
+        const current = target === 'compression' ? { ...inherited, ...valueObject(configured.parameters) } : creation?.parameters ?? valueObject(options.parameters);
+        if (target === 'compression') {
+            if (typeof configured.maxOutputTokens === 'number') current.maxOutputTokens = configured.maxOutputTokens;
+            else delete current.maxOutputTokens;
         }
-        if (!fields.length) { this.details = ['模型目录尚未提供可编辑参数', '可在模型目录中补充有来源的能力声明，然后返回这里设置']; this.log('保留现有参数'); return; }
-        this.openForm('当前对话参数 · 仅影响后续请求', fields, async values => {
-            const parameters = { ...current };
-            for (const field of fields) {
-                if (!values[field.key]) delete parameters[field.key];
-                else parameters[field.key] = field.key === 'reasoningEffort' ? values[field.key] : Number(values[field.key]);
-            }
-            await this.updateConversationOptions({ parameters });
-        });
+        const fields: Field[] = declaredParameterFields(entry, current);
+        if (target === 'compression') { const output = fields.find(field => field.key === 'maxOutputTokens'); if (output) output.label = output.label.replace(/留空[^）]+/, '留空沿核心默认上限'); }
+        if (!fields.length) { this.log('当前模型没有可编辑的有效参数声明，沿用默认设置'); if (creation) await this.creationMenu(); return; }
+        this.openForm(target === 'compression' ? '本对话压缩模型参数' : '当前主模型参数', fields, async values => {
+            const parameters = readParameterValues(entry, values, current);
+            const compressionModelSelection = { profileId: profileId!, modelId: modelId!, parameters,
+                ...(typeof parameters.maxOutputTokens === 'number' ? { maxOutputTokens: parameters.maxOutputTokens } : {}) };
+            if (creation && this.creation === creation) {
+                if (target === 'compression') creation.compression = compressionModelSelection;
+                else creation.parameters = parameters;
+                await this.creationMenu();
+            } else await this.updateConversationOptions(target === 'compression' ? { compressionModelSelection } : { parameters });
+        }, () => creation ? this.creationMenu() : this.settingsMenu());
     }
 
     private workspacePath(): string {
         const options = valueObject(this.conversation?.options);
         return typeof options.workingDirectory === 'string' ? options.workingDirectory
-            : Array.isArray(options.writeRoots) && typeof options.writeRoots[0] === 'string' ? options.writeRoots[0] : this.streams.cwd ?? process.cwd();
+            : Array.isArray(options.writeRoots) && typeof options.writeRoots[0] === 'string' ? options.writeRoots[0] : this.creation?.roots[0] ?? this.project.roots[0];
     }
 
     private async updateConversationOptions(patch: Record<string, unknown>): Promise<boolean> {
@@ -985,7 +1263,7 @@ export class InteractiveCli {
     }
 
     private async workspaceMenu(): Promise<void> {
-        if (!this.conversation) { await this.newConversation('archive'); return; }
+        if (!this.conversation) { await this.selectProjectDirectory(); return; }
         const options = valueObject(this.conversation.options);
         const roots = Array.isArray(options.writeRoots) ? options.writeRoots.map(String) : [];
         this.menu = { title: '工作区与允许写入的目录', index: 0, context: [`工作目录：${this.workspacePath()}`, ...roots.map(root => '可写：' + root)], items: [
@@ -1152,7 +1430,7 @@ export class InteractiveCli {
         });
     }
 
-    private async sendDraft(mode: 'queue' | 'steer' = 'queue'): Promise<void> {
+    private async sendDraft(mode: 'queue' | 'steer' = this.draft.inputMode): Promise<void> {
         if (this.busy) { this.log('命令回执仍在等待，草稿可继续编辑'); return; }
         const pending = this.pendingDraft;
         if (pending) {
@@ -1164,7 +1442,7 @@ export class InteractiveCli {
                 if (original && typeof original === 'object' && typeof (original as RpcResult).ok === 'boolean') {
                     if ((original as RpcResult).ok) {
                         pending.draft.clearIfAcknowledged(pending.revision);
-                        if (pending.text !== undefined) { this.history.push({ text: pending.text, conversationId: pending.conversationId }); if (this.history.length > 100) this.history.shift(); }
+                        if (pending.historyEntry || pending.text !== undefined) { this.history.push(pending.historyEntry ?? { text: pending.text!, conversationId: pending.conversationId }); if (this.history.length > 100) this.history.shift(); }
                     }
                     this.pendingDrafts.delete(pending.conversationId);
                     this.referencePreparations.delete(pending.draft);
@@ -1174,14 +1452,17 @@ export class InteractiveCli {
             return;
         }
         if (this.observing) { this.log('当前为只读观察，先用/run control申请控制'); return; }
-        if (!this.draft.text.trim()) return;
-        if (!this.conversation) { this.log('先选好服务商、模型和工作区，输入草稿继续保留'); await this.newConversation('archive'); return; }
+        if (!this.draft.text.trim() && !this.draft.references.length) return;
+        if (!this.conversation) { this.log('草稿已保留，选择对话与模型后即可发送'); if (this.creation) await this.creationMenu(); else this.conversationModeMenu(); return; }
         if (this.run?.kind === 'maintenance' && !terminalRun(this.run)) { this.log('维护中，草稿已保留，维护结束后再次发送'); return; }
         if (this.run?.state === 'outcome_unknown') { this.log('原执行结果仍待核实，草稿已保留，请先查询原动作'); return; }
         const current = this.run && !terminalRun(this.run);
+        if (!current && valueObject(this.conversation.options).toolsEnabled !== false && this.selectedProfile && this.selectedModel
+            && !await this.requireModelTools(this.selectedProfile, this.selectedModel)) return;
         const draft = this.draft;
         const revision = draft.revision;
         const conversationId = String(this.conversation.conversationId);
+        const historyEntry: InputHistoryEntry = { text: draft.text, references: structuredClone(draft.references), inputMode: mode, conversationId };
         const previousPreparation = this.referencePreparations.get(draft);
         const commandId = previousPreparation?.conversationId === conversationId && previousPreparation.revision === revision
             ? previousPreparation.commandId : randomUUID();
@@ -1196,12 +1477,14 @@ export class InteractiveCli {
             const prepared = await prepareCliInputReferences(this.client, { conversationId, text: draft.text, existing: draft.references,
                 cwd: this.workspacePath(), commandId });
             const content = { ...prepared, text: prepared.text.startsWith('//') || prepared.text.startsWith('@@') ? prepared.text.slice(1) : prepared.text };
+            historyEntry.text = draft.text.startsWith('//') || draft.text.startsWith('@@') ? draft.text[0] + content.text : content.text;
+            historyEntry.references = structuredClone(content.references);
             params[current ? 'content' : 'input'] = content;
-            this.pendingDrafts.set(conversationId, { commandId, conversationId, revision, draft, text: content.text });
+            this.pendingDrafts.set(conversationId, { commandId, conversationId, revision, draft, text: content.text, historyEntry });
             const result = await this.client.request(current ? 'inputs.submit' : this.budget ? 'runs.start' : 'runs.startInteractive', params, { clientCommandId: commandId });
             if (this.pendingDrafts.get(conversationId)?.commandId !== commandId) return;
             if (result.ok && result.receiptId) {
-                this.history.push({ text: content.text, conversationId }); if (this.history.length > 100) this.history.shift();
+                this.history.push(historyEntry); if (this.history.length > 100) this.history.shift();
                 draft.clearIfAcknowledged(revision); this.pendingDrafts.delete(conversationId);
                 this.referencePreparations.delete(draft);
                 if (!current && this.conversation?.conversationId === conversationId) {
@@ -1229,15 +1512,23 @@ export class InteractiveCli {
         const words = parsed.words.map((word, index) => index === 0 ? word.replace(/^\//, '') : word);
         const name = words.join(' ');
         const hasOptions = Object.keys(parsed.options).length > 0;
-        if (!hasOptions && ['new', 'session new', 'conversation create'].includes(name)) { this.commandDraft = undefined; await this.newConversation('archive'); return; }
+        if (!hasOptions && ['new', 'session new', 'conversation create'].includes(name)) { this.commandDraft = undefined; this.conversationModeMenu(); return; }
+        if (!hasOptions && ['back', 'project', 'close', 'connect', 'models'].includes(name)) {
+            this.commandDraft = undefined;
+            if (name === 'close') this.sessionNavigationMenu(undefined, true);
+            else if (name === 'back' || name === 'project') this.sessionNavigationMenu();
+            else if (name === 'models') this.modelMenu();
+            else { this.selectingModel = false; this.selectionTarget = 'conversation'; this.modelSetting = undefined; await this.listProfiles(); }
+            return;
+        }
         if (!hasOptions && name === 'resume') { this.commandDraft = undefined; await this.listConversations(); return; }
         if (!hasOptions && ['settings', 'workspace', 'providers', 'usage', 'references'].includes(name)) {
             this.commandDraft = undefined;
             if (name === 'settings') this.settingsMenu();
             else if (name === 'workspace') await this.workspaceMenu();
-            else if (name === 'providers') { this.selectionTarget = 'conversation'; this.modelSetting = undefined; await this.listProfiles(); }
+            else if (name === 'providers') { this.selectionTarget = 'conversation'; this.modelSetting = undefined; this.selectingModel = false; await this.listProfiles(); }
             else if (name === 'references') await this.referenceMenu();
-            else { await this.refreshUsage(true); this.details = usageOverviewLines(this.usageOverview, this.usageState); this.detailsOffset = 0; }
+            else { await this.refreshUsage(true); this.details = detailedUsageLines(this.usageOverview, this.usageState); this.detailsOffset = 0; }
             return;
         }
         if (name === 'history' && !hasOptions && this.conversation) { this.commandDraft = undefined; await this.restoreTranscript(String(this.conversation.conversationId), this.viewEpoch, this.historyCursor); return; }
@@ -1268,10 +1559,17 @@ export class InteractiveCli {
         if (name === 'artifact list' && !hasOptions) { this.commandDraft = undefined; await this.artifactsMenu(); return; }
         if (name === 'status') {
             this.commandDraft = undefined;
+            if (parsed.options.diagnostics === true) {
+                this.menu = undefined; this.partialVisible = false;
+                this.details = humanJson({ state: this.status, connection: this.connection, lastOperation: this.lastOperationReceipt,
+                    lastSettings: this.conversationUpdateReceipts.get(String(this.conversation?.conversationId)), run: this.run,
+                    lastFailure: this.lastFailure, controlEvents: this.controlEvents, messages: this.logs, graphics: this.nativeGraphics?.diagnostics?.() }).split('\n');
+                this.detailsOffset = 0; this.detailCache = undefined; return;
+            }
             const settings = this.conversationUpdateReceipts.get(String(this.conversation?.conversationId));
             if (settings) {
                 const showReceipt = () => { this.menu = undefined; this.partialVisible = false; this.details = humanJson(settings).split('\n'); this.detailsOffset = 0; this.detailCache = undefined; };
-                if (parsed.options.json === true || parsed.options.diagnostics === true) {
+                if (parsed.options.json === true) {
                     const run = this.run ? await this.perform(['runs', 'get', String(this.run.runId), '--json']) : undefined;
                     showReceipt();
                     if (run) this.details = humanJson({ lastSettings: settings, run }).split('\n');
@@ -1283,7 +1581,15 @@ export class InteractiveCli {
                 ] };
                 return;
             }
-            if (this.run && (parsed.options.json === true || parsed.options.diagnostics === true)) await this.perform(['runs', 'get', String(this.run.runId), '--json']);
+            if (!this.run && !this.partialAnswer) {
+                this.menu = { title: '当前状态与详情', index: 0, context: [this.conversation ? this.observing ? '只读观察' : '已就绪' : '待创建对话'], items: [
+                    ...(this.lastOperationReceipt ? [{ label: '最近操作的原始回执', action: () => { this.details = humanJson(this.lastOperationReceipt).split('\n'); this.detailsOffset = 0; this.detailCache = undefined; } }] : []),
+                    { label: '连接与控制详情', action: () => { this.details = humanJson({ connection: this.connection, events: this.controlEvents, messages: this.logs, lastFailure: this.lastFailure, graphics: this.nativeGraphics?.diagnostics?.() }).split('\n'); this.detailsOffset = 0; this.detailCache = undefined; } },
+                    { label: '返回', action: () => { this.menu = undefined; } },
+                ] };
+                return;
+            }
+            if (this.run && parsed.options.json === true) await this.perform(['runs', 'get', String(this.run.runId), '--json']);
             else if (this.partialAnswer) { this.partialVisible = true; this.partialFollow = true; this.updateState(); }
             else if (this.run) await this.perform(['runs', 'get', String(this.run.runId)]);
             else this.log('当前没有已选执行，可用/run list查看记录');
@@ -1464,6 +1770,9 @@ export class InteractiveCli {
 
     private updateState(): void {
         const run = this.run;
+        if (run && terminalRun(run) && run.runId !== this.lastFinishedActivityRun) {
+            this.lastFinishedActivityRun = String(run.runId); this.lastReplyFinishedAt = Date.now(); this.scheduleAppearanceDeadline();
+        }
         const failure = run ? runFailureLines(run) : [];
         const failureKey = failure.length ? JSON.stringify([run?.runId, ...failure]) : undefined;
         if (failureKey !== this.failureKey) {
@@ -1494,7 +1803,10 @@ export class InteractiveCli {
         const states: Record<string, string> = { running: '工作中', succeeded: '已完成', failed: '执行失败', cancelled: '已取消', waiting: '等待答复', stopping: '正在停止', paused: '已暂停', outcome_unknown: '原结果待核实', queued: '排队中' };
         const phases: Record<string, string> = { executing_tools: '正在执行工具', generating: '正在生成', model_request: '正在请求模型', preparing: '准备中' };
         const cleanup: Record<string, string> = { released: '资源已释放', not_needed: '无需清理', running: '资源收尾中', pending: '等待收尾', unconfirmed: '资源收尾待核实' };
-        this.status = this.run ? `${states[String(this.run.state)] ?? '工作中'} · ${phases[String(this.run.phase)] ?? (this.state === 'thinking' ? '正在思考' : this.state === 'searching' ? '正在查阅' : this.state === 'typing' ? '正在写入' : '')} · ${cleanup[String(this.run.cleanupState)] ?? '资源状态待更新'}${this.observing ? ' · 只读观察' : ''}` : '空闲 · ' + (this.observing ? '只读观察' : '输入已可用');
+        this.status = this.run ? [this.run.state === 'succeeded' ? '回复完成' : states[String(this.run.state)] ?? '工作中',
+            phases[String(this.run.phase)] ?? (this.state === 'thinking' ? '正在思考' : this.state === 'searching' ? '正在查阅' : this.state === 'typing' ? '正在写入' : ''),
+            ['released', 'not_needed'].includes(String(this.run.cleanupState)) ? '' : cleanup[String(this.run.cleanupState)] ?? '资源状态待更新',
+            this.observing ? '只读观察' : ''].filter(Boolean).join(' · ') : '空闲 · ' + (this.observing ? '只读观察' : '输入已可用');
         this.scheduleRender();
     }
 
@@ -1722,6 +2034,23 @@ export class InteractiveCli {
         this.nativeGraphicsAttempted = true;
         this.nativeGraphics = this.createNativeGraphics(event => {
             if (this.disposed) return;
+            if (event.type === 'text-metrics' && event.characterWidths && typeof event.characterWidths === 'object') {
+                if (this.renderer.setCharacterWidths(event.characterWidths as Record<string, number>) || event.measurementCompleted === true) {
+                    this.detailCache = undefined; this.nativePaintRevision = -1; this.scheduleRender(true);
+                }
+            }
+            if (event.viewport) {
+                this.terminal.updateViewport?.(event.viewport);
+                if (this.renderer.setViewport?.(event.viewport)) {
+                    this.detailCache = undefined; this.nativePaintRevision = -1;
+                    if (typeof event.scrollRows === 'number' && event.scrollRows !== 0) {
+                        this.noteUserActivity();
+                        if (this.menu) this.menu.index = Math.max(0, Math.min(this.menu.items.length - 1, this.menu.index + event.scrollRows));
+                        else if (!this.form) this.scrollDetails(event.scrollRows);
+                    }
+                    this.scheduleRender(true);
+                }
+            }
             if (event.type === 'ready') {
                 this.nativeGraphicsReady = true;
                 if (String(this.initial.options.graphics ?? 'auto') === 'auto' && this.renderer.options.color && !this.terminal.linear) {
@@ -1730,6 +2059,7 @@ export class InteractiveCli {
                 }
             } else if (event.type === 'unavailable' || event.type === 'exit') {
                 this.nativeGraphicsReady = false;
+                if (this.renderer.setCharacterWidths({})) this.detailCache = undefined;
                 if (this.renderer.options.graphics === 'native') {
                     this.renderer.options.graphics = this.terminalGraphicsMode; this.renderer.reset(); this.detailCache = undefined; this.scheduleRender(true);
                 }
@@ -1742,10 +2072,81 @@ export class InteractiveCli {
         this.nativeGraphics?.hide(); this.nativeFrameKey = ''; this.nativeRectangle = ''; this.nativePaintRevision = -1;
     }
 
+    private sessionNavigationMenu(after?: () => Promise<void>, closing = false): void {
+        if (!this.conversation) { if (after) void after(); else this.showStartup(); return; }
+        const temporary = valueObject(this.conversation.retention).mode === 'temporary';
+        const active = Boolean(this.run && !terminalRun(this.run));
+        const action = closing || temporary && !this.observing ? 'close' : 'return';
+        const items: MenuItem[] = [{ label: action === 'close' ? temporary ? '关闭临时对话并清除正文，返回项目' : '关闭当前对话，返回项目' : '返回项目，保留对话与草稿',
+            detail: active ? '先停止当前回复并确认资源收尾' : '应用继续运行', action: async () => { if (await this.leaveCurrentConversation(action, true) && after) await after(); } }];
+        if (active && !temporary && !closing) items.push({ label: '返回项目，让后台按原预算继续', detail: '释放当前前台控制，保留可恢复的对话', action: async () => { if (await this.leaveCurrentConversation('return', false) && after) await after(); } });
+        items.push({ label: '继续当前对话', action: () => { this.menu = undefined; } });
+        this.menu = { title: closing ? '关闭当前对话' : '返回项目', index: 0, items, back: () => { this.menu = undefined; } };
+        this.scheduleRender();
+    }
+
+    private async leaveCurrentConversation(action: 'return' | 'close', stopRun: boolean): Promise<boolean> {
+        if (!this.conversation) { this.showStartup(); return true; }
+        if (this.busy || this.switching || this.pendingDrafts.has(String(this.conversation.conversationId))) { this.log('原命令或发送回执仍待确认，核对后再离开当前对话'); return false; }
+        const conversation = this.conversation;
+        const conversationId = String(conversation.conversationId);
+        const temporary = valueObject(conversation.retention).mode === 'temporary';
+        if (temporary && !this.observing && action === 'return') { this.sessionNavigationMenu(); return false; }
+        if (this.observing && action === 'close') { this.log('当前为只读观察，可返回项目或先取得控制再关闭'); return false; }
+        this.switching = true; this.busy = true;
+        try {
+            if (!this.observing && this.run && !terminalRun(this.run) && (stopRun || action === 'close')) {
+                const stopped = await cancelExecution(this.client, conversationId, String(this.run.runId));
+                if (!stopped.ok) { this.showError(stopped); return false; }
+                const run = valueObject(stopped.data);
+                if (!terminalRun(run) || !['released', 'not_needed'].includes(String(run.cleanupState))) { this.log('当前回复或资源收尾仍待确认，原对话继续保留'); return false; }
+                this.run = run;
+            }
+            if (action === 'close' || this.pendingSessionCloses.has(conversationId)) {
+                if (this.run && !['released', 'not_needed'].includes(String(this.run.cleanupState))) { this.log('原执行资源收尾仍待确认，当前对话继续保留'); return false; }
+                const pending = this.pendingSessionCloses.get(conversationId);
+                let closed = pending?.result;
+                if (!closed && pending) {
+                    const receipt = await this.client.getReceipt(pending.commandId, conversationId);
+                    const original = valueObject(receipt.data).result;
+                    if (!original || typeof valueObject(original).ok !== 'boolean') { this.log('原关闭结果仍待确认，本次仅查原回执'); return false; }
+                    closed = original as RpcResult;
+                } else if (!closed) {
+                    const commandId = randomUUID(); this.pendingSessionCloses.set(conversationId, { commandId });
+                    closed = await this.client.request('conversations.close', { conversationId, reason: '人工关闭当前对话，返回项目' }, { clientCommandId: commandId });
+                }
+                if (!closed.ok) { if (!closed.error?.mayHaveStarted) this.pendingSessionCloses.delete(conversationId); this.showError(closed); return false; }
+                this.pendingSessionCloses.get(conversationId)!.result = closed;
+            }
+            if (!this.observing) {
+                const released = await this.client.releaseControl('conversation', conversationId);
+                if (!released.ok && (released.error?.mayHaveStarted || !['CONTROL_REQUIRED', 'CONTROL_CONFLICT', 'NOT_FOUND', 'TEMPORARY_GONE'].includes(released.error?.code ?? ''))) { this.showError(released); return false; }
+            }
+            await this.monitor?.stop(); this.monitor = undefined; this.viewEpoch += 1;
+            if (temporary) {
+                this.drafts.delete(conversationId); this.pendingDrafts.delete(conversationId);
+                for (let index = this.history.length - 1; index >= 0; index -= 1) if (this.history[index].conversationId === conversationId) this.history.splice(index, 1);
+                for (const [key, pending] of this.pendingCommands) if (pending.conversationId === conversationId) this.pendingCommands.delete(key);
+            } else this.drafts.set(conversationId, this.draft);
+            this.project = projectFromOptions(conversation.options, this.streams.cwd ?? process.cwd());
+            this.conversation = undefined; this.run = undefined; this.draft = new DraftBuffer(); this.outputText = '';
+            this.partialAnswer = undefined; this.partialVisible = false; this.lastFormalAnswer = undefined;
+            this.transcript = []; this.details = []; this.detailCache = undefined; this.logs = [];
+            this.form = undefined; this.commandDraft = undefined; this.creation = undefined; this.setupContinuation = undefined;
+            this.modelSetting = undefined; this.selectingModel = false; this.selectionTarget = 'conversation';
+            this.usageScope = ''; this.usageOverview = undefined; this.selectedProfile = undefined; this.selectedModel = undefined;
+            this.status = '项目已打开 · 可以新建或继续对话'; this.observing = this.initial.options.observe === true;
+            this.renderer.reset(); this.showStartup(); this.scheduleRender(true);
+            this.pendingSessionCloses.delete(conversationId);
+            return true;
+        } finally { this.busy = false; this.switching = false; }
+    }
+
     private showQuit(): void {
         const temporary = valueObject(this.conversation?.retention).mode === 'temporary';
-        const items: MenuItem[] = [{ label: '取消所属执行、关闭会话并退出', action: () => this.quit(false) }];
-        if (!temporary) items.push({ label: '明确脱离前台，后台按原预算继续', action: () => this.quit(true) });
+        const items: MenuItem[] = [{ label: this.conversation ? '关闭当前对话并退出应用' : '退出应用', action: () => this.quit(false) }];
+        if (this.conversation) items.push({ label: '只返回项目，保留应用', action: () => this.sessionNavigationMenu() });
+        if (this.conversation && !temporary) items.push({ label: '明确脱离前台，后台按原预算继续', action: () => this.quit(true) });
         items.push({ label: '返回，继续编辑', action: () => { this.menu = undefined; } });
         this.menu = { title: '退出前确认', items, index: 0 };
     }
@@ -1753,54 +2154,14 @@ export class InteractiveCli {
     private async quit(detach: boolean): Promise<void> {
         if (detach && valueObject(this.conversation?.retention).mode === 'temporary') { this.log('临时会话关闭即清，退出需要取消并关闭'); this.showQuit(); return; }
         if (!detach && this.conversation && !this.observing) {
-            if (this.run && !terminalRun(this.run)) {
-                await this.cancelRun();
-                const end = Date.now() + 30_000;
-                const runId = String(this.run.runId);
-                while (Date.now() < end) {
-                    const result: RpcResult<Record<string, unknown>> = await this.client.request('runs.get', { conversationId: this.conversation.conversationId, runId });
-                    if (result.ok && result.data) {
-                        const snapshot = result.data;
-                        this.run = snapshot; this.updateState();
-                        if (terminalRun(snapshot) && ['released', 'not_needed'].includes(String(snapshot.cleanupState))) break;
-                    }
-                    await new Promise(resolveWait => setTimeout(resolveWait, 100));
-                }
-                if (this.run && !['released', 'not_needed'].includes(String(this.run.cleanupState))) { this.log('资源收尾仍待确认，退出前台后按原runId查询'); await this.finish(7); return; }
-            }
-            const result = await this.client.request('conversations.close', { conversationId: this.conversation.conversationId, reason: '人工前台退出' });
-            if (!result.ok) { this.showError(result); return; }
-            await this.client.releaseControl('conversation', String(this.conversation.conversationId));
+            if (!await this.leaveCurrentConversation('close', true)) return;
         } else if (this.conversation && !this.observing) await this.client.releaseControl('conversation', String(this.conversation.conversationId));
         await this.finish(0);
     }
 
     private async closeTemporaryAndOpen(targetId: string, observe: boolean): Promise<void> {
         if (!this.conversation || this.switching) return;
-        if (this.busy) { this.log('原命令回执仍在等待，先核对原回执后再关闭临时会话'); return; }
-        const conversationId = String(this.conversation.conversationId);
-        const runId = this.run && !terminalRun(this.run) ? String(this.run.runId) : undefined;
-        this.switching = true; this.busy = true;
-        let closed = false;
-        try {
-            if (runId) {
-                const stopped = await cancelExecution(this.client, conversationId, runId);
-                if (!stopped.ok) { this.showError(stopped); return; }
-                if (!terminalRun(valueObject(stopped.data)) || !['released', 'not_needed'].includes(String(valueObject(stopped.data).cleanupState))) {
-                    this.showError({ ok: false, error: { code: 'CLEANUP_UNCONFIRMED', message: '原执行结果或资源收尾仍待确认，临时会话继续保留', retryable: true, mayHaveStarted: true, details: { conversationId, runId } } }); return;
-                }
-            }
-            const result = await this.client.request('conversations.close', { conversationId, reason: '明确关闭临时会话后切换' });
-            if (!result.ok) { this.showError(result); return; }
-            await this.monitor?.stop(); this.monitor = undefined;
-            this.drafts.delete(conversationId); this.pendingDrafts.delete(conversationId);
-            for (let index = this.history.length - 1; index >= 0; index -= 1) if (this.history[index].conversationId === conversationId) this.history.splice(index, 1);
-            for (const [key, pending] of this.pendingCommands) if (pending.conversationId === conversationId) this.pendingCommands.delete(key);
-            this.conversation = undefined; this.run = undefined; this.draft = new DraftBuffer(); this.outputText = '';
-            this.logs = []; this.details = []; this.detailCache = undefined; this.form = undefined; this.commandDraft = undefined; this.renderer.reset();
-            closed = true;
-        } finally { this.switching = false; this.busy = false; }
-        if (closed) await this.openConversation(targetId, observe);
+        if (await this.leaveCurrentConversation('close', true)) await this.openConversation(targetId, observe);
     }
 
     private async printTranscript(text: string, replace = false): Promise<void> {
@@ -1818,11 +2179,12 @@ export class InteractiveCli {
     }
 
     private showResult(execution: CommandExecution, options: { raw?: boolean; titleHint?: string } = {}): void {
+        this.lastOperationReceipt = structuredClone(execution);
         if (!execution.result.ok) { this.showError(execution.result); return; }
         this.partialVisible = false;
         this.details = interactiveResultLines(execution, options);
         this.detailsOffset = 0;
-        this.log(execution.result.receiptId ? '操作回执 ' + execution.result.receiptId : '查询已返回');
+        this.log('操作完成 · /status可查看详情');
         this.scheduleRender();
     }
     private rememberProfileCatalog(result: RpcResult): void {
@@ -1834,9 +2196,11 @@ export class InteractiveCli {
     }
     private showError(result: RpcResult, operation = true): void {
         if (operation) this.errorSerial += 1;
+        this.lastFailure = structuredClone(result);
         const message = `${result.error?.code ?? 'ERROR'}：${result.error?.message ?? '操作未完成'}`;
         this.log(message);
-        this.details = [message, ...(result.error?.details ? JSON.stringify(result.error.details, null, 2).split('\n') : [])];
+        this.status = result.error?.message ?? '操作未完成';
+        this.details = [result.error?.message ?? '操作未完成，可在/status查看原始信息'];
         this.detailsOffset = 0;
         this.scheduleRender();
     }
@@ -1863,27 +2227,34 @@ export class InteractiveCli {
             details = [this.menu.title + (!this.menu.commandMenu && this.menu.query ? ' · 筛选：' + this.menu.query : ''), ...shownContext, ...this.menu.items.slice(start, start + pageSize).map((item, index) => `${start + index === this.menu!.index ? '>' : ' '} ${item.label}${item.disabled ? ' [不可用]' : ''}`), selected?.disabled ?? selected?.detail ?? '', `${this.menu.index + 1}/${this.menu.items.length} · ↑↓选择 · Enter确认${context.length > shownContext.length ? ' · PgUp/PgDn详情' : ''}`];
         } else if (this.form) {
             const field = this.form.fields[this.form.index];
-            details = [this.form.title, `${this.form.index + 1}/${this.form.fields.length} · ${field.label}`, ...(field.choices ? ['可选：' + field.choices.join(' / '), '↑↓切换选项'] : []), 'Enter下一项 · Shift+Tab上一项 · Esc保留原稿并返回'];
+            const geometry = this.renderer.geometry(this.terminal.width, this.terminal.height, true);
+            const width = Math.max(8, this.terminal.width - (geometry.canDraw ? geometry.graphicColumns + 9 : 4));
+            details = [this.form.title, ...(this.form.error ? [this.form.error] : []), `${this.form.index + 1}/${this.form.fields.length} · ${field.label}`, ...(field.choices ? ['可选：' + field.choices.join(' / '), '↑↓切换选项'] : []), 'Enter下一项 · Shift+Tab上一项 · Esc保留原稿并返回'].flatMap(line => wrapText(line, width, this.renderer.textMetrics));
         } else if (!details.length) {
             const retention = valueObject(this.conversation?.retention);
             details = ['准备工作', `对话：${valueObject(this.conversation?.options).title || '未命名对话'}`, `保存：${({ archive: '归档保存', temporary: '临时保存', ttl: '限时保存' } as Record<string, string>)[String(retention.mode ?? 'archive')]}`, `模型：${this.selectedModel ?? '待选择'}`, `工作目录：${this.workspacePath()}`, 'Enter发送/排队 · Alt+Enter补充当前轮', '/approvals批准 · Ctrl+C打断', '/settings设置 · @材料 · /quit退出'];
         }
-        const normalHint = `AltM模型 · AltW工作区 · AltS设置 · Enter${this.enterBehavior === 'newline' ? '换行' : this.run && !terminalRun(this.run) ? '排队' : '发送'} · AltEnter补充 · @材料 · /命令`;
+        const normalHint = `Esc返回项目 · AltM模型 · AltW工作区 · AltS设置 · Enter${this.enterBehavior === 'newline' ? '换行' : this.run && !terminalRun(this.run) ? '排队' : '发送'} · AltEnter补充 · @材料 · /命令`;
         const expandedHint = normalHint + ' · AltN新对话 · AltR恢复';
-        const chatHint = visibleWidth(expandedHint, this.renderer.options.ambiguousWidth) <= this.terminal.width - 4 ? expandedHint : normalHint;
-        return { inline: true, state: this.state, status: (this.showingPartial ? this.partialAnswer!.caption + ' · ' : '') + this.status, heading: `${this.selectedModel ?? '待选择模型'} · ${basename(this.workspacePath()) || this.workspacePath()}`,
-            connection: `${this.connection} | ${graphicsSummary(this.renderer.options.graphics, this.renderer.options.color)}`, details, logs: this.logs,
-            metrics: usageOverviewLines(this.usageOverview, this.usageState),
+        const chatHint = visibleWidth(expandedHint, this.renderer.textMetrics) <= this.terminal.width - 4 ? expandedHint : normalHint;
+        const pageRows = this.detailPage().pageRows;
+        const readingHint = !this.menu && !this.form && maxOffset > 0 ? `PgUp/PgDn回看 ${this.detailsOffset + 1}-${Math.min(lines.length, this.detailsOffset + pageRows)}/${lines.length} · ${this.draft.text ? 'Esc返回项目' : 'End回最新'}` : chatHint;
+        const model = this.creation ? this.newSelection.modelId : this.selectedModel;
+        const options = valueObject(this.conversation?.options);
+        const compression = this.creation?.compression === null ? model : this.creation?.compression?.modelId ?? valueObject(options.compressionModelSelection).modelId ?? valueObject(options.compressionModel).modelId ?? (typeof options.compressionModel === 'string' ? options.compressionModel : undefined);
+        return { inline: true, state: this.state, ...idleAppearance(this.lastUserActivityAt, this.lastReplyFinishedAt, Date.now(), Boolean(this.run && !terminalRun(this.run))), status: (this.showingPartial ? this.partialAnswer!.caption + ' · ' : '') + this.status, heading: model ? `主模型 ${model} · 压缩 ${compression ?? '沿API设置'} · ${basename(this.workspacePath()) || this.workspacePath()}` : `待选择模型 · ${this.project.name}`,
+            connection: `${this.client.connected === false ? '正在连接' : this.conversation ? this.observing ? '只读观察' : '已就绪' : this.creation ? '准备新对话' : '待配置对话'} | ${graphicsSummary(this.renderer.options.graphics, this.renderer.options.color)}`, details, logs: [],
+            metrics: this.conversation ? chatUsageLines(this.usageOverview).slice(0, 3) : [],
             draft: this.form?.draft ?? this.commandDraft ?? this.draft, hidden: this.form?.fields[this.form.index].hidden,
-            inputLabel: this.form?.fields[this.form.index].label,
-            hint: this.form ? '表单输入 · Enter下一项 · Esc返回' : this.pendingDraft ? '原发送状态待确认，再次发送只查原回执' : this.run?.kind === 'maintenance' && !terminalRun(this.run) ? '维护中，草稿保留；结束后再次发送' : chatHint, stateStartedAt: this.stateStartedAt };
+            inputLabel: this.form?.fields[this.form.index].label ?? (this.draft.references.length ? `草稿已选 ${this.draft.references.length} 份材料` : undefined),
+            hint: this.form ? '表单输入 · Enter下一项 · Esc返回' : this.pendingDraft ? '原发送状态待确认，再次发送只查原回执' : this.run?.kind === 'maintenance' && !terminalRun(this.run) ? '维护中，草稿保留；结束后再次发送' : readingHint, stateStartedAt: this.stateStartedAt };
     }
 
     private menuContextLines(): string[] {
         const geometry = this.renderer.geometry(this.terminal.width, this.terminal.height, true);
         const sprite = geometry.canDraw && this.renderer.options.graphics !== 'none' && this.renderer.assets.sprites ? geometry.graphicColumns : 0;
         const width = Math.max(8, this.terminal.width - (sprite ? sprite + 9 : 4));
-        return (this.menu?.context ?? []).flatMap(line => wrapText(line, width, this.renderer.options.ambiguousWidth));
+        return (this.menu?.context ?? []).flatMap(line => wrapText(line, width, this.renderer.textMetrics));
     }
 
     private detailLines(): string[] {
@@ -1893,10 +2264,18 @@ export class InteractiveCli {
         const width = Math.max(8, columns - (sprite ? sprite + 9 : 4));
         const ambiguousWidth = this.renderer.options.ambiguousWidth;
         const source = this.showingPartial ? this.partialAnswer!.lines() : this.details.length || this.terminal.linear ? this.details : this.transcript;
-        if (this.detailCache?.source === source && this.detailCache.width === width && this.detailCache.ambiguousWidth === ambiguousWidth) return this.detailCache.lines;
-        const lines = source.flatMap(line => wrapText(line, width, ambiguousWidth));
-        this.detailCache = { source, width, ambiguousWidth, lines };
+        const emojiFallback = process.platform === 'win32' && !terminalGraphicsHost().queries;
+        if (this.detailCache?.source === source && this.detailCache.width === width && this.detailCache.ambiguousWidth === ambiguousWidth && this.detailCache.emojiFallback === emojiFallback) return this.detailCache.lines;
+        const lines = markdownDisplayLines(source, { emojiFallback }).flatMap(line => wrapText(line, width, this.renderer.textMetrics));
+        this.detailCache = { source, width, ambiguousWidth, emojiFallback, lines };
         return lines;
+    }
+
+    private scrollDetails(delta: number): void {
+        const { maxOffset } = this.detailPage();
+        this.detailsOffset = Math.max(0, Math.min(maxOffset, Math.min(maxOffset, this.detailsOffset) + delta));
+        if (this.partialVisible) this.partialFollow = delta > 0 && this.detailsOffset === maxOffset;
+        else if (!this.details.length && this.transcript.length) this.transcriptFollow = delta > 0 && this.detailsOffset === maxOffset;
     }
 
     private detailPage(): { lines: string[]; pageRows: number; maxOffset: number } {
@@ -1926,23 +2305,34 @@ export class InteractiveCli {
                     const frame = [view.connection, ...view.details, view.status, ...(view.metrics ?? []), ...view.logs.slice(-1), view.inputLabel ?? '输入', view.hidden ? '（隐藏）' : view.draft.text].join('\n') + '\n';
                     if (frame !== this.lastLinearFrame) { await this.terminal.write(terminalSafeText(frame)); this.lastLinearFrame = frame; }
                 } else {
-                    const geometry = { width: this.terminal.width, height: this.terminal.height };
+                    const geometry = this.terminal.frameGeometry?.() ?? { width: this.terminal.width, height: this.terminal.height, revision: 0 };
                     const view = this.view();
+                    if (this.nativeGraphicsReady && this.renderer.options.graphics === 'native') {
+                        const nativeGeometry = this.renderer.geometry(geometry.width, geometry.height, view.inline);
+                        const visibleRows = nativeGeometry.canDraw ? nativeGeometry.bodyRows : Math.max(1, this.renderer.frameHeight(geometry.height, view.inline) - 13);
+                        const draftLines = layoutDraftInput(view.hidden ? '' : view.draft.text, view.draft.cursorGrapheme, geometry.width - 8, '▏', this.renderer.textMetrics).lines;
+                        if (this.nativeGraphics?.measureText?.(terminalSafeText(['─╭╮╰╯▏•·', 'sandbox_agent · ' + (view.heading ?? ''), view.connection, ...view.logs.slice(-2), view.status, ...(view.metrics ?? []), view.hint, view.inputLabel ?? '', ...view.details.slice(0, visibleRows), ...draftLines].join('\n'))) === false) return;
+                    }
                     const layoutRevision = this.nativeLayoutRevision;
                     const nativeImage = this.nativeGraphicsReady ? this.renderer.nativeImage(view, geometry.width, geometry.height) : undefined;
                     const output = this.renderer.render(view, geometry.width, geometry.height);
+                    const contentChanged = this.renderer.lastRenderChanged === true;
+                    if (contentChanged) this.nativeGraphics?.beginFrame?.();
+                    try {
                     if (output) await this.terminal.write(output, geometry);
-                    if (!this.disposed && !this.editing && !this.printingTranscript && geometry.width === this.terminal.width && geometry.height === this.terminal.height) {
+                    const currentGeometry = this.terminal.isCurrentGeometry?.(geometry) ?? (geometry.width === this.terminal.width && geometry.height === this.terminal.height);
+                    if (!this.disposed && !this.editing && !this.printingTranscript && currentGeometry) {
                         if (nativeImage) {
                             const rectangle = JSON.stringify(nativeImage.rectangle);
-                            const reanchor = layoutRevision !== this.nativePaintRevision && Boolean(output) || rectangle !== this.nativeRectangle;
+                            const reanchor = layoutRevision !== this.nativePaintRevision && contentChanged || rectangle !== this.nativeRectangle;
                             if (reanchor || nativeImage.key !== this.nativeFrameKey) {
                                 if (this.nativeGraphics?.frame(nativeImage.frame, nativeImage.rectangle, reanchor)) {
                                     this.nativeFrameKey = nativeImage.key; this.nativeRectangle = rectangle; this.nativePaintRevision = layoutRevision;
                                 }
                             }
                         } else if (this.nativeFrameKey) this.hideNativeGraphics();
-                    }
+                    } else if (!currentGeometry) { this.renderer.reset(); this.renderAgain = true; }
+                    } finally { if (contentChanged) this.nativeGraphics?.endFrame?.(); }
                 }
             } catch { await this.finish(4); }
             finally {
@@ -1965,8 +2355,25 @@ export class InteractiveCli {
         }, delay);
     }
 
+    private noteUserActivity(): void {
+        this.lastUserActivityAt = Date.now();
+        this.scheduleAppearanceDeadline();
+    }
+
+    private scheduleAppearanceDeadline(): void {
+        if (this.appearanceTimer) clearTimeout(this.appearanceTimer);
+        this.appearanceTimer = undefined;
+        if (this.disposed || this.run && !terminalRun(this.run)) return;
+        const remaining = Math.max(this.lastUserActivityAt, this.lastReplyFinishedAt) + 30_000 - Date.now();
+        if (remaining <= 0) return;
+        this.appearanceTimer = setTimeout(() => { this.appearanceTimer = undefined; this.scheduleRender(); }, remaining);
+        this.appearanceTimer.unref();
+    }
+
     private async finish(code: number): Promise<void> {
         if (this.disposed) return;
+        if (this.appearanceTimer) clearTimeout(this.appearanceTimer);
+        this.appearanceTimer = undefined;
         this.disposed = true;
         this.preferencesGeneration += 1;
         this.viewEpoch += 1;

@@ -6,6 +6,7 @@ import type { Evidence } from '../models/evidence.js';
 import { arrayObjects, assembleResponse, checkToolResults, freezeOwned, gateDeclaredTools, immutableJson, mediaBlock, objectValue, parseArguments, requireRoute, stringValue, validateTools, verifySnapshot } from './assemble.js';
 import { attemptTimeout, bearerHeaders, decodeResponse, endpointUrl } from './http.js';
 import { requestProviderResponse } from './streaming.js';
+import { providerRequestHeaders } from './request-identity.js';
 import type { DiscoveryPage, NativeBlock, NativeSendView, NormalizedResponse, ProviderAdapter, ProviderAttempt, ProviderProfile, RawProviderResponse, RequestSnapshot, SendContext, StopKind, ToolCall, ToolResult } from './types.js';
 
 const reserved = new Set(['model', 'messages', 'contents', 'input', 'tools', 'stream', 'stream_options', 'provider', 'headers']);
@@ -14,31 +15,43 @@ export function normalizeCompatibleChatMetadata(entry: ModelEntry): ModelEntry {
     const metadata = entry.rawMetadata;
     const architecture = objectValue(metadata.architecture);
     const topProvider = objectValue(metadata.top_provider);
+    const limit = objectValue(metadata.limit);
+    const capabilities = objectValue(metadata.capabilities);
+    const modalities = objectValue(metadata.modalities);
     const positiveCount = (value: unknown): number | null => typeof value === 'number' && Number.isSafeInteger(value) && value > 0 ? value : null;
     const strings = (value: unknown): string[] | null => Array.isArray(value) && value.length > 0
         && value.every(item => typeof item === 'string' && item.trim().length > 0) ? [...new Set(value as string[])] : null;
     const declared = <Value>(template: Evidence<Value>, value: Value | null): Evidence<Value> => ({
         ...template, value, status: value === null ? 'unknown' : 'supported',
     });
-    const maximum = positiveCount(Object.hasOwn(metadata, 'max_output_tokens') ? metadata.max_output_tokens : topProvider?.max_completion_tokens);
+    const maximum = positiveCount(Object.hasOwn(metadata, 'max_output_tokens') ? metadata.max_output_tokens : limit?.output ?? topProvider?.max_completion_tokens);
     const parameters = { ...entry.parameters };
     const { source, sourceRef, observedAt, expiresAt, scope, version, confidence } = entry.contextWindow;
     const parameter = (value: ParameterSpec): Evidence<ParameterSpec> => ({ source, sourceRef, observedAt, expiresAt,
         scope, version, confidence, value, status: 'supported' });
     if (maximum !== null) parameters.maxOutputTokens = parameter({ type: 'integer', min: 1, max: maximum, wirePath: 'max_tokens' });
     const effort = objectValue(metadata.effort);
-    const levels = strings(effort?.supported_levels);
+    const reasoning = objectValue(capabilities?.reasoning);
+    const declaredTools = objectValue(metadata.tools) ?? objectValue(capabilities?.tools);
+    const levels = strings(effort?.supported_levels ?? reasoning?.effort);
     if (levels) {
         const defaultLevel = typeof effort?.default_level === 'string' && levels.includes(effort.default_level) ? effort.default_level : null;
         parameters.reasoningEffort = parameter({ type: 'string', enum: levels, wirePath: 'reasoning_effort',
             ...(defaultLevel !== null ? { default: defaultLevel } : {}) });
     }
     return { ...entry, displayName: stringValue(metadata.displayName) ?? stringValue(metadata.name) ?? entry.modelId,
-        contextWindow: declared(entry.contextWindow, positiveCount(Object.hasOwn(metadata, 'context_window') ? metadata.context_window : metadata.context_length)),
+        contextWindow: declared(entry.contextWindow, positiveCount(Object.hasOwn(metadata, 'context_window') ? metadata.context_window : limit?.context ?? metadata.context_length)),
         maxOutputTokens: declared(entry.maxOutputTokens, maximum),
-        inputModalities: declared(entry.inputModalities, strings(Object.hasOwn(metadata, 'input_modalities') ? metadata.input_modalities : architecture?.input_modalities)),
-        outputModalities: declared(entry.outputModalities, strings(Object.hasOwn(metadata, 'output_modalities') ? metadata.output_modalities : architecture?.output_modalities)),
+        ...(positiveCount(limit?.input) !== null ? { maxInputTokens: declared(entry.contextWindow, positiveCount(limit?.input)) } : {}),
+        inputModalities: declared(entry.inputModalities, normalizeCatalogModalities(strings(Object.hasOwn(metadata, 'input_modalities') ? metadata.input_modalities : modalities?.input ?? architecture?.input_modalities))),
+        outputModalities: declared(entry.outputModalities, normalizeCatalogModalities(strings(Object.hasOwn(metadata, 'output_modalities') ? metadata.output_modalities : modalities?.output ?? architecture?.output_modalities))),
+        ...(typeof declaredTools?.supported === 'boolean' ? { tools: declared(entry.tools, declaredTools.supported) } : {}),
+        ...(typeof reasoning?.supported === 'boolean' ? { thinking: declared(entry.tools, reasoning.supported) } : {}),
         parameters };
+}
+
+function normalizeCatalogModalities(values: string[] | null): string[] | null {
+    return values ? [...new Set(values.map(value => /^(?:image|audio|video)\//.test(value) ? value.slice(0, value.indexOf('/')) : value))] : null;
 }
 
 function normalizeChatResponse(attemptId: string, raw: RawProviderResponse): NormalizedResponse {
@@ -196,7 +209,8 @@ export class CompatibleChatAdapter implements ProviderAdapter {
         url.searchParams.set('limit', String(profile.discovery.pageSize));
         if (cursor) url.searchParams.set('after', cursor);
         const raw = decodeResponse(await context.transport.request({ method: 'GET', url: url.href,
-            headers: bearerHeaders(context.credential), timeoutMs: 10_000, maxResponseBytes: 4 * 1024 * 1024 }, signal));
+            headers: providerRequestHeaders(profile, bearerHeaders(context.credential), { purpose: 'catalog', conversationId: context.conversationId }),
+            timeoutMs: 10_000, maxResponseBytes: 4 * 1024 * 1024 }, signal));
         if (!Array.isArray(raw.json.data) || raw.json.data.some(model => !objectValue(model))) {
             throw new AgentFault('E_CATALOG_INCOMPLETE', '模型目录页缺少完整data数组');
         }

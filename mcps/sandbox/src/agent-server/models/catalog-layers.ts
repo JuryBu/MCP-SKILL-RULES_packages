@@ -16,7 +16,8 @@ export function catalogLayers(snapshot: CatalogSnapshot | null): { discoveryEntr
     if (snapshot.discoveryEntries && snapshot.declarations) {
         return { discoveryEntries: snapshot.discoveryEntries, declarations: snapshot.declarations };
     }
-    const isDeclaration = (entry: ModelEntry): boolean => [...fields.map(field => entry[field]), ...Object.values(entry.parameters)].some(declaredSource);
+    const isDeclaration = (entry: ModelEntry): boolean => [...fields.map(field => entry[field]), ...Object.values(entry.parameters),
+        ...(entry.maxInputTokens ? [entry.maxInputTokens] : []), ...(entry.thinking ? [entry.thinking] : [])].some(declaredSource);
     return { discoveryEntries: snapshot.entries.filter(entry => !isDeclaration(entry)), declarations: snapshot.entries.filter(isDeclaration) };
 }
 
@@ -29,6 +30,11 @@ function overlayEvidence<Value>(discovery: Evidence<Value>, declaration: Evidenc
         return { ...declaration, conflicts: [...(declaration.conflicts ?? []), structuredClone(discovery)] };
     }
     return declaration;
+}
+
+function overlayOptionalEvidence<Value>(discovery: Evidence<Value> | undefined, declaration: Evidence<Value> | undefined, now: number): Evidence<Value> | undefined {
+    if (!declaration) return discovery;
+    return overlayEvidence(discovery ?? { ...declaration, value: null, status: 'unknown', conflicts: undefined }, declaration, now);
 }
 
 export function composeCatalogEntries(discoveryEntries: ModelEntry[], declarations: ModelEntry[], scope: CatalogSourceScope, now: number): ModelEntry[] {
@@ -49,6 +55,8 @@ export function composeCatalogEntries(discoveryEntries: ModelEntry[], declaratio
             }
         }
         entries.set(key, { ...base, retired: availability?.retired ?? declaration.retired, parameters,
+            maxInputTokens: overlayOptionalEvidence(discovery?.maxInputTokens, declaration.maxInputTokens, now),
+            thinking: overlayOptionalEvidence(discovery?.thinking, declaration.thinking, now),
             contextWindow: overlayEvidence(base.contextWindow, declaration.contextWindow, now),
             maxOutputTokens: overlayEvidence(base.maxOutputTokens, declaration.maxOutputTokens, now),
             inputModalities: overlayEvidence(base.inputModalities, declaration.inputModalities, now),

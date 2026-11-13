@@ -55,6 +55,7 @@ export class SharedMcpCatalog {
     private readonly clients = new Map<SharedServiceId, Promise<BrokerMcpClient>>();
     private readonly liveClients = new Set<BrokerMcpClient>();
     private readonly nativeSchemas = new Map<string, Record<string, unknown>>();
+    private readonly schemaFailures = new Map<string, { code: string; reason: string }>();
     private readonly loadedScopes = new Map<string, { conversationId: string; principalId: string; runId: string; rootRunId: string;
         runEpoch: number; tools: Map<string, LoadedModelTool> }>();
     private readonly sequential = new LocalSequentialThinking();
@@ -107,10 +108,12 @@ export class SharedMcpCatalog {
             for (const spec of this.specifications.filter(entry => entry.serviceId === configuration.serviceId)) {
                 if (spec.disabledReason && !input.includeUnavailable) continue;
                 const cached = this.cache.get(spec.serviceId, spec.name, configuration.revision);
+                const failure = this.schemaFailures.get(this.toolId(spec.serviceId, spec.name));
                 all.push({ toolId: this.toolId(spec.serviceId, spec.name), serviceId: spec.serviceId, name: this.modelName(spec.serviceId, spec.name),
                     summary: spec.summary, effectKinds: spec.effects, modelEffect: 'none', resourceKind: null, schemaHash: cached?.schemaHash ?? null,
-                    adapterVersion: configuration.revision, availability: spec.disabledReason ? 'disabled' : cached ? 'available' : 'unavailable',
-                    reason: spec.disabledReason ?? (cached ? null : '已明确配置，工具schema将在使用时核对') });
+                    adapterVersion: configuration.revision, availability: spec.disabledReason ? 'disabled' : cached ? 'available' : failure ? 'unavailable' : 'schema_pending',
+                    schemaStatus: cached ? 'verified' : failure?.code === 'TOOL_CAPABILITY_UNVERIFIED' ? 'unsupported' : 'pending',
+                    reason: spec.disabledReason ?? (cached ? null : failure?.reason ?? '已明确配置，尚未核对schema；使用tool_describe或tool_load进行检查') });
             }
         }
         return { entries: all.slice(offset, offset + limit), nextCursor: offset + limit < all.length ? String(offset + limit) : null };
@@ -143,9 +146,10 @@ export class SharedMcpCatalog {
                 const classified = sequential || entry.serviceId === 'exa' || entry.toolId === 'sandbox.sandbox_status'
                     || entry.toolId === 'sandbox.smart_search' && Boolean(native && Object.hasOwn(native, 'mode'))
                     || Boolean(webFact);
-                facts.push({ ...entry, retentionAvailability: {
+                const availability = entry.availability === 'schema_pending' ? 'unknown' : entry.availability;
+                facts.push({ ...entry, availability, retentionAvailability: {
                     temporary: available && temporary ? 'available' : 'unavailable',
-                    ttl: available ? 'available' : entry.availability, archive: available ? 'available' : entry.availability },
+                    ttl: available ? 'available' : availability, archive: available ? 'available' : availability },
                     ...(available && classified && entry.schemaHash && (sequential || spec && !spec.disabledReason) ? { argumentPolicy: {
                         scope: 'all_allowed_arguments', modelEffect: 'none', schemaHash: entry.schemaHash,
                         adapterVersion: entry.adapterVersion,
@@ -187,6 +191,21 @@ export class SharedMcpCatalog {
     }
 
     async describe(name: string, signal?: AbortSignal): Promise<{ toolId: string; schemaHash: string; function: ModelFunctionSchema }> {
+        try {
+            const description = await this.describeSchema(name, signal);
+            this.schemaFailures.delete(description.toolId);
+            return description;
+        } catch (error) {
+            const spec = this.specifications.find(entry => name === this.toolId(entry.serviceId, entry.name)
+                || name === this.modelName(entry.serviceId, entry.name));
+            if (spec && error instanceof AgentFault && !['TOOL_CANCELLED', 'INVALID_PARAMS'].includes(error.code)) {
+                this.schemaFailures.set(this.toolId(spec.serviceId, spec.name), { code: error.code, reason: error.message });
+            }
+            throw error;
+        }
+    }
+
+    private async describeSchema(name: string, signal?: AbortSignal): Promise<{ toolId: string; schemaHash: string; function: ModelFunctionSchema }> {
         if (this.closed) throw new AgentFault('TOOL_SERVICE_UNAVAILABLE', '本工具连接已关闭');
         const sequential = this.configurations.get('sequential-thinking');
         if (sequential?.enabled && ['sequential-thinking.sequentialthinking', this.modelName('sequential-thinking', 'sequentialthinking')].includes(name)) {
@@ -236,6 +255,13 @@ export class SharedMcpCatalog {
             roots: context.roots.map(pathIdentity).sort(), protectedPaths: (context.protectedPaths ?? []).map(pathIdentity).sort(), retention: context.retention });
     }
 
+    modelPublicationReason(name: string, context: BoundToolContext): string | null {
+        if (['sequential-thinking.sequentialthinking', this.modelName('sequential-thinking', 'sequentialthinking')].includes(name)) return null;
+        const { spec } = this.resolve(name);
+        return context.retention.mode === 'temporary' && !spec.supportsTemporary
+            ? '此工具尚未验证临时会话路由；当前临时会话保持未加载，可由主调用方选择支持的保存方式' : null;
+    }
+
     async load(names: readonly string[], context: BoundToolContext): Promise<LoadedModelTool[]> {
         if (this.closed) throw new AgentFault('TOOL_SERVICE_UNAVAILABLE', '本工具连接已关闭');
         if (!Array.isArray(names) || names.length < 1 || names.length > 32 || names.some(name => typeof name !== 'string' || !name)) {
@@ -277,6 +303,20 @@ export class SharedMcpCatalog {
     releaseLoadedTools(context: BoundToolContext): void {
         for (const [key, scope] of this.loadedScopes) if (scope.conversationId === context.conversationId && scope.principalId === context.principalId
             && scope.runId === context.runId && scope.rootRunId === context.rootRunId && scope.runEpoch === context.runEpoch) this.loadedScopes.delete(key);
+    }
+
+    isIndependentRead(name: string, args: Record<string, unknown>): boolean {
+        if (['sandbox.sandbox_status', 'mcp_sandbox__sandbox_status'].includes(name)) {
+            return (args.action === undefined || ['overview', 'envs'].includes(String(args.action)))
+                && !['gcMode', 'gcScope', 'quarantineId'].some(key => key in args);
+        }
+        if (['sandbox.smart_search', 'mcp_sandbox__smart_search'].includes(name)) {
+            const searches = Array.isArray(args.queries) ? args.queries : [args];
+            return (args.mode === undefined || args.mode === 'exact') && !args.taskId && !args.cancel
+                && searches.every(query => query && typeof query === 'object'
+                    && ((query as Record<string, unknown>).mode === undefined || (query as Record<string, unknown>).mode === 'exact'));
+        }
+        return ['exa.web_search_exa', 'exa.web_fetch_exa', 'mcp_exa__web_search_exa', 'mcp_exa__web_fetch_exa'].includes(name);
     }
 
     async execute(name: string, args: unknown, context: BoundToolContext): Promise<unknown> {
@@ -337,6 +377,7 @@ export class SharedMcpCatalog {
         this.loadedScopes.clear();
         this.cache.clear();
         this.nativeSchemas.clear();
+        this.schemaFailures.clear();
         const pendingClients = [...this.clients.values()];
         const clients = new Set(this.liveClients);
         this.clients.clear();

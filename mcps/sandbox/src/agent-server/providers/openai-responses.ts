@@ -5,6 +5,7 @@ import { arrayObjects, assembleResponse, checkToolResults, freezeOwned, gateDecl
 import { attemptTimeout, bearerHeaders, decodeResponse, endpointUrl } from './http.js';
 import { CompatibleChatAdapter } from './compatible-chat.js';
 import { requestProviderResponse } from './streaming.js';
+import { providerRequestHeaders } from './request-identity.js';
 import type { LookupResult, ProviderLookupHandle } from './types.js';
 import type { DiscoveryPage, NativeBlock, NativeSendView, NormalizedResponse, ProviderAdapter, ProviderAttempt, ProviderProfile, RawProviderResponse, RequestSnapshot, SendContext, StopKind, ToolCall, ToolResult } from './types.js';
 
@@ -128,7 +129,7 @@ export class OpenAIResponsesAdapter implements ProviderAdapter {
             || JSON.parse(snapshot.body).store !== true) return { status: 'unsupported' };
         const endpoint = `${this.endpoint(snapshot.profile, snapshot.modelId)}/${encodeURIComponent(handle.providerResponseId)}`;
         const response = await context.transport.request({ method: 'GET', url: endpoint,
-            headers: bearerHeaders(context.credential), timeoutMs: 10_000 }, signal);
+            headers: providerRequestHeaders(snapshot.profile, bearerHeaders(context.credential), { purpose: 'lookup', conversationId: snapshot.conversationId }), timeoutMs: 10_000 }, signal);
         if (response.status === 404) return { status: 'not_found', provesNotAccepted: false };
         const raw = decodeResponse(response, this.protocol);
         if (raw.json.id !== handle.providerResponseId) throw new AgentFault('E_RESPONSE_IDENTITY', '查回结果与原供应商响应身份不同');

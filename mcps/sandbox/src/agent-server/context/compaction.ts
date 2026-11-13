@@ -13,6 +13,7 @@ import { feedbackSourceNodeIds } from './feedback.js';
 import { activeRequirements, boundedRequirementGuidance } from './requirements.js';
 import { applySemanticChunk, semanticTailInput } from './semantic-tail.js';
 import { updateCommunicationWindow } from './communication-window.js';
+import { captureCompletedFragments } from './completed-fragments.js';
 
 export interface CompactionPreview {
     conversationId: string;
@@ -24,6 +25,7 @@ export interface CompactionPreview {
     firstSeq: number | null;
     lastSeq: number | null;
     requiresBudget: boolean;
+    recentRawRetention: { unit: 'complete_user_rounds' | 'complete_model_steps'; count: number };
 }
 
 export function previewCompaction(capture: ContextCapture, config: Pick<FrozenCompressionConfig, 'policy'>): CompactionPreview {
@@ -31,14 +33,17 @@ export function previewCompaction(capture: ContextCapture, config: Pick<FrozenCo
     return { conversationId: capture.conversationId, historyEpoch: capture.historyEpoch, viewRevision: capture.viewRevision,
         appendSeq: capture.appendSeq, roundIds: selected.targets.map(round => round.roundId), retainedRoundIds: selected.retained.map(round => round.roundId),
         firstSeq: selected.targets[0]?.firstSeq ?? null, lastSeq: selected.targets.at(-1)?.lastSeq ?? null,
-        requiresBudget: capture.execution === null };
+        requiresBudget: capture.execution === null,
+        recentRawRetention: capture.activeCompletedPrefix ? { unit: 'complete_model_steps', count: Math.max(1, config.policy.keepCompleteSteps ?? 2) }
+            : { unit: 'complete_user_rounds', count: config.policy.keepCompleteRounds } };
 }
 
 export async function prepareCompaction(input: {
     port: CompactionPort; sources: ContextSourcePort; capture: ContextCapture; config: FrozenCompressionConfig;
     execution: ExecutionLease; candidateId?: string; reason: CompactionReason; signal?: AbortSignal; now?: number;
 }): Promise<CompactionCandidate> {
-    const { capture, config, execution, port, sources, signal } = input;
+    const { config, execution, port, sources, signal } = input;
+    const capture = await captureCompletedFragments(port, input.capture, config.policy, signal);
     checkAbort(signal);
     if (execution.conversationId !== capture.conversationId || !execution.runId || !execution.rootBudgetId
         || !execution.stepId || !Number.isSafeInteger(execution.runEpoch) || execution.runEpoch < 1

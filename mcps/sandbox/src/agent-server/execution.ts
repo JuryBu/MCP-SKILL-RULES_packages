@@ -17,6 +17,7 @@ import { hasMcpToolImageReferences } from './media/tool-results.js';
 import { appendNativeHistoryView } from './context/native-view-build.js';
 import { scopedToolActionId } from './tool-action-identity.js';
 import { createExecutionProgress } from './execution-progress.js';
+import { MAX_PARALLEL_TOOL_READS, settleIndependentReads } from './tools/parallel.js';
 
 export interface ExecutionPlan {
     profile: ProviderProfile;
@@ -297,7 +298,8 @@ export function createProviderExecutor(services: ExecutionServices): AgentExecut
                     rootRunId: trusted.rootRunId ?? String(context.snapshot.rootRunId ?? context.snapshot.runId),
                     roundId: trusted.roundId ?? context.snapshot.activeRoundId ?? context.snapshot.runId,
                     runEpoch: context.snapshot.runEpoch, policyRevision: trusted.policyRevision!, retention: trusted.retention,
-                    ...identity, signal: AbortSignal.any([context.signal, trusted.signal]) };
+                    ...identity, modelToolNames: plan.toolNames, allowInternalDelegation: canUseInternalDelegation(context),
+                    signal: AbortSignal.any([context.signal, trusted.signal]) };
                 await bound.assertCurrent?.();
                 if (bound.signal.aborted) throw new ProviderFault('E_CANCELLED', '模型工具表发布前已取消', { acceptance: 'not_sent' });
                 return bound;
@@ -315,8 +317,8 @@ export function createProviderExecutor(services: ExecutionServices): AgentExecut
             let toolSchemaHash = sha256(canonicalJson(tools));
             let toolSchemaHashes: Record<string, string> = {};
             let modelCallsUsed = 0;
-            const bindTool = async (state: ProviderApprovalContinuationState, call: ToolCall): Promise<BoundToolContext> => {
-                const actionId = state.toolActionIds?.[state.nextToolCallIndex];
+            const bindTool = async (state: ProviderApprovalContinuationState, call: ToolCall, index = state.nextToolCallIndex): Promise<BoundToolContext> => {
+                const actionId = state.toolActionIds?.[index];
                 if (!actionId) throw new ProviderFault('E_TOOL_ACTION_IDENTITY_REQUIRED', '工具动作缺少已固定的内部身份', { acceptance: 'accepted' });
                 const trusted = await services.toolContext(context, { stepId: state.stepId, actionId, attemptId: state.response.attemptId });
                 if (trusted.conversationId !== context.snapshot.conversationId || trusted.runId !== context.snapshot.runId
@@ -330,6 +332,7 @@ export function createProviderExecutor(services: ExecutionServices): AgentExecut
                     stepId: state.stepId, actionId, attemptId: state.response.attemptId, callId: call.callId,
                     providerCallId: call.providerCallId, providerProtocol: state.protocol, modelContentId: state.modelContentId,
                     rootBudgetId: state.rootBudgetId, deadlineAt: trusted.deadlineAt ?? plan.deadlineAt,
+                    modelToolNames: plan.toolNames, allowInternalDelegation: canUseInternalDelegation(context),
                     toolSchemaHash: state.toolSchemaHashes[call.name], signal: AbortSignal.any([context.signal, trusted.signal]) };
             };
             const suspend = async (): Promise<'released' | 'not_needed' | 'unconfirmed'> => {
@@ -337,9 +340,10 @@ export function createProviderExecutor(services: ExecutionServices): AgentExecut
                     actionId: context.snapshot.runId, attemptId: confirmedAttemptId ?? context.snapshot.runId });
                 return services.tools.suspendForApproval(trusted);
             };
-            const pauseForLocalPolicy = async (state: ProviderApprovalContinuationState, refused: ToolResult): Promise<ExecutorOutcome> => {
+            const pauseForLocalPolicy = async (state: ProviderApprovalContinuationState, refused: ToolResult,
+                refusedIndex = state.nextToolCallIndex): Promise<ExecutorOutcome> => {
                 const error = localPolicyError(refused)!;
-                const actionId = state.toolActionIds![state.nextToolCallIndex];
+                const actionId = state.toolActionIds![refusedIndex];
                 const skippedToolCalls: string[] = [];
                 for (let index = state.nextToolCallIndex + 1; index < state.response.toolCalls.length; index++) {
                     const call = state.response.toolCalls[index];
@@ -406,43 +410,64 @@ export function createProviderExecutor(services: ExecutionServices): AgentExecut
                 }
                 for (; state.nextToolCallIndex < state.response.toolCalls.length; state.nextToolCallIndex++) {
                     if (context.signal.aborted) throw new ProviderFault('E_CANCELLED', '工具执行前已取消', { acceptance: 'not_sent' });
-                    const call = state.response.toolCalls[state.nextToolCallIndex];
-                    activeToolContext = await bindTool(state, call);
-                    currentActionId = activeToolContext.actionId;
-                    const internal = DELEGATION_FUNCTION_SCHEMAS.some(schema => schema.name === call.name || `local.${schema.name}` === call.name);
-                    const allowedInternal = canUseInternalDelegation(context) && state.view.tools?.some(schema => schema.name === call.name);
-                    let result: ToolExecutionResult;
-                    try {
-                        result = internal && !allowedInternal
-                            ? { ok: false, error: { ...new AgentFault('CHILD_AGENTS_DISABLED', '该请求未向模型开放内部派发工具').toJSON(),
-                                actionId: activeToolContext.actionId, attemptId: state.response.attemptId } }
-                            : await services.tools.execute(call.name, call.arguments, activeToolContext);
-                    } catch (error) { result = localPolicyFailure(error, activeToolContext); }
-                    if (result.disposition === 'awaiting_approval' || result.error?.code === 'APPROVAL_REQUIRED') {
-                        if (!result.approval?.pendingToolId || !result.pendingTool) throw new ProviderFault('E_APPROVAL_CONTINUATION_REQUIRED', '批准待办缺少已冻结的原工具动作', { acceptance: 'accepted' });
-                        state.pendingToolId = result.pendingTool.pendingToolId;
-                        state.toolOperationIds[state.nextToolCallIndex] = `pending-tool-completion:${state.pendingToolId}`;
-                        state.published = [...published];
-                        state.confirmedToolEffects = jsonCopy(confirmedToolEffects);
-                        const { signal: discardedSignal, assertCurrent: discardedCurrent, ...identity } = activeToolContext;
-                        const interaction = await context.requestApproval({ operationId: `approval:${state.pendingToolId}`, approval: result.approval,
-                            stepId: state.stepId, callId: call.callId, toolContext: jsonCopy(identity) as ApprovalToolIdentity,
-                            state: jsonCopy(state) as unknown as JsonValue });
-                        return { status: 'paused', stopReason: 'APPROVAL_REQUIRED', effectState: 'confirmed', cleanupState: await suspend(),
-                            result: { interactionId: interaction.interactionId, pendingToolId: state.pendingToolId,
-                                pendingApprovals: [jsonCopy(result.approval) as unknown as JsonValue] } };
+                    const batch: { index: number; call: ToolCall; trusted: BoundToolContext }[] = [];
+                    for (let index = state.nextToolCallIndex; index < Math.min(state.response.toolCalls.length,
+                        state.nextToolCallIndex + MAX_PARALLEL_TOOL_READS); index++) {
+                        const call = state.response.toolCalls[index];
+                        const trusted = await bindTool(state, call, index);
+                        const independent = services.tools.isIndependentRead?.(call.name, call.arguments, trusted) === true;
+                        if (batch.length && !independent) break;
+                        batch.push({ index, call, trusted });
+                        if (!independent) break;
                     }
-                    const originalResult: ToolResult = {
-                        callId: call.callId, name: call.name, result: jsonCopy(result) as unknown as JsonValue, isError: !result.ok,
-                    };
-                    const normalized = localPolicyError(originalResult) ? originalResult : await transformToolResult(services, context, plan, originalResult,
-                        { stepId: state.stepId, actionId: activeToolContext.actionId, attemptId: state.response.attemptId, toolContext: activeToolContext });
-                    rememberEffect(normalized, state.stepId, state.response.attemptId, activeToolContext.actionId);
-                    await context.recordStep({ kind: 'tool', operationId: state.toolOperationIds[state.nextToolCallIndex], stepId: state.stepId,
-                        originStepId: state.stepId, actionId: activeToolContext.actionId, protocol: state.protocol, result: normalized });
-                    state.results.push(normalized);
-                    if (localPolicyError(normalized)) return pauseForLocalPolicy(state, normalized);
-                    if (result.error?.mayHaveStarted) return { status: 'outcome_unknown', stopReason: result.error.code,
+                    activeToolContext = batch[0].trusted;
+                    currentActionId = activeToolContext.actionId;
+                    const completed = await settleIndependentReads(batch.map(({ call, trusted }) => async () => {
+                        const internal = DELEGATION_FUNCTION_SCHEMAS.some(schema => schema.name === call.name || `local.${schema.name}` === call.name);
+                        const allowedInternal = canUseInternalDelegation(context) && state.view.tools?.some(schema => schema.name === call.name);
+                        try {
+                            return internal && !allowedInternal
+                                ? { ok: false, error: { ...new AgentFault('CHILD_AGENTS_DISABLED', '该请求未向模型开放内部派发工具').toJSON(),
+                                    actionId: trusted.actionId, attemptId: state.response.attemptId } } as ToolExecutionResult
+                                : await services.tools.execute(call.name, call.arguments, trusted);
+                        } catch (error) { return localPolicyFailure(error, trusted); }
+                    }));
+                    let refused: { result: ToolResult; index: number } | undefined;
+                    let unknown: ToolExecutionResult['error'];
+                    for (let position = 0; position < batch.length; position++) {
+                        const { call, trusted, index } = batch[position];
+                        state.nextToolCallIndex = index;
+                        activeToolContext = trusted;
+                        currentActionId = trusted.actionId;
+                        const result = completed[position];
+                        if (result.disposition === 'awaiting_approval' || result.error?.code === 'APPROVAL_REQUIRED') {
+                            if (!result.approval?.pendingToolId || !result.pendingTool) throw new ProviderFault('E_APPROVAL_CONTINUATION_REQUIRED', '批准待办缺少已冻结的原工具动作', { acceptance: 'accepted' });
+                            state.pendingToolId = result.pendingTool.pendingToolId;
+                            state.toolOperationIds[state.nextToolCallIndex] = `pending-tool-completion:${state.pendingToolId}`;
+                            state.published = [...published];
+                            state.confirmedToolEffects = jsonCopy(confirmedToolEffects);
+                            const { signal: discardedSignal, assertCurrent: discardedCurrent, ...identity } = activeToolContext;
+                            const interaction = await context.requestApproval({ operationId: `approval:${state.pendingToolId}`, approval: result.approval,
+                                stepId: state.stepId, callId: call.callId, toolContext: jsonCopy(identity) as ApprovalToolIdentity,
+                                state: jsonCopy(state) as unknown as JsonValue });
+                            return { status: 'paused', stopReason: 'APPROVAL_REQUIRED', effectState: 'confirmed', cleanupState: await suspend(),
+                                result: { interactionId: interaction.interactionId, pendingToolId: state.pendingToolId,
+                                    pendingApprovals: [jsonCopy(result.approval) as unknown as JsonValue] } };
+                        }
+                        const originalResult: ToolResult = {
+                            callId: call.callId, name: call.name, result: jsonCopy(result) as unknown as JsonValue, isError: !result.ok,
+                        };
+                        const normalized = localPolicyError(originalResult) ? originalResult : await transformToolResult(services, context, plan, originalResult,
+                            { stepId: state.stepId, actionId: activeToolContext.actionId, attemptId: state.response.attemptId, toolContext: activeToolContext });
+                        rememberEffect(normalized, state.stepId, state.response.attemptId, activeToolContext.actionId);
+                        await context.recordStep({ kind: 'tool', operationId: state.toolOperationIds[state.nextToolCallIndex], stepId: state.stepId,
+                            originStepId: state.stepId, actionId: activeToolContext.actionId, protocol: state.protocol, result: normalized });
+                        state.results.push(normalized);
+                        if (localPolicyError(normalized)) refused ??= { result: normalized, index };
+                        if (result.error?.mayHaveStarted) unknown ??= result.error;
+                    }
+                    if (refused) return pauseForLocalPolicy(state, refused.result, refused.index);
+                    if (unknown) return { status: 'outcome_unknown', stopReason: unknown.code,
                         effectState: 'unknown', cleanupState: await suspend() };
                 }
                 originalTurnOpen = false;

@@ -16,7 +16,78 @@ export interface NormalizedUsage {
     raw: JsonValue;
     issues: string[];
     outputTokenDetails: Record<string, number> | null;
-    providerCostBasis?: { field: 'cost_in_usd_ticks'; ticksPerUsd: 10000000000; rounding: 'ceil_to_micros' };
+    providerCostBasis?: { field: 'cost_in_usd_ticks'; ticksPerUsd: 10000000000; rounding: 'ceil_to_micros' }
+        | { field: 'cost'; currency: 'USD'; rounding: 'ceil_to_micros'; sourceRef: string };
+    modalityUsage?: { input: ModalityUsage; output: ModalityUsage; cacheRead: ModalityUsage };
+    billingObservation?: { billingSource: string | null; accountDebit: JsonValue; subscriptionAllowance: JsonValue; listCost: JsonValue;
+        currency: 'USD' | null; invoiceStatus: 'unverified'; sourceFields: string[]; sourceRef?: string; estimated?: boolean };
+}
+
+export interface ModalityUsage {
+    tokens: Record<string, number> | null;
+    status: 'known' | 'partial' | 'unknown';
+    sourceField: string;
+    totalTokens: number | null;
+    issues: string[];
+}
+
+export function normalizeModalityUsage(raw: JsonValue | undefined, sourceField: string, totalTokens: number | null): ModalityUsage {
+    const result: ModalityUsage = { tokens: null, status: 'unknown', sourceField, totalTokens, issues: [] };
+    if (!Array.isArray(raw) || !raw.length) return result;
+    const tokens: Record<string, number> = Object.create(null) as Record<string, number>;
+    for (const value of raw) {
+        const detail = record(value);
+        const count = tokenCount(detail.tokenCount);
+        if (typeof detail.modality !== 'string' || !/^[A-Za-z][A-Za-z0-9_]{0,63}$/.test(detail.modality) || count === null) {
+            return { ...result, issues: ['modality_detail_invalid'] };
+        }
+        const modality = detail.modality.toLowerCase();
+        const sum = (tokens[modality] ?? 0) + count;
+        if (!Number.isSafeInteger(sum)) return { ...result, issues: ['modality_detail_overflow'] };
+        tokens[modality] = sum;
+    }
+    const sum = Object.values(tokens).reduce((subtotal, count) => subtotal + count, 0);
+    if (!Number.isSafeInteger(sum)) return { ...result, issues: ['modality_detail_overflow'] };
+    return { ...result, tokens: { ...tokens }, status: totalTokens !== null && sum === totalTokens ? 'known' : 'partial',
+        issues: totalTokens !== null && sum !== totalTokens ? ['modality_bucket_mismatch'] : [] };
+}
+
+function billingObservation(usage: JsonObject): Pick<NormalizedUsage, 'billingObservation'> {
+    const opencode = record(usage.opencode);
+    if (!Object.keys(opencode).length && !Object.hasOwn(usage, 'cost')) return {};
+    const amount = (value: JsonValue | undefined): JsonValue => typeof value === 'number' && Number.isFinite(value) && value >= 0
+        || typeof value === 'string' && /^(?:0|[1-9][0-9]*)(?:\.[0-9]+)?$/.test(value) ? value! : null;
+    return { billingObservation: { billingSource: typeof opencode.billing_source === 'string' ? opencode.billing_source : null,
+        accountDebit: amount(usage.cost), subscriptionAllowance: amount(opencode.allowance), listCost: amount(opencode.list_cost),
+        ...(typeof opencode.estimated === 'boolean' ? { estimated: opencode.estimated } : {}),
+        currency: null, invoiceStatus: 'unverified', sourceFields: ['cost', 'opencode.allowance', 'opencode.list_cost'].filter(field =>
+            field === 'cost' ? Object.hasOwn(usage, 'cost') : Object.hasOwn(opencode, field.slice('opencode.'.length))) } };
+}
+
+export function decimalUsdMicros(value: JsonValue | undefined): number | null {
+    if (typeof value !== 'number' && typeof value !== 'string' || typeof value === 'number' && (!Number.isFinite(value) || value < 0)) return null;
+    const text = String(value);
+    const match = text.length <= 96 ? text.match(/^(0|[1-9][0-9]*)(?:\.([0-9]+))?(?:e([+-]?[0-9]{1,2}))?$/i) : null;
+    if (!match) return null;
+    const fraction = match[2] ?? '';
+    const scale = 6 + Number(match[3] ?? 0) - fraction.length;
+    const digits = BigInt(match[1] + fraction);
+    const micros = scale >= 0 ? digits * 10n ** BigInt(scale) : (digits + 10n ** BigInt(-scale) - 1n) / 10n ** BigInt(-scale);
+    return micros <= BigInt(Number.MAX_SAFE_INTEGER) ? Number(micros) : null;
+}
+
+export function normalizeScopedProviderUsage(usage: NormalizedUsage, endpoint: string): NormalizedUsage {
+    let url: URL;
+    try { url = new URL(endpoint); } catch { return usage; }
+    if (url.protocol !== 'https:' || url.hostname !== 'opencode.ai' || url.port || url.username || url.password
+        || !/^\/(?:inference|zen)(?:\/|$)/.test(url.pathname) || !usage.billingObservation) return usage;
+    const observation = { ...usage.billingObservation, currency: 'USD' as const, sourceRef: 'https://opencode.ai/docs/console/api/inference/#cost' };
+    const reported = decimalUsdMicros(observation.accountDebit);
+    const knownSource = ['free', 'balance', 'go', 'go-plus', 'byok'].includes(observation.billingSource ?? '');
+    return { ...usage, billingObservation: observation, ...(reported !== null && knownSource && observation.estimated !== true ? {
+        providerCostMicros: reported, providerCostCurrency: 'USD', providerCostBasis: {
+            field: 'cost' as const, currency: 'USD' as const, rounding: 'ceil_to_micros' as const, sourceRef: observation.sourceRef },
+    } : {}) };
 }
 
 export function normalizeProgrokUsage(raw: JsonValue | undefined): NormalizedUsage {
@@ -54,12 +125,13 @@ export function normalizeUsage(protocol: 'compatible_chat' | 'gemini' | 'openai_
         return { inputTokens: tokenCount(usage.input_tokens), inputUncachedTokens: tokenCount(usage.input_tokens),
             outputTokens: tokenCount(usage.output_tokens), cacheReadTokens: tokenCount(usage.cache_read_input_tokens),
             cacheWriteTokens: tokenCount(usage.cache_creation_input_tokens), reasoningTokens: null, totalTokens: tokenCount(usage.total_tokens),
-            inputIncludesCache: false, outputIncludesReasoning: true, providerCostMicros: null, providerCostCurrency: null, raw: raw ?? null, issues: [], outputTokenDetails: null };
+            inputIncludesCache: false, outputIncludesReasoning: true, providerCostMicros: null, providerCostCurrency: null, raw: raw ?? null, issues: [], outputTokenDetails: null,
+            ...billingObservation(usage) };
     }
     if (protocol === 'openai_responses') {
         const normalized = normalizeUsage('compatible_chat', { prompt_tokens: usage.input_tokens ?? null, prompt_tokens_details: usage.input_tokens_details ?? null,
             completion_tokens: usage.output_tokens ?? null, completion_tokens_details: usage.output_tokens_details ?? null, total_tokens: usage.total_tokens ?? null });
-        return { ...normalized, raw: raw ?? null };
+        return { ...normalized, raw: raw ?? null, ...billingObservation(usage) };
     }
     const promptDetails = record(usage.prompt_tokens_details);
     const outputDetails = record(usage.completion_tokens_details);
@@ -68,21 +140,17 @@ export function normalizeUsage(protocol: 'compatible_chat' | 'gemini' | 'openai_
         : usage.prompt_cache_hit_tokens ?? promptDetails.cached_tokens);
     const explicitMiss = tokenCount(usage.prompt_cache_miss_tokens);
     const issues: string[] = [];
+    const modalityUsage = protocol === 'gemini' ? {
+        input: normalizeModalityUsage(usage.promptTokensDetails, 'promptTokensDetails', inputTokens),
+        output: normalizeModalityUsage(usage.candidatesTokensDetails, 'candidatesTokensDetails', tokenCount(usage.candidatesTokenCount)),
+        cacheRead: normalizeModalityUsage(usage.cacheTokensDetails, 'cacheTokensDetails', cacheReadTokens),
+    } : undefined;
     let outputTokenDetails: Record<string, number> | null = null;
     if (protocol === 'gemini' && Array.isArray(usage.candidatesTokensDetails)) {
-        outputTokenDetails = {};
-        for (const item of usage.candidatesTokensDetails) {
-            const detail = record(item);
-            const count = tokenCount(detail.tokenCount);
-            if (typeof detail.modality !== 'string' || count === null) { issues.push('output_modality_detail_invalid'); outputTokenDetails = null; break; }
-            const modality = detail.modality.toLowerCase();
-            outputTokenDetails[modality] = (outputTokenDetails[modality] ?? 0) + count;
-        }
-        const output = tokenCount(usage.candidatesTokenCount);
-        if (outputTokenDetails && output !== null && Object.values(outputTokenDetails).reduce((sum, count) => sum + count, 0) !== output) {
-            issues.push('output_modality_bucket_mismatch');
-            outputTokenDetails = null;
-        }
+        const detail = modalityUsage!.output;
+        if (detail.issues.some(issue => issue !== 'modality_bucket_mismatch')) issues.push('output_modality_detail_invalid');
+        else if (detail.issues.includes('modality_bucket_mismatch')) issues.push('output_modality_bucket_mismatch');
+        else if (detail.tokens) outputTokenDetails = detail.tokens;
     }
     let inputUncachedTokens = explicitMiss;
     if (inputUncachedTokens === null && inputTokens !== null && cacheReadTokens !== null) {
@@ -91,7 +159,7 @@ export function normalizeUsage(protocol: 'compatible_chat' | 'gemini' | 'openai_
     }
     if (explicitMiss !== null && inputTokens !== null && cacheReadTokens !== null
         && explicitMiss + cacheReadTokens !== inputTokens) issues.push('input_bucket_mismatch');
-    if (issues.length) inputUncachedTokens = null;
+    if (issues.some(issue => ['cache_read_exceeds_input', 'input_bucket_mismatch'].includes(issue))) inputUncachedTokens = null;
     return {
         inputTokens, inputUncachedTokens,
         outputTokens: tokenCount(protocol === 'gemini' ? usage.candidatesTokenCount : usage.completion_tokens),
@@ -100,6 +168,7 @@ export function normalizeUsage(protocol: 'compatible_chat' | 'gemini' | 'openai_
         totalTokens: tokenCount(protocol === 'gemini' ? usage.totalTokenCount : usage.total_tokens),
         inputIncludesCache: true, outputIncludesReasoning: protocol === 'compatible_chat',
         providerCostMicros: null, providerCostCurrency: null, raw: raw ?? null, issues, outputTokenDetails,
+        ...(modalityUsage ? { modalityUsage } : {}), ...billingObservation(usage),
     };
 }
 
@@ -207,7 +276,7 @@ export function priceUsage(usage: NormalizedUsage, price: PriceEntry, now = Date
     if (price.outputByModality) {
         if (!usage.outputTokenDetails) missing.push('output_modality_usage');
         else for (const [modality, count] of Object.entries(usage.outputTokenDetails)) {
-            const rate = price.outputByModality[modality];
+            const rate = Object.hasOwn(price.outputByModality, modality) ? price.outputByModality[modality] : undefined;
             if (count === 0) continue;
             if (rate === undefined || rate === null) missing.push(`output_${modality}_price`);
             else amount += cost(count, rate, price.unitTokens);
@@ -278,7 +347,8 @@ export function estimateReportedUsageUpperBound(input: {
         const detail = record(item);
         const count = tokenCount(detail.tokenCount);
         if (typeof detail.modality !== 'string' || count === null) return null;
-        const rate = price.outputByModality?.[detail.modality.toLowerCase()];
+        const modality = detail.modality.toLowerCase();
+        const rate = price.outputByModality && Object.hasOwn(price.outputByModality, modality) ? price.outputByModality[modality] : undefined;
         if (count > 0 && price.outputByModality && (rate === undefined || rate === null)) return null;
         detailedTokens += count;
         if (!Number.isSafeInteger(detailedTokens) || (candidates !== null && detailedTokens > candidates)) return null;
