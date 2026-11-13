@@ -218,7 +218,9 @@ web_fetch_page(taskId="...", waitSeconds=30)
 - `gpt-5.5 via Codex CLI`
 - `sonnet via Claude Code CLI`
 
-现代 Antigravity 从当前账号的 `GetUserStatus` 目录选型，普通材料默认 Gemini 3.8 Flash High（当前为 `MODEL_PLACEHOLDER_M318`），按当次目录核验模型 ID、禁用状态及额度。`WEB_FETCHER_LS_MODEL` 可显式选择文字模型，App离线的schema ACP入口也保留这个既有配置。视觉审查自动选择可用 Argon High、其次 Carbon High，两者不可用时停止，Claude 保留显式使用。只有目录接口明确不支持的旧环境才使用原 `M132 -> M20 -> M18 -> M16 -> M36` 兼容表及 `WEB_FETCHER_LS_MODEL_FALLBACKS`，现代目录不会混入旧映射。完整入口、取消和错误边界，以及候选05图片成功、候选06 LS摘要500／结果未知、候选07未实际生成和候选08正常MCP摘要／视觉成功的实际范围，见[反重力模型桥](docs/antigravity-model-bridge.md)。
+现代Antigravity从当前账号的`GetUserStatus`目录选型，材料默认Hydrogen XHigh→Hydrogen High→Carbon High，视觉默认Carbon High；按本次目录核验ID、禁用和额度，仅明确容量拒绝允许推进自动候选。认证、额度、取消或结果未知时停止。只有目录接口明确不支持的旧环境才使用原`M132 -> M20 -> M18 -> M16 -> M36`兼容表及`WEB_FETCHER_LS_MODEL_FALLBACKS`，显式Claude等旧选项继续保留。
+
+7.4.1新增可选`model`，page／rich／inspect均可固定本次型号，支持对应链路的slug、显示名或M编号；无法确定平台的名称须同时指定`modelChain`。`WEB_FETCHER_LS_MODEL`同样固定模型，图片和结构化文字均会传递，失败时不悄悄换平台。Codex不再固定退役型号，优先取24小时内本机`CODEX_HOME/models_cache.json`可见目录的首选型号，缺少目录时不传`-m`，使用CLI自身默认；默认推理`max`、速度`standard`，显式环境配置继续生效。`_meta.modelCall`记录实际型号与`modelSource`，结构化`400/model_not_found`准确归为明确拒绝。完整入口及历史验收边界见[反重力模型桥](docs/antigravity-model-bridge.md)。
 
 Codex 模型桥默认值保持 `gpt-5.5` + `model_reasoning_effort=medium` + `model_speed_tier=fast`，可覆盖 `WEB_FETCHER_CODEX_MODEL`、`WEB_FETCHER_CODEX_REASONING`、`WEB_FETCHER_CODEX_SPEED`。Claude Code CLI 默认值保持 `sonnet` + `--effort low`，可用 `WEB_FETCHER_CLAUDE_CODE_MODEL`、`WEB_FETCHER_CLAUDE_CODE_EFFORT`、`WEB_FETCHER_CLAUDE_CODE_TIMEOUT_MS`、`WEB_FETCHER_CLAUDE_CODE_MAX_BUDGET_USD` 覆盖；`auto` 末跳仍需 `WEB_FETCHER_CLAUDE_CODE_AUTO_FALLBACK=1`。
 
@@ -236,7 +238,7 @@ Codex 模型桥默认值保持 `gpt-5.5` + `model_reasoning_effort=medium` + `mo
 
 - `mode="structure"`：提取页面结构树，包含文本、边界框、层级、字体与颜色等信息。
 - `mode="detect"`：检测 `overlap`、`overflow`、`readability`、`alignment`。
-- `mode="ai_review"`：每页打包截图、结构树和几何检测结果，缺少截图时不提交模型；Antigravity 使用 CLI 图片入口并按视觉用途选择 Argon／Carbon，Codex 使用 `-i` 传图。当前 Claude Code 桥只提供文字，图片请求在生成前明确拒绝。`modelCalls` 记录逐页实际入口、模型和提交状态。
+- `mode="ai_review"`：每页打包截图、结构树和几何检测结果，缺少截图时不提交模型；Antigravity使用CLI原生图片入口并默认Carbon High，Codex使用`-i`传图。当前Claude Code桥只提供文字，图片请求在生成前明确拒绝。`modelCalls`记录逐页实际入口、模型和提交状态。
 - `mode="all"`：一次执行结构提取、规则检测和 AI 审查。
 
 EPUB 路线是静态 ebook 结构，不创建 DOM session；`ai_review` 当前只返回静态结构说明，不执行截图型视觉审查。
@@ -245,7 +247,7 @@ AI Review 支持同步单页和后台批量：
 
 ```text
 web_inspect(url="file:///C:/demo.pptx", mode="ai_review", page=1, modelChain="auto")
-web_inspect(url="file:///C:/deck.pptx", mode="ai_review", page="all", background=true, batchSize=5)
+web_inspect(url="file:///C:/deck.pptx", mode="all", page="all", background=true)
 web_inspect(action="check", taskId="...", waitSeconds=30)
 ```
 

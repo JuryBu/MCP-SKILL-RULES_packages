@@ -9,6 +9,7 @@ import {
     withCliEndpoint,
 } from './antigravity-cli.js';
 import {
+    getAntigravityCapacityCandidates,
     legacyAntigravityCatalog,
     parseAntigravityCatalog,
     selectAntigravityModel,
@@ -278,24 +279,6 @@ export function getLsModelCandidates(model: string): string[] {
         .split(',').map(item => item.trim()).filter(Boolean)])];
 }
 
-function flashLevel(label: string): number {
-    const level = /^Gemini\s+3\.8\s+Flash\s*(?:\((High|Medium|Low)\)|(High|Medium|Low))$/i.exec(label);
-    return level ? ['high', 'medium', 'low'].indexOf((level[1] ?? level[2]).toLowerCase()) : -1;
-}
-
-function modernCapacityCandidates(catalog: AntigravityCatalog, selected: { id: string; label: string }): string[] {
-    const candidates = [selected.id];
-    const selectedLevel = flashLevel(selected.label);
-    if (selectedLevel < 0) return candidates;
-    for (const level of [1, 2]) {
-        if (level <= selectedLevel) continue;
-        const model = catalog.models.find(item => !item.disabled
-            && (item.quotaRemaining === undefined || item.quotaRemaining > 0) && flashLevel(item.label) === level);
-        if (model && !candidates.includes(model.id)) candidates.push(model.id);
-    }
-    return candidates;
-}
-
 export function createAntigravityClient(overrides: Partial<AntigravityClientDependencies> = {}) {
     const dependencies: AntigravityClientDependencies = {
         discover: discoverAntigravityEndpoints, rpc: callAntigravityRpc, generate: callAntigravityModel,
@@ -308,6 +291,9 @@ export function createAntigravityClient(overrides: Partial<AntigravityClientDepe
         if (endpoint.transport !== 'cli-ls') cachedEndpoint = { endpoint, verifiedAt: Date.now(), accountKey };
     };
     const callEndpoint = async (request: AntigravityRequest, endpoint: AntigravityEndpoint): Promise<AntigravityResult> => {
+        if (request.generationTimeoutMs !== undefined) {
+            request = { ...request, deadline: Math.min(request.deadline, performance.now() + request.generationTimeoutMs) };
+        }
         const interruption = stopped(request);
         if (interruption) return { ...interruption, transport: endpoint.transport };
         let catalog: AntigravityCatalog;
@@ -334,24 +320,26 @@ export function createAntigravityClient(overrides: Partial<AntigravityClientDepe
         remember(protocolEndpoint, catalog.accountKey);
         const interruptionAfterCatalog = stopped(request);
         if (interruptionAfterCatalog) return { ...interruptionAfterCatalog, transport: protocolEndpoint.transport };
-        const explicitModel = request.model ?? process.env.WEB_FETCHER_LS_MODEL;
+        const explicitModel = request.model;
         let selection;
-        try { selection = selectAntigravityModel(catalog, explicitModel); }
+        try { selection = selectAntigravityModel(catalog, explicitModel, request.purpose); }
         catch { return antigravityFailure('invalid-response', 'Antigravity model selection failed', protocolEndpoint.transport); }
         if (selection.error) return { ...selection.error, transport: protocolEndpoint.transport };
         if (!selection.model) return antigravityFailure('invalid-response', 'Antigravity catalog selected no model', protocolEndpoint.transport);
         const models = explicitModel ? [selection.model.id] : catalog.modern
-            ? modernCapacityCandidates(catalog, selection.model)
+            ? getAntigravityCapacityCandidates(catalog, selection.model, request.purpose).map(model => model.id)
             : getLsModelCandidates(selection.model.id).filter(model => catalog.models.some(item => item.id === model && !item.disabled));
         let result: AntigravityResult | undefined;
         for (const model of models) {
             const interruptionBeforeGeneration = stopped(request);
             if (interruptionBeforeGeneration) return { ...interruptionBeforeGeneration, transport: protocolEndpoint.transport, model };
-            const candidateSelection = selectAntigravityModel(catalog, model);
+            const candidateSelection = selectAntigravityModel(catalog, model, request.purpose);
             if (candidateSelection.error) return { ...candidateSelection.error, transport: protocolEndpoint.transport };
             try { result = await dependencies.generate(request, protocolEndpoint, model); }
             catch { return antigravityFailure('transport-unknown', 'Antigravity generation failed; submission state unknown', protocolEndpoint.transport, model, true); }
-            const capacityRejected = result.outcome === 'rejected' && result.safeToFallback
+            if (result.cleanup && (!result.cleanup.confirmed || result.cleanup.fault)) return { ...result, safeToFallback: false };
+            const capacityRejected = result.outcome === 'rejected' && result.safeToFallback === true
+                && result.text === null
                 && /\bno capacity available\b/i.test(result.error ?? '');
             if (explicitModel || !result.safeToFallback || (catalog.modern ? !capacityRejected : result.outcome !== 'unsupported')) return result;
             if (model !== models.at(-1)) {
@@ -361,10 +349,14 @@ export function createAntigravityClient(overrides: Partial<AntigravityClientDepe
         return result ?? antigravityFailure('unsupported', 'No compatible legacy Antigravity model', protocolEndpoint.transport);
     };
     const call = async (request: AntigravityRequest): Promise<AntigravityResult> => {
+        const configuredModel = request.model ?? process.env.WEB_FETCHER_LS_MODEL;
+        if (configuredModel !== undefined && request.model === undefined) request = { ...request, model: configuredModel };
         const interruption = stopped(request);
         if (interruption) return interruption;
         if (typeof request.prompt !== 'string' || !request.prompt.trim()
             || (request.model !== undefined && (typeof request.model !== 'string' || !request.model.trim()))
+            || (request.generationTimeoutMs !== undefined && (typeof request.generationTimeoutMs !== 'number'
+                || !Number.isFinite(request.generationTimeoutMs) || request.generationTimeoutMs <= 0))
             || (request.imagePaths !== undefined && (!Array.isArray(request.imagePaths)
                 || request.imagePaths.some(image => typeof image !== 'string' || !image)))) {
             return antigravityFailure('rejected', 'Antigravity request contains invalid prompt, model, or attachments');
@@ -394,9 +386,7 @@ export function createAntigravityClient(overrides: Partial<AntigravityClientDepe
         if (interruptionBeforeCli) return interruptionBeforeCli;
         if (request.schema) {
             let result: AntigravityResult;
-            const configuredModel = request.model ?? process.env.WEB_FETCHER_LS_MODEL;
-            const agentRequest = configuredModel === undefined ? request : { ...request, model: configuredModel };
-            try { result = await dependencies.cliAgent(agentRequest); }
+            try { result = await dependencies.cliAgent(request); }
             catch { return antigravityFailure('transport-unknown', 'Antigravity structured agent failed; submission state unknown', 'cli-agent', null, true); }
             if (result.cleanup && !result.cleanup.confirmed) return { ...result, safeToFallback: false };
             if (result.submitted || !result.safeToFallback || !['not-started', 'unsupported'].includes(result.outcome)) return result;

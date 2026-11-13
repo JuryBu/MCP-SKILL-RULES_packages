@@ -86,6 +86,7 @@ export async function extractDomStructureFromPage(page: Page, options: DomInspec
     const raw = await page.evaluate(extractVisibleDomElements, {
         maxDepth: options.maxDepth ?? DEFAULT_MAX_DEPTH,
         minElementSize: MIN_VISIBLE_ELEMENT_SIZE,
+        viewport: page.viewportSize(),
     });
     const elements = raw.elements.map(toInspectElement);
 
@@ -192,10 +193,10 @@ async function withDomPage<T>(url: string, options: DomInspectorOptions, callbac
 
 async function captureDomIssueScreenshots(page: Page, issues: InspectIssue[], scale: number): Promise<void> {
     ensureTempDirs();
-    const pageBounds = await page.evaluate(() => ({
-        width: Math.max(document.documentElement.scrollWidth, document.body?.scrollWidth || 0, window.innerWidth),
-        height: Math.max(document.documentElement.scrollHeight, document.body?.scrollHeight || 0, window.innerHeight),
-    }));
+    const pageBounds = await page.evaluate(viewport => ({
+        width: Math.max(document.documentElement.scrollWidth, document.body?.scrollWidth || 0, viewport?.width ?? document.documentElement.clientWidth),
+        height: Math.max(document.documentElement.scrollHeight, document.body?.scrollHeight || 0, viewport?.height ?? document.documentElement.clientHeight),
+    }), page.viewportSize());
 
     const prioritized = issues.map((issue, index) => ({ issue, index })).sort((first, second) =>
         Number(second.issue.metadata?.assessment === "confirmed") - Number(first.issue.metadata?.assessment === "confirmed"));

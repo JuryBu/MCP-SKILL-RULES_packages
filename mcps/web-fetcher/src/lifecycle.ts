@@ -1,7 +1,7 @@
 import fs from "fs";
 import path from "path";
 import os from "os";
-import { exec } from "child_process";
+import { execFile } from "child_process";
 
 /**
  * MCP Web-Fetcher 进程生命周期管理 v6.2
@@ -44,46 +44,51 @@ export function getIdleTime(): number {
  * Codex app-server 在重连 / 切线程 / 刷新时，可能重复拉起同一 MCP，
  * 但旧实例的 stdin 不一定立刻断开。这里用于让旧实例在空闲时主动让位。
  */
-export async function hasNewerSiblingInstance(): Promise<boolean> {
-    if (process.platform !== "win32") return false;
+export interface LifecycleProcess {
+    ProcessId?: number;
+    ParentProcessId?: number;
+    Name?: string;
+    CommandLine?: string;
+}
 
-    const currentScript = (process.argv[1] || "").replace(/\\/g, "\\\\");
-    if (!currentScript) return false;
+interface LifecycleProbeOptions {
+    platform?: NodeJS.Platform;
+    parentPid?: number;
+    pid?: number;
+    scriptPath?: string;
+    query?: (filter: string) => Promise<LifecycleProcess[] | null>;
+}
 
-    const escapedScript = currentScript.replace(/'/g, "''");
-
+export async function queryLifecycleProcesses(filter: string, execute: typeof execFile = execFile): Promise<LifecycleProcess[] | null> {
     try {
-        const result = await new Promise<string | null>((resolve) => {
-            exec(
-                `wmic process where "ParentProcessId=${process.ppid} and name='node.exe'" get ProcessId,CommandLine /format:csv`,
-                { encoding: "utf-8", timeout: 5000, windowsHide: true },
-                (error, stdout) => {
-                    if (error) resolve(null);
-                    else resolve(stdout || null);
-                }
-            );
+        const output = await new Promise<string>((resolve, reject) => {
+            const script = "$ErrorActionPreference='Stop'; [Console]::OutputEncoding=[System.Text.UTF8Encoding]::new($false); "
+                + `@(Get-CimInstance -ClassName Win32_Process -Filter '${filter.replace(/'/g, "''")}' | Select-Object ProcessId,ParentProcessId,Name,CommandLine) | ConvertTo-Json -Compress`;
+            execute("powershell.exe", ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script],
+                { encoding: "utf8", timeout: 5000, windowsHide: true, maxBuffer: 1024 * 1024 },
+                (error, stdout) => error ? reject(error) : resolve(String(stdout)));
         });
+        const parsed: unknown = JSON.parse(output.replace(/^\uFEFF/u, "").trim() || "[]");
+        if (parsed === null) return [];
+        const rows = Array.isArray(parsed) ? parsed : [parsed];
+        if (rows.some(row => !row || typeof row !== "object" || Array.isArray(row))) return null;
+        return rows as LifecycleProcess[];
+    } catch { return null; }
+}
 
-        if (!result) return false;
-
-        const lines = result
-            .split(/\r?\n/u)
-            .map((line) => line.trim())
-            .filter(Boolean);
-
-        for (const line of lines) {
-            if (!line.includes(escapedScript)) continue;
-            const parts = line.split(",");
-            const pid = Number(parts[parts.length - 1]);
-            if (Number.isFinite(pid) && pid > process.pid) {
-                return true;
-            }
-        }
-    } catch {
-        return false;
-    }
-
-    return false;
+export async function hasNewerSiblingInstance(options: LifecycleProbeOptions = {}): Promise<boolean> {
+    if ((options.platform ?? process.platform) !== "win32") return false;
+    const normalize = (value: string) => value.replace(/[\\/]+/g, "/").toLowerCase();
+    const currentScript = normalize(options.scriptPath ?? process.argv[1] ?? "");
+    if (!currentScript) return false;
+    const parentPid = options.parentPid ?? process.ppid;
+    const pid = options.pid ?? process.pid;
+    try {
+        const siblings = await (options.query ?? queryLifecycleProcesses)(`ParentProcessId=${parentPid} AND Name='node.exe'`);
+        return siblings?.some(sibling => Number.isSafeInteger(sibling.ProcessId) && Number(sibling.ProcessId) > pid
+            && sibling.ParentProcessId === parentPid && typeof sibling.CommandLine === "string"
+            && normalize(sibling.CommandLine).includes(currentScript)) ?? false;
+    } catch { return false; }
 }
 
 /**
@@ -130,43 +135,32 @@ export function checkParentAliveWithTolerance(): "alive" | "degraded" | "dead" {
 /**
  * 检测父进程是否为 Antigravity LS
  * 
- * 通过 wmic 查询父进程名称，匹配 language_server 前缀。
+ * 通过 CIM 查询父进程名称，匹配 language_server 前缀。
  * 仅启动时调用一次，结果缓存。
  * 
  * 非 LS 环境（其他 IDE、手动启动等）会启用空闲超时兜底。
  */
-let cachedIsLS: boolean | null = null;
+let cachedParentHost: "antigravity-ls" | "other" | undefined;
+
+export async function detectParentHost(options: LifecycleProbeOptions = {}): Promise<"antigravity-ls" | "other" | "unknown"> {
+    if ((options.platform ?? process.platform) !== "win32") return "other";
+    const parentPid = options.parentPid ?? process.ppid;
+    try {
+        const parents = await (options.query ?? queryLifecycleProcesses)(`ProcessId=${parentPid}`);
+        const parent = parents?.find(candidate => candidate.ProcessId === parentPid);
+        if (!parent || typeof parent.Name !== "string" || !parent.Name.trim()) return "unknown";
+        return /^language_server(?:[_\-.]|$)/iu.test(parent.Name) ? "antigravity-ls" : "other";
+    } catch { return "unknown"; }
+}
 
 export async function isAntigravityLS(): Promise<boolean> {
-    if (cachedIsLS !== null) return cachedIsLS;
-
-    if (process.platform !== "win32") {
-        // 非 Windows 暂时默认非 LS（未来可扩展）
-        cachedIsLS = false;
-        return false;
+    const kind = cachedParentHost ?? await detectParentHost();
+    if (kind === "unknown") {
+        logStdinEvent("父宿主 CIM 查询未确认，保留父进程管理，暂不启用非 LS 空闲退出");
+        return true;
     }
-
-    try {
-        const result = await new Promise<string | null>((resolve) => {
-            exec(
-                `wmic process where ProcessId=${process.ppid} get Name /value`,
-                { encoding: "utf-8", timeout: 5000, windowsHide: true },
-                (error, stdout) => {
-                    if (error) resolve(null);
-                    else resolve(stdout?.trim() || null);
-                }
-            );
-        });
-
-        if (result) {
-            // LS 进程名通常为 language_server_amd64.exe 或类似
-            cachedIsLS = result.toLowerCase().includes("language_server");
-            return cachedIsLS;
-        }
-    } catch { /* 查询失败，保守认定为非 LS */ }
-
-    cachedIsLS = false;
-    return false;
+    cachedParentHost = kind;
+    return kind === "antigravity-ls";
 }
 
 /**

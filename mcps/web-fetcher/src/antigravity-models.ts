@@ -66,10 +66,43 @@ function quotaValue(value: JsonObject): number | undefined {
   return undefined;
 }
 
-function flashRank(label: string): number | undefined {
-  const match = /^Gemini\s+3\.8\s+Flash\s*(?:\((High|Medium|Low)\)|(High|Medium|Low))$/i.exec(label);
+export type AntigravityModelPurpose = 'material' | 'visual-review';
+
+function modelProfile(label: string): { family: string; effort: string; slug: string } | undefined {
+  const match = /^Gemini\s+(\d+(?:\.\d+)?)\s+(Hydrogen|Carbon)\s*(?:\((XHigh|High|Medium|Low)\)|(XHigh|High|Medium|Low))(?:\s*\(Limited Time\))?$/iu.exec(label);
   if (!match) return undefined;
-  return ['high', 'medium', 'low'].indexOf((match[1] ?? match[2]).toLowerCase());
+  const family = match[2].toLowerCase();
+  const effort = (match[3] ?? match[4]).toLowerCase();
+  return { family, effort, slug: `gemini-${match[1]}-${family}-${effort}` };
+}
+
+export function getAntigravityModelCandidates(
+  catalog: AntigravityCatalog,
+  purpose: AntigravityModelPurpose = 'material',
+): AntigravityModel[] {
+  if (!catalog.modern) return catalog.models.slice();
+  const preferences = purpose === 'visual-review'
+    ? ['carbon-high']
+    : ['hydrogen-xhigh', 'hydrogen-high', 'carbon-high'];
+  return catalog.models.map(model => {
+    const profile = modelProfile(model.label);
+    return { model, rank: profile ? preferences.indexOf(`${profile.family}-${profile.effort}`) : -1 };
+  }).filter(candidate => candidate.rank >= 0)
+    .sort((left, right) => left.rank - right.rank)
+    .map(candidate => candidate.model);
+}
+
+export function getAntigravityCapacityCandidates(
+  catalog: AntigravityCatalog,
+  selected: AntigravityModel,
+  purpose: AntigravityModelPurpose = 'material',
+): AntigravityModel[] {
+  const ranked = getAntigravityModelCandidates(catalog, purpose);
+  const selectedIndex = ranked.findIndex(model => model.id === selected.id);
+  if (selectedIndex < 0) return [selected];
+  const candidates = [selected, ...ranked.slice(selectedIndex + 1)
+    .filter(model => !model.disabled && (model.quotaRemaining === undefined || model.quotaRemaining > 0))];
+  return candidates.filter((model, index) => candidates.findIndex(candidate => candidate.id === model.id) === index);
 }
 
 function parseModel(
@@ -77,6 +110,7 @@ function parseModel(
   key: string | undefined,
   teamsTier: string | undefined,
   accountQuota: number | undefined,
+  modelFormat: 'rpc' | 'agent' = 'rpc',
 ): AntigravityModel | undefined {
   const outer = objectValue(value);
   const nested = objectValue(outer?.modelConfig) ?? objectValue(outer?.config);
@@ -86,7 +120,7 @@ function parseModel(
   if (!entry) return undefined;
   const alias = objectValue(entry.modelOrAlias);
   const modelObject = objectValue(entry.model);
-  const id = [
+  const id = modelFormat === 'agent' ? textValue(entry.modelId) : [
     alias?.model,
     alias?.alias,
     entry.modelOrAlias,
@@ -99,6 +133,8 @@ function parseModel(
   ].map(enumValue).find(candidate => candidate !== undefined);
   if (!id) return undefined;
   const label = textValue(entry.label) ?? textValue(entry.displayName) ?? textValue(entry.name) ?? id;
+  const modelId = textValue(entry.modelId);
+  const profile = modelProfile(label);
   const allowedTiers = Array.isArray(entry.allowedTiers)
     ? entry.allowedTiers.map(tier => textValue(tier) ?? textValue(objectValue(tier)?.id)).filter(Boolean)
     : [];
@@ -120,9 +156,10 @@ function parseModel(
   return {
     id,
     label,
+    ...(modelId !== undefined ? { modelId } : {}),
     disabled,
     supportsImages,
-    ...(flashRank(label) !== undefined ? { family: 'gemini-3.8-flash' } : {}),
+    ...(profile !== undefined ? { family: profile.family } : {}),
     ...(quotaRemaining !== undefined ? { quotaRemaining } : {}),
     ...(description !== undefined ? { description } : {}),
   };
@@ -171,6 +208,34 @@ function accountKey(status: JsonObject): string | undefined {
     : undefined;
 }
 
+function addCatalogModel(models: Map<string, AntigravityModel>, model: AntigravityModel): void {
+  const existing = models.get(model.id);
+  if (!existing) {
+    models.set(model.id, model);
+    return;
+  }
+  const quotas = [existing.quotaRemaining, model.quotaRemaining]
+    .filter((quota): quota is number => quota !== undefined);
+  models.set(model.id, {
+    ...existing,
+    disabled: existing.disabled || model.disabled || existing.label !== model.label
+      || (existing.modelId !== undefined && model.modelId !== undefined && existing.modelId !== model.modelId),
+    supportsImages: existing.supportsImages && model.supportsImages,
+    ...(existing.modelId === undefined && model.modelId !== undefined ? { modelId: model.modelId } : {}),
+    ...(quotas.length > 0 ? { quotaRemaining: Math.min(...quotas) } : {}),
+  });
+}
+
+export function parseAntigravityAgentCatalog(availableModels: unknown): AntigravityCatalog {
+  if (!Array.isArray(availableModels)) return { models: [], modern: false };
+  const models = new Map<string, AntigravityModel>();
+  for (const entry of availableModels) {
+    const model = parseModel(entry, undefined, undefined, undefined, 'agent');
+    if (model) addCatalogModel(models, model);
+  }
+  return { models: [...models.values()], modern: true };
+}
+
 export function parseAntigravityCatalog(raw: unknown): AntigravityCatalog {
   const status = statusValue(raw);
   if (!status) return { models: [], modern: false };
@@ -192,17 +257,7 @@ export function parseAntigravityCatalog(raw: unknown): AntigravityCatalog {
     for (const [key, value] of configEntries(container)) {
       const model = parseModel(value, key, teamsTier, quotaValue(status));
       if (!model) continue;
-      const existing = models.get(model.id);
-      if (existing) {
-        const quotas = [existing.quotaRemaining, model.quotaRemaining]
-          .filter((quota): quota is number => quota !== undefined);
-        models.set(model.id, {
-          ...existing,
-          disabled: existing.disabled || model.disabled || existing.label !== model.label,
-          supportsImages: existing.supportsImages && model.supportsImages,
-          ...(quotas.length > 0 ? { quotaRemaining: Math.min(...quotas) } : {}),
-        });
-      } else models.set(model.id, model);
+      addCatalogModel(models, model);
     }
   }
   const key = accountKey(status);
@@ -224,11 +279,32 @@ function selectedModel(model: AntigravityModel): AntigravitySelection {
   return { model };
 }
 
-export function selectAntigravityModel(catalog: AntigravityCatalog, explicit?: string): AntigravitySelection {
+export function selectAntigravityModel(
+  catalog: AntigravityCatalog,
+  explicit?: string,
+  purpose: AntigravityModelPurpose = 'material',
+): AntigravitySelection {
   if (explicit !== undefined) {
     const requested = explicit.trim();
     const id = enumValue(requested);
-    const matches = catalog.models.filter(candidate => id !== undefined ? candidate.id === id : candidate.label === requested);
+    let matches = catalog.models.filter(candidate => id !== undefined
+      ? candidate.id === id || enumValue(candidate.id) === id
+      : candidate.id === requested || candidate.modelId === requested || candidate.label === requested);
+    if (matches.length === 0 && id === undefined) {
+      const alias = /^(hydrogen|carbon)(?:-(xhigh|high))?$/u.exec(requested);
+      if (alias) {
+        const efforts = alias[2] ? [alias[2]] : alias[1] === 'hydrogen' ? ['xhigh', 'high'] : ['high'];
+        for (const effort of efforts) {
+          matches = catalog.models.filter(candidate => {
+            const profile = modelProfile(candidate.label);
+            return profile?.family === alias[1] && profile.effort === effort;
+          });
+          if (matches.length > 0) break;
+        }
+      } else {
+        matches = catalog.models.filter(candidate => modelProfile(candidate.label)?.slug === requested);
+      }
+    }
     if (matches.length > 1) {
       return { error: antigravityFailure('invalid-response', '显式 Antigravity 模型名称在当前目录中存在歧义') };
     }
@@ -245,15 +321,11 @@ export function selectAntigravityModel(catalog: AntigravityCatalog, explicit?: s
     const model = catalog.models.find(candidate => !candidate.disabled) ?? catalog.models[0];
     return selectedModel(model);
   }
-  const candidates = catalog.models
-    .filter(candidate => flashRank(candidate.label) !== undefined)
-    .slice()
-    .sort((left, right) => (flashRank(left.label)! - flashRank(right.label)!)
-      || Number(right.id === 'MODEL_PLACEHOLDER_M318') - Number(left.id === 'MODEL_PLACEHOLDER_M318'));
+  const candidates = getAntigravityModelCandidates(catalog, purpose);
   const model = candidates.find(candidate => !candidate.disabled) ?? candidates[0];
   return model
     ? selectedModel(model)
-    : { error: antigravityFailure('rejected', '当前目录缺少已授权的 Gemini 3.8 Flash 默认模型及同族备选') };
+    : { error: antigravityFailure('rejected', `当前目录缺少已授权的 ${purpose === 'visual-review' ? 'Carbon High' : 'Hydrogen XHigh/High 或 Carbon High'} 模型`) };
 }
 
 export function legacyAntigravityCatalog(): AntigravityCatalog {

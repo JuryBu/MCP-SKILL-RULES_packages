@@ -69,7 +69,7 @@ const HEARTBEAT_BROWSER_TIMEOUT = 20 * 60 * 1000; // 20 分钟无活动 → 关�
 // 创建 MCP Server 实例
 const server = new McpServer({
     name: "web-fetcher-mcp-server",
-    version: "7.4.0",
+    version: "7.4.1",
 });
 
 // 注册所有工具
@@ -118,9 +118,10 @@ server.registerResource(
             "- `modelChain=\"codex\"`：强制走 Codex CLI 模型桥。",
             "- `modelChain=\"claude-code\"`：强制走 Claude Code CLI `claude -p` provider。",
             "- `modelChain` 未填写时使用 `chain`，两者都未填写时使用 `auto`；两参数只控制模型调用，web-fetcher 的网页内容仍从指定 URL 获取。",
-            "- Codex 模型桥默认值：`gpt-5.5` + `model_reasoning_effort=medium` + `model_speed_tier=fast`，可用 `WEB_FETCHER_CODEX_MODEL`、`WEB_FETCHER_CODEX_REASONING`、`WEB_FETCHER_CODEX_SPEED` 覆盖。",
+            "- Codex 默认从24小时内的本机models_cache.json可见目录按优先序选型，无有效目录则交CLI自身默认；不再固定退役型号。推理默认max、速度standard（service_tier=default、fast_mode=false）；可用WEB_FETCHER_CODEX_MODEL／REASONING／SPEED覆盖，modelCall保留实际型号与modelSource。",
             "- Claude Code CLI 默认值：`sonnet` + `--effort low`；可用 `WEB_FETCHER_CLAUDE_CODE_MODEL`、`WEB_FETCHER_CLAUDE_CODE_EFFORT`、`WEB_FETCHER_CLAUDE_CODE_TIMEOUT_MS`、`WEB_FETCHER_CLAUDE_CODE_MAX_BUDGET_USD` 覆盖。",
-            "- 现代 Antigravity 按当前账号 GetUserStatus 目录选型，普通材料默认 Gemini 3.8 Flash High（M318）；视觉审查优先可用 Argon High、其次 Carbon High，均不可用则停止。显式模型、准入与额度按当次目录核验，Claude 不进入自动常用选择。仅旧目录接口不支持时使用旧兼容表。",
+            "- 现代Antigravity按当前GetUserStatus目录选型：普通材料Hydrogen XHigh→Hydrogen High→Carbon High，视觉Carbon High；只按明确容量拒绝推进获准候选，认证／额度／未知结果停止。旧目录接口明确不支持时保留原兼容表；显式Claude等已有选项继续可用。",
+            "- page／rich／inspect的可选model固定本次模型，支持对应链路的slug、显示名或M编号；不明确的型号须同时指定modelChain。请求和链路环境指定型号都不自动替换或跨平台。Codex结构化model_not_found为明确拒绝，不标结果未知。",
             "- 只读状态不启动 CLI，也不生成模型请求；CLI 随实际调用启动，正常结束后退出。GetModelResponse 是单轮纯文字，客户端不附本机 RULES。",
             "- 一次总期限覆盖发现、排队、启动和生成；取消向下传递。已提交后超时、断连或终态缺失会报告结果未知，并停止原请求的自动重发；认证与额度错误同样停止后备。",
             "- 只有 AI Summary 与 AI Review 受 `modelChain` 影响；网页抓取、截图、交互主链不变。",
@@ -142,7 +143,7 @@ server.registerResource(
             "- DOM 使用直接文字行框、绘制顺序采样与非滚动裁剪区域，正常背景/留白/滚动不再直接当成缺陷；PPTX/PDF 区分背景装饰、绘制顺序与真实内容。structure.metadata.inspectionLimitations 说明扫描、字体、复杂绘制等边界，零 issue 不等于整页已验收；DOM alignment 不跨无关布局组推断。",
             "- `mode=\"ai_review\"`：结合截图、结构树与规则检测结果，截图缺失时不提交模型；Antigravity 图片请求与纯文字 LS 分流，CLI 无图片能力时明确返回错误。当前 Claude Code 桥只提供文字，收到图片会在生成前拒绝。",
             "- EPUB 路线第一阶段只提供静态结构；`ai_review` 返回结构说明，不执行截图型视觉审查。",
-            "- `background=true` 可用于多页文档后台批量审查，再用 `web_inspect(action=\"check\", taskId=\"...\", waitSeconds=30-45)` 查询。",
+            "- ai_review与all均支持background=true，在结构／截图／模型工作前返回taskId；用web_inspect(action=\"check\",taskId=\"...\",waitSeconds=30-45)查询原任务。AGY页按执行位串行，排队受父总期限控制，每页模型期限从取得执行位起计。",
             "",
             "## 页面容量、并发与响应式视口（7.2）",
             "",
@@ -238,7 +239,7 @@ server.registerResource(
         contents: [
             {
                 uri: "web-fetcher://test/hello",
-                text: "MCP Web Fetcher v7.4.0 - Resource 机制正常\n\n可用于将抓取结果存储为 resource，AI 按需读取。",
+                text: "MCP Web Fetcher v7.4.1 - Resource 机制正常\n\n可用于将抓取结果存储为 resource，AI 按需读取。",
                 mimeType: "text/plain",
             },
         ],
@@ -341,7 +342,7 @@ async function heartbeatCheck(): Promise<void> {
 
 // 启动 stdio 传输
 async function main(): Promise<void> {
-    console.error(`[web-fetcher] MCP Server v7.4.0 启动中... (ppid=${process.ppid})`);
+    console.error(`[web-fetcher] MCP Server v7.4.1 启动中... (ppid=${process.ppid})`);
     logStdinEvent("STARTED");
 
     // 清理遗留的临时目录（防止意外中断导致堆积）
@@ -375,7 +376,7 @@ async function main(): Promise<void> {
     await server.connect(transport);
     runtimeLifecycle.ready();
 
-    console.error(`[web-fetcher] MCP Server v7.4.0 已启动，绑定父 LS PID=${process.ppid}`);
+    console.error(`[web-fetcher] MCP Server v7.4.1 已启动，绑定父 LS PID=${process.ppid}`);
     logStdinEvent(`BOUND to parent LS PID=${process.ppid}`);
 
     // === 非 LS 环境兜底超时 ===
@@ -434,7 +435,13 @@ main().catch((error) => {
 });
 
 // 优雅关闭
-const cleanup = async () => {
+let cleanupPromise: Promise<void> | undefined;
+const cleanup = (): Promise<void> => {
+    cleanupPromise ??= cleanupResources();
+    return cleanupPromise;
+};
+
+async function cleanupResources(): Promise<void> {
     console.error("[web-fetcher] 正在关闭...");
     clearInterval(heartbeatTimer);
     // v4.0: 关闭临时 HTTP 服务器
@@ -442,12 +449,21 @@ const cleanup = async () => {
         const { stopAllServers } = await import('./local-server.js');
         stopAllServers();
     } catch { /* ignore */ }
-    await sessionManager.closeAll();
-    await desktopManager.closeAll();
-    await humanBrowserManager.closeAll();
-    await disposeAntigravityCli();
-    await browserManager.shutdown();
-};
+    const steps: Array<[string, () => Promise<unknown>]> = [
+        ["sessions", () => sessionManager.closeAll()],
+        ["desktop", () => desktopManager.closeAll()],
+        ["human-browser", () => humanBrowserManager.closeAll()],
+        ["antigravity-cli", () => disposeAntigravityCli()],
+        ["browser", () => browserManager.shutdown()],
+    ];
+    for (const [name, close] of steps) {
+        try {
+            await close();
+        } catch (error) {
+            console.error(`[web-fetcher] ${name} 关闭失败: ${error instanceof Error ? error.message : String(error)}`);
+        }
+    }
+}
 
 process.on("SIGINT", async () => {
     await cleanup();

@@ -11,6 +11,8 @@
 
 ## 当前模型入口约定（2026-11-13）
 
+7.4.1现代目录的自动材料型号为Hydrogen XHigh→Hydrogen High→Carbon High，视觉为Carbon High；请求`model`及`WEB_FETCHER_LS_MODEL`均固定本次型号并传至文本／图片入口，旧目录协议兼容保持。多页审查的队列等待计入父总期限，每页预算从取得执行位起计；生成到期后仍独立执行有界自有资源清理。Windows生命周期识别迁至CIM，以下旧WMIC相关示例只保留历史背景。
+
 App 在线时，纯文字继续优先使用新版 App LS 或旧 LS。App 离线时，请求带 `schema` 的结构化文本使用隔离工作目录与配置的 ACP `cli-agent` 文本入口，图片数为0；无 `schema` 的轻量纯文字保留按需 `cli-ls`。图片附件继续使用既有ACP图片机制。
 
 agent 只有在明确未提交、结果为 `not-started` 或明确 `unsupported`，并且 `safeToFallback=true` 时，才在原总期限内兼容到 `cli-ls`。认证、准入、额度、拒绝、取消和未知结果停止后备；不借此重新提交原未知任务。

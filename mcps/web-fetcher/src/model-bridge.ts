@@ -47,6 +47,7 @@ export interface SummaryBridgeResult {
     error?: string;
     transport?: AntigravityTransport | "codex-cli" | "claude-code-cli" | null;
     modelUsed?: string | null;
+    modelSource?: "request" | "environment" | "catalog" | "cli-default";
     outcome?: AntigravityOutcome;
     submitted?: boolean;
     outcomeUnknown?: boolean;
@@ -65,6 +66,7 @@ export interface ModelBridgeRequest {
     purpose?: "material" | "visual-review";
     chain?: SummaryChain;
     timeoutMs?: number;
+    generationTimeoutMs?: number;
     schema?: Record<string, unknown>;
     imagePaths?: string[];
     schemaName?: string;
@@ -79,6 +81,42 @@ interface ProviderCallResult {
     outcome: AntigravityOutcome;
     submitted: boolean;
     safeToFallback: boolean;
+    modelUsed?: string | null;
+    modelSource?: "request" | "environment" | "catalog" | "cli-default";
+}
+
+interface ProviderParsedResult {
+    text: string | null;
+    error?: string;
+    terminalMissing?: string;
+    errorCode?: string;
+    errorStatus?: number;
+    errorType?: string;
+}
+
+function structuredErrorDetails(value: unknown, depth = 0): Pick<ProviderParsedResult, "errorCode" | "errorStatus" | "errorType"> | undefined {
+    if (depth > 3 || !value) return undefined;
+    if (typeof value === "string") {
+        const text = stripAnsi(value).trim();
+        const start = text.indexOf("{");
+        if (start < 0 || !text.endsWith("}")) return undefined;
+        try { return structuredErrorDetails(JSON.parse(text.slice(start)), depth + 1); } catch { return undefined; }
+    }
+    if (typeof value !== "object" || Array.isArray(value)) return undefined;
+    const event = value as Record<string, any>;
+    const error = event.error && typeof event.error === "object" ? event.error : event;
+    const details = {
+        errorCode: typeof error.code === "string" ? error.code : undefined,
+        errorStatus: typeof event.status === "number" ? event.status : typeof error.status === "number" ? error.status : undefined,
+        errorType: typeof error.type === "string" ? error.type : undefined,
+    };
+    const nested = structuredErrorDetails(error.message, depth + 1);
+    if (!details.errorCode && !details.errorStatus && !details.errorType && !nested) return undefined;
+    return {
+        errorCode: details.errorCode ?? nested?.errorCode,
+        errorStatus: details.errorStatus ?? nested?.errorStatus,
+        errorType: nested?.errorType ?? details.errorType,
+    };
 }
 
 function findLocalCommand(name: string): string {
@@ -187,7 +225,7 @@ function terminateChild(child: ChildProcessWithoutNullStreams): void {
     try { child.kill("SIGKILL"); } catch { }
 }
 
-function extractCodexJsonResult(stdout: string): { text: string | null; error?: string; terminalMissing?: string } {
+export function extractCodexJsonResult(stdout: string): ProviderParsedResult {
     const lines = stdout
         .split(/\r?\n/u)
         .map((line) => line.trim())
@@ -196,6 +234,9 @@ function extractCodexJsonResult(stdout: string): { text: string | null; error?: 
     let lastAgentText: string | null = null;
     let completed = false;
     let failure: string | undefined;
+    let errorCode: string | undefined;
+    let errorStatus: number | undefined;
+    let errorType: string | undefined;
 
     for (const line of lines) {
         if (!line.startsWith("{")) continue;
@@ -205,6 +246,10 @@ function extractCodexJsonResult(stdout: string): { text: string | null; error?: 
             if (event?.type === "turn.failed" || event?.type === "error") {
                 failure = typeof event.error?.message === "string" ? event.error.message
                     : typeof event.message === "string" ? event.message : "Codex 返回失败终态";
+                const details = structuredErrorDetails(event);
+                if (details?.errorCode) errorCode = details.errorCode;
+                if (details?.errorStatus) errorStatus = details.errorStatus;
+                if (details?.errorType) errorType = details.errorType;
             }
             if (event?.type === "item.completed" && event.item?.type === "agent_message" && typeof event.item.text === "string") {
                 lastAgentText = event.item.text;
@@ -214,7 +259,7 @@ function extractCodexJsonResult(stdout: string): { text: string | null; error?: 
         }
     }
 
-    if (failure !== undefined) return { text: null, error: failure || "Codex 返回失败终态" };
+    if (failure !== undefined) return { text: null, error: failure || "Codex 返回失败终态", errorCode, errorStatus, errorType };
     if (!completed) return { text: null, terminalMissing: "Codex CLI 未取得成功终态，生成结果待核" };
     return { text: lastAgentText?.trim() || null };
 }
@@ -262,7 +307,7 @@ async function runProviderCommand(
     args: string[],
     prompt: string,
     timeoutMs: number,
-    parse: (stdout: string) => { text: string | null; error?: string; terminalMissing?: string },
+    parse: (stdout: string) => ProviderParsedResult,
     signal?: AbortSignal,
     env: NodeJS.ProcessEnv = process.env,
 ): Promise<ProviderCallResult> {
@@ -346,11 +391,16 @@ async function runProviderCommand(
             }
             const message = parsed.error || diagnosticSnippet(stderr)
                 || parsed.terminalMissing || `模型CLI退出码 ${code}`;
+            const details = parsed.errorCode || parsed.errorStatus ? parsed : structuredErrorDetails(parsed.error)
+                || stderr.split(/\r?\n/u).map(line => structuredErrorDetails(line)).find(value => value !== undefined);
             const outcome: AntigravityOutcome = /quota|credit|billing|budget|rate limit|429|额度|余额/iu.test(message)
                 ? "quota-exhausted"
                 : /not logged in|authentication|unauthorized|invalid api key|login required|登录|认证/iu.test(message)
                     ? "auth-required"
-                    : code === 0 ? "invalid-response" : "transport-unknown";
+                    : details?.errorCode === "model_not_found"
+                        || (details?.errorStatus === 400 && details?.errorType === "invalid_request_error")
+                        ? "rejected"
+                        : code === 0 ? "invalid-response" : "transport-unknown";
             finish(providerFailure(message, submitted, false, outcome));
         });
     });
@@ -459,7 +509,37 @@ function resolveSummaryCandidates(requested: SummaryChain): ResolvedSummaryChain
     return candidates;
 }
 
-async function generateViaCodex(prompt: string, timeoutMs: number, schema?: Record<string, unknown>, imagePaths: string[] = [], schemaName = "model", signal?: AbortSignal): Promise<ProviderCallResult> {
+export function resolveCodexModelSelection(model?: string): { model: string | null; source: "request" | "environment" | "catalog" | "cli-default"; efforts?: string[] } {
+    if (model?.trim()) return { model: model.trim(), source: "request" };
+    const configured = process.env.WEB_FETCHER_CODEX_MODEL?.trim() || CODEX_AI_SUMMARY_MODEL;
+    if (configured) return { model: configured, source: "environment" };
+    try {
+        const filename = path.join(process.env.CODEX_HOME || path.join(os.homedir(), ".codex"), "models_cache.json");
+        const stat = fs.statSync(filename);
+        if (!stat.isFile() || stat.size > 4 * 1024 * 1024) throw new Error("invalid catalog");
+        const catalog = JSON.parse(fs.readFileSync(filename, "utf-8"));
+        const age = Date.now() - Date.parse(catalog.fetched_at);
+        if (!Number.isFinite(age) || age < -60_000 || age > 24 * 60 * 60_000) throw new Error("stale catalog");
+        const candidates = Array.isArray(catalog.models) ? catalog.models.filter((candidate: any) =>
+            typeof candidate?.slug === "string" && /^[a-z0-9][a-z0-9._-]{0,127}$/iu.test(candidate.slug)
+            && candidate.visibility === "list" && candidate.supported_in_api !== false
+            && Number.isFinite(candidate.priority),
+        ).sort((left: any, right: any) => left.priority - right.priority) : [];
+        const selected = candidates[0];
+        if (selected) return {
+            model: selected.slug,
+            source: "catalog",
+            efforts: Array.isArray(selected.supported_reasoning_levels)
+                ? selected.supported_reasoning_levels.map((entry: any) => entry?.effort).filter((entry: any) => typeof entry === "string")
+                : undefined,
+        };
+    } catch {
+    }
+    return { model: null, source: "cli-default" };
+}
+
+async function generateViaCodex(prompt: string, timeoutMs: number, schema?: Record<string, unknown>, imagePaths: string[] = [], schemaName = "model", signal?: AbortSignal, model?: string): Promise<ProviderCallResult> {
+    const selection = resolveCodexModelSelection(model);
     const schemaPath = schema
         ? path.join(os.tmpdir(), `mcp-web-fetcher-${schemaName.replace(/[^a-z0-9_-]/giu, "-")}-schema-${randomUUID()}.json`)
         : null;
@@ -476,11 +556,19 @@ async function generateViaCodex(prompt: string, timeoutMs: number, schema?: Reco
         "--ignore-user-config",
         "--ignore-rules",
         "--sandbox", "read-only",
-        "-m", CODEX_AI_SUMMARY_MODEL,
-        "-c", `model_reasoning_effort=${CODEX_AI_SUMMARY_REASONING_EFFORT}`,
-        "-c", `model_speed_tier=${CODEX_AI_SUMMARY_SPEED_TIER}`,
         "-C", process.cwd(),
     ];
+
+    if (selection.model) args.push("-m", selection.model);
+    const reasoning = CODEX_AI_SUMMARY_REASONING_EFFORT;
+    if (reasoning && (!selection.efforts?.length || selection.efforts.includes(reasoning))) {
+        args.push("-c", `model_reasoning_effort=${reasoning}`);
+    }
+    if (CODEX_AI_SUMMARY_SPEED_TIER === "standard") {
+        args.push("-c", "service_tier=\"default\"", "-c", "fast_mode=false");
+    } else if (CODEX_AI_SUMMARY_SPEED_TIER) {
+        args.push("-c", `model_speed_tier=${CODEX_AI_SUMMARY_SPEED_TIER}`);
+    }
 
     if (schemaPath) {
         args.push("--output-schema", schemaPath);
@@ -493,7 +581,8 @@ async function generateViaCodex(prompt: string, timeoutMs: number, schema?: Reco
     args.push("-");
 
     try {
-        return await runProviderCommand(getCodexCommand(), args, prompt, timeoutMs, extractCodexJsonResult, signal);
+        const result = await runProviderCommand(getCodexCommand(), args, prompt, timeoutMs, extractCodexJsonResult, signal);
+        return { ...result, modelUsed: selection.model, modelSource: selection.source };
     } finally {
         if (schemaPath) {
             try {
@@ -505,7 +594,7 @@ async function generateViaCodex(prompt: string, timeoutMs: number, schema?: Reco
     }
 }
 
-async function generateViaClaudeCode(prompt: string, timeoutMs: number, signal?: AbortSignal): Promise<ProviderCallResult> {
+async function generateViaClaudeCode(prompt: string, timeoutMs: number, signal?: AbortSignal, model?: string): Promise<ProviderCallResult> {
     const now = Date.now();
     if (now < claudeCodeCircuitOpenUntil) {
         console.error("[model-bridge] Claude Code CLI skipped: circuit breaker is open");
@@ -535,7 +624,7 @@ async function generateViaClaudeCode(prompt: string, timeoutMs: number, signal?:
         "-p",
         "--output-format", "json",
         "--no-session-persistence",
-        "--model", CLAUDE_CODE_AI_SUMMARY_MODEL,
+        "--model", model || CLAUDE_CODE_AI_SUMMARY_MODEL,
         "--effort", CLAUDE_CODE_AI_SUMMARY_EFFORT,
     ];
 
@@ -586,6 +675,7 @@ export async function generateSummaryText(
     chain: SummaryChain = "auto",
     timeoutMs: number = CODEX_AI_SUMMARY_TIMEOUT,
     signal?: AbortSignal,
+    model?: string,
 ): Promise<SummaryBridgeResult> {
     const schema = {
         type: "object",
@@ -605,6 +695,7 @@ export async function generateSummaryText(
         schema,
         schemaName: "ai-summary",
         signal,
+        model,
         purpose: "material",
     });
     if (!result.text) return result;
@@ -652,7 +743,14 @@ export async function generateModelText(request: ModelBridgeRequest): Promise<Su
         };
     }
 
-    const chain = request.chain ?? "auto";
+    let chain = request.chain ?? "auto";
+    const explicitModel = request.model?.trim();
+    if (explicitModel && chain === "auto") {
+        if (/^(?:M\d+$|MODEL_|gemini|carbon|hydrogen|argon|flash|gpt-oss)/iu.test(explicitModel)) chain = "antigravity";
+        else if (/^(?:gpt-|o\d|codex)/iu.test(explicitModel)) chain = "codex";
+        else if (/^(?:claude-|sonnet|opus|haiku)/iu.test(explicitModel)) chain = "claude-code";
+        else return { text: null, chainUsed: null, providerLabel: null, outcome: "rejected", submitted: false, outcomeUnknown: false, fallbackAllowed: false, error: "显式model无法确定所属链路，请同时指定modelChain" };
+    }
     const imagePaths = request.imagePaths ?? [];
     for (const imagePath of imagePaths) {
         try {
@@ -665,7 +763,8 @@ export async function generateModelText(request: ModelBridgeRequest): Promise<Su
 
     const callResolved = async (target: ResolvedSummaryChain): Promise<SummaryBridgeResult> => {
         if (target === "antigravity") {
-            const result = await callAntigravity({ prompt: request.prompt, model: request.model, imagePaths, schema: request.schema, deadline, signal, ...(request.purpose ? { purpose: request.purpose } : {}) });
+            const selectedModel = explicitModel || process.env.WEB_FETCHER_LS_MODEL?.trim() || undefined;
+            const result = await callAntigravity({ prompt: request.prompt, model: selectedModel, imagePaths, schema: request.schema, deadline, signal, generationTimeoutMs: request.generationTimeoutMs, ...(request.purpose ? { purpose: request.purpose } : {}) });
             return {
                 text: result.text,
                 chainUsed: result.text ? "antigravity" : null,
@@ -676,35 +775,36 @@ export async function generateModelText(request: ModelBridgeRequest): Promise<Su
                 outcome: result.outcome,
                 submitted: result.submitted,
                 outcomeUnknown: result.submitted && ["transport-unknown", "timeout-unknown", "invalid-response", "cancelled"].includes(result.outcome),
-                fallbackAllowed: !request.model && result.safeToFallback,
+                fallbackAllowed: !selectedModel && result.safeToFallback,
                 ...(result.cleanup ? { cleanup: result.cleanup } : {}),
             };
         }
 
         if (target === "claude-code") {
             if (imagePaths.length > 0) return { text: null, chainUsed: null, providerLabel: null, outcome: "unsupported", submitted: false, fallbackAllowed: false, error: "当前Claude Code模型桥未提供图片传输，本次图片请求尚未提交" };
-            const result = await generateViaClaudeCode(request.prompt, Math.max(0, deadline - performance.now()), signal);
+            const result = await generateViaClaudeCode(request.prompt, Math.max(0, Math.min(deadline - performance.now(), request.generationTimeoutMs ?? Infinity)), signal, explicitModel);
             return {
                 text: result.text,
                 chainUsed: result.text ? "claude-code" : null,
                 providerLabel: result.text ? AI_SUMMARY_CLAUDE_CODE_LABEL : null,
                 error: result.text ? undefined : `Claude Code CLI 模型调用失败${result.error ? `: ${result.error}` : ""}`,
                 transport: "claude-code-cli",
-                modelUsed: CLAUDE_CODE_AI_SUMMARY_MODEL,
+                modelUsed: explicitModel || CLAUDE_CODE_AI_SUMMARY_MODEL,
                 outcome: result.outcome,
                 submitted: result.submitted,
                 outcomeUnknown: result.submitted && ["transport-unknown", "timeout-unknown", "invalid-response", "cancelled"].includes(result.outcome),
-                fallbackAllowed: result.safeToFallback,
+                fallbackAllowed: !explicitModel && result.safeToFallback,
             };
         }
 
         const result = await generateViaCodex(
             request.prompt,
-            Math.max(0, deadline - performance.now()),
+            Math.max(0, Math.min(deadline - performance.now(), request.generationTimeoutMs ?? Infinity)),
             request.schema,
             imagePaths,
             request.schemaName,
             signal,
+            explicitModel,
         );
         return {
             text: result.text,
@@ -712,11 +812,12 @@ export async function generateModelText(request: ModelBridgeRequest): Promise<Su
             providerLabel: result.text ? AI_SUMMARY_CODEX_LABEL : null,
             error: result.error,
             transport: "codex-cli",
-            modelUsed: CODEX_AI_SUMMARY_MODEL,
+            modelUsed: result.modelUsed,
+            modelSource: result.modelSource,
             outcome: result.outcome,
             submitted: result.submitted,
             outcomeUnknown: result.submitted && ["transport-unknown", "timeout-unknown", "invalid-response", "cancelled"].includes(result.outcome),
-            fallbackAllowed: result.safeToFallback,
+            fallbackAllowed: !explicitModel && !process.env.WEB_FETCHER_CODEX_MODEL?.trim() && result.safeToFallback,
         };
     };
 

@@ -79,6 +79,7 @@ const FetchPageInputSchema = z.object({
         .enum(SUMMARY_CHAIN_VALUES)
         .optional()
         .describe("AI Summary 模型链路选择，仅 outputMode=ai_summary 时生效。未填时回退到 chain，再默认 auto"),
+    model: z.string().trim().min(1).max(200).optional().describe("仅ai_summary：显式模型名称、slug或M编号；固定本次型号，失败时不替换模型或跨链路；不明确的名称请同时指定modelChain"),
     chain: z
         .enum(SUMMARY_CHAIN_VALUES)
         .optional()
@@ -134,6 +135,7 @@ export function registerFetchPage(server: McpServer): void {
 - scrollCount (number, 可选): 滚动次数，用于加载评论区等懒加载内容，默认 0
 - outputMode (string, 可选): 输出模式 summary(默认)/full/compact/minimal/headings/ai_summary
 - modelChain (string, 可选): 仅 ai_summary 生效，可选 auto/antigravity/codex/claude-code；未填回退到 chain，再默认 auto
+- model (string, 可选): 仅 ai_summary 生效，显式型号保持固定，不自动换模型或平台
 - chain (string, 可选): 兼容旧参数，仅 ai_summary 生效；modelChain 未填时使用
 
 ⚠️ 注意: PPTX 文本提取可能为空（幻灯片内容多为图形化排版），建议用 web_fetch_screenshot 截图查看 PPTX 内容。DOCX 文本提取正常。
@@ -155,6 +157,7 @@ export function registerFetchPage(server: McpServer): void {
                 scrollCount: FetchPageInputSchema.shape.scrollCount,
                 outputMode: FetchPageInputSchema.shape.outputMode,
                 modelChain: FetchPageInputSchema.shape.modelChain,
+                model: FetchPageInputSchema.shape.model,
                 chain: FetchPageInputSchema.shape.chain,
                 background: FetchPageInputSchema.shape.background,
                 taskId: FetchPageInputSchema.shape.taskId,
@@ -207,7 +210,7 @@ export function registerFetchPage(server: McpServer): void {
                         const { extractEpubDocument, formatEpubAsMarkdown } = await import("../ebook/epub.js");
                         const document = extractEpubDocument(filePath);
                         const markdown = formatEpubAsMarkdown(document);
-                        return appendTiming(await formatOutput(markdown, sourceUrl, outputMode, modelChain, params.background), startTime);
+                        return appendTiming(await formatOutput(markdown, sourceUrl, outputMode, modelChain, params.background, params.model), startTime);
                     } catch (e: any) {
                         const code = e?.code ? `${e.code}: ` : "";
                         const stage = e?.stage ? `\n阶段: ${e.stage}` : "";
@@ -229,7 +232,7 @@ export function registerFetchPage(server: McpServer): void {
                         const ext = path.extname(filePath);
                         const name = path.basename(filePath);
                         const header = `# ${name}\n\n\`\`\`${ext.slice(1)}\n${textContent}\n\`\`\``;
-                        return appendTiming(await formatOutput(header, sourceUrl, outputMode, modelChain, params.background), startTime);
+                        return appendTiming(await formatOutput(header, sourceUrl, outputMode, modelChain, params.background, params.model), startTime);
                     } catch (e: any) {
                         return { isError: true, content: [{ type: "text" as const, text: `读取文件失败: ${e.message}` }] };
                     }
@@ -240,7 +243,7 @@ export function registerFetchPage(server: McpServer): void {
                     try {
                         const { xlsxToTextSummary } = await import("../converter.js");
                         const summary = await xlsxToTextSummary(filePath);
-                        return appendTiming(await formatOutput(summary, sourceUrl, outputMode, modelChain, params.background), startTime);
+                        return appendTiming(await formatOutput(summary, sourceUrl, outputMode, modelChain, params.background, params.model), startTime);
                     } catch (e: any) {
                         return { isError: true, content: [{ type: "text" as const, text: `Excel 解析失败: ${e.message}` }] };
                     }
@@ -275,7 +278,7 @@ export function registerFetchPage(server: McpServer): void {
                                     const name = path.basename(filePath);
                                     const header = `# ${name}\n\n${mdContent || "(空文档)"}`;
                                     try { fs.unlinkSync(htmlPath); } catch { }
-                                    return appendTiming(await formatOutput(header, sourceUrl, outputMode, modelChain, params.background), startTime);
+                                    return appendTiming(await formatOutput(header, sourceUrl, outputMode, modelChain, params.background, params.model), startTime);
                                 }
                             } else {
                                 // DOCX: 转 txt 已经足够好
@@ -292,7 +295,7 @@ export function registerFetchPage(server: McpServer): void {
                                     const name = path.basename(filePath);
                                     const header = `# ${name}\n\n${textContent || "(空文档)"}`;
                                     try { fs.unlinkSync(txtPath); } catch { }
-                                    return appendTiming(await formatOutput(header, sourceUrl, outputMode, modelChain, params.background), startTime);
+                                    return appendTiming(await formatOutput(header, sourceUrl, outputMode, modelChain, params.background, params.model), startTime);
                                 }
                             }
                         }
@@ -314,7 +317,7 @@ export function registerFetchPage(server: McpServer): void {
                     if (detection.status === "challenge_required") {
                         pageCache.delete(sourceUrl);
                     } else {
-                        return appendTiming(await formatOutput(cached, sourceUrl, outputMode, modelChain, params.background), startTime);
+                        return appendTiming(await formatOutput(cached, sourceUrl, outputMode, modelChain, params.background, params.model), startTime);
                     }
                 }
             }
@@ -566,7 +569,7 @@ export function registerFetchPage(server: McpServer): void {
                     pageCache.set(params.url ?? sourceUrl, resultContent);
                 }
 
-                return appendTiming(await formatOutput(resultContent, sourceUrl, outputMode, modelChain, params.background), startTime, browserManager.lastRetryCount);
+                return appendTiming(await formatOutput(resultContent, sourceUrl, outputMode, modelChain, params.background, params.model), startTime, browserManager.lastRetryCount);
             } catch (error) {
                 const failure = pageReadFailure(error, 'content.navigation', sourceUrl, page?.url());
 
@@ -592,10 +595,10 @@ export function registerFetchPage(server: McpServer): void {
 /**
  * 根据 outputMode 格式化输出
  */
-async function formatOutput(content: string, url: string, outputMode: string, modelChain: SummaryChain = "auto", background = false) {
+async function formatOutput(content: string, url: string, outputMode: string, modelChain: SummaryChain = "auto", background = false, model?: string) {
     // ai_summary 模式：调用 Flash 模型生成智能摘要
     if (outputMode === "ai_summary") {
-        return formatAiSummary(content, url, modelChain, background);
+        return formatAiSummary(content, url, modelChain, background, model);
     }
 
     if (outputMode === "summary") {
@@ -653,7 +656,7 @@ async function formatOutput(content: string, url: string, outputMode: string, mo
  * AI Summary 模式：调用模型桥生成智能摘要
  * 指定链路不可用或调用失败时降级为 compact 模式
  */
-async function formatAiSummary(content: string, url: string, modelChain: SummaryChain = "auto", background = false) {
+async function formatAiSummary(content: string, url: string, modelChain: SummaryChain = "auto", background = false, model?: string) {
     // 1. 先写完整内容到临时文件（无论 AI 是否可用都保留原文）
     const filePath = getTempFilePath(url);
     try {
@@ -664,9 +667,9 @@ async function formatAiSummary(content: string, url: string, modelChain: Summary
     const { prompt } = buildSummaryPrompt(content, url);
     if (background) {
         const task = startBackgroundTask("web-fetch-ai-summary", async (runContext) => {
-            const result = await generateSummaryText(prompt, modelChain, getAiSummaryBackgroundTimeoutMs(), runContext.signal);
+            const result = await generateSummaryText(prompt, modelChain, getAiSummaryBackgroundTimeoutMs(), runContext.signal, model);
             runContext.updateMetadata({ modelCall: {
-                chainUsed: result.chainUsed, transport: result.transport, modelUsed: result.modelUsed, outcome: result.outcome,
+                chainUsed: result.chainUsed, transport: result.transport, modelUsed: result.modelUsed, modelSource: result.modelSource, outcome: result.outcome,
                 submitted: result.submitted, outcomeUnknown: result.outcomeUnknown, fallbackAllowed: result.fallbackAllowed,
                 ...(result.cleanup ? { cleanup: result.cleanup } : {}),
             } });
@@ -713,7 +716,7 @@ async function formatAiSummary(content: string, url: string, modelChain: Summary
     let lastAiSummaryError: string | undefined;
     let modelCall: Omit<SummaryBridgeResult, "text" | "error" | "providerLabel"> | undefined;
     try {
-        const result = await generateSummaryText(prompt, modelChain);
+        const result = await generateSummaryText(prompt, modelChain, undefined, undefined, model);
         const { text: _text, error: _error, providerLabel: _providerLabel, ...state } = result;
         modelCall = state;
 

@@ -209,19 +209,19 @@ export function resolveSummaryModelChain(
 export const AI_SUMMARY_ANTIGRAVITY_LABEL = "Antigravity";
 
 /** Codex 链路展示名 */
-export const AI_SUMMARY_CODEX_LABEL = `${process.env.WEB_FETCHER_CODEX_MODEL || "gpt-5.5"} via Codex CLI`;
+export const AI_SUMMARY_CODEX_LABEL = "Codex CLI";
 
 /** Claude Code 链路展示名 */
 export const AI_SUMMARY_CLAUDE_CODE_LABEL = `${process.env.WEB_FETCHER_CLAUDE_CODE_MODEL || "sonnet"} via Claude Code CLI`;
 
 /** Codex CLI 默认模型 */
-export const CODEX_AI_SUMMARY_MODEL = process.env.WEB_FETCHER_CODEX_MODEL || "gpt-5.5";
+export const CODEX_AI_SUMMARY_MODEL = process.env.WEB_FETCHER_CODEX_MODEL?.trim() || "";
 
 /** Codex CLI 默认推理强度 */
-export const CODEX_AI_SUMMARY_REASONING_EFFORT = process.env.WEB_FETCHER_CODEX_REASONING || "medium";
+export const CODEX_AI_SUMMARY_REASONING_EFFORT = process.env.WEB_FETCHER_CODEX_REASONING || "max";
 
 /** Codex CLI 默认速度档 */
-export const CODEX_AI_SUMMARY_SPEED_TIER = process.env.WEB_FETCHER_CODEX_SPEED || "fast";
+export const CODEX_AI_SUMMARY_SPEED_TIER = process.env.WEB_FETCHER_CODEX_SPEED || "standard";
 
 /** Codex CLI AI Summary 超时 */
 export const CODEX_AI_SUMMARY_TIMEOUT = 45000;

@@ -3,9 +3,10 @@ import { randomUUID } from "crypto";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import fs from "fs";
 import { fileURLToPath } from "url";
+import { performance } from "node:perf_hooks";
 import { browserManager } from "../browser.js";
 import { viewportSchema, assertViewportTarget, applyExplicitViewport, type ResponsiveViewport } from "../viewport.js";
-import { throwIfRequestExpired } from "../request-context.js";
+import { getRequestContext, throwIfRequestExpired } from "../request-context.js";
 import { touchActivity } from "../lifecycle.js";
 import { generateModelText } from "../model-bridge.js";
 import { ensureTempDirs, generateCacheKey, saveTempFile, TEMP_DIRS } from "../temp-store.js";
@@ -39,7 +40,7 @@ const InspectInputSchema = z.object({
     taskId: z
         .string()
         .optional()
-        .describe("后台 ai_review 任务 ID"),
+        .describe("后台 ai_review/all 任务 ID"),
     waitSeconds: z
         .number()
         .int()
@@ -84,10 +85,11 @@ const InspectInputSchema = z.object({
         .enum(SUMMARY_CHAIN_VALUES)
         .optional()
         .describe("兼容旧参数：AI 模型链路，ai_review 时使用。modelChain 未填时使用"),
+    model: z.string().trim().min(1).optional().describe("本次 AI 审查使用的模型；平台识别与回退约束由模型链路统一处理"),
     background: z
         .boolean()
         .optional()
-        .describe("后台执行，ai_review 批量时推荐"),
+        .describe("后台执行，支持 ai_review 和 all；结构提取也在后台进行"),
     batchSize: z
         .number()
         .int()
@@ -95,7 +97,7 @@ const InspectInputSchema = z.object({
         .max(10)
         .optional()
         .default(5)
-        .describe("AI 批量并发大小"),
+        .describe("AI 批量并发上限；antigravity/auto 按单执行位逐页审查"),
     thresholds: z
         .object({
             smallFontPx: z.number().positive().optional(),
@@ -150,6 +152,7 @@ interface InspectResponse {
     scale: number;
     modelChain: SummaryChain;
     chain: SummaryChain;
+    model?: string;
     background: boolean;
     batchSize: number;
     thresholds?: InspectThresholds;
@@ -161,6 +164,7 @@ interface InspectResponse {
     progress?: BackgroundTaskProgress;
     deadlineAt?: string;
     timedOut?: boolean;
+    cleanupStatus?: "pending" | "done" | "unconfirmed";
     result?: AIReviewReport;
     error?: string;
 }
@@ -200,10 +204,13 @@ interface BackgroundTask {
     timedOut?: boolean;
     finishedAt?: number;
     result?: AIReviewReport;
+    output?: InspectionResults;
+    cleanupStatus?: InspectResponse["cleanupStatus"];
     error?: string;
 }
 
 const backgroundTasks = new Map<string, BackgroundTask>();
+type InspectionResults = Pick<InspectResponse, "structure" | "detection" | "aiReview">;
 function envMs(name: string): number | undefined {
     const value = process.env[name];
     if (!value) return undefined;
@@ -217,6 +224,7 @@ const BACKGROUND_TASK_TIMEOUT_MS =
     ?? 15 * 60 * 1000;
 const BACKGROUND_TASK_RESULT_TTL_MS = 5 * 60 * 1000;
 const AI_REVIEW_TIMEOUT_MS = 60_000;
+const AI_REVIEW_CLEANUP_TIMEOUT_MS = 5_000;
 const AI_REVIEW_MAX_ELEMENTS = 80;
 const AI_REVIEW_MAX_ISSUES = 50;
 
@@ -263,8 +271,9 @@ export function registerInspect(server: McpServer): void {
   - scale (number, 可选): 局域截图放大倍率，默认 1.4
   - modelChain (string, 可选): AI 模型链路，auto/antigravity/codex/claude-code；未填回退到 chain，再默认 auto
   - chain (string, 可选): 兼容旧参数，AI 模型链路；modelChain 未填时使用
+  - model (string, 可选): 本次 AI 审查的模型
   - background (boolean, 可选): 后台执行，默认 false
-  - batchSize (number, 可选): AI 批量并发大小，默认 5
+  - batchSize (number, 可选): AI 批量并发上限，默认 5；antigravity/auto 逐页执行
   - thresholds (object, 可选): smallFontPx/smallFontPt/contrastRatio/titleTopVarianceEmu/sizeVarianceRatio/gapVarianceRatio 阈值覆盖`,
             inputSchema: {
                 viewport: InspectInputSchema.shape.viewport,
@@ -280,6 +289,7 @@ export function registerInspect(server: McpServer): void {
                 scale: InspectInputSchema.shape.scale,
                 modelChain: InspectInputSchema.shape.modelChain,
                 chain: InspectInputSchema.shape.chain,
+                model: InspectInputSchema.shape.model,
                 background: InspectInputSchema.shape.background,
                 batchSize: InspectInputSchema.shape.batchSize,
                 thresholds: InspectInputSchema.shape.thresholds,
@@ -301,7 +311,7 @@ export function registerInspect(server: McpServer): void {
             for (const issue of response.detection?.issues ?? []) {
                 if (issue.screenshotPath) generatedPaths.push(issue.screenshotPath);
             }
-            for (const report of [response.aiReview, response.result]) {
+            for (const report of new Set([response.aiReview, response.result])) {
                 for (const finding of report?.aiFindings ?? []) {
                     const screenshotPath = finding.metadata?.screenshotPath;
                     if (typeof screenshotPath === "string") generatedPaths.push(screenshotPath);
@@ -333,11 +343,17 @@ async function handleInspect(params: InspectInput): Promise<InspectResponse> {
         scale: normalized.scale,
         modelChain: normalized.modelChain,
         chain: normalized.chain,
+        model: normalized.model,
         background: normalized.background,
         batchSize: normalized.batchSize,
         thresholds: normalized.thresholds,
         ...(normalized.viewport ? { viewport: normalized.viewport } : {}),
     };
+
+    if (normalized.background && (normalized.mode === "ai_review" || normalized.mode === "all")) {
+        const taskId = startAIReviewTask(route, normalized);
+        return { ...base, taskId, status: "running", progress: backgroundTasks.get(taskId)?.progress };
+    }
 
     switch (normalized.mode) {
         case "structure":
@@ -351,31 +367,20 @@ async function handleInspect(params: InspectInput): Promise<InspectResponse> {
                 detection: await runDetection(route, normalized),
             };
         case "ai_review":
-            if (normalized.background) {
-                const taskId = startAIReviewTask(route, normalized);
-                return {
-                    ...base,
-                    taskId,
-                    status: "running",
-                    progress: backgroundTasks.get(taskId)?.progress,
-                };
-            }
             return {
                 ...base,
-                aiReview: await runAIReview(route, normalized),
+                ...await runInspection(route, normalized, undefined, getRequestContext()?.signal),
             };
         case "all":
             return {
                 ...base,
-                structure: await getStructure(route, normalized),
-                detection: await runDetection(route, normalized),
-                aiReview: await runAIReview(route, normalized),
+                ...await runInspection(route, normalized, undefined, getRequestContext()?.signal),
             };
     }
     throw new Error(`unsupported inspect mode: ${normalized.mode}`);
 }
 
-type NormalizedInspectInput = Required<Omit<InspectInput, "action" | "taskId" | "waitSeconds" | "url" | "mode" | "page" | "detect" | "modelChain" | "chain" | "background" | "thresholds" | "viewport">> & {
+type NormalizedInspectInput = Required<Omit<InspectInput, "action" | "taskId" | "waitSeconds" | "url" | "mode" | "page" | "detect" | "modelChain" | "chain" | "model" | "background" | "thresholds" | "viewport">> & {
     viewport?: ResponsiveViewport;
     url: string;
     mode: InspectMode;
@@ -383,6 +388,7 @@ type NormalizedInspectInput = Required<Omit<InspectInput, "action" | "taskId" | 
     detect: InspectResponse["detect"];
     modelChain: SummaryChain;
     chain: SummaryChain;
+    model?: string;
     background: boolean;
     thresholds?: InspectThresholds;
 };
@@ -399,6 +405,7 @@ function normalizeParams(params: InspectInput): NormalizedInspectInput {
         scale: params.scale ?? 1.4,
         modelChain: resolveSummaryModelChain(params.chain, params.modelChain),
         chain: resolveSummaryModelChain(params.chain, params.modelChain),
+        model: params.model?.trim(),
         background: params.background ?? false,
         batchSize: params.batchSize ?? 5,
         thresholds: params.thresholds,
@@ -467,7 +474,24 @@ async function runDetection(route: InspectRoute, params: NormalizedInspectInput)
     return emptyDetection(route, params.mode);
 }
 
-async function runAIReview(route: InspectRoute, params: NormalizedInspectInput, progress?: BackgroundTaskProgress, signal?: AbortSignal): Promise<AIReviewReport> {
+async function runInspection(route: InspectRoute, params: NormalizedInspectInput, progress?: BackgroundTaskProgress, signal?: AbortSignal, publish?: (output: InspectionResults) => void): Promise<InspectionResults> {
+    const output: InspectionResults = {};
+    if (params.mode === "all") {
+        signal?.throwIfAborted();
+        throwIfRequestExpired();
+        output.structure = await getStructure(route, params);
+        publish?.({ ...output });
+        signal?.throwIfAborted();
+        throwIfRequestExpired();
+        output.detection = await runDetection(route, params);
+        publish?.({ ...output });
+    }
+    output.aiReview = await runAIReview(route, params, progress, signal, output, report => publish?.({ ...output, aiReview: report }));
+    publish?.({ ...output });
+    return output;
+}
+
+async function runAIReview(route: InspectRoute, params: NormalizedInspectInput, progress?: BackgroundTaskProgress, signal?: AbortSignal, prepared: InspectionResults = {}, publish?: (report: AIReviewReport) => void): Promise<AIReviewReport> {
     signal?.throwIfAborted();
     if (route === "ebook") {
         const structure = await getStructure(route, params);
@@ -481,11 +505,11 @@ async function runAIReview(route: InspectRoute, params: NormalizedInspectInput, 
             dismissReason: {},
         };
     }
-    const structure = await getStructure(route, params);
+    const structure = prepared.structure ?? await getStructure(route, params);
     if (!Array.isArray(structure)) {
         return aiReviewError(route, "无法提取页面结构，AI 审查已跳过");
     }
-    const detection = await runDetection(route, { ...params, autoScreenshot: true });
+    const detection = prepared.detection ?? await runDetection(route, { ...params, autoScreenshot: true });
     if (!("summary" in detection) || !Array.isArray(detection.issues)) {
         return aiReviewError(route, "无法运行几何检测，AI 审查已跳过");
     }
@@ -494,64 +518,95 @@ async function runAIReview(route: InspectRoute, params: NormalizedInspectInput, 
     progress && (progress.total = pages.length);
     const reports: AIReviewReport[] = [];
     let generationStopped = false;
-    for (let index = 0; index < pages.length; index += params.batchSize) {
-        signal?.throwIfAborted();
-        throwIfRequestExpired();
-        if (generationStopped) break;
-        const batch = pages.slice(index, index + params.batchSize);
-        const batchReports = await Promise.all(batch.map(async pageNumber => {
-            const pageStructure = structure.find(page => page.page === pageNumber);
-            if (!pageStructure) return null;
-            const pageIssues = detection.issues.filter(issue => issue.page === pageNumber);
-            const screenshot = await captureReviewScreenshot(route, params.url, pageNumber, params.scale, params.viewport);
-            const screenshotPath = screenshot?.path ?? null;
-            signal?.throwIfAborted();
+    const serial = params.modelChain === "antigravity" || params.modelChain === "auto";
+    const batchSize = serial ? 1 : params.batchSize;
+    for (let index = 0; index < pages.length; index += batchSize) {
+        if (signal?.aborted) {
+            generationStopped = true;
+            break;
+        }
+        try {
             throwIfRequestExpired();
-            if (generationStopped) return null;
-            if (!screenshotPath) {
-                generationStopped = true;
-                return aiReviewError(route, `第 ${pageNumber} 页截图不可用，未提交模型审查`);
-            }
-            const readinessNote = screenshot?.note;
-            const prompt = buildAIReviewPrompt(route, params.url, pageNumber, pageStructure, pageIssues, screenshotPath)
-                + (readinessNote ? `\n截图完整性警告：${readinessNote}。不要把未完成加载当成确定的设计缺陷。` : "");
-            const model = await generateModelText({
-                prompt,
-                purpose: "visual-review",
-                chain: params.modelChain,
-                timeoutMs: AI_REVIEW_TIMEOUT_MS,
-                schema: aiReviewSchema(),
-                schemaName: "ai-review",
-                imagePaths: [screenshotPath],
-                signal,
-            });
-            signal?.throwIfAborted();
-            if (!model.text && model.fallbackAllowed === false) generationStopped = true;
-            const report = normalizeAIReviewResponse(model.text, {
-                route,
-                page: pageNumber,
-                screenshotPath,
-                chainUsed: model.chainUsed,
-                providerLabel: model.providerLabel,
-                error: model.error,
-                modelCall: {
+        } catch (error) {
+            generationStopped = true;
+            reports.push(aiReviewError(route, error instanceof Error ? error.message : String(error)));
+            break;
+        }
+        if (generationStopped) break;
+        const batch = pages.slice(index, index + batchSize);
+        const completed: Array<AIReviewReport | null> = batch.map(() => null);
+        const batchReports = await Promise.all(batch.map(async (pageNumber, pageIndex) => {
+            try {
+                signal?.throwIfAborted();
+                throwIfRequestExpired();
+                const pageStructure = structure.find(page => page.page === pageNumber);
+                if (!pageStructure) return null;
+                const pageIssues = detection.issues.filter(issue => issue.page === pageNumber);
+                const screenshot = await captureReviewScreenshot(route, params.url, pageNumber, params.scale, params.viewport);
+                const screenshotPath = screenshot?.path ?? null;
+                signal?.throwIfAborted();
+                throwIfRequestExpired();
+                if (generationStopped) return null;
+                if (!screenshotPath) {
+                    generationStopped = true;
+                    return aiReviewError(route, `第 ${pageNumber} 页截图不可用，未提交模型审查`);
+                }
+                const readinessNote = screenshot?.note;
+                const prompt = buildAIReviewPrompt(route, params.url, pageNumber, pageStructure, pageIssues, screenshotPath)
+                    + (readinessNote ? `\n截图完整性警告：${readinessNote}。不要把未完成加载当成确定的设计缺陷。` : "");
+                const deadline = getRequestContext()?.deadline ?? performance.now() + BACKGROUND_TASK_TIMEOUT_MS;
+                const model = await generateModelText({
+                    prompt,
+                    purpose: "visual-review",
+                    chain: params.modelChain,
+                    model: params.model,
+                    timeoutMs: Math.max(0, deadline - performance.now()),
+                    deadline,
+                    generationTimeoutMs: AI_REVIEW_TIMEOUT_MS,
+                    schema: aiReviewSchema(),
+                    schemaName: "ai-review",
+                    imagePaths: [screenshotPath],
+                    signal,
+                });
+                if ((!model.text && model.fallbackAllowed === false) || model.outcomeUnknown || model.cleanup?.confirmed === false) generationStopped = true;
+                const report = normalizeAIReviewResponse(model.text, {
+                    route,
                     page: pageNumber,
+                    screenshotPath,
                     chainUsed: model.chainUsed,
-                    transport: model.transport,
-                    modelUsed: model.modelUsed,
-                    outcome: model.outcome,
-                    submitted: model.submitted,
-                    outcomeUnknown: model.outcomeUnknown,
-                    fallbackAllowed: model.fallbackAllowed,
-                    ...(model.cleanup ? { cleanup: model.cleanup } : {}),
-                },
-                knownIssues: pageIssues,
-            });
-            if (report.error) generationStopped = true;
-            if (model.cleanup?.warnings.length) report.summary += `\n⚠️ CLI 清理: ${model.cleanup.warnings.join("；")}`;
-            if (readinessNote) report.summary += `\n⚠️ ${readinessNote}`;
-            if (progress) progress.completed += 1;
-            return report;
+                    providerLabel: model.providerLabel,
+                    error: model.error,
+                    modelCall: {
+                        page: pageNumber,
+                        chainUsed: model.chainUsed,
+                        transport: model.transport,
+                        modelUsed: model.modelUsed,
+                        outcome: model.outcome,
+                        submitted: model.submitted,
+                        outcomeUnknown: model.outcomeUnknown,
+                        fallbackAllowed: model.fallbackAllowed,
+                        ...(model.cleanup ? { cleanup: model.cleanup } : {}),
+                    },
+                    knownIssues: pageIssues,
+                });
+                if (report.error) generationStopped = true;
+                if (signal?.aborted) {
+                    generationStopped = true;
+                    report.error ??= signal.reason instanceof Error ? signal.reason.message : "AI 审查已取消";
+                }
+                if (model.cleanup?.warnings.length) report.summary += `\n⚠️ CLI 清理: ${model.cleanup.warnings.join("；")}`;
+                if (readinessNote) report.summary += `\n⚠️ ${readinessNote}`;
+                if (progress) progress.completed += 1;
+                completed[pageIndex] = report;
+                publish?.(mergeAIReviewReports([...reports, ...completed.filter((entry): entry is AIReviewReport => entry !== null)]));
+                return report;
+            } catch (error) {
+                generationStopped = true;
+                const report = aiReviewError(route, error instanceof Error ? error.message : String(error));
+                completed[pageIndex] = report;
+                publish?.(mergeAIReviewReports([...reports, ...completed.filter((entry): entry is AIReviewReport => entry !== null)]));
+                return report;
+            }
         }));
         reports.push(...batchReports.filter((report): report is AIReviewReport => report !== null));
     }
@@ -560,7 +615,9 @@ async function runAIReview(route: InspectRoute, params: NormalizedInspectInput, 
         reports.push(aiReviewError(route, `模型请求已停止，剩余${pages.length - reports.length}页未审查；请核对原始错误和生成状态后再安排新任务`));
     }
 
-    return persistAIReviewReport(mergeAIReviewReports(reports));
+    const result = persistAIReviewReport(mergeAIReviewReports(reports));
+    publish?.(result);
+    return result;
 }
 
 function emptyStructure(page: number | "all" | null): EmptyStructure {
@@ -609,37 +666,59 @@ function startAIReviewTask(route: InspectRoute, params: NormalizedInspectInput):
     };
     backgroundTasks.set(id, task);
     const controller = new AbortController();
+    const deadline = performance.now() + BACKGROUND_TASK_TIMEOUT_MS;
     let settled = false;
     let timeout: ReturnType<typeof setTimeout> | null = null;
-    const settle = (status: Exclude<BackgroundTaskStatus, "running">, value: AIReviewReport | string, timedOut = false) => {
+    let cleanupTimeout: ReturnType<typeof setTimeout> | null = null;
+    const settle = (status: Exclude<BackgroundTaskStatus, "running">, error?: string) => {
         if (settled) return;
         settled = true;
         if (timeout) {
             clearTimeout(timeout);
             timeout = null;
         }
+        if (cleanupTimeout) clearTimeout(cleanupTimeout);
+        task.progress = { ...task.progress };
         task.status = status;
-        task.timedOut = timedOut || undefined;
-        if (status === "done") {
-            task.result = value as AIReviewReport;
-        } else {
-            task.error = String(value);
-        }
+        if (error) task.error = error;
         task.finishedAt = Date.now();
     };
     timeout = setTimeout(() => {
-        controller.abort(new Error("AI Review 后台任务总期限已到"));
+        if (settled) return;
         task.timedOut = true;
+        task.cleanupStatus = "pending";
         task.error = "AI Review 后台任务超时，正在结束自有操作";
+        controller.abort(new Error("AI Review 后台任务总期限已到"));
+        cleanupTimeout = setTimeout(() => {
+            if (settled) return;
+            task.cleanupStatus = "unconfirmed";
+            settle("error", "AI Review 后台任务超时，自有操作清理尚未确认；请先核对原任务，不自动重放");
+        }, AI_REVIEW_CLEANUP_TIMEOUT_MS);
+        cleanupTimeout.unref?.();
     }, BACKGROUND_TASK_TIMEOUT_MS);
     timeout.unref?.();
-    void (async () => {
-        try {
-            settle("done", await runBackgroundWork('inspect-ai', () => runAIReview(route, params, task.progress, controller.signal), BACKGROUND_TASK_TIMEOUT_MS, undefined, controller.signal, undefined, true));
-        } catch (error) {
-            settle("error", error instanceof Error ? error.message : String(error), task.timedOut === true);
-        }
-    })();
+    setImmediate(() => {
+        void (async () => {
+            try {
+                await runBackgroundWork('inspect-ai', () => runInspection(route, params, task.progress, controller.signal, output => {
+                    if (settled) return;
+                    task.output = output;
+                    task.result = output.aiReview;
+                }), Math.max(0, deadline - performance.now()), undefined, controller.signal, undefined, true);
+                if (settled) return;
+                task.cleanupStatus = task.result?.modelCalls?.some(call => call.cleanup?.confirmed === false || (call.submitted && !call.cleanup && call.outcomeUnknown)) ? "unconfirmed" : "done";
+                settle(task.timedOut ? "error" : "done", task.timedOut
+                    ? task.cleanupStatus === "unconfirmed"
+                        ? "AI Review 后台任务总期限已到，自有操作退出尚未确认；请核对原任务，不自动重放"
+                        : "AI Review 后台任务总期限已到，自有操作已结束"
+                    : undefined);
+            } catch (error) {
+                if (settled) return;
+                task.cleanupStatus = "unconfirmed";
+                settle("error", error instanceof Error ? error.message : String(error));
+            }
+        })();
+    });
     return id;
 }
 
@@ -661,13 +740,14 @@ async function checkBackgroundTask(taskId: string | undefined, waitSeconds: numb
         tool: "web_inspect",
         url: task.params.url,
         route: task.route,
-        mode: "ai_review",
+        mode: task.params.mode,
         page: task.params.page,
         detect: task.params.detect,
         autoScreenshot: task.params.autoScreenshot,
         scale: task.params.scale,
         modelChain: task.params.modelChain,
         chain: task.params.chain,
+        model: task.params.model,
         background: true,
         batchSize: task.params.batchSize,
         thresholds: task.params.thresholds,
@@ -676,6 +756,8 @@ async function checkBackgroundTask(taskId: string | undefined, waitSeconds: numb
         progress: task.progress,
         deadlineAt: task.deadlineAt ? new Date(task.deadlineAt).toISOString() : undefined,
         timedOut: task.timedOut,
+        cleanupStatus: task.cleanupStatus,
+        ...task.output,
         result: task.result,
         error: task.error,
     };

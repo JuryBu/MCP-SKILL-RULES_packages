@@ -30,6 +30,7 @@ function mockHttpRpc(endpoint, scopedRequest, method, model) {
 }
 
 async function harness(context, options = {}, dependencies = {}) {
+    options = { models: [{ modelId: 'gemini-4-hydrogen-xhigh', name: 'Gemini 4 Hydrogen (XHigh)' }, { modelId: 'gemini-4-carbon-high', name: 'Gemini 4 Carbon (High)' }], ...options };
     const root = await fs.mkdtemp(path.join(os.tmpdir(), 'agy-cli-test-'));
     const auditPath = path.join(root, 'audit.jsonl');
     const image = path.join(root, 'image.png');
@@ -96,7 +97,7 @@ test('structured text agent needs no image capability and retains schema and iso
     const schema = { type: 'object', properties: { summary: { type: 'string' } }, required: ['summary'] };
     const result = await mock.client.callAgent(request({ prompt: 'Summarize supplied text only', schema }));
     assert.equal(result.outcome, 'success');
-    assert.equal(result.model, 'gemini-3.8-flash-high');
+    assert.equal(result.model, 'gemini-4-hydrogen-xhigh');
     assert.equal(result.cleanup.confirmed, true);
     assert.equal(result.cleanup.tempRemoved, true);
     const events = await mock.events();
@@ -112,7 +113,7 @@ test('image sends real bytes and isolated deny settings, denies permissions and 
     const result = await mock.client.callAgent(request({ imagePaths: [mock.image] }));
     assert.equal(result.outcome, 'success');
     assert.equal(result.text, '{"image":true}');
-    assert.equal(result.model, 'gemini-3.8-flash-high');
+    assert.equal(result.model, 'gemini-4-hydrogen-xhigh');
     const events = await mock.events();
     const args = events.find(event => event.kind === 'spawn').args;
     assert.equal(args.includes('--dangerously-skip-permissions'), false);
@@ -228,7 +229,7 @@ for (const [label, options, expected] of [
     ['native tool invocation', { nativeTool: true }, 'rejected'],
     ['unbounded stream', { overflow: true }, 'invalid-response'],
     ['non-JSON protocol output', { invalidStdout: true }, 'invalid-response'],
-    ['missing catalog model', { models: [] }, 'unsupported'],
+    ['missing catalog model', { models: [] }, 'invalid-response'],
     ['disabled catalog model', { models: [{ modelId: 'gemini-3.8-flash-high', disabled: true }] }, 'rejected'],
     ['model switch unsupported', { setModelError: { code: -32601, message: 'method not found' } }, 'unsupported'],
     ['bad final status', { terminal: { terminalStatus: 'failed' } }, 'invalid-response'],
@@ -351,7 +352,7 @@ test('post-submission callback rejection remains unknown and cannot fall back', 
 test('nonzero exit after a confirmed terminal preserves the model result and reports the cleanup failure', async context => {
     const mock = await harness(context, { exitCode: 2 });
     const result = await mock.client.callAgent(request({ imagePaths: [mock.image] }));
-    assert.equal(result.outcome, 'success'); assert.equal(result.model, 'gemini-3.8-flash-high');
+    assert.equal(result.outcome, 'success'); assert.equal(result.model, 'gemini-4-hydrogen-xhigh');
     assert.equal(result.text, '{"image":true}'); assert.equal(result.cleanup.status, 'abnormal-exit');
     assert.equal(result.cleanup.exitCode, 2); assert.equal(result.cleanup.confirmed, true);
     assert.equal(result.cleanup.fault.outcome, 'transport-unknown');

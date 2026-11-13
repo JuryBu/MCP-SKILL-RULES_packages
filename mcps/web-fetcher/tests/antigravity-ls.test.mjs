@@ -14,7 +14,7 @@ import {
 import { antigravityFailure } from '../src/antigravity-types.ts';
 import { callAntigravityModel } from '../src/antigravity-rpc.ts';
 
-const defaultModel = 'MODEL_PLACEHOLDER_M318';
+const defaultModel = 'MODEL_PLACEHOLDER_M528';
 const modernEntries = [
     ['Gemini 4 Carbon (Medium)', 437], ['Gemini 4 Carbon (High)', 427], ['Gemini 4 Carbon (Low)', 438],
     ['Gemini 4 Argon (Medium)', 418], ['Gemini 4 Argon (High)', 417], ['Gemini 4 Argon (Low)', 419],
@@ -89,7 +89,7 @@ function generationRequests(fixture) {
     return fixture.requests.filter(operation => operation.method === 'GetModelResponse');
 }
 
-test('modern App uses the current 22-entry Ultra catalog and M318 without starting CLI', async context => {
+test('modern App uses the current 22-entry Ultra catalog and Hydrogen XHigh without starting CLI', async context => {
     const fixture = await endpointFixture(context, (operation, _incoming, outgoing) =>
         json(outgoing, operation.method === 'GetUserStatus' ? catalog() : { response: 'app result' }));
     const client = clientFor(fixture.endpoint);
@@ -348,11 +348,11 @@ test('modern model404 is explicit unsupported and does not trigger a second mode
     assert.equal(generationRequests(fixture).length, 1);
 });
 
-test('complete capacity rejection alone permits default Flash Medium and Low once within the original deadline', async context => {
+test('complete capacity rejection alone permits Hydrogen High then Carbon High within the original deadline', async context => {
     const deadline = performance.now() + 2000;
     const fixture = await endpointFixture(context, (operation, _incoming, outgoing) => {
         if (operation.method === 'GetUserStatus') json(outgoing, catalog());
-        else if (operation.body.model === 'MODEL_PLACEHOLDER_M320') json(outgoing, { response: 'low capacity fallback' });
+        else if (operation.body.model === 'MODEL_PLACEHOLDER_M427') json(outgoing, { response: 'Carbon capacity fallback' });
         else json(outgoing, { code: 'unavailable', message: `No capacity available for ${operation.body.model}` }, 503);
     });
     const client = clientFor(fixture.endpoint, {
@@ -363,16 +363,16 @@ test('complete capacity rejection alone permits default Flash Medium and Low onc
     });
     const result = await client.callAntigravity(request({ deadline }));
     assert.equal(result.outcome, 'success');
-    assert.equal(result.model, 'MODEL_PLACEHOLDER_M320');
-    assert.equal(result.text, 'low capacity fallback');
+    assert.equal(result.model, 'MODEL_PLACEHOLDER_M427');
+    assert.equal(result.text, 'Carbon capacity fallback');
     assert.deepEqual(generationRequests(fixture).map(operation => operation.body.model),
-        [defaultModel, 'MODEL_PLACEHOLDER_M319', 'MODEL_PLACEHOLDER_M320']);
+        [defaultModel, 'MODEL_PLACEHOLDER_M525', 'MODEL_PLACEHOLDER_M427']);
 });
 
-test('explicit M318 capacity rejection preserves submitted and never substitutes M319', async context => {
+test('explicit M528 capacity rejection preserves submitted and never substitutes M525', async context => {
     const fixture = await endpointFixture(context, (operation, _incoming, outgoing) => operation.method === 'GetUserStatus'
-        ? json(outgoing, catalog()) : json(outgoing, { code: 'unavailable', message: 'No capacity available for gemini-3.8-flash-high' }, 503));
-    const result = await clientFor(fixture.endpoint).callAntigravity(request({ model: 'M318' }));
+        ? json(outgoing, catalog()) : json(outgoing, { code: 'unavailable', message: 'No capacity available for gemini-4-hydrogen-xhigh' }, 503));
+    const result = await clientFor(fixture.endpoint).callAntigravity(request({ model: 'M528' }));
     assert.equal(result.outcome, 'rejected');
     assert.equal(result.model, defaultModel);
     assert.equal(result.submitted, true);
@@ -380,50 +380,50 @@ test('explicit M318 capacity rejection preserves submitted and never substitutes
     assert.equal(generationRequests(fixture).length, 1);
 });
 
-test('a transient capacity rejection never disables or skips M318 in the next request', async context => {
+test('a transient capacity rejection never disables or skips Hydrogen XHigh in the next request', async context => {
     let rejected = false;
     const fixture = await endpointFixture(context, (operation, _incoming, outgoing) => {
         if (operation.method === 'GetUserStatus') json(outgoing, catalog());
         else if (operation.body.model === defaultModel && !rejected) {
             rejected = true;
-            json(outgoing, { code: 'unavailable', message: 'No capacity available for gemini-3.8-flash-high' }, 503);
+            json(outgoing, { code: 'unavailable', message: 'No capacity available for gemini-4-hydrogen-xhigh' }, 503);
         } else json(outgoing, { response: 'capacity recovered' });
     });
     const client = clientFor(fixture.endpoint);
-    assert.equal((await client.callAntigravity(request())).model, 'MODEL_PLACEHOLDER_M319');
+    assert.equal((await client.callAntigravity(request())).model, 'MODEL_PLACEHOLDER_M525');
     assert.equal((await client.callAntigravity(request())).model, defaultModel);
     assert.deepEqual(generationRequests(fixture).map(operation => operation.body.model),
-        [defaultModel, 'MODEL_PLACEHOLDER_M319', defaultModel]);
+        [defaultModel, 'MODEL_PLACEHOLDER_M525', defaultModel]);
 });
 
 test('capacity fallback only uses models present and enabled in the current catalog', async context => {
     const fixture = await endpointFixture(context, (operation, _incoming, outgoing) => {
         if (operation.method === 'GetUserStatus') json(outgoing, catalog('fixture', models => {
-            models.find(item => item.modelOrAlias.model === 'MODEL_PLACEHOLDER_M319').disabled = true;
+            models.find(item => item.modelOrAlias.model === 'MODEL_PLACEHOLDER_M525').disabled = true;
         }));
-        else if (operation.body.model === defaultModel) json(outgoing, { code: 'unavailable', message: 'No capacity available for gemini-3.8-flash-high' }, 503);
-        else json(outgoing, { response: 'enabled low' });
+        else if (operation.body.model === defaultModel) json(outgoing, { code: 'unavailable', message: 'No capacity available for gemini-4-hydrogen-xhigh' }, 503);
+        else json(outgoing, { response: 'enabled Carbon High' });
     });
     const result = await clientFor(fixture.endpoint).callAntigravity(request());
-    assert.equal(result.model, 'MODEL_PLACEHOLDER_M320');
-    assert.deepEqual(generationRequests(fixture).map(operation => operation.body.model), [defaultModel, 'MODEL_PLACEHOLDER_M320']);
+    assert.equal(result.model, 'MODEL_PLACEHOLDER_M427');
+    assert.deepEqual(generationRequests(fixture).map(operation => operation.body.model), [defaultModel, 'MODEL_PLACEHOLDER_M427']);
 });
 
-test('capacity fallback skips a known zero-quota Medium without blocking an available Low', async context => {
+test('capacity fallback skips a known zero-quota Hydrogen High without blocking available Carbon High', async context => {
     const fixture = await endpointFixture(context, (operation, _incoming, outgoing) => {
         if (operation.method === 'GetUserStatus') json(outgoing, catalog('fixture', models => {
-            models.find(item => item.modelOrAlias.model === 'MODEL_PLACEHOLDER_M319').quotaInfo.remainingFraction = 0;
+            models.find(item => item.modelOrAlias.model === 'MODEL_PLACEHOLDER_M525').quotaInfo.remainingFraction = 0;
         }));
-        else if (operation.body.model === defaultModel) json(outgoing, { code: 'unavailable', message: 'No capacity available for gemini-3.8-flash-high' }, 503);
-        else json(outgoing, { response: 'available Low' });
+        else if (operation.body.model === defaultModel) json(outgoing, { code: 'unavailable', message: 'No capacity available for gemini-4-hydrogen-xhigh' }, 503);
+        else json(outgoing, { response: 'available Carbon High' });
     });
     const result = await clientFor(fixture.endpoint).callAntigravity(request());
     assert.equal(result.outcome, 'success');
-    assert.equal(result.model, 'MODEL_PLACEHOLDER_M320');
-    assert.deepEqual(generationRequests(fixture).map(operation => operation.body.model), [defaultModel, 'MODEL_PLACEHOLDER_M320']);
+    assert.equal(result.model, 'MODEL_PLACEHOLDER_M427');
+    assert.deepEqual(generationRequests(fixture).map(operation => operation.body.model), [defaultModel, 'MODEL_PLACEHOLDER_M427']);
 });
 
-test('auth, 403, 429, generic503 and reset during capacity fallback stop before Low', async context => {
+test('auth, 403, 429, generic503 and reset during capacity fallback stop before Carbon', async context => {
     const failures = [
         [401, 'unauthenticated', 'login required', 'auth-required'],
         [403, 'permission_denied', 'quota exhausted', 'quota-exhausted'],
@@ -436,7 +436,7 @@ test('auth, 403, 429, generic503 and reset during capacity fallback stop before 
         await context.test(`${status} ${outcome}`, async subcontext => {
             const fixture = await endpointFixture(subcontext, (operation, incoming, outgoing) => {
                 if (operation.method === 'GetUserStatus') json(outgoing, catalog());
-                else if (operation.body.model === defaultModel) json(outgoing, { code: 'unavailable', message: 'No capacity available for gemini-3.8-flash-high' }, 503);
+                else if (operation.body.model === defaultModel) json(outgoing, { code: 'unavailable', message: 'No capacity available for gemini-4-hydrogen-xhigh' }, 503);
                 else if (!status) incoming.socket.destroy();
                 else json(outgoing, { code, message }, status);
             });
@@ -444,7 +444,7 @@ test('auth, 403, 429, generic503 and reset during capacity fallback stop before 
             assert.equal(result.outcome, outcome);
             assert.equal(result.submitted, true);
             assert.equal(result.safeToFallback, false);
-            assert.deepEqual(generationRequests(fixture).map(operation => operation.body.model), [defaultModel, 'MODEL_PLACEHOLDER_M319']);
+            assert.deepEqual(generationRequests(fixture).map(operation => operation.body.model), [defaultModel, 'MODEL_PLACEHOLDER_M525']);
         });
     }
 });

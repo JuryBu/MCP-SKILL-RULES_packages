@@ -200,6 +200,123 @@ function noExecutable() {
   return child => child.emit('error', Object.assign(new Error('fixture ENOENT'), { code: 'ENOENT' }));
 }
 
+for (const code of [0, 1]) {
+  test(`Codex structured model_not_found is a known rejection at exit ${code}`, async context => {
+    const harness = fixture(context);
+    const pending = harness.bridge.generateModelText({ prompt: 'known model rejection', chain: 'codex' });
+    const child = harness.children[0];
+    child.start();
+    child.output(codexText('intermediate output', false));
+    child.output(JSON.stringify({ type: 'error', status: 400, error: {
+      type: 'invalid_request_error', code: 'model_not_found', message: 'The requested model is not supported for this account.',
+    } }) + '\n');
+    child.output(JSON.stringify({ type: 'turn.failed', error: { message: 'The requested model is not supported for this account.' } }) + '\n');
+    child.close(code);
+    assertFailure(await pending, { outcome: 'rejected', submitted: true, unknown: false });
+    assert.equal(harness.calls.length, 1);
+  });
+}
+
+test('AGY environment model freezes cross-provider fallback and reaches the transport', async context => {
+  const harness = fixture(context, {
+    env: { WEB_FETCHER_LS_MODEL: 'gemini-4-carbon-high' },
+    agy: () => agyResult({ outcome: 'rejected', submitted: true, safeToFallback: true }),
+  });
+  const result = await harness.bridge.generateModelText({ prompt: 'explicit environment' });
+  assertFailure(result, { outcome: 'rejected', submitted: true, unknown: false });
+  assert.equal(harness.calls.length, 1);
+  assert.equal(harness.calls[0].request.model, 'gemini-4-carbon-high');
+});
+
+for (const channel of ['nested-message', 'stderr']) {
+  test(`Codex known model rejection remains known in ${channel}`, async context => {
+    const harness = fixture(context);
+    const pending = harness.bridge.generateModelText({ prompt: 'receipt parity', chain: 'codex' });
+    const child = harness.children[0];
+    child.start();
+    const body = JSON.stringify({ type: 'error', status: 400, error: {
+      type: 'invalid_request_error', code: 'model_not_found', message: 'Requested model is not supported.',
+    } });
+    if (channel === 'stderr') child.errorOutput(body);
+    else child.output(JSON.stringify({ type: 'error', message: body }) + '\n');
+    child.close(1);
+    assertFailure(await pending, { outcome: 'rejected', submitted: true, unknown: false });
+  });
+}
+
+for (const channel of ['stdout', 'stderr']) {
+  for (const code of [0, 1]) {
+    test(`Codex outer HTTP status keeps its inner rejection code in ${channel} at exit ${code}`, async context => {
+      const harness = fixture(context);
+      const pending = harness.bridge.generateModelText({ prompt: 'nested status', chain: 'codex' });
+      const child = harness.children[0];
+      child.start();
+      const body = JSON.stringify({ type: 'error', status: 400, message: JSON.stringify({ error: {
+        type: 'invalid_request_error', code: 'model_not_found', message: 'Requested model is unsupported.',
+      } }) });
+      if (channel === 'stdout') child.output(body + '\n');
+      else child.errorOutput(body + '\n');
+      child.close(code);
+      assertFailure(await pending, { outcome: 'rejected', submitted: true, unknown: false });
+    });
+  }
+}
+
+test('Codex turn.failed keeps outer status and nested error.message details', async context => {
+  const harness = fixture(context);
+  const pending = harness.bridge.generateModelText({ prompt: 'nested failed turn', chain: 'codex' });
+  const child = harness.children[0];
+  child.start();
+  child.output(JSON.stringify({ type: 'turn.failed', status: 400, error: { message: JSON.stringify({ error: {
+    type: 'invalid_request_error', code: 'model_not_found', message: 'Requested model is unsupported.',
+  } }) } }) + '\n');
+  child.close(1);
+  assertFailure(await pending, { outcome: 'rejected', submitted: true, unknown: false });
+});
+
+for (const shape of ['direct', 'nested']) {
+  test(`Codex ${shape} HTTP 400 preserves invalid_request_error with code:null`, async context => {
+    const harness = fixture(context);
+    const pending = harness.bridge.generateModelText({ prompt: 'type-only model rejection', chain: 'codex' });
+    const child = harness.children[0];
+    const errorDetails = { type: 'invalid_request_error', message: 'Unsupported model for this account.', code: null };
+    const event = shape === 'direct'
+      ? { type: 'error', status: 400, error: errorDetails }
+      : { type: 'error', status: 400, message: JSON.stringify({ error: errorDetails }) };
+    child.start();
+    child.output(JSON.stringify(event) + '\n');
+    child.close(1);
+    assertFailure(await pending, { outcome: 'rejected', submitted: true, unknown: false });
+    assert.equal(harness.calls.length, 1);
+  });
+}
+
+test('request model selects Codex without first submitting to Antigravity and never replays', async context => {
+  const harness = fixture(context, { plans: [noExecutable()] });
+  const result = await harness.bridge.generateModelText({ prompt: 'explicit codex', model: 'gpt-test-current' });
+  assertFailure(result, { outcome: 'not-started', fallback: false });
+  assert.deepEqual(harness.calls.map(call => call.provider), ['codex']);
+  assert.equal(harness.calls[0].args[harness.calls[0].args.indexOf('-m') + 1], 'gpt-test-current');
+  assert.equal(result.modelUsed, 'gpt-test-current');
+  assert.ok(harness.calls[0].args.includes('fast_mode=false'));
+  assert.ok(harness.calls[0].args.includes('service_tier="default"'));
+  assert.equal(harness.calls[0].args.some(value => value === 'model_speed_tier=fast'), false);
+});
+
+test('an ambiguous explicit model with auto is rejected before any provider starts', async context => {
+  const harness = fixture(context);
+  assertFailure(await harness.bridge.generateModelText({ prompt: 'ambiguous', model: 'unknown-family-name' }), { outcome: 'rejected' });
+  assert.equal(harness.calls.length, 0);
+});
+
+test('summary wrapper forwards its optional model without changing the task prompt', async context => {
+  const harness = fixture(context, { agy: () => agyResult({ text: '{"summary":"ok"}', outcome: 'success', submitted: true }) });
+  const result = await harness.bridge.generateSummaryText('same task', 'antigravity', 10000, undefined, 'M525');
+  assert.equal(result.text, 'ok');
+  assert.equal(harness.calls[0].request.model, 'M525');
+  assert.equal(harness.calls[0].request.prompt, 'same task');
+});
+
 for (const outcome of ['quota-exhausted', 'auth-required', 'rejected', 'unsupported', 'cancelled', 'invalid-response', 'timeout-unknown', 'transport-unknown']) {
   test(`auto does not repeat an LS ${outcome} on another model or platform`, async context => {
     const submitted = !['rejected', 'unsupported'].includes(outcome);

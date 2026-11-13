@@ -51,7 +51,7 @@ test("DOM structure preserves partial-readiness notes and never swallows cancell
     const { extractDomStructureFromPage } = await import("../src/inspector/dom-inspector.ts");
     const original = browserManager.waitForVisualReady;
     let evaluations = 0;
-    const page = { evaluate: async () => {
+    const page = { viewportSize: () => ({ width: 390, height: 844 }), evaluate: async () => {
         evaluations += 1;
         return { elements: [], dimensions: { width: 390, height: 844, viewportWidth: 390, viewportHeight: 844 }, url: "https://example.test/", title: "Fixture" };
     } };

@@ -8,7 +8,7 @@ import { randomUUID } from 'node:crypto';
 import { setTimeout, clearTimeout } from 'node:timers';
 import { getRuntimeMemorySampler, type MemoryProvider } from './memory-sampler.js';
 import { antigravityFailure, remainingAntigravityMs, type AntigravityEndpoint, type AntigravityOutcome, type AntigravityRequest, type AntigravityResult } from './antigravity-types.js';
-import { parseAntigravityCatalog, selectAntigravityModel } from './antigravity-models.js';
+import { getAntigravityCapacityCandidates, parseAntigravityAgentCatalog, parseAntigravityCatalog, selectAntigravityModel } from './antigravity-models.js';
 import { callAntigravityRpc } from './antigravity-rpc.js';
 
 const MAX_OUTPUT_BYTES = 2 * 1024 * 1024;
@@ -19,6 +19,7 @@ const MAX_IMAGES_BYTES = 12 * 1024 * 1024;
 const MAX_REQUEST_BYTES = 20 * 1024 * 1024;
 const CLI_EOF_GRACE_MS = 3000;
 const CLI_CLEANUP_RESERVE_MS = 4000;
+const CLI_FORCE_CLEANUP_MS = 1500;
 const DENIED_ACTIONS = ['read_file', 'write_file', 'command', 'read_url', 'execute_url', 'download_url', 'mcp'];
 const IMAGE_SETTINGS = JSON.stringify({
     toolPermission: 'strict',
@@ -32,7 +33,7 @@ export type AntigravityCliCleanup = import('./antigravity-types.js').Antigravity
 export type AntigravityCliResult = AntigravityResult;
 
 class CliFault extends Error {
-    constructor(readonly outcome: AntigravityOutcome, message: string, readonly fallback = false) { super(message); }
+    constructor(readonly outcome: AntigravityOutcome, message: string, readonly fallback = false, readonly capacityRejected = false) { super(message); }
 }
 
 function classifyError(value: unknown): CliFault {
@@ -46,6 +47,7 @@ function classifyError(value: unknown): CliFault {
     if (/method.not.found|not.supported|unsupported|unknown.model|model.not.found|"code":-32601/iu.test(message)) {
         return new CliFault('unsupported', 'Antigravity CLI 不支持所需协议或模型', true);
     }
+    if (/No capacity available/iu.test(message)) return new CliFault('rejected', 'Antigravity CLI 当前模型暂无容量（No capacity available）', true, true);
     return new CliFault('rejected', 'Antigravity CLI 拒绝请求');
 }
 
@@ -76,19 +78,29 @@ async function bounded<T>(operation: Promise<T>, deadline: number): Promise<T | 
 
 class RequestScope {
     readonly controller = new AbortController();
-    readonly operationDeadline: number;
+    operationDeadline: number;
     model: string | null;
-    private readonly timer: ReturnType<typeof setTimeout>;
+    private timer: ReturnType<typeof setTimeout>;
     private reason: 'cancelled' | 'deadline' = 'cancelled';
     private readonly onAbort = () => this.cancel();
 
-    constructor(readonly request: AntigravityRequest) {
-        const remaining = remainingAntigravityMs(request);
+    constructor(readonly request: AntigravityRequest, executionDeadline = Infinity) {
         this.model = request.model ?? null;
-        this.operationDeadline = request.deadline - Math.min(CLI_CLEANUP_RESERVE_MS, Math.max(30, Math.floor(remaining / 5)));
+        this.operationDeadline = Math.min(request.deadline, executionDeadline);
         this.timer = setTimeout(() => { this.reason = 'deadline'; this.controller.abort(); }, remainingAntigravityMs({ deadline: this.operationDeadline }));
         request.signal?.addEventListener('abort', this.onAbort, { once: true });
         if (request.signal?.aborted) this.cancel();
+    }
+
+    startExecution(executionDeadline = Infinity): void {
+        this.check();
+        const remaining = remainingAntigravityMs(this.request);
+        const cleanupReserve = Math.min(CLI_CLEANUP_RESERVE_MS, Math.max(30, Math.floor(remaining / 5)));
+        this.operationDeadline = Math.min(executionDeadline, this.request.deadline - cleanupReserve,
+            this.request.generationTimeoutMs === undefined ? Infinity : performance.now() + this.request.generationTimeoutMs);
+        clearTimeout(this.timer);
+        this.timer = setTimeout(() => { this.reason = 'deadline'; this.controller.abort(); }, remainingAntigravityMs({ deadline: this.operationDeadline }));
+        this.check();
     }
 
     cancel(): void { this.controller.abort(); }
@@ -158,6 +170,7 @@ export interface AntigravityCliOptions {
     memoryProvider?: MemoryProvider;
     platform?: NodeJS.Platform;
     queueLimit?: number;
+    terminateOwned?: typeof terminateOwned;
 }
 
 class AcpRuntime {
@@ -179,7 +192,7 @@ class AcpRuntime {
     private stderrFault?: CliFault;
     private readonly pending = new Map<number, { resolve: (value: JsonObject) => void; reject: (error: Error) => void }>();
 
-    constructor(readonly root: string, command: string, agent: boolean, spawnProcess: typeof spawn) {
+    constructor(readonly root: string, command: string, agent: boolean, spawnProcess: typeof spawn, private readonly terminate = terminateOwned) {
         const args = [...(agent ? ['--settings', IMAGE_SETTINGS] : []), 'acp', '--stdio', '--include-default-customizations=false', '--cli_log_file', path.join(root, 'backend.log')];
         this.child = spawnProcess(command, args, { cwd: root, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true, detached: process.platform !== 'win32' }) as ChildProcessWithoutNullStreams;
         this.closed = new Promise(resolve => {
@@ -307,6 +320,7 @@ class AcpRuntime {
 
     async close(deadline: number): Promise<AntigravityCliCleanup> {
         const started = performance.now();
+        deadline = Math.min(deadline, started + CLI_CLEANUP_RESERVE_MS);
         let method: AntigravityCliCleanup['method'] = this.ended ? 'already-exited' : 'stdin-eof';
         let eofWaitMs = 0;
         const warnings: string[] = [];
@@ -319,10 +333,12 @@ class AcpRuntime {
             if (graceEnd > performance.now()) await bounded(this.closed, graceEnd);
             eofWaitMs = Math.round(performance.now() - started);
         }
-        if (!this.ended && remainingAntigravityMs({ deadline }) > 0) {
+        if (!this.ended) {
             method = 'owned-tree-terminate';
             warnings.push('CLI 未在 EOF 宽限内退出，已请求终止自有进程树');
-            await bounded(terminateOwned(this.child, deadline), Math.max(performance.now(), deadline - Math.min(80, remainingAntigravityMs({ deadline }) / 5)));
+            deadline = Math.max(Number.isFinite(deadline) ? deadline : 0, performance.now() + CLI_FORCE_CLEANUP_MS);
+            try { await bounded(this.terminate(this.child, deadline), deadline - 250); }
+            catch { warnings.push('CLI 自有进程树终止请求失败，仍等待退出确认'); }
         }
         if (!this.ended) await bounded(this.closed, deadline);
         if (!this.ended) warnings.push('CLI 自有进程树退出尚未确认，运行实例保持隔离');
@@ -371,22 +387,18 @@ interface QueueEntry {
     work: (runtime: AcpRuntime, scope: RequestScope, markSubmitted: () => void) => Promise<AntigravityResult>;
     resolve: (result: AntigravityCliResult) => void;
     onAbort: () => void;
+    executionDeadline?: number;
+}
+
+interface AgentAttemptState {
+    capacityRejected: boolean;
+    candidates: string[];
+    executionDeadline?: number;
 }
 
 export function selectAntigravityAgentModel(available: JsonObject[], request: Pick<AntigravityRequest, 'model' | 'purpose'>): JsonObject | undefined {
-    if (request.model) {
-        const direct = available.find(item => item.modelId === request.model || item.name === request.model);
-        if (direct) return direct;
-        const normalize = (value: string) => value.toLowerCase().replace(/\(limited time\)/gu, '').replace(/[^\p{L}\p{N}]/gu, '');
-        const matches = available.filter(item => typeof item.name === 'string' && normalize(item.name) === normalize(request.model!));
-        return matches.length === 1 ? matches[0] : undefined;
-    }
-    const eligible = available.filter(item => item.disabled !== true && item.quotaInfo?.remainingFraction !== 0);
-    const preferences = request.purpose === 'visual-review'
-        ? [/argon.*high/iu, /carbon.*high/iu]
-        : [/gemini.*3[.\-]?8.*flash.*high/iu];
-    return preferences.map(pattern => eligible.find(item => pattern.test(`${item.modelId} ${item.name}`))).find(Boolean)
-        ?? preferences.map(pattern => available.find(item => pattern.test(`${item.modelId} ${item.name}`))).find(Boolean);
+    const selection = selectAntigravityModel(parseAntigravityAgentCatalog(available), request.model, request.purpose);
+    return selection.model ? available.find(item => item.modelId === selection.model!.id) : undefined;
 }
 
 export class AntigravityCliClient {
@@ -407,18 +419,20 @@ export class AntigravityCliClient {
         return { installed: this.isInstalled(), running: Boolean(this.runtime && !this.runtime.ended), closing: Boolean(this.runtime?.closing), activeLeases: this.active ? 1 : 0, queuedRequests: this.queue.length, maxConcurrency: 1, memoryProtection: 'startup-watermark-only' };
     }
 
-    private enqueue(request: AntigravityRequest, transport: CliTransport, work: QueueEntry['work']): Promise<AntigravityCliResult> {
+    private enqueue(request: AntigravityRequest, transport: CliTransport, work: QueueEntry['work'], executionDeadline?: number): Promise<AntigravityCliResult> {
+        request = { ...request, model: request.model ?? (process.env.WEB_FETCHER_LS_MODEL?.trim() || undefined) };
         if (typeof request.prompt !== 'string' || !request.prompt.trim()
             || (request.model !== undefined && (typeof request.model !== 'string' || !request.model.trim()))
+            || (request.generationTimeoutMs !== undefined && (!Number.isFinite(request.generationTimeoutMs) || request.generationTimeoutMs <= 0))
             || (request.imagePaths !== undefined && (!Array.isArray(request.imagePaths) || request.imagePaths.some(image => typeof image !== 'string' || !image)))) {
             return Promise.resolve(antigravityFailure('rejected', 'CLI 请求的文本、模型或附件无效', transport));
         }
         if (remainingAntigravityMs(request) <= 0) return Promise.resolve(antigravityFailure('not-started', '请求期限已到或无效', transport, request.model ?? null));
         if (this.disposed) return Promise.resolve(antigravityFailure('cancelled', 'CLI 客户端已释放', transport, request.model ?? null));
         if (this.queue.length >= (this.options.queueLimit ?? 16)) return Promise.resolve(antigravityFailure('rejected', 'CLI 等待队列已满', transport, request.model ?? null));
-        const scope = new RequestScope(request);
+        const scope = new RequestScope(request, executionDeadline);
         return new Promise(resolve => {
-            const entry: QueueEntry = { scope, transport, work, resolve, onAbort: () => {
+            const entry: QueueEntry = { scope, transport, work, resolve, executionDeadline, onAbort: () => {
                 const index = this.queue.indexOf(entry);
                 if (index < 0) return;
                 this.queue.splice(index, 1);
@@ -477,7 +491,7 @@ export class AntigravityCliClient {
             let runtime: AcpRuntime | undefined;
             let result: AntigravityCliResult;
             try {
-                entry.scope.check();
+                entry.scope.startExecution(entry.executionDeadline);
                 if (this.runtime && !this.runtime.ended) throw new CliFault('rejected', '上一个自有 CLI 尚未确认退出');
                 if (this.runtime?.ended) { await rm(this.runtime.root, { recursive: true, force: true }); this.runtime = undefined; }
                 const command = this.resolveCommand();
@@ -486,14 +500,14 @@ export class AntigravityCliClient {
                 root = await mkdtemp(path.join(os.tmpdir(), 'web-fetcher-agy-'));
                 await chmod(root, 0o700);
                 entry.scope.check();
-                runtime = new AcpRuntime(root, command, entry.transport === 'cli-agent', this.options.spawnProcess ?? spawn);
+                runtime = new AcpRuntime(root, command, entry.transport === 'cli-agent', this.options.spawnProcess ?? spawn, this.options.terminateOwned);
                 this.runtime = runtime;
                 await runtime.initialize(entry.scope);
                 result = await entry.work(runtime, entry.scope, () => { submitted = true; });
                 submitted ||= result.submitted;
             } catch (error) { result = this.failure(error, entry, submitted); }
             if (runtime) {
-                const cleanup = await runtime.close(entry.scope.request.deadline);
+                const cleanup = await this.closeRuntime(runtime, entry.scope.request.deadline);
                 result = { ...result, cleanup };
                 if (cleanup.confirmed && this.runtime === runtime) this.runtime = undefined;
             }
@@ -510,13 +524,22 @@ export class AntigravityCliClient {
         }
     }
 
+    private async closeRuntime(runtime: AcpRuntime, deadline: number): Promise<AntigravityCliCleanup> {
+        try { return await runtime.close(deadline); }
+        catch {
+            const cleanup = await AcpRuntime.prototype.close.call(runtime, performance.now() + CLI_FORCE_CLEANUP_MS);
+            cleanup.warnings.unshift('CLI 清理入口异常，已执行自有运行实例的兜底清理');
+            return cleanup;
+        }
+    }
+
     withEndpoint(request: AntigravityRequest, work: (endpoint: AntigravityEndpoint, scopedRequest: AntigravityRequest) => Promise<AntigravityResult>): Promise<AntigravityCliResult> {
         if (request.imagePaths?.length) return Promise.resolve(antigravityFailure('unsupported', 'CLI LS 仅支持纯文字请求', 'cli-ls', request.model ?? null, false, true));
         return this.enqueue(request, 'cli-ls', async (runtime, scope, markSubmitted) => {
             const endpoint = await runtime.endpoint(scope, this.options.verifyEndpoint ?? verifyEndpoint);
             scope.check();
             const scopedRequest: AntigravityRequest = {
-                ...request,
+                ...scope.request,
                 deadline: scope.operationDeadline,
                 signal: scope.controller.signal,
                 onSubmitted: model => {
@@ -529,8 +552,28 @@ export class AntigravityCliClient {
         });
     }
 
-    callAgent(request: AntigravityRequest): Promise<AntigravityCliResult> {
+    async callAgent(request: AntigravityRequest): Promise<AntigravityCliResult> {
+        const explicit = request.model ?? (process.env.WEB_FETCHER_LS_MODEL?.trim() || undefined);
+        request = { ...request, model: explicit };
+        const state: AgentAttemptState = { capacityRejected: false, candidates: [] };
+        const attempted = new Set<string>();
+        let automaticModel: string | undefined;
+        while (true) {
+            state.capacityRejected = false;
+            const result = await this.callAgentOnce(request, state, automaticModel);
+            if (result.model) attempted.add(result.model);
+            if (state.capacityRejected && (!result.cleanup?.confirmed || result.cleanup.fault || request.signal?.aborted
+                || remainingAntigravityMs({ deadline: state.executionDeadline ?? request.deadline }) <= 0)) return { ...result, safeToFallback: false };
+            if (explicit || !state.capacityRejected || result.outcome !== 'rejected' || result.text !== null
+                || !result.safeToFallback) return result;
+            automaticModel = state.candidates.find(candidate => !attempted.has(candidate));
+            if (!automaticModel) return result;
+        }
+    }
+
+    private callAgentOnce(request: AntigravityRequest, state: AgentAttemptState, automaticModel?: string): Promise<AntigravityCliResult> {
         return this.enqueue(request, 'cli-agent', async (runtime, scope, markSubmitted) => {
+            state.executionDeadline ??= scope.operationDeadline;
             const imagePaths = request.imagePaths ?? [];
             if (imagePaths.length > 8) throw new CliFault('rejected', '图片请求最多包含 8 个附件');
             if (imagePaths.length && runtime.capabilities.promptCapabilities?.image !== true) throw new CliFault('unsupported', 'ACP 未声明原生图片能力', true);
@@ -544,22 +587,25 @@ export class AntigravityCliClient {
             }
             if (request.schema) prompt.push({ type: 'text', text: `Return JSON matching this schema: ${JSON.stringify(request.schema)}` });
             const available: JsonObject[] = Array.isArray(runtime.session.models?.availableModels) ? runtime.session.models.availableModels : [];
-            let model = selectAntigravityAgentModel(available, request);
-            if (!model && request.model && /^(?:MODEL_PLACEHOLDER_)?M\d+$/iu.test(request.model)) {
+            const explicit = scope.request.model;
+            const catalog = parseAntigravityAgentCatalog(available);
+            let selection = selectAntigravityModel(catalog, explicit ?? automaticModel, request.purpose);
+            if (!selection.model && explicit && /^(?:MODEL_PLACEHOLDER_)?M\d+$/iu.test(explicit)) {
                 const endpoint = await runtime.endpoint(scope, this.options.verifyEndpoint ?? verifyEndpoint);
                 const status = await scope.wait(callAntigravityRpc(endpoint, 'GetUserStatus', {}, { deadline: scope.operationDeadline, signal: scope.controller.signal }));
                 if (status.status !== 200) throw classifyError(status.data);
-                const selection = selectAntigravityModel(parseAntigravityCatalog(status.data), request.model);
-                if (selection.error) throw new CliFault(selection.error.outcome, selection.error.error ?? '显式模型无法映射');
-                if (!selection.model) throw new CliFault('invalid-response', '显式模型目录缺少映射结果');
-                model = selectAntigravityAgentModel(available, { ...request, model: selection.model.label });
+                const mapped = selectAntigravityModel(parseAntigravityCatalog(status.data), explicit, request.purpose);
+                if (mapped.error) throw new CliFault(mapped.error.outcome, mapped.error.error ?? '显式模型无法映射');
+                if (!mapped.model) throw new CliFault('invalid-response', '显式模型目录缺少映射结果');
+                selection = selectAntigravityModel(catalog, mapped.model.label, request.purpose);
             }
-            if (!model || typeof model.modelId !== 'string') throw new CliFault('unsupported', 'ACP 目录中没有所选模型', !request.model);
-            scope.model = model.modelId;
-            if (model.disabled === true) throw new CliFault('rejected', 'ACP 所选模型已停用');
-            if (model.quotaInfo?.remainingFraction === 0) throw new CliFault('quota-exhausted', 'ACP 所选模型额度已耗尽');
+            if (selection.error) throw new CliFault(selection.error.outcome, selection.error.error ?? 'ACP 所选模型不可用');
+            const model = selection.model;
+            if (!model) throw new CliFault('invalid-response', 'ACP 目录缺少所选模型');
+            if (state.candidates.length === 0) state.candidates = getAntigravityCapacityCandidates(catalog, model, request.purpose).map(candidate => candidate.id);
+            scope.model = model.id;
             const sessionId = runtime.session.sessionId;
-            if (runtime.session.models.currentModelId !== model.modelId) await scope.wait(runtime.rpc('session/set_model', { sessionId, modelId: model.modelId }));
+            if (runtime.session.models.currentModelId !== model.id) await scope.wait(runtime.rpc('session/set_model', { sessionId, modelId: model.id }));
             let text = '';
             let outputBytes = 0;
             let messageId: string | undefined;
@@ -580,16 +626,27 @@ export class AntigravityCliClient {
             let terminal: JsonObject;
             try { terminal = await scope.wait(pendingPrompt); }
             catch (error) {
+                if (error instanceof CliFault && error.capacityRejected && outputBytes === 0) {
+                    state.capacityRejected = true;
+                    return antigravityFailure('rejected', error.message, 'cli-agent', model.id, true, !explicit);
+                }
                 runtime.notifyCancel(sessionId);
                 await bounded(pendingPrompt.catch(() => undefined), Math.min(request.deadline - 600, performance.now() + 700));
                 throw error;
             } finally { runtime.onUpdate = undefined; }
-            if (terminal.error || terminal.isError === true) throw classifyError(terminal.error ?? terminal);
+            if (terminal.error || terminal.isError === true) {
+                const error = classifyError(terminal.error ?? terminal);
+                if (error.capacityRejected && outputBytes === 0) {
+                    state.capacityRejected = true;
+                    return antigravityFailure('rejected', error.message, 'cli-agent', model.id, true, !explicit);
+                }
+                throw error;
+            }
             if (terminal.stopReason === 'cancelled') throw new CliFault('cancelled', 'ACP 已确认取消');
             if (terminal.stopReason === 'refusal') throw new CliFault('rejected', 'ACP 已拒绝生成');
             if (terminal.stopReason !== 'end_turn' || !text.trim() || (terminal.terminalStatus && !['success', 'completed', 'done'].includes(terminal.terminalStatus))) throw new CliFault('invalid-response', 'ACP 未返回完整成功终态');
-            return { text: text.trim(), transport: 'cli-agent', model: model.modelId, outcome: 'success', submitted: true, safeToFallback: false };
-        });
+            return { text: text.trim(), transport: 'cli-agent', model: model.id, outcome: 'success', submitted: true, safeToFallback: false };
+        }, state.executionDeadline);
     }
 
     dispose(): Promise<void> {
@@ -598,11 +655,26 @@ export class AntigravityCliClient {
         this.active?.scope.cancel();
         for (const entry of [...this.queue]) entry.scope.cancel();
         this.disposing = (async () => {
-            await this.draining;
-            if (this.runtime && !(await this.runtime.close(performance.now() + CLI_CLEANUP_RESERVE_MS)).confirmed) throw new Error('自有 CLI 退出尚未确认');
-            if (this.runtime?.ended) { await rm(this.runtime.root, { recursive: true, force: true }); this.runtime = undefined; }
-            for (const root of this.retainedRoots) { await rm(root, { recursive: true, force: true }); this.retainedRoots.delete(root); }
-        })();
+            const errors: unknown[] = [];
+            const draining = this.draining;
+            try { await draining; } catch (error) { errors.push(error); }
+            finally { if (this.draining === draining) this.draining = undefined; }
+            if (this.runtime) {
+                try {
+                    const cleanup = await this.closeRuntime(this.runtime, performance.now() + CLI_CLEANUP_RESERVE_MS);
+                    if (!cleanup.confirmed) errors.push(new Error('自有 CLI 退出尚未确认'));
+                } catch (error) { errors.push(error); }
+            }
+            if (this.runtime?.ended) {
+                this.retainedRoots.add(this.runtime.root);
+                this.runtime = undefined;
+            }
+            for (const root of this.retainedRoots) {
+                try { await rm(root, { recursive: true, force: true }); this.retainedRoots.delete(root); }
+                catch (error) { errors.push(error); }
+            }
+            if (errors.length) throw new AggregateError(errors, 'CLI 释放未完整完成');
+        })().catch(error => { this.disposing = undefined; throw error; });
         return this.disposing;
     }
 }

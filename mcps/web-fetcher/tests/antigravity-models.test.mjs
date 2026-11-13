@@ -67,14 +67,14 @@ function assertFailure(selection, outcome, model = null) {
   assert.ok(selection.error?.error);
 }
 
-test('22-model current status maps aliases to RPC enums and defaults to Flash 3.8 High', () => {
+test('22-model current status maps aliases to RPC enums and defaults to Hydrogen XHigh', () => {
   const raw = statusFixture();
   const snapshot = structuredClone(raw);
   const catalog = parseAntigravityCatalog(raw);
   assert.equal(catalog.modern, true);
   assert.equal(catalog.models.length, 22);
   assert.equal(catalog.tier, 'Google AI Ultra');
-  assert.equal(selectAntigravityModel(catalog).model?.id, 'MODEL_PLACEHOLDER_M318');
+  assert.equal(selectAntigravityModel(catalog).model?.id, 'MODEL_PLACEHOLDER_M528');
   assert.equal(catalog.models.find(model => model.id === 'MODEL_PLACEHOLDER_M318')?.quotaRemaining, 0.9675812);
   assert.equal(catalog.models.at(-1)?.id, 'MODEL_OPENAI_GPT_OSS_120B_MEDIUM');
   assert.equal(catalog.models.every(model => model.supportsImages), true);
@@ -85,7 +85,7 @@ test('21-model current status preserves the same default after GPT-OSS removal',
   const catalog = parseAntigravityCatalog(statusFixture(currentModels.slice(0, 21).map(entry => modelEntry(entry))));
   assert.equal(catalog.modern, true);
   assert.equal(catalog.models.length, 21);
-  assert.equal(selectAntigravityModel(catalog).model?.id, 'MODEL_PLACEHOLDER_M318');
+  assert.equal(selectAntigravityModel(catalog).model?.id, 'MODEL_PLACEHOLDER_M528');
 });
 
 test('explicit shorthand, RPC enum and actual labels match exactly without fuzzy substitution', () => {
@@ -94,54 +94,55 @@ test('explicit shorthand, RPC enum and actual labels match exactly without fuzzy
     assert.equal(selectAntigravityModel(catalog, explicit).model?.id, 'MODEL_PLACEHOLDER_M402');
   }
   assert.equal(selectAntigravityModel(catalog, 'GPT-OSS 120B (Medium)').model?.id, 'MODEL_OPENAI_GPT_OSS_120B_MEDIUM');
-  for (const explicit of ['M99999', 'Opus', 'Claude Opus 5.5', 'claude opus 5.5 (high)', 'gemini-3.8-flash-high', '']) {
+  assert.equal(selectAntigravityModel(catalog, 'gemini-3.8-flash-high').model?.id, 'MODEL_PLACEHOLDER_M318');
+  for (const explicit of ['M99999', 'Opus', 'Claude Opus 5.5', 'claude opus 5.5 (high)', '']) {
     assertFailure(selectAntigravityModel(catalog, explicit), 'rejected');
   }
 });
 
-test('disabled explicit requests are rejected and an unavailable High default selects authorized Medium', () => {
-  const entries = currentModels.map(entry => modelEntry(entry, entry[2] === 'M318' ? { disabled: true } : {}));
+test('disabled explicit requests are rejected and an unavailable XHigh default selects authorized High', () => {
+  const entries = currentModels.map(entry => modelEntry(entry, entry[2] === 'M528' ? { disabled: true } : {}));
   const catalog = parseAntigravityCatalog(statusFixture(entries));
-  assertFailure(selectAntigravityModel(catalog, 'M318'), 'rejected', 'MODEL_PLACEHOLDER_M318');
-  assertFailure(selectAntigravityModel(catalog, 'Gemini 3.8 Flash (High)'), 'rejected', 'MODEL_PLACEHOLDER_M318');
-  assert.equal(selectAntigravityModel(catalog).model?.id, 'MODEL_PLACEHOLDER_M319');
+  assertFailure(selectAntigravityModel(catalog, 'M528'), 'rejected', 'MODEL_PLACEHOLDER_M528');
+  assertFailure(selectAntigravityModel(catalog, 'Gemini 4 Hydrogen (XHigh)'), 'rejected', 'MODEL_PLACEHOLDER_M528');
+  assert.equal(selectAntigravityModel(catalog).model?.id, 'MODEL_PLACEHOLDER_M525');
 });
 
 test('duplicate labels are ambiguous and an enum-looking label never shadows an actual enum', () => {
   const entries = [
-    modelEntry(currentModels[12]),
-    modelEntry(['Gemini 3.8 Flash (High)', 'alternate-flash', 'M999']),
-    modelEntry(['M318', 'misleading-label', 'M998']),
+    modelEntry(currentModels[7]),
+    modelEntry(['Gemini 4 Hydrogen (XHigh)', 'alternate-hydrogen', 'M999']),
+    modelEntry(['M528', 'misleading-label', 'M998']),
   ];
   const catalog = parseAntigravityCatalog(statusFixture(entries));
-  assertFailure(selectAntigravityModel(catalog, 'Gemini 3.8 Flash (High)'), 'invalid-response');
-  assert.equal(selectAntigravityModel(catalog, 'M318').model?.id, 'MODEL_PLACEHOLDER_M318');
-  assert.equal(selectAntigravityModel(catalog).model?.id, 'MODEL_PLACEHOLDER_M318');
+  assertFailure(selectAntigravityModel(catalog, 'Gemini 4 Hydrogen (XHigh)'), 'invalid-response');
+  assert.equal(selectAntigravityModel(catalog, 'M528').model?.id, 'MODEL_PLACEHOLDER_M528');
+  assert.equal(selectAntigravityModel(catalog).model?.id, 'MODEL_PLACEHOLDER_M528');
 });
 
-test('missing default chooses only returned Flash 3.8 siblings and never Claude, Hydrogen or Orchestrator', () => {
-  const withoutHigh = currentModels.filter(entry => entry[2] !== 'M318').map(entry => modelEntry(entry));
-  assert.equal(selectAntigravityModel(parseAntigravityCatalog(statusFixture(withoutHigh))).model?.id, 'MODEL_PLACEHOLDER_M319');
-  const onlyLow = currentModels.filter(entry => !['M318', 'M319'].includes(entry[2])).map(entry => modelEntry(entry));
-  assert.equal(selectAntigravityModel(parseAntigravityCatalog(statusFixture(onlyLow))).model?.id, 'MODEL_PLACEHOLDER_M320');
-  const noFlash = currentModels.filter(entry => !['M318', 'M319', 'M320'].includes(entry[2])).map(entry => modelEntry(entry));
-  assertFailure(selectAntigravityModel(parseAntigravityCatalog(statusFixture(noFlash))), 'rejected');
-  const misleadingEnum = [modelEntry(['Gemini 4 Hydrogen (High)', 'gemini-4-hydrogen-high', 'M318'])];
+test('missing default chooses returned Hydrogen High then Carbon High and never excluded families', () => {
+  const withoutXHigh = currentModels.filter(entry => entry[2] !== 'M528').map(entry => modelEntry(entry));
+  assert.equal(selectAntigravityModel(parseAntigravityCatalog(statusFixture(withoutXHigh))).model?.id, 'MODEL_PLACEHOLDER_M525');
+  const onlyCarbon = currentModels.filter(entry => !['M528', 'M525'].includes(entry[2])).map(entry => modelEntry(entry));
+  assert.equal(selectAntigravityModel(parseAntigravityCatalog(statusFixture(onlyCarbon))).model?.id, 'MODEL_PLACEHOLDER_M427');
+  const noAllowed = currentModels.filter(entry => !['M528', 'M525', 'M427'].includes(entry[2])).map(entry => modelEntry(entry));
+  assertFailure(selectAntigravityModel(parseAntigravityCatalog(statusFixture(noAllowed))), 'rejected');
+  const misleadingEnum = [modelEntry(['Gemini 4 Argon (High)', 'gemini-4-argon-high', 'M528'])];
   assertFailure(selectAntigravityModel(parseAntigravityCatalog(statusFixture(misleadingEnum))), 'rejected');
 });
 
-test('all Flash models disabled fail explicitly without selecting another family', () => {
-  const entries = currentModels.map(entry => modelEntry(entry, entry[0].includes('Flash') ? { disabled: true } : {}));
-  assertFailure(selectAntigravityModel(parseAntigravityCatalog(statusFixture(entries))), 'rejected', 'MODEL_PLACEHOLDER_M318');
+test('all policy models disabled fail explicitly without selecting another family', () => {
+  const entries = currentModels.map(entry => modelEntry(entry, ['M528', 'M525', 'M427'].includes(entry[2]) ? { disabled: true } : {}));
+  assertFailure(selectAntigravityModel(parseAntigravityCatalog(statusFixture(entries))), 'rejected', 'MODEL_PLACEHOLDER_M528');
 });
 
 test('zero quota is preserved for explicit and default selection without changing models', () => {
   for (const quotaInfo of [{ remainingFraction: 0 }, { remainingFraction: '0' }, { remaining: 0 }]) {
-    const entries = currentModels.map(entry => modelEntry(entry, entry[2] === 'M318' ? { quotaInfo } : {}));
+    const entries = currentModels.map(entry => modelEntry(entry, entry[2] === 'M528' ? { quotaInfo } : {}));
     const catalog = parseAntigravityCatalog(statusFixture(entries));
-    assert.equal(catalog.models.find(model => model.id === 'MODEL_PLACEHOLDER_M318')?.quotaRemaining, 0);
-    assertFailure(selectAntigravityModel(catalog, 'M318'), 'quota-exhausted', 'MODEL_PLACEHOLDER_M318');
-    assertFailure(selectAntigravityModel(catalog), 'quota-exhausted', 'MODEL_PLACEHOLDER_M318');
+    assert.equal(catalog.models.find(model => model.id === 'MODEL_PLACEHOLDER_M528')?.quotaRemaining, 0);
+    assertFailure(selectAntigravityModel(catalog, 'M528'), 'quota-exhausted', 'MODEL_PLACEHOLDER_M528');
+    assertFailure(selectAntigravityModel(catalog), 'quota-exhausted', 'MODEL_PLACEHOLDER_M528');
   }
 });
 
@@ -149,11 +150,11 @@ test('empty quota information stays unknown, while legacy numeric quota and acco
   const entry = modelEntry(currentModels[12], { quotaInfo: {} });
   const unknown = parseAntigravityCatalog(statusFixture([entry]));
   assert.equal(unknown.models[0].quotaRemaining, undefined);
-  assert.ok(selectAntigravityModel(unknown).model);
+  assert.ok(selectAntigravityModel(unknown, 'M318').model);
   const numeric = parseAntigravityCatalog(statusFixture([{ ...entry, quota: 0 }]));
-  assertFailure(selectAntigravityModel(numeric), 'quota-exhausted', 'MODEL_PLACEHOLDER_M318');
+  assertFailure(selectAntigravityModel(numeric, 'M318'), 'quota-exhausted', 'MODEL_PLACEHOLDER_M318');
   const accountQuota = parseAntigravityCatalog(statusFixture([entry], { quotaInfo: { remainingFraction: 0 } }));
-  assertFailure(selectAntigravityModel(accountQuota), 'quota-exhausted', 'MODEL_PLACEHOLDER_M318');
+  assertFailure(selectAntigravityModel(accountQuota, 'M318'), 'quota-exhausted', 'MODEL_PLACEHOLDER_M318');
 });
 
 test('known account tier restrictions and explicit admission flags are rejected', () => {
@@ -176,8 +177,8 @@ test('account identity is hashed and reparsing the same model ID refreshes quota
   assert.match(first.accountKey, /^sha256:[a-f0-9]{64}$/);
   assert.notEqual(first.accountKey, second.accountKey);
   assert.ok(!JSON.stringify(first).includes('fixture-account-a'));
-  assert.ok(selectAntigravityModel(first).model);
-  assertFailure(selectAntigravityModel(second), 'quota-exhausted', 'MODEL_PLACEHOLDER_M318');
+  assert.ok(selectAntigravityModel(first, 'M318').model);
+  assertFailure(selectAntigravityModel(second, 'M318'), 'quota-exhausted', 'MODEL_PLACEHOLDER_M318');
   assert.equal(first.accountKey, parseAntigravityCatalog(statusFixture([modelEntry(currentModels[12])])).accountKey);
 });
 
@@ -208,7 +209,7 @@ test('older keyed objects and nested modelConfig wrappers remain dynamic rather 
     const catalog = parseAntigravityCatalog(raw);
     assert.equal(catalog.modern, true);
     assert.equal(catalog.models.length, 1);
-    assert.equal(selectAntigravityModel(catalog).model?.id, 'MODEL_PLACEHOLDER_M318');
+    assert.equal(selectAntigravityModel(catalog, 'M318').model?.id, 'MODEL_PLACEHOLDER_M318');
   }
 });
 

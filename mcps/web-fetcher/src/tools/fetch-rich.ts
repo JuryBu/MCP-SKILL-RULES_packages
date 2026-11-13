@@ -49,6 +49,7 @@ const FetchRichInputSchema = z.object({
         .enum(SUMMARY_CHAIN_VALUES)
         .optional()
         .describe("AI Summary 模型链路选择，仅 compact=ai_summary 时生效。未填时回退到 chain，再默认 auto"),
+    model: z.string().trim().min(1).max(200).optional().describe("仅ai_summary：显式模型名称、slug或M编号；固定本次型号，不自动替换或跨平台"),
     chain: z
         .enum(SUMMARY_CHAIN_VALUES)
         .optional()
@@ -92,6 +93,7 @@ export function registerFetchRich(server: McpServer): void {
   - scrollCount (number, 可选): 滚动次数，默认 0
   - compact (string, 可选): 文本压缩模式 full/compact/minimal/headings/ai_summary，默认 compact
   - modelChain (string, 可选): 仅 ai_summary 生效，可选 auto/antigravity/codex/claude-code；未填回退到 chain，再默认 auto
+  - model (string, 可选): 仅 ai_summary 生效，显式型号保持固定，不自动换模型或平台
   - chain (string, 可选): 兼容旧参数，仅 ai_summary 生效；modelChain 未填时使用
   - quality (string, 可选): 图片质量 hd/clear/default/compact/fast，默认 default
   - viewport (object, 可选): 网页 CSS 视口 {width,height}，显式指定时不会被 quality 重设；不模拟设备 UA/触摸，文件预览不适用
@@ -109,6 +111,7 @@ export function registerFetchRich(server: McpServer): void {
                 scrollCount: FetchRichInputSchema.shape.scrollCount,
                 compact: FetchRichInputSchema.shape.compact,
                 modelChain: FetchRichInputSchema.shape.modelChain,
+                model: FetchRichInputSchema.shape.model,
                 chain: FetchRichInputSchema.shape.chain,
                 quality: FetchRichInputSchema.shape.quality,
                 saveMode: FetchRichInputSchema.shape.saveMode,
@@ -311,7 +314,7 @@ export function registerFetchRich(server: McpServer): void {
                     // AI Summary 模式：通过模型桥生成智能摘要
                     try {
                         const { prompt } = buildSummaryPrompt(content, sourceUrl);
-                        const result = await generateSummaryText(prompt, modelChain);
+                        const result = await generateSummaryText(prompt, modelChain, undefined, undefined, params.model);
                         const { text: _text, error: _error, providerLabel: _providerLabel, ...state } = result;
                         modelCall = state;
                         if (result.text && result.providerLabel && result.chainUsed) {

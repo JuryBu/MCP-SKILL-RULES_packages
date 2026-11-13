@@ -28,11 +28,11 @@ export interface RawDomElement {
     occludedBy: Array<{ domPath: string; samples: number }>;
 }
 
-export function extractVisibleDomElements(args: { maxDepth: number; minElementSize: number }) {
+export function extractVisibleDomElements(args: { maxDepth: number; minElementSize: number; viewport?: { width: number; height: number } | null }) {
     const excludedTags = new Set(["script", "style", "noscript", "meta", "link", "title", "head", "template"]);
     const maxDepth = Math.max(1, args.maxDepth || 20);
-    const viewportWidth = window.innerWidth;
-    const viewportHeight = window.innerHeight;
+    const viewportWidth = args.viewport?.width ?? document.documentElement.clientWidth;
+    const viewportHeight = args.viewport?.height ?? document.documentElement.clientHeight;
     const width = Math.max(document.documentElement.scrollWidth, document.body?.scrollWidth ?? 0, viewportWidth);
     const height = Math.max(document.documentElement.scrollHeight, document.body?.scrollHeight ?? 0, viewportHeight);
     const inspectionLimitations = new Set<string>(["Text line rectangles are not glyph pixels; visual review is required for candidates."]);

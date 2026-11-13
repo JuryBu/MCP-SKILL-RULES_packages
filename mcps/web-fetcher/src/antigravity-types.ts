@@ -18,6 +18,7 @@ export interface AntigravityRequest {
   model?: string;
   imagePaths?: string[];
   schema?: Record<string, unknown>;
+  generationTimeoutMs?: number;
   deadline: number;
   signal?: AbortSignal;
   onSubmitted?: (model?: string) => void;
@@ -61,6 +62,7 @@ export interface AntigravityEndpoint {
 export interface AntigravityModel {
   id: string;
   label: string;
+  modelId?: string;
   disabled: boolean;
   supportsImages: boolean;
   family?: string;

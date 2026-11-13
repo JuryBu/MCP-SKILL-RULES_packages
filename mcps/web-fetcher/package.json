@@ -1,6 +1,6 @@
 {
   "name": "web-fetcher-mcp-server",
-  "version": "7.4.0",
+  "version": "7.4.1",
   "description": "MCP Server - 使用已登录浏览器 Cookie 抓取网页内容",
   "type": "module",
   "main": "dist/index.js",
@@ -27,8 +27,9 @@
     "test:verification:browser": "node --test tests/assisted-continuation-http.test.mjs",
     "test:navigation": "node --import tsx --test --test-concurrency=1 tests/navigation-read.test.mjs tests/navigation-read-lease.test.mjs tests/readiness-navigation-budget.test.mjs",
     "test:navigation:browser": "node --import tsx --test --test-concurrency=1 tests/navigation-read-browser.test.mjs tests/navigation-read-document-gap.test.mjs tests/redirect-interception-browser.test.mjs",
-    "test:models": "node --import tsx --test --test-concurrency=1 tests/antigravity-*.test.mjs",
-    "test": "npm run build && npm run test:images && npm run test:login && npm run test:resources && npm run test:verification && npm run test:navigation && npm run test:runtime-status && npm run test:models && node --test tests/inspection-runtime-assets.test.mjs"
+    "test:models": "node --import tsx --test --test-concurrency=1 tests/antigravity-*.test.mjs tests/codex-model-selection.test.mjs",
+    "test:antigravity-rework": "node --import tsx --test --test-concurrency=1 tests/inspect-rework.test.mjs tests/cli-lifecycle-rework.test.mjs tests/viewport-stealth-rework.test.mjs",
+    "test": "npm run build && npm run test:images && npm run test:login && npm run test:resources && npm run test:verification && npm run test:navigation && npm run test:runtime-status && npm run test:models && npm run test:antigravity-rework && node --test tests/inspection-runtime-assets.test.mjs"
   },
   "engines": {
     "node": ">=18"
