@@ -90,8 +90,10 @@ export function convertHistoryExchange(exchange: HistoryExchange, target: Histor
         targetProtocol: target.protocol, nativeRefs, callIds: response.toolCalls.map(call => call.callId),
         operation: sameProtocol ? 'native_replay' as const : 'target_protocol_view' as const };
     if (sameProtocol) return immutableJson({ response, results, provenance });
+    const plainChatReasoning = exchange.sourceProtocol === 'compatible_chat' || exchange.sourceProtocol === 'progrok';
     const opaqueReasoning = response.replayMessages.some(message => message.type === 'reasoning'
-        || message.reasoning_content !== undefined || message.reasoning !== undefined
+        || message.reasoning_content !== undefined && (!plainChatReasoning
+            || message.reasoning_content !== null && typeof message.reasoning_content !== 'string') || message.reasoning !== undefined
         || Array.isArray(message.content) && message.content.some(part => part && typeof part === 'object' && !Array.isArray(part)
             && ['thinking', 'redacted_thinking'].includes(String(part.type))));
     if (response.blocks.some(block => block.type !== 'text' || block.thought || typeof block.text !== 'string')

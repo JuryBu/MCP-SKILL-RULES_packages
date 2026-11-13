@@ -23,9 +23,31 @@ function history(response, protocol, { followup = true } = {}) {
     return { fixture, input, service: new ContextService() };
 }
 
-const chat = () => normalizeChatResponse('chat-attempt', { httpStatus: 200, headers: {}, body: '{}', json: {
+const chat = (reasoningContent) => normalizeChatResponse('chat-attempt', { httpStatus: 200, headers: {}, body: '{}', json: {
     model: 'chat-source', choices: [{ index: 0, finish_reason: 'tool_calls', message: { role: 'assistant', content: 'Observed source facts.',
+        ...(reasoningContent === undefined ? {} : { reasoning_content: reasoningContent }),
         tool_calls: [{ id: 'original-call', type: 'function', function: { name: 'read_file', arguments: '{"path":"source.txt"}' } }] } }] } });
+
+for (const reasoningContent of ['', 'Source model reasoning retained in its original response.', null]) {
+    test(`Chat plaintext reasoning metadata can transfer without changing its original value (${reasoningContent === null ? 'null' : reasoningContent.length})`, async () => {
+        const response = chat(reasoningContent);
+        const { fixture, input, service } = history(response, 'compatible_chat');
+        const original = hashContext([...fixture.port.contents]);
+        const result = await service.buildView(input);
+        const parts = result.view.contents.flatMap(message => message.parts);
+        assert.ok(parts.some(part => part.functionCall?.id === 'original-call'));
+        assert.ok(parts.some(part => part.functionResponse?.id === 'original-call'));
+        assert.equal(response.replayMessages[0].reasoning_content, reasoningContent);
+        assert.equal(hashContext([...fixture.port.contents]), original);
+        assert.equal(result.historyTransferProvenance[0].operation, 'target_protocol_view');
+        assert.doesNotThrow(() => input.adapter.encode(result.view, input.modelId, { maxOutputTokens: 512 }));
+    });
+}
+
+test('Chat opaque reasoning metadata remains rejected before transfer', async () => {
+    const { input, service } = history(chat({ native_state: 'opaque-provider-value' }), 'compatible_chat');
+    await assert.rejects(service.buildView(input), error => error.code === 'E_HISTORY_CONTENT_UNSUPPORTED');
+});
 
 test('ContextService converts a paired Chat history into Gemini and preserves original call IDs and source hashes', async () => {
     const { fixture, input, service } = history(chat(), 'compatible_chat');
