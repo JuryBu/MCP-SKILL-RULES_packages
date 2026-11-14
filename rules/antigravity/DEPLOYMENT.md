@@ -33,7 +33,7 @@ $GeminiRoot = Join-Path $env:USERPROFILE ".gemini"
 $BackupDir = Join-Path $GeminiRoot ("backups\rules\" + (Get-Date -Format "yyyyMMdd-HHmmss") + "-before-sync")
 New-Item -ItemType Directory -Force -Path $BackupDir | Out-Null
 
-# 1. 备份已有文件
+# 1. Back up any existing rule files before overwriting
 foreach ($rel in @(
     "GEMINI.md",
     "guidance\engineering-workflow.md",
@@ -50,7 +50,7 @@ foreach ($rel in @(
     }
 }
 
-# 2. 渲染用户目录占位符并安装模板（不会触碰本机已有的 personal-care.local.md）
+# 2. Render <USER> placeholders and install templates (leaves personal-care.local.md untouched)
 $ToolkitAntigravityRoot = Join-Path (Get-Location) "rules\antigravity"
 if (-not (Test-Path -LiteralPath $ToolkitAntigravityRoot) -and (Test-Path -LiteralPath ".\GEMINI.template.md")) {
     $ToolkitAntigravityRoot = (Get-Location).Path
@@ -82,11 +82,10 @@ foreach ($entry in $Map.GetEnumerator()) {
 
 ---
 
-## 三、接收方本地调整项与生效验证
+## 三、接收方本地调整项、双机角色防撞与生效验证
 
-1. **本地调整项**：
-   - 语气与角色风格（默认猫娘搭档口吻，可在本地 `GEMINI.md` 第一节改为中性工程风格）；
-   - 已安装的 MCP 服务列表（见 `templates/config.antigravity.example.json`；若未配置 `exa`，按规则自动降级 `search_web`）；
-   - 本机订阅实际可用的模型名称与思考档（模板默认主力 `Gemini 4 Carbon High`、先遣手脚 `Gemini 4 Hydrogen XHigh`）。
+1. **本地调整项与双机角色自知（`development` vs `training`）**：
+   - **双机角色标记（多机用户必配）**：若同时维护开发机（`development`）与训练机（`training`），安装后请在各自机器的 `%USERPROFILE%\.gemini\GEMINI.md` 第七节及仓库外的 `%USERPROFILE%\.gemini\guidance\personal-care.local.md` 中明确标出本机 `local_role`（使助手清楚自己是「开发机的反重力」还是「训练机的反重力」，并在 Git 提交时分别使用 `[Antigravity/dev]` 与 `[Antigravity/training]` 正交双标，不混用署名）。后续若训练机需增加条件式训练监督规则，建议独立存为 `guidance\training-machine.md` 按需读取，不覆盖跨机共享的 `GEMINI.template.md`。
+   - **语气与模型/MCP 列表**：可在本地 `GEMINI.md` 第一节调整语气风格，按实际订阅与 `templates/config.antigravity.example.json` 调整可用模型档位与 MCP 服务（未配 `exa` 时自动降级 `search_web`）。
 2. **生效验证**：
-   - 保存后在 Antigravity 2.0 新开一条对话（无需重启宿主），用一个纯只读小问题验证：让助手确认已注入 `GEMINI.md`（2.0 模块化版），说出单文件 `24,000 bytes` 预算线、`call_mcp_tool` `10 KiB` 落盘位置以及 `schedule` 双模式（单次短巡检 Timer 与 `*/20` 持续工程防断 Cron）的区别。
+   - 保存后在 Antigravity 2.0 新开一条对话（无需重启宿主），用一个纯只读小问题验证：让助手确认已注入 `GEMINI.md`（2.0 模块化版），复述本机机器角色（若已配置 `development` / `training`）及对应 Git 双标格式、单文件 `24,000 bytes` 预算线、`call_mcp_tool` `10 KiB` 落盘位置与 `schedule` 双模式的区别。
