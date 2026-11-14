@@ -9,7 +9,10 @@ This folder contains privacy-scrubbed Rules templates for each host:
 - `codex/guidance/*.template.md` → six shared, trigger-read topics in every profile, plus the selected development/training role manual; the model observer topic applies only to an installed and explicitly enabled observer, and the old Sandbox path is a migration pointer.
 - `codex/local-overrides.example.md` → placeholder schema; copy it outside the repository before adding private values.
 - `codex/system-prompt.template.md` → common Codex baseline paired with the profile AGENTS.
-- `antigravity/GEMINI.template.md` → merge into the receiver's Antigravity rules file.
+- `antigravity/GEMINI.template.md` → Antigravity 2.0 core global rule (`< 24,000 bytes`, installed to `%USERPROFILE%/.gemini/GEMINI.md`).
+- `antigravity/guidance/*.template.md` → four event-triggered Antigravity 2.0 topics (`engineering-workflow`, `design-writing`, `web-visual`, `maintenance-upgrades`) installed under `%USERPROFILE%/.gemini/guidance/`.
+- `antigravity/skills/tools-reference/SKILL.template.md` → on-demand Antigravity 2.0 tool & runtime reference skill (`< 24,000 bytes`, installed to `%USERPROFILE%/.gemini/antigravity/skills/tools-reference/SKILL.md`).
+- `antigravity/local-care.example.md` & `antigravity/DEPLOYMENT.md` → repository-external private overlay placeholder and Antigravity 2.0 deployment/budget guide.
 - `claude-code/CLAUDE.template.md` → merge into the receiver's Claude Code rules file.
 - `dsh/60-context-memory.template.md` → merge the minimal Memory Store fragment into the existing `~/.dsh/rules/60-context-memory.md` section; preserve host context/Record/thread rules and verify actual request loading separately.
 - `windsurf/global_rules.template.md` → short per-conversation Windsurf rules.

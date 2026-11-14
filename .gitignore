@@ -58,6 +58,7 @@ cookies-backup.json
 localstorage-backup.json
 rules/codex/local-overrides.md
 rules/codex/*.local.md
+rules/antigravity/*.local.md
 *.pem
 *.key
 *.p12

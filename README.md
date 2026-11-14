@@ -87,7 +87,7 @@ Rules 保留少汇报腔、解释技术概念、Plan / Task / Stage Guard、子�
 | 宿主 | Rules 入口 |
 | --- | --- |
 | Codex | `rules/codex/profiles/` 中的中性、普通猫娘、开发机猫娘、训练机猫娘四种组合 |
-| Antigravity | `rules/antigravity/GEMINI.template.md` |
+| Antigravity 2.0 | `rules/antigravity/GEMINI.template.md`、四个 `guidance` 按需专题、`tools-reference` 手册与 `DEPLOYMENT.md` |
 | Claude Code | `rules/claude-code/CLAUDE.template.md` |
 | Windsurf | `rules/windsurf/global_rules.template.md` 与五个 `system_rules` 分片 |
 
@@ -202,7 +202,7 @@ The project started as an Antigravity toolset and now supports Codex, Antigravit
 - Persistent browser profiles store receiver-side cookies and localStorage and must never be repackaged. Sandbox adds timeouts, memory limits, and task governance but is not an OS-level VM or AppContainer; commands retain the receiver user's file and environment access.
 - Sandbox provides short execution, parallel batches, persistent sessions, background launches, smart code search, and Council reviews across Grok, Antigravity, Codex, and explicit Claude Code routes. Council 1.15.1 adds manifest-governed artifacts, abort/resume hardening, guarded garbage collection, and a cross-worker `agy` lease pool while keeping runtime data outside the source tree.
 - The broker forwards long-task timeouts, writes shutdown state reliably, and includes optional Exa, Windsurf subagent, and NapCat endpoints. NapCat remains disabled until the receiver supplies a local OneBot service and private binding.
-- Rules templates focus on natural human communication, evidence-based engineering work, privacy, and visual QA. Codex Rules are composed from a shared engineering core plus optional catgirl, development-machine, or training-machine overlays; Windsurf uses a short global rule plus five system-rule fragments.
+- Rules templates focus on natural human communication, evidence-based engineering work, privacy, and visual QA. Codex Rules are composed from a shared engineering core plus optional catgirl, development-machine, or training-machine overlays; Antigravity 2.0 uses a `<24 KB` core `GEMINI.template.md` plus four trigger-read `guidance` topics and the `tools-reference` skill; Windsurf uses a short global rule plus five system-rule fragments.
 - Seventeen license-reviewed portable skills are included and validated during package checks, including the new `hatch-pet` workflow.
 
 ## Installation

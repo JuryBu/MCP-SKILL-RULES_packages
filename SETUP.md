@@ -161,10 +161,13 @@ The system prompt is shared by all four profiles and contains only universal exe
 
 ## 6. Configure Antigravity
 
-Rules:
+Rules and on-demand modules (see `rules/antigravity/DEPLOYMENT.md` for the 24 KB per-file budget and PowerShell installer snippet):
 
 ```text
-rules/antigravity/GEMINI.template.md -> receiver Antigravity GEMINI.md
+rules/antigravity/GEMINI.template.md                         -> %USERPROFILE%/.gemini/GEMINI.md
+rules/antigravity/guidance/*.template.md                     -> %USERPROFILE%/.gemini/guidance/*.md
+rules/antigravity/skills/tools-reference/SKILL.template.md   -> %USERPROFILE%/.gemini/antigravity/skills/tools-reference/SKILL.md
+rules/antigravity/local-care.example.md                      -> copy outside repo if private overlay is desired
 ```
 
 MCP example:

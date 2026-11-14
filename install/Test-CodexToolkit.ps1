@@ -69,7 +69,7 @@ function Test-ForbiddenRuntimeFiles {
         "auth.json", ".cockpit_codex_auth.json", "cookies-backup.json", "localstorage-backup.json",
         "credentials.json", ".credentials.json", "token.json", "tokens.json", "broker-private.env.json",
         ".env", ".env.local", ".env.production", ".env.development", "cookies", "cookie",
-        "web data", "login data", "local state", "binding.json", "heartbeat.json", "local-overrides.md",
+        "web data", "login data", "local state", "binding.json", "heartbeat.json", "local-overrides.md", "personal-care.local.md",
         "heartbeat-runtime.json", "heartbeat.stop", "qrcode.png", ".codex-empty-input",
         "broker-state.json", "broker.pid", "dedupe.json", "dedupe-state.json", "task-registry.json",
         "router-runtime.json", "task-router-runtime.json", "supervisor-runtime.json", "napcat-runtime.json"
@@ -86,7 +86,8 @@ function Test-ForbiddenRuntimeFiles {
                 $lowerName -match '(^|[-_.])(state|runtime)\.json$' -or
                 $_.Name -match '\.(sqlite|sqlite3|db)(-wal|-shm)?$' -or
                 $_.Name -match '\.(jsonl|har|vscdb|pb|pem|key|p12|pfx|log|bak|zip|7z|exe|dll)$' -or
-                $_.Name -like "*.before-*"
+                $_.Name -like "*.before-*" -or
+                $lowerName -like "*.local.md"
             )
         }
     if ($badFiles) {
@@ -186,6 +187,13 @@ function Test-PackageStructure {
         "rules\codex\local-overrides.example.md",
         "rules\codex\system-prompt.template.md",
         "rules\antigravity\GEMINI.template.md",
+        "rules\antigravity\DEPLOYMENT.md",
+        "rules\antigravity\local-care.example.md",
+        "rules\antigravity\guidance\engineering-workflow.template.md",
+        "rules\antigravity\guidance\design-writing.template.md",
+        "rules\antigravity\guidance\web-visual.template.md",
+        "rules\antigravity\guidance\maintenance-upgrades.template.md",
+        "rules\antigravity\skills\tools-reference\SKILL.template.md",
         "rules\claude-code\CLAUDE.template.md",
         "rules\windsurf\global_rules.template.md",
         "rules\windsurf\system_rules\tools.template.md",
