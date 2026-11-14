@@ -3,7 +3,7 @@ name: tools-reference
 description: >-
   全局规则的按需技术手册（与 GEMINI.md 同等效力）：涵盖 Antigravity 2.0 Lazy MCP 调用规范、
   宿主 call_mcp_tool 10KiB 自动落盘读取、PowerShell 5.1 与 Python 3.9 编码避坑、invoke_subagent / swarm / image-generator / agentapi / schedule 防断与 256k 压缩机制、
-  exa 与 web-fetcher 7.4.1 网页/截图/Office 原生查看、sandbox 1.20.7 内存水位与现代模型路由、
+  exa 与 web-fetcher 7.4.1 网页/截图/Office 原生查看、sandbox 1.20.7 内存水位/3m0s上限与 sandbox_launch 路由、
   memory-store 五端跨链路路由与 2.0 会话原文读取、后台短轮询及 24KB/20k 规则预算校验。
 ---
 
@@ -18,11 +18,9 @@ description: >-
 - **共享网关拓扑**：`exa`（可选）、`memory-store`、`sandbox`、`sequential-thinking`、`web-fetcher` 统一经本机常驻网关 `http://127.0.0.1:14588/<endpoint>/mcp` 接入（配置位于 `C:/Users/<USER>/.gemini/config/mcp_config.json`，参考仓库 `templates/config.antigravity.example.json`）。需要做复杂架构权衡、多假设根因推演且普通思维链易漏分支时，可按需调用 `sequential-thinking`。
 - **Lazy Loading 调用铁律**：MCP 工具默认懒加载。首次使用某工具或传入非默认参数前，必须先用 `read_file` 查看 `C:/Users/<USER>/.gemini/antigravity/mcp/<serverName>/<toolName>.json` 确认真实字段与枚举，再用 `call_mcp_tool` 调用，严禁凭记忆猜参数名。
 - **⚠️ 宿主 `call_mcp_tool` `10 KiB` 自动转存机制（必知，非 MCP 截断故障！）**：
-  - 共享 MCP 后端支持大字符返回，但 **Antigravity 2.0 宿主对 `call_mcp_tool`（及 `read_board` 等部分内置工具）硬编码了 `10 KiB`（`10,240 bytes`）内联阈值**：只要单次返回超过 `10,240 bytes`，宿主会自动将完整无损的原始返回保存在 `C:/Users/<USER>/.gemini/antigravity/brain/<当前会话ID>/.system_generated/steps/<步号>/output.txt`，并在上下文中仅返回一行路径提示（或头尾预览）。
-  - **省往返双层策略（治本优先）**：
-    1. **源头控流 `< 9 KB`（免二次读取 Turn）**：写 `sandbox_exec` 脚本时严禁无脑全量打印大文件或深层目录，直接在脚本内完成筛选、行号定位与统计摘要（如需留存完整明细备查则写入会话 `scratch/*.json`，`stdout` 只打印 `< 8 KB` 关键结论）；调用 `memory_query` 用 `depth="summary"`、`web_fetch_page` 用 `outputMode="summary"|"compact"`，一步内联拿完结果，零额外往返。
-    2. **落盘后单轮 `45 KiB` 并行吞完（禁串行翻页）**：若确需读取大原文触发了 `saved to: file:///.../steps/<n>/output.txt`（或 Sandbox `output-artifacts`），**严禁误判截断重跑，也严禁 `200` 行一页串行翻好几轮**——内置 `read_file` 单次上限达 `46,080 bytes`（`45 KiB`，是 `10 KiB` 的 4.5 倍），`<= 45 KiB` 直接 1 次读全；更大文件在同一轮用多个 `read_file(ByteOffset=0 / 46080 / 92160)` 并行一次拉齐，或多文件直接委派子代理在独立上下文消化后只回传带行号精要。
-- **显式身份与后台短轮询**：网关由多端共享，无隐式「当前对话」。对话工具必传显式稳定 `conversationId`；持久资源（`sandbox_session`、`sandbox_launch`、`web_interact` 会话、`sandbox_council` 等）必传显式 `ownerId`。耗时任务一律用 `background=true` 启动，持**同一公开 `taskId`** 以 `waitSeconds=30～45` 短轮询（严禁 `>60s`）；统一查询/取消入口为 `memory-store` 的 `background_task_status` / `background_task_cancel`，状态未知先查原任务，禁盲目重发。
+  - **Antigravity 2.0 宿主对 `call_mcp_tool`（及 `read_board` 等）硬编码了 `10 KiB`（`10,240 B`）内联阈值**：超出时完整无损落盘至 `C:/Users/<USER>/.gemini/antigravity/brain/<当前会话ID>/.system_generated/steps/<步号>/output.txt` 并返回路径/预览。
+  - **省往返双层策略**：① **源头控流 `< 9 KB`**：脚本内先做筛选统计（完整明细存 `scratch/*.json`，`stdout < 8 KB`），查询用 `depth="summary"` / `outputMode="summary"|"compact"` 一步内联拿完；② **落盘后单轮 `45 KiB` 吞完**：内置 `read_file` 单次达 `46,080 B`（`45 KiB`），`<= 45 KiB` 1 次读全，更大文件同轮按 `ByteOffset=0 / 46080 / 92160` 并行拉齐或交子代理过滤，**严禁误判截断重跑或小步串行翻页**。
+- **显式身份与后台短轮询**：网关由多端共享，无隐式「当前对话」。对话工具必传显式稳定 `conversationId`；持久资源（`sandbox_session`、`sandbox_launch`、`web_interact` 会话、`sandbox_council` 等）**创建、查询、终止、清理全程必带同一显式 `ownerId`**。支持 `background=true` 的耗时工具持**同一公开 `taskId`** 以 `waitSeconds=30～45` 短轮询（严禁 `>= 60s`，通用查询/取消走 `memory-store` 的 `background_task_status` / `background_task_cancel`）；**本地长命令（`sandbox_exec` 无 `background`）改走 `sandbox_launch` 并用其自有 `action="status"|"kill"|"clean"` 管理**，状态未知先查原任务，禁盲目重发。
 - **Windows PowerShell 5.1 与 Python 3.9 兼容避坑**：
   1. **防吞引号与管道中文乱码**：`sandbox_exec` 与 `run_command` 底层均为 Windows PowerShell 5.1，禁止在单行 `python -c` / `node -e` 内多层嵌套引号或裸写 `$`。通过管道向 `python -` 传含中文的内联脚本时，PowerShell 5.1 默认 `$OutputEncoding` 为 GBK/ASCII 会把中文转坏导致 `SyntaxError: Non-UTF-8 code`——**必须在管道前加 `$OutputEncoding = [System.Text.UTF8Encoding]::new($false)`**，或直接给 `sandbox_exec` 传 `language="python", code="..."`，或在会话 `scratch/` 目录写带 `# -*- coding: utf-8 -*-` 的 `.py` 脚本执行。
   2. **Python 3.9 GBK `.pth` 启动崩溃陷阱**：若环境 `site-packages` 含 GBK 编码 `.pth` 文件，传 `-X utf8` 或设 `PYTHONUTF8=1` 会触发 `init_import_site: UnicodeDecodeError`！纯标准库脚本加 **`-S`**（`python -S`），需第三方库时保持 `PYTHONUTF8=0` 并在首行写 `sys.stdout.reconfigure(encoding='utf-8')`，所有 `open()` 显式传 `encoding='utf-8'`。
@@ -54,9 +52,9 @@ description: >-
 - **`language_server.exe` 自动压缩（`context_summary`）底层机制与防超时参数**：
   - 现役 `oneharness` 在 `hooks.checkpointNeeded` 比较 `CheckpointConfig.MaxTokenLimit = 256,000`（扣减 `systemPrompt + tools` 占位后超出即触发，压后回落至 `~30k`）；`NewContextSummaryHook` **直接读取当前对话主模型（`PlannerConfig.Model`，如 `Carbon High`）**发起摘要请求，且流超时在二进制 `.data` 段硬编码只读 `300000000000 ns`（**`5m0s`，无任何环境变量或 flag 可调**）。
   - 上下文越过 `~235k` 时极易触发 `cache_read_tokens=0` 冷 Prefill，若同窗叠加大批 `Carbon High` 子代理重流抢占通道，TTFT 易突破 `5m0s` 报错。持续工程须自查本对话 `transcript.jsonl` 末条 `PLANNER_RESPONSE` 的 `input_tokens + cache_read_tokens`：`180k～210k` 阶段间隙写齐近况后提醒输入 `/compact`（走 `SlashCommandScopeItem` 拼接 `ON-DEMAND COMPACTION`，支持附带保留指令，趁热缓存秒压），且 `>= 200k` 禁同窗新发大批 `Carbon High` 重流。
-- **web-fetcher 7.4.1+ 模型摘要与视觉审查**：本段用于 `web-fetcher`；上方模型要求继续用于原生 `invoke_subagent` 与 `swarm`。
-  - **参数与入口**：`web_fetch_page(outputMode="ai_summary")`、`web_fetch_rich(compact="ai_summary")`、`web_inspect(mode="ai_review"|"all")` 均支持可选 `model` 和 `modelChain`；指定型号时优先传完整 slug 与明确链路。`auto` 保持 `Antigravity -> Codex` 顺序，配置 `WEB_FETCHER_CLAUDE_CODE_AUTO_FALLBACK=1` 才追加 Claude Code。纯文字优先在线 App LS，离线后按能力使用自有 `cli-ls`／`cli-agent`；原生图片走 `cli-agent`。
-  - **默认模型与期限**：现代目录材料任务采用 `Hydrogen XHigh -> Hydrogen High -> Carbon High`，视觉采用 `Carbon High`；旧 LS 保留原映射。page 摘要及 inspect 的 `ai_review`／`all` 长任务使用 `background=true`，沿原 `taskId` 每 30～45 秒查询；`all` 在结构处理前返回任务号并保留结构、检测、审查结果。核对 `_meta.modelCall` 或逐页 `modelCalls` 与 `cleanup`；认证、准入、额度、取消与结果未知时停止，已提交后超时先查原任务。
+- **web-fetcher 7.4.1+ 模型摘要与视觉审查**（仅限 `web-fetcher`，原生 `invoke_subagent`/`swarm` 仍守上方红线）：
+  - **入口与模型**：`web_fetch_page(outputMode="ai_summary")`、`web_fetch_rich(compact="ai_summary")`、`web_inspect(mode="ai_review"|"all")` 支持可选 `model`（优先完整 slug，请求/环境型号固定单候选，别名/Mxx 按当前目录）与 `modelChain`。`auto` 为 `Antigravity -> Codex`（配 `WEB_FETCHER_CLAUDE_CODE_AUTO_FALLBACK=1` 才加 Claude Code）；纯文字优先在线 App LS，离线按能力走自有 `cli-ls`／`cli-agent`，原生图片走 `cli-agent`（旧 LS 保原协议映射）。现代目录材料用 `Hydrogen XHigh -> Hydrogen High -> Carbon High`，视觉用 `Carbon High`；Codex 按请求/环境、新鲜本机目录、CLI 默认取型号写入 `modelUsed`／`modelSource`（撤旧固定 `gpt-5.5`，明确 `model_not_found`/HTTP 400 `invalid_request_error` 归已知拒绝）。
+  - **后台与后备**：page 摘要与 inspect `ai_review`／`all` 长任务传 `background=true` 沿原 `taskId` 每 30～45s 查询（`all` 先返任务号并保留结构/检测/审查；Antigravity 多页内部串行、单页期限获共享 CLI 位后起算、父期限含排队，撤旧 `batchSize=1` 绕行；`rich` 仍同步，长页拆为 page 后台摘要 + 独立截图）。核对 `_meta.modelCall` 或逐页 `modelCalls` 与 `cleanup`；认证、准入、额度、取消与结果未知时停止，已提交超时/断连先查原任务；仅完整无部分输出的明确 `No capacity available`、`safeToFallback=true` 且清理确认后按原总期限有限续选（`agent -> LS` 兼容另需明确未提交或不支持、允许后备且清理确认）。
 
 ## 三、网页检索、视觉核验、Office 原生预览与前端缓存避坑
 
@@ -64,17 +62,21 @@ description: >-
 - **Office 与本地文件 `file://` 原生查看（禁转 PDF、禁并发）**：Word / PPT / Excel / PDF / SVG / HTML 直接用 `web-fetcher` 走 `file://` 截图（`web_fetch_screenshot`）与检查（`web_inspect`）；**严禁并发调 LibreOffice 截图**（防争抢配置报 `EPERM`，首次冷启动约 `45s`）。图片任意单边须 `<= 8000px`，分片长图逐张用 `read_file` 看全。
 - **前端本地调试三项避坑**：① 本地 HTML/JS 修改落盘后，复用旧 `web_interact` 会话传 URL 可能仍读旧缓存，**须先 `close` 旧会话再新开**；② 无头浏览器 `window.innerHeight` 与全屏容器 `clientHeight` 可能不同，全屏画布优先绑定容器 `clientHeight` + `ResizeObserver`；③ 末轮改码后必须重截所有受影响视角，禁混用旧截图。接收方自配的持久登录态用前先访问目标页实测，收尾只关本任务 `ownerId` 自建会话，禁删共享 Cookie/profile。
 
-## 四、MCP sandbox（v1.20.7+）：内存调度、四类超时与多模型通道
+## 四、MCP sandbox（v1.20.7+）：内存调度、宿主 `3m0s` 分界与 `sandbox_launch`
 
 | 状态码 / 错误类型 | 真实含义 | 强制处置规范 |
 |---|---|---|
 | `admission_timeout` | 命令**尚未启动**，内存/并发接纳排队超时 | 查 `admissionDecision.blockedBy`，按 `retryAfterMs` 最多重试 1 次；仍受阻则拆小、改后台或报告，**严禁绕到原生 `run_command` 跑同一重命令** |
-| `execution_timeout` | 命令**已启动**，运行超出执行期限 | 先检查已产生的副作用、输出 artifact 与进程树清理，再决定续跑或缩小范围 |
+| `execution_timeout` | 命令**已启动**，超出单次执行期限 | 先核查副作用、输出 artifact 与进程树清理，再调高毫秒 `timeout`、拆小或改走 `sandbox_launch` |
 | `caller_deadline_exceeded` | 排队 + 运行超出调用方期限 | 按 `mayHaveStarted` 核实是否已执行，禁止把未知状态当未执行盲目重发 |
 | `broker_backend_timeout` | 网关与后端通信超时 | 先查原持久任务或产物状态，禁止盲目重发 |
+| 宿主 `timed out after 3m0s` | 反重力 `call_mcp_tool` 默认 **`180s`** 同步 RPC 硬上限 | 传 `timeout=0` 或网关放宽至 `1800s` 仍会被宿主掐断；先查进程与产物确认无残留（禁盲重发），改走 **`sandbox_launch`** |
 | `commandStarted=false` 类错误 | 目录缺失、参数越界等启动前拒绝 | 属调用侧参数问题（Sandbox 本身正常），修正路径或参数，禁止绕过 Sandbox |
 
-- **`sandbox_exec` 执行与内存上限（v1.20.7+）**：按实时物理/提交水位接纳（显式 `24MB` 按 `24MB` 记账，黄区允许 `<= 192MB` 安全小请求）。`code` 与 `command` 二选一互斥，必传稳定 `ownerId`；`language="node"` 运行在 ESM 环境（用 `import` 禁 `require`，顶层 `await` 正常收尾）；默认进程树硬上限 `maxMemoryMB=256`，若脚本内需拉起 `agy`、无头浏览器或编译等重子进程，须显式传 `maxMemoryMB=1024`（或按需调高）。超长耗时脱离任务用 `sandbox_launch`。
+- **`sandbox_exec` vs `sandbox_launch` 分界与内存上限（v1.20.7+）**：
+  1. **同步天花板与工具分工**：`sandbox_exec` **无 `background` 参数**，默认 `timeout=30000`（`30s`），外层受宿主 `call_mcp_tool` **`180s`（`3m0s`）** 同步上限封顶（网关默认 `120s`、带参最高 `1800s`）。`30s～90s` 的中短探针显式传毫秒 `timeout`（建议 `<= 120000`），**严禁传 `timeout=0` 或 `>= 180000` 硬扛**；凡预估 **`> 90～120s` 或时长不确定**的模型训练、多折回测、大包 `uv pip install`、全量拉数，一律直接用 **`sandbox_launch`**（仅传 `command`，脱离进程、日志落盘、无运行超时；交互式变量复用才用 `sandbox_session`，单步默认 `15s`）。
+  2. **`sandbox_launch` 轮询契约**：启动、`action="status"`、`action="kill"`、`action="clean"` **全程必带同一显式 `ownerId`**（勿照抄 Schema 省略 `ownerId` 的示例，否则跨调用被拒）；`status` 轮询 `waitSeconds` 严守 **`30～45`**（**严禁 `>= 60s` / 禁填 Schema 允许的 `60～300`**，填 `>= 180` 同样撞爆宿主 `3m0s`）。
+  3. **内存水位与数值库线程防爆**：按实时物理/提交水位接纳（显式 `24MB` 按 `24MB` 记账，黄区允许 `<= 192MB` 安全小请求）；`sandbox_exec` 的 `code` 与 `command` 互斥、`language="node"` 为 ESM（用 `import` 禁 `require`，顶层 `await` 正常收尾）；默认进程树硬上限 `maxMemoryMB=256`，拉起 `agy`、浏览器、编译或科学计算须显式调高（如 `1024～4096`），且在 Windows Job Object 下跑 `numpy/scipy/sklearn/torch` 时设 `OPENBLAS_NUM_THREADS=1`（及 `OMP_NUM_THREADS=1`）防虚拟地址提交暴涨误触 `💀 memory`。
 - **`smart_search` 三模式（严禁使用内置 `grep_search`）**：**必传 `searchPath`**；`exact`（ripgrep 精确字面量/正则，`<0.5s` 首选）｜`fuzzy`（tree-sitter AST 符号模糊定位，`<2s`）｜`smart`（语义搜索，`45～90s`，走 `background=true` + 可传 `modelChain="auto"` / `"grok"` / `"antigravity"` / `"codex"`；`v1.20.7` 下 `antigravity` 链支持紧凑单文件 `direct` 单步语义解析；`smart` 默认申请 `512 MB` 内存预留，整机可用内存近 `1.5 GB` 黄区时勿与大内存 `sandbox_exec` 同拍挤占；多词用 `queries` 数组并行）。
 - **`sandbox_codex`、`sandbox_council`、`sandbox_agent` 与现代模型目录（v1.20.7+）**：`sandbox_codex` 用于重型纯代码 Review / 跨文件核查（`background=true` + `action="check"` + `waitSeconds=45`，**仅主代理可调，子代理严禁调用**）；`sandbox_council` 只讨论找盲点不执行，托管产物遵循 `SANDBOX_DATA_ROOT`（清理前必先 `gcMode="dryRun"`），支持 `codex`、`grok`、`geminiCli`、`antigravityCli`（统一复用 `%LOCALAPPDATA%\agy\bin\agy.exe` 探测，复杂文件与大输入自动落临时索引，可用 `SANDBOX_COUNCIL_GEMINI_CLI_*` / `SANDBOX_COUNCIL_LARGE_INPUT_*` 调整）。反重力现代自动链为 **`Hydrogen XHigh -> Hydrogen High -> Carbon High`**，支持完整 ID 或简写（`"hydrogen-xhigh"`、`"hydrogen"`、`"carbon"`，`"pro"`/`"strong"` 优先命中 `Carbon High`）。用户明确指定外部 API 模型时使用 `sandbox_agent`（必传 `callerHost="antigravity"` 与 `callerConversationId`）或 `sandbox_grok`，未知受理先查原命令回执与预算，禁止自动重发。
 
