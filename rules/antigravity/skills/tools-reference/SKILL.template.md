@@ -4,7 +4,7 @@ description: >-
   全局规则的按需技术手册（与 GEMINI.md 同等效力）：涵盖 Antigravity 2.0 Lazy MCP 调用规范、
   宿主 call_mcp_tool 10KiB 自动落盘读取、PowerShell 5.1 与 Python 3.9 编码避坑、invoke_subagent / swarm / image-generator / agentapi / schedule 防断与 256k 压缩机制、
   exa 与 web-fetcher 7.4.1 网页/截图/Office 原生查看、sandbox 1.20.7 内存水位/3m0s上限与 sandbox_launch 路由、
-  memory-store 五端跨链路路由与 2.0 会话原文读取、后台短轮询及 24KB/20k 规则预算校验。
+  memory-store 五端原文读取、communication-core 门面拓扑及 24KB/20k 规则预算校验。
 ---
 
 # 全局工具与环境按需手册（Antigravity 2.0）
@@ -15,14 +15,14 @@ description: >-
 
 ## 一、Antigravity 2.0 Lazy MCP 机制、宿主 `10 KiB` 落盘与本机脚本避坑
 
-- **共享网关拓扑**：`exa`（可选）、`memory-store`、`sandbox`、`sequential-thinking`、`web-fetcher` 统一经本机常驻网关 `http://127.0.0.1:14588/<endpoint>/mcp` 接入（配置位于 `C:/Users/<USER>/.gemini/config/mcp_config.json`，参考仓库 `templates/config.antigravity.example.json`）。需要做复杂架构权衡、多假设根因推演且普通思维链易漏分支时，可按需调用 `sequential-thinking`。
+- **共享网关与可选门面拓扑**：`exa`（可选）、`memory-store`、`sandbox`、`sequential-thinking`、`web-fetcher` 经本机常驻 HTTP 网关 `http://127.0.0.1:14588/<endpoint>/mcp` 接入；若已启用 `communication-core`，经本地 Node stdio 门面（`broker-stdio.mjs` + `COMMUNICATION_CORE_FACADE_REGISTRY` 私有登记）接入（配于 `C:/Users/<USER>/.gemini/config/mcp_config.json`，六工具契约与外部渠道回信规范必读 `guidance/communication-bridges.md`）。复杂多假设权衡可调 `sequential-thinking`。
 - **Lazy Loading 调用铁律**：MCP 工具默认懒加载。首次使用某工具或传入非默认参数前，必须先用 `read_file` 查看 `C:/Users/<USER>/.gemini/antigravity/mcp/<serverName>/<toolName>.json` 确认真实字段与枚举，再用 `call_mcp_tool` 调用，严禁凭记忆猜参数名。
 - **⚠️ 宿主 `call_mcp_tool` `10 KiB` 自动转存机制（必知，非 MCP 截断故障！）**：
   - **Antigravity 2.0 宿主对 `call_mcp_tool`（及 `read_board` 等）硬编码了 `10 KiB`（`10,240 B`）内联阈值**：超出时完整无损落盘至 `C:/Users/<USER>/.gemini/antigravity/brain/<当前会话ID>/.system_generated/steps/<步号>/output.txt` 并返回路径/预览。
   - **省往返双层策略**：① **源头控流 `< 9 KB`**：脚本内先做筛选统计（完整明细存 `scratch/*.json`，`stdout < 8 KB`），查询用 `depth="summary"` / `outputMode="summary"|"compact"` 一步内联拿完；② **落盘后单轮 `45 KiB` 吞完**：内置 `read_file` 单次达 `46,080 B`（`45 KiB`），`<= 45 KiB` 1 次读全，更大文件同轮按 `ByteOffset=0 / 46080 / 92160` 并行拉齐或交子代理过滤，**严禁误判截断重跑或小步串行翻页**。
 - **显式身份与后台短轮询**：网关由多端共享，无隐式「当前对话」。对话工具必传显式稳定 `conversationId`；持久资源（`sandbox_session`、`sandbox_launch`、`web_interact` 会话、`sandbox_council` 等）**创建、查询、终止、清理全程必带同一显式 `ownerId`**。支持 `background=true` 的耗时工具持**同一公开 `taskId`** 以 `waitSeconds=30～45` 短轮询（严禁 `>= 60s`，通用查询/取消走 `memory-store` 的 `background_task_status` / `background_task_cancel`）；**本地长命令（`sandbox_exec` 无 `background`）改走 `sandbox_launch` 并用其自有 `action="status"|"kill"|"clean"` 管理**，状态未知先查原任务，禁盲目重发。
 - **Windows PowerShell 5.1 与 Python 3.9 兼容避坑**：
-  1. **防吞引号与管道中文乱码**：`sandbox_exec` 与 `run_command` 底层均为 Windows PowerShell 5.1，禁止在单行 `python -c` / `node -e` 内多层嵌套引号或裸写 `$`。通过管道向 `python -` 传含中文的内联脚本时，PowerShell 5.1 默认 `$OutputEncoding` 为 GBK/ASCII 会把中文转坏导致 `SyntaxError: Non-UTF-8 code`——**必须在管道前加 `$OutputEncoding = [System.Text.UTF8Encoding]::new($false)`**，或直接给 `sandbox_exec` 传 `language="python", code="..."`，或在会话 `scratch/` 目录写带 `# -*- coding: utf-8 -*-` 的 `.py` 脚本执行。
+  1. **防吞引号与管道中文乱码**：`sandbox_exec` 与 `run_command` 底层均为 Windows PowerShell 5.1，禁止在单行 `python -c` / `node -e` 内多层嵌套引号或裸写 `$`。通过管道向 `python -` 传含中文的内联脚本时，PowerShell 5.1 默认 `$OutputEncoding` 为 GBK/ASCII 会把中文转坏导致 `SyntaxError: Non-UTF-8 code`——**管道前必加 `$OutputEncoding = [System.Text.UTF8Encoding]::new($false)`**，或直接传 `language="python", code="..."`，或写会话 `scratch/*.py` 脚本执行。
   2. **Python 3.9 GBK `.pth` 启动崩溃陷阱**：若环境 `site-packages` 含 GBK 编码 `.pth` 文件，传 `-X utf8` 或设 `PYTHONUTF8=1` 会触发 `init_import_site: UnicodeDecodeError`！纯标准库脚本加 **`-S`**（`python -S`），需第三方库时保持 `PYTHONUTF8=0` 并在首行写 `sys.stdout.reconfigure(encoding='utf-8')`，所有 `open()` 显式传 `encoding='utf-8'`。
   3. **Python 3.9 `f-string` 语法限制**：`{...}` 表达式内部禁止出现反斜杠 `\`（如 `.strip('\"')` 会报 `SyntaxError`），先把引号抽成独立变量 `q = '"'` 再 `.strip(q)`。
   4. **工作区保留设备名与递归陷阱**：Windows 下遍历大工作区目录若遇历史遗留的 `nul`/`con` 特殊文件名，Python `ntpath.relpath` 会报 `path is on mount '\\.\nul'`，PowerShell `Get-ChildItem -Depth` 也可能慢扫超时；遍历脚本中务必跳过 `nul`/`con` 并用 Python `os.scandir` 显式控深。
@@ -77,7 +77,7 @@ description: >-
   1. **同步天花板与工具分工**：`sandbox_exec` **无 `background` 参数**，默认 `timeout=30000`（`30s`），外层受宿主 `call_mcp_tool` **`180s`（`3m0s`）** 同步上限封顶（网关默认 `120s`、带参最高 `1800s`）。`30s～90s` 的中短探针显式传毫秒 `timeout`（建议 `<= 120000`），**严禁传 `timeout=0` 或 `>= 180000` 硬扛**；凡预估 **`> 90～120s` 或时长不确定**的模型训练、多折回测、大包 `uv pip install`、全量拉数，一律直接用 **`sandbox_launch`**（仅传 `command`，脱离进程、日志落盘、无运行超时；交互式变量复用才用 `sandbox_session`，单步默认 `15s`）。
   2. **`sandbox_launch` 轮询契约**：启动、`action="status"`、`action="kill"`、`action="clean"` **全程必带同一显式 `ownerId`**（勿照抄 Schema 省略 `ownerId` 的示例，否则跨调用被拒）；`status` 轮询 `waitSeconds` 严守 **`30～45`**（**严禁 `>= 60s` / 禁填 Schema 允许的 `60～300`**，填 `>= 180` 同样撞爆宿主 `3m0s`）。
   3. **内存水位与数值库线程防爆**：按实时物理/提交水位接纳（显式 `24MB` 按 `24MB` 记账，黄区允许 `<= 192MB` 安全小请求）；`sandbox_exec` 的 `code` 与 `command` 互斥、`language="node"` 为 ESM（用 `import` 禁 `require`，顶层 `await` 正常收尾）；默认进程树硬上限 `maxMemoryMB=256`，拉起 `agy`、浏览器、编译或科学计算须显式调高（如 `1024～4096`），且在 Windows Job Object 下跑 `numpy/scipy/sklearn/torch` 时设 `OPENBLAS_NUM_THREADS=1`（及 `OMP_NUM_THREADS=1`）防虚拟地址提交暴涨误触 `💀 memory`。
-- **`smart_search` 三模式（严禁使用内置 `grep_search`）**：**必传 `searchPath`**；`exact`（ripgrep 精确字面量/正则，`<0.5s` 首选）｜`fuzzy`（tree-sitter AST 符号模糊定位，`<2s`）｜`smart`（语义搜索，`45～90s`，走 `background=true` + 可传 `modelChain="auto"` / `"grok"` / `"antigravity"` / `"codex"`；`v1.20.7` 下 `antigravity` 链支持紧凑单文件 `direct` 单步语义解析；`smart` 默认申请 `512 MB` 内存预留，整机可用内存近 `1.5 GB` 黄区时勿与大内存 `sandbox_exec` 同拍挤占；多词用 `queries` 数组并行）。
+- **`smart_search` 三模式**：**必传 `searchPath`**；`exact`（精确字面量/正则，`<0.5s` 首选）｜`fuzzy`（AST 模糊定位，`<2s`）｜`smart`（语义搜索，`45～90s`，走 `background=true` + 可传 `modelChain="auto"` / `"grok"` / `"antigravity"` / `"codex"`；`v1.20.7` 下 `antigravity` 链支持紧凑单文件 `direct` 单步语义解析；`smart` 默认申请 `512 MB` 内存预留，整机可用内存近 `1.5 GB` 黄区时勿与大内存 `sandbox_exec` 同拍挤占；多词用 `queries` 数组并行）。
 - **`sandbox_codex`、`sandbox_council`、`sandbox_agent` 与现代模型目录（v1.20.7+）**：`sandbox_codex` 用于重型纯代码 Review / 跨文件核查（`background=true` + `action="check"` + `waitSeconds=45`，**仅主代理可调，子代理严禁调用**）；`sandbox_council` 只讨论找盲点不执行，托管产物遵循 `SANDBOX_DATA_ROOT`（清理前必先 `gcMode="dryRun"`），支持 `codex`、`grok`、`geminiCli`、`antigravityCli`（统一复用 `%LOCALAPPDATA%\agy\bin\agy.exe` 探测，复杂文件与大输入自动落临时索引，可用 `SANDBOX_COUNCIL_GEMINI_CLI_*` / `SANDBOX_COUNCIL_LARGE_INPUT_*` 调整）。反重力现代自动链为 **`Hydrogen XHigh -> Hydrogen High -> Carbon High`**，支持完整 ID 或简写（`"hydrogen-xhigh"`、`"hydrogen"`、`"carbon"`，`"pro"`/`"strong"` 优先命中 `Carbon High`）。用户明确指定外部 API 模型时使用 `sandbox_agent`（必传 `callerHost="antigravity"` 与 `callerConversationId`）或 `sandbox_grok`，未知受理先查原命令回执与预算，禁止自动重发。
 
 ## 五、MCP memory-store、五端会话原文读取与 Stage Guard

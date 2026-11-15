@@ -21,6 +21,6 @@
        - `Antigravity-Machine: <development|training|standalone>`
        - `Antigravity-Conversation: <当前稳定 conversationId>`
 2. **五端共享仓库唯一主目录串行与双机模板分层防冲突**：
-   - **唯一主目录与 `main` 串行**：在共享工具包仓库（`<toolkit-root>`）中只于唯一主目录的 `main` 分支操作，不为实现或发布另建分支、worktree、clone 或整仓副本；若其它宿主维护线程正在修改相关模块，先核对协调，绝不并发抢改覆盖。
-   - **双机规则分层防冲突**：`rules/antigravity/GEMINI.template.md` 与基础四专题保持跨机通用；后续若训练机部署 Antigravity 2.0 并需接入条件式训练监督规则，应独立新增按需专题（如 `rules/antigravity/guidance/training-machine.template.md`）并在本机私有入口挂接，避免开发机与训练机反复抢改同一核心文件。
+   - **唯一主目录与 `main` 串行**：在共享工具包仓库（`<toolkit-root>`）中只于唯一主目录的 `main` 分支操作，不为实现或发布另建分支、worktree、clone 或整仓副本；多宿主维护线程并行工作时，先准备差异并经 `communication-core`（见 `guidance/communication-bridges.md`）或用户确认串行 Git 发布窗口后再精确暂存、提交与推送，绝不并发抢改或混入他人未提交改动。
+   - **双机规则分层防冲突**：`rules/antigravity/GEMINI.template.md` 与基础五专题保持跨机通用；后续若训练机部署 Antigravity 2.0 并需接入条件式训练监督规则，应独立新增按需专题（如 `rules/antigravity/guidance/training-machine.template.md`）并在本机私有入口挂接，避免开发机与训练机反复抢改同一核心文件。
    - **严格脱敏审查**：公开模板更新前必须运行 `./install/Test-CodexToolkit.ps1` 的可移植文本与结构校验并逐行检查 `git diff --cached`，**严禁将本机私有个人信息、社交/内容平台账号 ID、Cookie/密钥、本机用户名绝对路径、私人目录昵称或私密对话正文提交进公开仓库**；本机安装生效与公开模板同步分开核验、如实汇报。

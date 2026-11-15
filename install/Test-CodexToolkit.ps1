@@ -190,6 +190,7 @@ function Test-PackageStructure {
         "rules\antigravity\DEPLOYMENT.md",
         "rules\antigravity\local-care.example.md",
         "rules\antigravity\guidance\engineering-workflow.template.md",
+        "rules\antigravity\guidance\communication-bridges.template.md",
         "rules\antigravity\guidance\design-writing.template.md",
         "rules\antigravity\guidance\web-visual.template.md",
         "rules\antigravity\guidance\maintenance-upgrades.template.md",
