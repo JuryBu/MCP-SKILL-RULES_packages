@@ -104,10 +104,10 @@ function Assert-Guidance {
         ([regex]::Unescape('\u8865\u9f50\u6700\u8fd1K\u6b21\u771f\u5b9e\u4ea4\u6d41')),
         ([regex]::Unescape('\u5373\u65f6\u66f4\u65b0\u6cbf\u7528\u5df2\u6709\u8bb0\u5f55')),
         ([regex]::Unescape('\u5230\u5b9e\u9645\u5f00\u5de5\u65f6\u7ed3\u675f')),
-        ([regex]::Unescape('\u91cd\u8981\u7684\u5b8c\u6574\u5de5\u7a0b\u89e3\u91ca\u3001\u4ea4\u63a5\u548c\u6b63\u5f0f\u6c47\u62a5\u4fdd\u7559\u5f85\u53d1\u8349\u7a3f')),
+        ([regex]::Unescape('\u91cd\u8981\u7684\u5b8c\u6574\u5de5\u7a0b\u89e3\u91ca\u3001\u4ea4\u63a5\u548c\u6b63\u5f0f\u6c47\u62a5\u4fdd\u7559\u4e00\u4efd\u5f85\u53d1\u8349\u7a3f')),
         ([regex]::Unescape('\u6700\u8fd1\u4e00\u4efd\u6709\u6548\u8349\u7a3f\u53ca\u5b9e\u9645\u56de\u590d\u5165\u53e3')),
         ([regex]::Unescape('\u6309\u7406\u89e3\u987a\u5e8f\u8fde\u63a5\u80cc\u666f\u3001\u52a8\u4f5c\u3001\u539f\u56e0\u3001\u7ed3\u679c\u548c\u4e0b\u4e00\u6b65')),
-        ([regex]::Unescape('\u6309\u8fd9\u4e2a\u987a\u5e8f\u548c\u7406\u89e3\u6240\u9700\u7684\u903b\u8f91\u7ec4\u7ec7\u5168\u6587')),
+        ([regex]::Unescape('\u5148\u4ea4\u56de\u5df2\u7ecf\u80fd\u591f\u56de\u7b54\u7684\u7ed3\u679c')),
         ([regex]::Unescape('\u7528\u6237\u5bf9\u8868\u8fbe\u4e0d\u6ee1\u610f\u65f6\uff0c\u4fdd\u7559\u539f\u8bdd\u3001\u95ee\u9898\u53e5\u548c\u4fee\u6b63\u8981\u6c42')),
         ([regex]::Unescape('\u7981\u6b62\u4efb\u4f55\u9632\u5fa1\u6027\u8868\u8ff0')),
         ([regex]::Unescape('\u80af\u5b9a\u53e5\u5305\u88c5')),
@@ -191,8 +191,8 @@ function Assert-Guidance {
     $audienceWord = if ($Profile -eq "neutral") { [regex]::Unescape('\u7528\u6237') } else { $ownerWord }
     $designText = Get-Content -LiteralPath (Join-Path $Root "guidance\design-writing.md") -Raw -Encoding UTF8
     $observerText = Get-Content -LiteralPath (Join-Path $Root "guidance\model-observer.md") -Raw -Encoding UTF8
-    Assert-Contains $agentsText "2026-11-09.2" "$Profile core content revision"
-    Assert-Contains $promptText "2026-11-09.2" "$Profile prompt content revision"
+    Assert-Contains $agentsText "2026-11-16.3" "$Profile core content revision"
+    Assert-Contains $promptText "2026-11-16.3" "$Profile prompt content revision"
     foreach ($encodedMarker in @('\u9884\u7b97\u5305\u542b\u771f\u5b9e\u64cd\u4f5c', '\u4e24\u9879\u5ba1\u67e5\u90fd\u987b\u76f4\u63a5\u8bfb\u53d6', '\u5177\u4f53\u5dee\u989d\u3001\u5f71\u54cd\u4e0e\u9009\u62e9\u5e76\u53d6\u5f97\u540c\u610f')) {
         Assert-Contains $engineeringText ([regex]::Unescape($encodedMarker)) "$Profile scope and review decisions"
     }
@@ -202,7 +202,7 @@ function Assert-Guidance {
     }
     Assert-Contains $agentsText ([regex]::Unescape('\u6bcf\u6761\u771f\u5b9e')) "$Profile real-message recording entry"
     Assert-Contains $agentsText ([regex]::Unescape('\u5148\u56de\u5e94\u5e76\u5b9e\u9645\u5e94\u7528\uff0c\u518d\u7b80\u8bb0\u5230\u672c\u5bf9\u8bdd\u7684\u4ea4\u6d41\u8fd1\u51b5')) "$Profile real-message response and application"
-    foreach ($encodedMarker in @('\u7528\u6237\u76f4\u63a5\u8bf4\u7684\u8bdd\u3001\u4e3b\u7ebf\u8f6c\u8fbe\u548c\u5408\u6210\u6750\u6599\u6309\u5b9e\u9645\u6765\u6e90\u533a\u5206', '\u5df2\u7ecf\u6539\u53d8\u7684\u505a\u6cd5', '\u4ee5\u53ca\u5df2\u7ecf\u64a4\u9500\u7684\u524d\u63d0', '\u4e0d\u81ea\u884c\u63d0\u51fa', '\u4efb\u52a1\u5c1a\u672a\u5b8c\u6210\u65f6\u4e5f\u4fdd\u7559\u8ba4\u771f\u3001\u6e29\u548c\u7684\u4ea4\u6d41')) {
+    foreach ($encodedMarker in @('\u7528\u6237\u76f4\u63a5\u8bf4\u7684\u8bdd\u3001\u4e3b\u7ebf\u8f6c\u8fbe\u548c\u5408\u6210\u6750\u6599\u6309\u5b9e\u9645\u6765\u6e90\u533a\u5206', '\u5df2\u505a\u7684\u4e8b\u548c\u5c1a\u672a\u505a\u5230\u7684\u90e8\u5206', '\u4ee5\u53ca\u5df2\u7ecf\u64a4\u9500\u7684\u524d\u63d0', '\u4e0d\u81ea\u884c\u63d0\u51fa', '\u4e8b\u60c5\u672a\u5b8c\u6210\u65f6\u7167\u5e38\u8ba4\u771f\u3001\u6e29\u548c\u5730\u4ea4\u6d41')) {
         Assert-Contains $promptText ([regex]::Unescape($encodedMarker)) "$Profile discussion decisions and criticism response"
     }
     foreach ($recentExchangeMarker in @(
@@ -219,8 +219,8 @@ function Assert-Guidance {
     Assert-Contains $observerText ([regex]::Unescape('20\u5206\u949f\u7eed\u63a5\u4f1a\u4f7f\u5230\u671f\u68c0\u67e5\u63a8\u8fdf\u523040\u5206\u949f')) "$Profile observer cadence mismatch"
     Assert-Contains $observerText ([regex]::Unescape('\u7f3a\u5931\u7684\u65e7\u5230\u671f\u70b9\u4e0d\u96c6\u4e2d\u8865\u53d1')) "$Profile observer delayed wake guard"
     foreach ($marker in @(
-        ([regex]::Unescape('\u4e0e\u5f53\u524d\u8ba8\u8bba\u6709\u5173\u7684\u5168\u90e8\u4ea4\u6d41\u53ca\u53cd\u9988')),
-        ([regex]::Unescape('\u6838\u5bf9\u7528\u6237\u5f53\u524d\u95ee\u9898\u3001\u539f\u8bdd\u3001\u5171\u540c\u80cc\u666f\u3001\u5173\u952e\u4e8b\u5b9e\u548c\u672a\u5b8c\u4e8b\u9879')),
+        ([regex]::Unescape('\u67e5\u56de\u4e0e\u672c\u6b21\u56de\u7b54\u6709\u5173\u7684\u7528\u6237\u8bc9\u6c42\u3001\u8fde\u7eed\u8865\u5145\u3001\u6279\u6ce8\u3001\u52a9\u624b\u5b9e\u9645\u56de\u590d\u548c\u53cd\u9988')),
+        ([regex]::Unescape('\u53d1\u9001\u524d\u7531\u52a9\u624b\u5bf9\u7167\u76f8\u5173\u7528\u6237\u539f\u8bdd\u3001\u8865\u5145\u3001\u6279\u6ce8\u548c\u6700\u8fd1\u53cd\u9988')),
         ([regex]::Unescape('\u540c\u4e00\u5bf9\u8c61\u6301\u7eed\u4fdd\u6301\u540c\u4e00\u540d\u79f0')),
         ([regex]::Unescape('\u7d27\u8ddf\u4e00\u53e5\u7b80\u77ed\u62ec\u53f7\u8bf4\u660e')),
         ([regex]::Unescape('\u5199MEMORY')),
