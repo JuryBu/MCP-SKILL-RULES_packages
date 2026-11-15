@@ -10,6 +10,22 @@
 
 所有ACK只确认当前任务/订阅、原generation和wake内明确完成的ID；未处理项继续pending。迟到ACK不清除后来消息，不替其它订阅/任务确认，不按消息数值大小或UUID顺序猜处理顺序。模型读到了正文也不等于已完成正文要求。
 
+## 跨端交流核心
+
+仅在接收方已安装并启用 `communication_core` 时适用。交流核心连接已登记的宿主对话与原有消息渠道，按可信绑定转交消息、保留来源与投递/处理记录；各宿主、NapCat与微信入口仍由各自组件负责。按已安装工具和私有配置选择路径，保留原来有效的消息通道，不擅自迁移路由或关闭其它对话。各端接入与验收状态分别核对。
+
+当前六工具提供授权对话绑定的分页列表、准确目标解析、发消息、查消息、等待事件和处理确认。`communication_list_conversations`列出本连接获准访问的绑定，`communication_resolve_target`返回该绑定的当前身份和代次；宿主全部真实对话、对话正文、单对话运行状态及宿主整体在线/可投递状态留待后续实现与验收，使用前另核实际能力。
+
+每次调用显式填写当前调用者真实的`machine_id`、`host`、`surface`与稳定`conversation_id`，值取本机登记身份，不借用其它对话。caller由调用方声明，当前门面按已登记身份选择连接，broker尚未提供可信宿主对话身份；该入口限已登记授权的本机可信调用方使用，实际来源与授权仍按私有登记和原操作范围核对。尚未登记时保留缺口，沿已有获准入口继续可独立完成的工作。
+
+发送前解析唯一目标，从返回值中明确选出`machine_id`、`host`、`surface`、`conversation_id`、`binding_id`和`binding_generation`六项组成发送target；adapter_id、capabilities、evidence等解析元数据留作判断，不放进发送target。`communication_send_message`保留原`origin`、有效期限、稳定`dedupe_key`及需要时的原消息`in_reply_to`；本人消息、代理协作和引用转述分别保留来源，代理转述沿原授权判断。跨渠道消息所带的原始回执绑定由负责该渠道的入口核对，不伪造原渠道消息ID、generation或wake。
+
+发送结果区分接纳、投递、原生注入、实际回复及业务处理。结果未知时用`communication_get_message`查询原message_id，或用`communication_wait`沿原游标继续，单次等待不超过45秒；保持原去重身份，不自动提交第二份业务。等待投递或回复与确认处理分别执行，超时也按原请求状态处理。
+
+接收方实际处理后，才用`communication_ack_processing`提交本条message_id、delivery_id和binding_generation，按实际进展选择processing、done或failed，未完成部分保留待办。该确认只作用于交流核心的这份投递；NapCat和微信的原渠道ACK仍按各自协议与责任入口处理，不代替其它订阅确认。
+
+QQ或微信来源的本人询问，沿原引用关系或核心登记的回送绑定归还原渠道；调查前的说明与最终结果、消息长度和表达方式沿本专题「通知、显示与健康验收」及接收方私有偏好。交流核心向Codex发送新消息时默认hidden，需要保留全部提醒气泡时显式选择visible，具体显示语义与验收沿上述章节。
+
 ## NapCat双机任务
 
 只有明确任务、来源/目标机器、接收者及可信对端时进入双机流程。双方登记相同稳定 `task_id`、各自 `conversation_id` 和角色；批次、日期与重跑放 `run_id` 或generation，不因命名习惯重建既有任务。
