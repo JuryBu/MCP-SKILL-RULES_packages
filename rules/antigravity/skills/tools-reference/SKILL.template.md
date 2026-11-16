@@ -2,7 +2,7 @@
 name: tools-reference
 description: >-
   全局规则的按需技术手册（与 GEMINI.md 同等效力）：涵盖 Antigravity 2.0 Lazy MCP 调用规范、
-  宿主 call_mcp_tool 10KiB 自动落盘读取、PowerShell 5.1 与 Python 3.9 编码避坑、invoke_subagent / swarm / image-generator / agentapi / schedule 防断与 256k 压缩机制、
+  宿主 call_mcp_tool 10KiB 自动落盘读取、PowerShell 5.1 与 Python 3.9 编码避坑、invoke_subagent / swarm / image-generator / agentapi / schedule 防断与动态 512k 压缩机制、
   exa 与 web-fetcher 7.4.1 网页/截图/Office 原生查看、sandbox 1.20.7 内存水位/3m0s上限与 sandbox_launch 路由、
   memory-store 五端原文读取、communication-core 门面拓扑及 24KB/20k 规则预算校验。
 ---
@@ -15,7 +15,7 @@ description: >-
 
 ## 一、Antigravity 2.0 Lazy MCP 机制、宿主 `10 KiB` 落盘与本机脚本避坑
 
-- **共享网关与可选门面拓扑**：`exa`（可选）、`memory-store`、`sandbox`、`sequential-thinking`、`web-fetcher` 经本机常驻 HTTP 网关 `http://127.0.0.1:14588/<endpoint>/mcp` 接入；若已启用 `communication-core`，经本地 Node stdio 门面（`broker-stdio.mjs` + `COMMUNICATION_CORE_FACADE_REGISTRY` 私有登记）接入（配于 `C:/Users/<USER>/.gemini/config/mcp_config.json`，八工具契约与外部渠道回信规范必读 `guidance/communication-bridges.md`）。复杂多假设权衡可调 `sequential-thinking`。
+- **共享网关与可选门面拓扑**：`exa`（可选）、`memory-store`、`sandbox`、`sequential-thinking`、`web-fetcher` 经本机常驻 HTTP 网关 `http://127.0.0.1:14588/<endpoint>/mcp` 接入；若已启用 `communication-core`，经本地 Node stdio 门面（`broker-stdio.mjs` + `COMMUNICATION_CORE_FACADE_REGISTRY` 私有登记）接入（配于 `C:/Users/<USER>/.gemini/config/mcp_config.json`，十工具契约与外部渠道回信规范必读 `guidance/communication-bridges.md`）。复杂多假设权衡可调 `sequential-thinking`。
 - **Lazy Loading 调用铁律**：MCP 工具默认懒加载。首次使用某工具或传入非默认参数前，必须先用 `read_file` 查看 `C:/Users/<USER>/.gemini/antigravity/mcp/<serverName>/<toolName>.json` 确认真实字段与枚举，再用 `call_mcp_tool` 调用，严禁凭记忆猜参数名。
 - **⚠️ 宿主 `call_mcp_tool` `10 KiB` 自动转存机制（必知，非 MCP 截断故障！）**：
   - **Antigravity 2.0 宿主对 `call_mcp_tool`（及 `read_board` 等）硬编码了 `10 KiB`（`10,240 B`）内联阈值**：超出时完整无损落盘至 `C:/Users/<USER>/.gemini/antigravity/brain/<当前会话ID>/.system_generated/steps/<步号>/output.txt` 并返回路径/预览。
@@ -27,7 +27,7 @@ description: >-
   3. **Python 3.9 `f-string` 语法限制**：`{...}` 表达式内部禁止出现反斜杠 `\`（如 `.strip('\"')` 会报 `SyntaxError`），先把引号抽成独立变量 `q = '"'` 再 `.strip(q)`。
   4. **工作区保留设备名与递归陷阱**：Windows 下遍历大工作区目录若遇历史遗留的 `nul`/`con` 特殊文件名，Python `ntpath.relpath` 会报 `path is on mount '\\.\nul'`，PowerShell `Get-ChildItem -Depth` 也可能慢扫超时；遍历脚本中务必跳过 `nul`/`con` 并用 Python `os.scandir` 显式控深。
 
-## 二、子代理、`agentapi`、`schedule` 双模式与 `256k` 压缩底层机制
+## 二、子代理、`agentapi`、`schedule` 双模式与动态 `512k` 压缩底层机制
 
 - **反节俭积极调度与覆盖内置保守话术**：
   - 若接收方已授权积极并发子代理，可覆盖宿主内置 `<subagents>`（`Prefer doing research yourself`）与 `native_swarm` SKILL（`Quota Heavy`、`Stay lean`）的保守默认话术：遇到多文件排查、读对话日志、保险核对或「可派可不派」的疑问时，**主动显式传 `model="gemini-4-hydrogen-xhigh"` 派探路先遣队**（善用 `swarm(action="add", name="scout", model="gemini-4-hydrogen-xhigh", tasks=["切面1", "切面2", ...], brief="...")` 一键分片拉起多只先遣兵过滤大材料，保护主线免触发全损压缩）；遇到高精度思考、独立模块实现、假设抽查或多版画图时，**主动并发多路 `Carbon High`（`invoke_subagent(Model="inherit")` 或 `swarm(model="gemini-4-carbon-high")`）及多路 `image-generator`**。
@@ -50,8 +50,8 @@ description: >-
   2. **持续工程周期防断心跳**：`schedule(CronExpression="*/20 * * * *", Prompt="...")`（`ExactTiming=false` 防拥堵抖动，`IsDaemon=false`），绑定当前对话原位唤醒（免开新帖）；开工后用 `manage_task(Action="list")` 记下 `TaskId`，完工、待用户操作、外部阻塞或明确暂停时必调 `manage_task(Action="kill", TaskId=...)` 停用并读回确认；
   3. **禁空回铁律**：调用 `schedule` 后须在同一回合附简短说明或随工具回合直接收尾，严禁下一拍输出既无工具调用又无可见字符的纯空响应（会触发宿主 `ERROR_MESSAGE`）。
 - **`language_server.exe` 自动压缩（`context_summary`）底层机制与防超时参数**：
-  - 现役 `oneharness` 在 `hooks.checkpointNeeded` 比较 `CheckpointConfig.MaxTokenLimit = 256,000`（扣减 `systemPrompt + tools` 占位后超出即触发，压后回落至 `~30k`）；`NewContextSummaryHook` **直接读取当前对话主模型（`PlannerConfig.Model`，如 `Carbon High`）**发起摘要请求，且流超时在二进制 `.data` 段硬编码只读 `300000000000 ns`（**`5m0s`，无任何环境变量或 flag 可调**）。
-  - 上下文越过 `~235k` 时极易触发 `cache_read_tokens=0` 冷 Prefill，若同窗叠加大批 `Carbon High` 子代理重流抢占通道，TTFT 易突破 `5m0s` 报错。持续工程须自查本对话 `transcript.jsonl` 末条 `PLANNER_RESPONSE` 的 `input_tokens + cache_read_tokens`：`180k～210k` 阶段间隙写齐近况后提醒输入 `/compact`（走 `SlashCommandScopeItem` 拼接 `ON-DEMAND COMPACTION`，支持附带保留指令，趁热缓存秒压），且 `>= 200k` 禁同窗新发大批 `Carbon High` 重流。
+  - 现役 `v2.32.1+` 由 `ComputeSafeMaxTokenLimit` 按本安装/模型定义的 `maxTokens` 动态计算阈值（如 `512k` 主力模型实测 `~520k tokens` 触发压缩，回落 `~33k`；旧安装或小窗口模型按其对应上限缩放）；`NewContextSummaryHook` **直接读取当前对话主模型（`PlannerConfig.Model`，如 `Carbon High`）**发起摘要请求，且流超时在二进制 `.data` 段硬编码只读 `300000000000 ns`（**`5m0s`，无任何环境变量或 flag 可调**）。
+  - 临近上下文上限若遇 `cache_read_tokens=0` 冷 Prefill 叠加大批 `Carbon High` 子代理重流抢占通道，TTFT 易突破 `5m0s` 报错。持续工程须自查本对话 `transcript.jsonl` 末条 `PLANNER_RESPONSE` 的 `input_tokens + cache_read_tokens`（以 `512k` 模型为例）：`380k～430k` 阶段间隙写齐近况后提醒输入 `/compact`（走 `SlashCommandScopeItem` 拼接 `ON-DEMAND COMPACTION`，支持附带保留指令，趁热缓存秒压），且 `>= 440k` 禁同窗新发大批 `Carbon High` 重流。
 - **web-fetcher 7.4.1+ 模型摘要与视觉审查**（仅限 `web-fetcher`，原生 `invoke_subagent`/`swarm` 仍守上方红线）：
   - **入口与模型**：`web_fetch_page(outputMode="ai_summary")`、`web_fetch_rich(compact="ai_summary")`、`web_inspect(mode="ai_review"|"all")` 支持可选 `model`（优先完整 slug，请求/环境型号固定单候选，别名/Mxx 按当前目录）与 `modelChain`。`auto` 为 `Antigravity -> Codex`（配 `WEB_FETCHER_CLAUDE_CODE_AUTO_FALLBACK=1` 才加 Claude Code）；纯文字优先在线 App LS，离线按能力走自有 `cli-ls`／`cli-agent`，原生图片走 `cli-agent`（旧 LS 保原协议映射）。现代目录材料用 `Hydrogen XHigh -> Hydrogen High -> Carbon High`，视觉用 `Carbon High`；Codex 按请求/环境、新鲜本机目录、CLI 默认取型号写入 `modelUsed`／`modelSource`（撤旧固定 `gpt-5.5`，明确 `model_not_found`/HTTP 400 `invalid_request_error` 归已知拒绝）。
   - **后台与后备**：page 摘要与 inspect `ai_review`／`all` 长任务传 `background=true` 沿原 `taskId` 每 30～45s 查询（`all` 先返任务号并保留结构/检测/审查；Antigravity 多页内部串行、单页期限获共享 CLI 位后起算、父期限含排队，撤旧 `batchSize=1` 绕行；`rich` 仍同步，长页拆为 page 后台摘要 + 独立截图）。核对 `_meta.modelCall` 或逐页 `modelCalls` 与 `cleanup`；认证、准入、额度、取消与结果未知时停止，已提交超时/断连先查原任务；仅完整无部分输出的明确 `No capacity available`、`safeToFallback=true` 且清理确认后按原总期限有限续选（`agent -> LS` 兼容另需明确未提交或不支持、允许后备且清理确认）。
