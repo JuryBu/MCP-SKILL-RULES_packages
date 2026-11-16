@@ -5,6 +5,7 @@ import { Readable, Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { canonicalMachineRole } from "./machine-role.mjs";
 import { renameReplaceSync } from "./atomic-file.mjs";
+import { OWNER_REPLY_EVENT_LIMITS } from "./owner-reply-events.mjs";
 
 const DEFAULT_ALLOWED_EVENTS = [
   "started",
@@ -347,6 +348,24 @@ function oneBotReadableText(message) {
   return "";
 }
 
+function oneBotOwnerEventContent(message) {
+  const parts = typeof message?.raw_message === "string" && message.raw_message
+    ? [message.raw_message]
+    : typeof message?.message === "string" ? [message.message] : message?.message;
+  if (!Array.isArray(parts)) return { unavailable: "native_content_unavailable" };
+  const chunks = [];
+  let bytes = 0;
+  for (const segment of parts) {
+    const text = typeof segment === "string" ? segment
+      : segment?.type === "text" ? String(segment?.data?.text ?? "")
+        : segment?.type ? `[${segment.type}]` : "[unknown]";
+    bytes += Buffer.byteLength(text, "utf8");
+    if (bytes > OWNER_REPLY_EVENT_LIMITS.cacheBytes) return { unavailable: "content_exceeds_retention" };
+    chunks.push(text);
+  }
+  return { text: chunks.join("") };
+}
+
 function decodeCqValue(value) {
   return String(value ?? "")
     .replace(/&#91;/g, "[")
@@ -661,7 +680,7 @@ function taskFileIndexMetadata(text) {
   return metadata.fileId ? metadata : null;
 }
 
-function summarizeGroupMessage(message, expectedSelfId) {
+function summarizeGroupMessage(message, expectedSelfId, includeOwnerEventContent = false) {
   const timestamp = Number(message?.time ?? 0);
   const text = oneBotReadableText(message);
   const taskMetadata = structuredTaskMetadata(text);
@@ -678,6 +697,7 @@ function summarizeGroupMessage(message, expectedSelfId) {
     senderName: String(message?.sender?.card ?? message?.sender?.nickname ?? ""),
     isSelf: senderId === expectedSelfId || explicitSelfHistory,
     text,
+    ...(includeOwnerEventContent ? { ownerEventContent: oneBotOwnerEventContent(message) } : {}),
     taskId: taskMetadata.taskId,
     sourceMachine: taskMetadata.sourceMachine,
     targetMachine: taskMetadata.targetMachine,
@@ -1649,7 +1669,7 @@ export function createNapCatNotifier(options = {}) {
       quick_reply: false,
     });
     const messages = (Array.isArray(history?.messages) ? history.messages : [])
-      .map((message) => summarizeGroupMessage(message, binding.expectedSelfId));
+      .map((message) => summarizeGroupMessage(message, binding.expectedSelfId, input.include_owner_event_content === true));
     return {
       target: targetCheck.target,
       identity: targetCheck.login,

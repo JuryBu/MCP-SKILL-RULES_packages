@@ -1,4 +1,7 @@
 import crypto from "node:crypto";
+import fs from "node:fs";
+import { OwnerReplyEventsError } from "./owner-reply-events.mjs";
+import { OwnerWindowEventsError, nativeWindowId, normalizeWindowRegisterInput } from "./owner-window-events.mjs";
 import {
   canonicalMachineRole,
   machineRoleAlias,
@@ -579,9 +582,21 @@ export function createControlPlane(options = {}) {
   }
 
   async function registerOwnerRoute(input) {
+    if (Object.prototype.hasOwnProperty.call(input, "window_capture")) {
+      throw new OwnerWindowEventsError("OWNER_WINDOW_INVALID_ARGUMENT", "window捕获使用独立窗口注册接口");
+    }
+    if (Object.prototype.hasOwnProperty.call(input, "capture_owner_events") && input.capture_owner_events !== true) {
+      throw new OwnerReplyEventsError("OWNER_EVENTS_INVALID_ARGUMENT", "capture_owner_events仅接受true显式启用；停止该路由使用原关闭接口");
+    }
+    if (Object.prototype.hasOwnProperty.call(input, "reply_delivery") && input.reply_delivery !== "events_only") {
+      throw new OwnerReplyEventsError("OWNER_EVENTS_INVALID_ARGUMENT", "reply_delivery仅接受events_only；普通路由省略该参数");
+    }
     const routeKey = requiredText(input.route_key, "route_key", 256);
     const targetKey = requiredText(input.target_key || config().defaultTargetKey, "target_key", 64);
     const existing = state.getOwnerRoute(routeKey);
+    if (!existing && input.reply_delivery === "events_only" && input.capture_owner_events !== true) {
+      throw new OwnerReplyEventsError("OWNER_EVENTS_INVALID_ARGUMENT", "events_only新路线必须同时capture_owner_events=true");
+    }
     let baselineMessageKeys = null;
     if (!existing || existing.status !== "open" || existing.baselineInitialized === false) {
       const history = await notifier.readConfiguredTargetMessages({ target_key: targetKey, count: 50, reverse_order: true });
@@ -589,43 +604,156 @@ export function createControlPlane(options = {}) {
         .filter((message) => !message.isSelf)
         .map((message) => messageKey(`owner:${targetKey}`, message));
     }
-    const route = state.openOwnerRoute({
+    let route = state.openOwnerRoute({
       routeKey,
       conversationId: requiredText(input.conversation_id, "conversation_id", 256),
       taskId: optionalText(input.task_id, 128) || null,
       targetKey,
+      ...(input.reply_delivery === "events_only" ? { replyDelivery: "events_only" } : {}),
+      ...(input.capture_owner_events === true ? { captureOwnerEvents: true } : {}),
       ...(baselineMessageKeys === null ? {} : { baselineMessageKeys }),
     });
+    if (input.capture_owner_events === true) route = state.enableOwnerReplyEvents(routeKey);
     return {
       ...route,
       baselineMessageCount: route.baselineMessageKeys.length,
       bufferedMessageCount: route.bufferedOwnerMessages.length,
       baselineMessageKeys: undefined,
       bufferedOwnerMessages: undefined,
+      ownerReplyEvents: undefined,
     };
   }
 
   function closeOwnerRoute(input) {
-    return state.closeOwnerRoute({ routeKey: requiredText(input.route_key, "route_key", 256) });
+    const route = state.closeOwnerRoute({ routeKey: requiredText(input.route_key, "route_key", 256) });
+    return { ...route, ownerReplyEvents: undefined };
+  }
+
+  function readOwnerEvents(input) {
+    if (!config().enabled) throw new OwnerReplyEventsError("OWNER_EVENTS_UNSUPPORTED", "主人通知通道未启用");
+    const result = state.readOwnerReplyEvents({
+      routeKey: input.route_key,
+      conversationId: input.conversation_id,
+      originalMessageId: input.original_qq_message_id,
+      expectedGeneration: input.expected_route_generation,
+      cursor: input.cursor,
+      limit: input.limit,
+    });
+    if (!config().targets[result.route.target_key]) throw new OwnerReplyEventsError("OWNER_EVENTS_SCOPE_MISMATCH", "原通知目标已不在当前binding");
+    return result;
+  }
+
+  function ownerWindowPolicy(targetKey) {
+    const configuration = config();
+    if (!configuration.enabled) throw new OwnerWindowEventsError("OWNER_WINDOW_UNSUPPORTED", "主人通知通道未启用");
+    let targets = configuration.targets;
+    if (notifier.bindingPath) {
+      let raw;
+      try {
+        raw = JSON.parse(fs.readFileSync(notifier.bindingPath, "utf8").replace(/^\uFEFF/, ""));
+      } catch {
+        throw new OwnerWindowEventsError("OWNER_WINDOW_TRUST_UNAVAILABLE", "无法从既有私有binding核对窗口授权");
+      }
+      if (raw.controlPlane?.enabled !== true || String(raw.expectedSelfId).trim() !== configuration.expectedSelfId) {
+        throw new OwnerWindowEventsError("OWNER_WINDOW_TRUST_UNAVAILABLE", "私有binding与当前通知配置身份不一致");
+      }
+      targets = raw.controlPlane.targets;
+    }
+    const configured = Object.hasOwn(configuration.targets ?? {}, targetKey) ? configuration.targets[targetKey] : null;
+    const target = Object.hasOwn(targets ?? {}, targetKey) ? targets[targetKey] : null;
+    const type = String(target?.type ?? "").trim().toLowerCase();
+    const id = nativeWindowId(typeof target?.id === "string" ? target.id.trim() : target?.id);
+    const selfId = nativeWindowId(configuration.expectedSelfId);
+    if (!configured || configured.type !== type || !["private", "group"].includes(type) || !id || !selfId) {
+      throw new OwnerWindowEventsError("OWNER_WINDOW_TRUST_UNAVAILABLE", "target_key没有可信的预配置QQ窗口");
+    }
+    const allowlist = type === "private" ? [id] : [...new Set(Object.entries(configuration.targets)
+      .filter(([key, value]) => value.type === "private" && Object.hasOwn(targets, key)
+        && String(targets[key]?.type ?? "").trim().toLowerCase() === "private")
+      .map(([key]) => nativeWindowId(typeof targets[key]?.id === "string" ? targets[key].id.trim() : targets[key]?.id))
+      .filter(Boolean))].sort();
+    if (!allowlist.length) throw new OwnerWindowEventsError("OWNER_WINDOW_TRUST_UNAVAILABLE", "group窗口缺少预配置private目标中的可信本人映射");
+    if (type === "group" && allowlist.length !== 1) {
+      throw new OwnerWindowEventsError("OWNER_WINDOW_TRUST_AMBIGUOUS", "多个不同private目标无法唯一确认group窗口的本人，须补充精确私有归属后接入");
+    }
+    return { windowTarget: { type, id }, windowSelfId: selfId, windowOwnerSenderAllowlist: allowlist };
+  }
+
+  function requireCurrentWindowPolicy(route, policy = ownerWindowPolicy(route.targetKey)) {
+    if (JSON.stringify(route.windowTarget) !== JSON.stringify(policy.windowTarget)
+      || route.windowSelfId !== policy.windowSelfId
+      || JSON.stringify(route.windowOwnerSenderAllowlist) !== JSON.stringify(policy.windowOwnerSenderAllowlist)) {
+      throw new OwnerWindowEventsError("OWNER_WINDOW_TRUST_CHANGED", "窗口或本人映射已变化，须核当前授权后重新CAS登记");
+    }
+  }
+
+  async function registerOwnerWindowRoute(input) {
+    const registration = normalizeWindowRegisterInput(input);
+    const policy = ownerWindowPolicy(registration.targetKey);
+    const existing = state.getOwnerRoute(registration.routeKey);
+    const knownReceipt = existing?.windowRegistrationReceipts?.some((entry) => entry.dedupe_key === registration.dedupeKey);
+    if (existing && (existing.windowCapture !== true || existing.conversationId !== registration.conversationId
+      || existing.targetKey !== registration.targetKey)) {
+      throw new OwnerWindowEventsError("OWNER_WINDOW_SCOPE_MISMATCH", "路由已由其它组件、目标或quote用途持有");
+    }
+    if (!knownReceipt && registration.expectedGeneration !== (existing?.windowRouteGeneration ?? 0)) {
+      throw new OwnerWindowEventsError("OWNER_WINDOW_GENERATION_MISMATCH", "窗口路由CAS预期已变化");
+    }
+    let baselineMessageKeys;
+    if (!knownReceipt && (!existing || existing.status !== "open")) {
+      const history = await notifier.readConfiguredTargetMessages({ target_key: registration.targetKey, count: 50, reverse_order: true });
+      if (history.target?.type !== policy.windowTarget.type || String(history.target?.id) !== policy.windowTarget.id
+        || !Array.isArray(history.messages) || history.messages.length > 50) {
+        throw new OwnerWindowEventsError("OWNER_WINDOW_TRUST_UNAVAILABLE", "初始历史与预授权窗口不一致或超出50条");
+      }
+      baselineMessageKeys = history.messages.filter((message) => !message.isSelf)
+        .map((message) => messageKey(`owner:${registration.targetKey}`, message));
+      const currentPolicy = ownerWindowPolicy(registration.targetKey);
+      if (JSON.stringify(policy) !== JSON.stringify(currentPolicy)) {
+        throw new OwnerWindowEventsError("OWNER_WINDOW_TRUST_CHANGED", "基线读取期间私有授权已变化");
+      }
+    }
+    return state.registerOwnerWindowRoute({ ...registration, ...policy,
+      ...(baselineMessageKeys === undefined ? {} : { baselineMessageKeys }) });
+  }
+
+  function getOwnerWindowRoute(input) {
+    return state.getOwnerWindowRoute({ routeKey: input.route_key, conversationId: input.conversation_id,
+      ...(input.dedupe_key === undefined ? {} : { dedupeKey: input.dedupe_key }) });
+  }
+
+  function closeOwnerWindowRoute(input) {
+    return state.closeOwnerWindowRoute({ routeKey: input.route_key, conversationId: input.conversation_id,
+      expectedGeneration: input.expected_generation });
+  }
+
+  function readOwnerWindowEvents(input) {
+    const registration = getOwnerWindowRoute(input);
+    const route = state.getOwnerRoute(registration.route.route_key);
+    requireCurrentWindowPolicy(route);
+    return state.readOwnerWindowEvents({ routeKey: input.route_key, conversationId: input.conversation_id,
+      expectedGeneration: input.expected_route_generation, cursor: input.cursor, limit: input.limit });
   }
 
   function migrateOwnerRoute(input) {
     if (!Object.prototype.hasOwnProperty.call(input, "expected_task_id")) {
       throw new Error("expected_task_id 必须显式提供，旧值为空时传 null");
     }
-    return state.migrateOwnerRoute({
+    const route = state.migrateOwnerRoute({
       routeKey: requiredText(input.route_key, "route_key", 256),
       expectedConversationId: requiredText(input.expected_conversation_id, "expected_conversation_id", 256),
       expectedTaskId: optionalText(input.expected_task_id, 128) || null,
       expectedTargetKey: requiredText(input.expected_target_key, "expected_target_key", 256),
       conversationId: requiredText(input.conversation_id, "conversation_id", 256),
     });
+    return { ...route, ownerReplyEvents: undefined };
   }
 
   async function sendOwnerAlert(input) {
     const routeKey = requiredText(input.route_key, "route_key", 256);
     const route = state.getOwnerRoute(routeKey);
     if (!route || route.status !== "open") throw new Error(`主人通知路由不存在或已关闭：${routeKey}`);
+    if (route.windowCapture === true) throw new OwnerWindowEventsError("OWNER_WINDOW_SCOPE_MISMATCH", "window路由只负责默认入站，通知发送沿原独立路由");
     const configuration = config();
     const target = configuration.targets[route.targetKey];
     if (!target) throw new Error(`binding 未定义通知目标：${route.targetKey}`);
@@ -676,7 +804,10 @@ export function createControlPlane(options = {}) {
     for (const [targetKey, routes] of routesByTarget) {
       let history;
       try {
-        history = await notifier.readConfiguredTargetMessages({ target_key: targetKey, count: 50, reverse_order: true });
+        history = await notifier.readConfiguredTargetMessages({
+          target_key: targetKey, count: 50, reverse_order: true,
+          ...(routes.some((route) => route.ownerEventGeneration !== undefined || route.windowCapture === true) ? { include_owner_event_content: true } : {}),
+        });
       } catch (error) {
         results.push({ outcome: "owner_channel_read_failed", targetKey, error: publicError(error) });
         continue;
@@ -694,6 +825,21 @@ export function createControlPlane(options = {}) {
           baselineMessageKeys,
         });
       });
+      const windowRoutes = readyRoutes.filter((route) => route.windowCapture === true);
+      let windowPolicy = null;
+      if (windowRoutes.length) {
+        try {
+          if (windowRoutes.length !== 1) throw new OwnerWindowEventsError("OWNER_WINDOW_ROUTE_CONFLICT", "此目标的window路由不唯一");
+          windowPolicy = ownerWindowPolicy(targetKey);
+          requireCurrentWindowPolicy(windowRoutes[0], windowPolicy);
+          if (history.target?.type !== windowPolicy.windowTarget.type || String(history.target?.id) !== windowPolicy.windowTarget.id) {
+            throw new OwnerWindowEventsError("OWNER_WINDOW_TRUST_UNAVAILABLE", "读取历史与预配置窗口不一致");
+          }
+        } catch (error) {
+          windowPolicy = null;
+          results.push({ outcome: "owner_window_policy_failed", targetKey, error: publicError(error) });
+        }
+      }
       for (const message of chronologicalMessages(history.messages)) {
         if (message.isSelf) continue;
         const quotedAlert = message.replyMessageId
@@ -702,7 +848,30 @@ export function createControlPlane(options = {}) {
         const resolvedRouteKey = quotedAlert?.targetKey === targetKey
           ? quotedAlert.routeKey
           : null;
-        if (!resolvedRouteKey) continue;
+        if (!resolvedRouteKey) {
+          if (quotedAlert || !windowPolicy) continue;
+          const windowRoute = windowRoutes[0];
+          if (!windowPolicy.windowOwnerSenderAllowlist.includes(String(message.senderId))
+            || (windowPolicy.windowTarget.type === "group"
+              && (!Array.isArray(message.mentionedUserIds) || !message.mentionedUserIds.includes(windowPolicy.windowSelfId)))) continue;
+          try {
+            const captured = state.captureOwnerWindowMessage({
+              routeKey: windowRoute.routeKey, conversationId: windowRoute.conversationId,
+              expectedGeneration: windowRoute.windowRouteGeneration,
+              messageKey: messageKey(`owner:${targetKey}`, message), messageId: message.messageId,
+              messageSeq: typeof message.messageSeq === "number" ? message.messageSeq
+                : typeof message.messageSeq === "string" && /^\d+$/.test(message.messageSeq) ? Number(message.messageSeq) : null,
+              senderId: message.senderId, quotedMessageId: message.replyMessageId,
+              mentionedUserIds: message.mentionedUserIds, nativeContent: message.ownerEventContent,
+            });
+            if (captured.captured) results.push({ outcome: "owner_window_captured", routeKey: windowRoute.routeKey,
+              messageSeq: message.messageSeq ?? null, ...captured });
+          } catch (error) {
+            results.push({ outcome: "owner_window_capture_failed", routeKey: windowRoute.routeKey,
+              messageSeq: message.messageSeq ?? null, error: publicError(error) });
+          }
+          continue;
+        }
         const route = readyRoutes.find((candidate) => candidate.routeKey === resolvedRouteKey);
         if (!route) continue;
         if (history.target.type === "private" && String(message.senderId) !== String(history.target.id)) continue;
@@ -712,6 +881,33 @@ export function createControlPlane(options = {}) {
         const key = messageKey(`owner:${targetKey}`, message);
         if (state.isOwnerRouteBaselineMessage(route.routeKey, key)) continue;
         if (state.hasSeenControlMessage(key)) continue;
+        const ownerReplyEvent = route.ownerEventGeneration === undefined ? null : {
+          routeKey: route.routeKey,
+          messageKey: key,
+          messageId: message.messageId,
+          messageSeq: sequence,
+          quotedMessageId: message.replyMessageId,
+          senderId: message.senderId,
+          ...(message.ownerEventContent ?? { unavailable: "native_content_unavailable" }),
+        };
+        if (route.replyDelivery === "events_only") {
+          try {
+            state.completeOwnerReplyDelivery({
+              routeKey: route.routeKey, messageKey: key, messageSeq: sequence, ownerReplyEvent,
+            });
+            results.push({ outcome: "owner_reply_captured", routeKey: route.routeKey, messageSeq: sequence });
+          } catch (error) {
+            results.push({ outcome: "owner_event_capture_failed", routeKey: route.routeKey, messageSeq: sequence, error: publicError(error) });
+          }
+          continue;
+        }
+        if (ownerReplyEvent) {
+          try {
+            state.recordOwnerReplyEvent(ownerReplyEvent);
+          } catch (error) {
+            results.push({ outcome: "owner_event_capture_failed", routeKey: route.routeKey, messageSeq: sequence, error: publicError(error) });
+          }
+        }
         if (standaloneDeferredOwnerMessage(message)) {
           state.bufferOwnerRouteMessage({
             routeKey: route.routeKey,
@@ -721,6 +917,7 @@ export function createControlPlane(options = {}) {
             text: message.text,
             contentTypes: message.contentTypes,
             attachments: message.attachments,
+            ...(ownerReplyEvent ? { ownerReplyEvent } : {}),
           });
           results.push({ outcome: "owner_reply_buffered", routeKey: route.routeKey, messageSeq: sequence });
           continue;
@@ -765,7 +962,10 @@ export function createControlPlane(options = {}) {
             results.push({ outcome: wake?.outcome === "busy" ? "owner_thread_busy" : "owner_thread_unavailable", routeKey: route.routeKey, messageSeq: sequence });
             continue;
           }
-          state.completeOwnerReplyDelivery({ routeKey: route.routeKey, messageKey: key, messageSeq: sequence });
+          state.completeOwnerReplyDelivery({
+            routeKey: route.routeKey, messageKey: key, messageSeq: sequence,
+            ...(ownerReplyEvent ? { ownerReplyEvent } : {}),
+          });
           results.push({ outcome: "owner_reply_delivered", routeKey: route.routeKey, messageSeq: sequence });
         } catch (error) {
           results.push({ outcome: "owner_reply_failed", routeKey: route.routeKey, messageSeq: sequence, error: publicError(error) });
@@ -785,6 +985,11 @@ export function createControlPlane(options = {}) {
     sendConnectionRequest,
     registerOwnerRoute,
     closeOwnerRoute,
+    readOwnerEvents,
+    registerOwnerWindowRoute,
+    getOwnerWindowRoute,
+    closeOwnerWindowRoute,
+    readOwnerWindowEvents,
     migrateOwnerRoute,
     sendOwnerAlert,
     scanGroupHistory,

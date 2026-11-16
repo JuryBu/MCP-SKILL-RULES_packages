@@ -5,6 +5,8 @@ import { createNapCatNotifier, NapCatNotifierError } from "./core.mjs";
 import { createTaskRegistry, TaskRegistryError } from "./task-registry.mjs";
 import { createTaskRouterController } from "./task-router-controller.mjs";
 import { createControlState, ControlStateError } from "./control-state.mjs";
+import { OwnerReplyEventsError } from "./owner-reply-events.mjs";
+import { OwnerWindowEventsError } from "./owner-window-events.mjs";
 import { createControlPlane } from "./control-plane.mjs";
 import { withOutgoingDeliveryTracking } from "./delivery-result.mjs";
 
@@ -348,6 +350,8 @@ const ownerRouteInputSchema = {
     conversation_id: { type: "string", minLength: 1, maxLength: 256 },
     task_id: { type: "string", minLength: 1, maxLength: 128 },
     target_key: { type: "string", minLength: 1, maxLength: 64 },
+    capture_owner_events: { type: "boolean", enum: [true], description: "仅true显式启用结构化引用回复保留；省略不更改既有设置，停止路由使用原关闭接口。" },
+    reply_delivery: { type: "string", enum: ["events_only"], description: "只用于同时capture_owner_events=true的新路线：回复仅保存为事件，交交流核心回送，不唤醒维护Codex；已有路线不能转换，省略保留原方式。" },
   },
   required: ["route_key", "conversation_id"],
   additionalProperties: false,
@@ -369,6 +373,75 @@ const ownerRouteMigrateInputSchema = {
     conversation_id: { type: "string", minLength: 1, maxLength: 256, description: "迁移后的新 conversation_id，必须与旧值不同。" },
   },
   required: ["route_key", "expected_conversation_id", "expected_task_id", "expected_target_key", "conversation_id"],
+  additionalProperties: false,
+};
+
+const ownerEventsReadInputSchema = {
+  type: "object",
+  properties: {
+    route_key: { type: "string", minLength: 1, maxLength: 256 },
+    conversation_id: { type: "string", minLength: 1, maxLength: 256 },
+    original_qq_message_id: { type: "string", pattern: "^-?[1-9]\\d{0,19}$" },
+    expected_route_generation: { type: "integer", minimum: 1 },
+    cursor: { type: "string", minLength: 1, maxLength: 4096 },
+    limit: { type: "integer", minimum: 1, maximum: 50 },
+  },
+  required: ["route_key", "conversation_id", "original_qq_message_id", "expected_route_generation"],
+  additionalProperties: false,
+};
+
+const ownerWindowScopeProperties = {
+  route_key: { type: "string", minLength: 1, maxLength: 256 },
+  conversation_id: { type: "string", minLength: 1, maxLength: 256, description: "持有本路由的稳定Core组件对话ID，保持不变；模型目标在window_binding中。" },
+};
+
+const ownerWindowRegisterInputSchema = {
+  type: "object",
+  properties: {
+    ...ownerWindowScopeProperties,
+    target_key: { type: "string", minLength: 1, maxLength: 64, description: "仅接受既有私有binding.controlPlane.targets键，不接受任意QQ地址。" },
+    capture_owner_events: { type: "boolean", const: true },
+    reply_delivery: { type: "string", const: "events_only" },
+    window_capture: { type: "boolean", const: true },
+    expected_generation: { type: "integer", minimum: 0, description: "provider路由CAS代次；首次为0，后续使用只读get返回的route_generation。" },
+    dedupe_key: { type: "string", minLength: 1, maxLength: 200, description: "同一注册请求复用此键；未知结果先get原键，不换键盲重发。" },
+    window_binding: {
+      type: "object",
+      properties: {
+        generation: { type: "integer", minimum: 1, description: "Core窗口CAS代次，与provider的route_generation分开。" },
+        owner_key: { type: "string", minLength: 1, maxLength: 2048, description: "模型machine_id、host、surface、conversation_id四项的JSON数组字符串。" },
+        target: {
+          type: "object",
+          properties: {
+            machine_id: { type: "string", minLength: 1, maxLength: 128 },
+            host: { type: "string", minLength: 1, maxLength: 64 },
+            surface: { type: "string", minLength: 1, maxLength: 64 },
+            conversation_id: { type: "string", minLength: 1, maxLength: 256 },
+            binding_id: { type: "string", minLength: 1, maxLength: 128 },
+            binding_generation: { type: "integer", minimum: 1 },
+          },
+          required: ["machine_id", "host", "surface", "conversation_id", "binding_id", "binding_generation"],
+          additionalProperties: false,
+        },
+      },
+      required: ["generation", "owner_key", "target"],
+      additionalProperties: false,
+    },
+  },
+  required: ["route_key", "conversation_id", "target_key", "capture_owner_events", "reply_delivery", "window_capture",
+    "expected_generation", "dedupe_key", "window_binding"],
+  additionalProperties: false,
+};
+
+const ownerWindowEventsReadInputSchema = {
+  type: "object",
+  properties: {
+    ...ownerWindowScopeProperties,
+    expected_route_generation: { type: "integer", minimum: 1 },
+    cursor: { type: "string", minLength: 1, maxLength: 4096 },
+    limit: { type: "integer", minimum: 1, maximum: 50 },
+  },
+  required: ["route_key", "conversation_id", "expected_route_generation"],
   additionalProperties: false,
 };
 
@@ -508,6 +581,40 @@ const tools = [
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
   },
   {
+    name: "napcat_owner_events_read",
+    description: "只读列出已显式启用保留的owner路由中，精确引用某条原外发QQ通知的结构化回复。校验绑定conversation_id、真实持久事件代次及游标范围，不扫聊天历史、不ACK、不发送或唤醒；旧通知缺结构化身份、保留过期时明确不可用。",
+    inputSchema: ownerEventsReadInputSchema,
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+  },
+  {
+    name: "napcat_owner_window_route_register",
+    description: "为预授权QQ窗口建立唯一默认入站路由，由稳定Core组件持有。首次/重开最近50条仅作基线；group本人sender由预配置private目标推导并要求@本机。事件冻结window_binding，无维护Codex唤醒，既有通知引用优先。注册CAS和去重回执持久保存，未知结果先get原键。",
+    inputSchema: ownerWindowRegisterInputSchema,
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+  },
+  {
+    name: "napcat_owner_window_route_get",
+    description: "只读查询默认窗口路由当前状态与可选原dedupe_key注册回执。registration=null表示该键尚未记录或已超出最近128条保留范围；不读QQ历史、不登记、不唤醒、不启动服务。",
+    inputSchema: { type: "object", properties: { ...ownerWindowScopeProperties,
+      dedupe_key: { type: "string", minLength: 1, maxLength: 200 } },
+    required: ["route_key", "conversation_id"], additionalProperties: false },
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+  },
+  {
+    name: "napcat_owner_window_route_close",
+    description: "按稳定Core组件身份与当前provider CAS代次关闭默认窗口入站，保留已有事件快照与注册回执；未知结果使用get核对，不触碰原quote路由。",
+    inputSchema: { type: "object", properties: { ...ownerWindowScopeProperties,
+      expected_generation: { type: "integer", minimum: 1 } },
+    required: ["route_key", "conversation_id", "expected_generation"], additionalProperties: false },
+    annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
+  },
+  {
+    name: "napcat_owner_window_events_read",
+    description: "只读分页读取默认QQ窗口原生human_message事件，无原外发QQ消息ID要求。每项含唯一event_id、原message_id/message_seq/sender_id、完整可读text/content、窗口与采集时route_generation/window_binding快照。cursor可持续轮询，改代次、过期或缺内容明确报错；source说明每次仅观察最近50条。无历史重扫、ACK、发送、登记或唤醒。",
+    inputSchema: ownerWindowEventsReadInputSchema,
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+  },
+  {
     name: "napcat_preview_training_event",
     description: "只生成固定格式训练通知正文和目标摘要，不发送消息。",
     inputSchema: eventInputSchema,
@@ -589,7 +696,8 @@ function textResult(value, isError = false) {
 }
 
 function errorResult(error) {
-  const knownError = error instanceof NapCatNotifierError || error instanceof TaskRegistryError || error instanceof ControlStateError;
+  const knownError = error instanceof NapCatNotifierError || error instanceof TaskRegistryError
+    || error instanceof ControlStateError || error instanceof OwnerReplyEventsError || error instanceof OwnerWindowEventsError;
   const safe = {
     ok: false,
     code: knownError ? error.code : "UNEXPECTED_ERROR",
@@ -736,6 +844,21 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     }
     if (name === "napcat_owner_route_close") {
       return textResult({ ok: true, route: controlPlane.closeOwnerRoute(args) });
+    }
+    if (name === "napcat_owner_events_read") {
+      return textResult(controlPlane.readOwnerEvents(args));
+    }
+    if (name === "napcat_owner_window_route_register") {
+      return textResult({ ...(await controlPlane.registerOwnerWindowRoute(args)), router: taskRouterController.ensureStarted() });
+    }
+    if (name === "napcat_owner_window_route_get") {
+      return textResult(controlPlane.getOwnerWindowRoute(args));
+    }
+    if (name === "napcat_owner_window_route_close") {
+      return textResult(controlPlane.closeOwnerWindowRoute(args));
+    }
+    if (name === "napcat_owner_window_events_read") {
+      return textResult(controlPlane.readOwnerWindowEvents(args));
     }
     if (name === "napcat_owner_route_migrate") {
       return textResult({ ok: true, route: controlPlane.migrateOwnerRoute(args), router: taskRouterController.ensureStarted() });

@@ -2,6 +2,11 @@ import fs from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { renameReplaceSync } from "./atomic-file.mjs";
+import { appendOwnerReplyEvent, enableOwnerEventCapture, ownerEventRouteFields, readOwnerReplyEventsPage } from "./owner-reply-events.mjs";
+import {
+  OwnerWindowEventsError, applyOwnerWindowClose, applyOwnerWindowRegistration, appendOwnerWindowEvent,
+  getOwnerWindowRegistration, readOwnerWindowEventsPage, validateOwnerWindowRoute,
+} from "./owner-window-events.mjs";
 
 const STATE_SCHEMA_VERSION = 6;
 const DEFAULT_MAX_SEEN = 2048;
@@ -335,6 +340,14 @@ function validateStoredOwnerRoute(route, routeKey, statePath) {
   }
   if (typeof route.baselineInitialized !== "boolean") {
     invalidState(statePath, `所有者路由历史基线状态无效（${routeKey}）`);
+  }
+  if (hasOwn(route, "windowCapture")) validateOwnerWindowRoute(route);
+  if (hasOwn(route, "replyDelivery") && route.windowCapture !== true) {
+    if (route.replyDelivery !== "events_only" || !Number.isSafeInteger(route.ownerEventGeneration)
+      || route.ownerEventGeneration <= 0) {
+      invalidState(statePath, `所有者路由回复方式无效（${routeKey}）`);
+    }
+    ownerEventRouteFields(route);
   }
   if (!Array.isArray(route.bufferedOwnerMessages) || route.bufferedOwnerMessages.length > 50) {
     invalidState(statePath, `所有者路由缓冲消息无效（${routeKey}）`);
@@ -870,11 +883,43 @@ export class ControlState {
     return Object.values(readState(this.statePath, this.maxSeen).state.ownerRoutes).map(clone);
   }
 
+  registerOwnerWindowRoute(input) {
+    return this.#write((state) => applyOwnerWindowRegistration(state, input, resolveNow(this.now, input)));
+  }
+
+  getOwnerWindowRoute(input) {
+    const snapshot = readState(this.statePath, this.maxSeen).state;
+    return getOwnerWindowRegistration(snapshot.ownerRoutes[input.routeKey], input);
+  }
+
+  closeOwnerWindowRoute(input) {
+    return this.#write((state) => applyOwnerWindowClose(state.ownerRoutes[input.routeKey], input, resolveNow(this.now, input)));
+  }
+
+  captureOwnerWindowMessage(input) {
+    return this.#write((state) => appendOwnerWindowEvent(state, state.ownerRoutes[input.routeKey], input, this.maxSeen));
+  }
+
+  readOwnerWindowEvents(input) {
+    const snapshot = readState(this.statePath, this.maxSeen).state;
+    return readOwnerWindowEventsPage(snapshot.ownerRoutes[input.routeKey], input);
+  }
+
   openOwnerRoute(input) {
     if (!isPlainObject(input)) invalidArgument("input 必须是对象");
     const routeKey = requiredString(input.routeKey, "routeKey", 256);
+    if (hasOwn(input, "replyDelivery") && input.replyDelivery !== "events_only") {
+      invalidArgument("replyDelivery 仅接受 events_only；普通路由省略该参数");
+    }
     return this.#write((state) => {
       const existing = state.ownerRoutes[routeKey] ?? null;
+      if (existing?.windowCapture === true) throw new OwnerWindowEventsError("OWNER_WINDOW_SCOPE_MISMATCH", "window路由须使用独立注册接口与CAS");
+      if (existing && hasOwn(input, "replyDelivery") && input.replyDelivery !== existing.replyDelivery) {
+        throw new ControlStateError("OWNER_ROUTE_CONFLICT", `已有路由的回复方式不可更改：${routeKey}`, { routeKey });
+      }
+      if (!existing && input.replyDelivery === "events_only" && input.captureOwnerEvents !== true) {
+        invalidArgument("events_only 新路由必须同时显式启用 captureOwnerEvents");
+      }
       const requestedOpenedAt = requestedDate(input, "openedAt");
       if (existing?.status === "open" && requestedOpenedAt !== null && requestedOpenedAt !== existing.openedAt) {
         throw new ControlStateError(
@@ -924,7 +969,10 @@ export class ControlState {
         bufferedOwnerMessages: existing?.status === "open"
           ? existing.bufferedOwnerMessages
           : [],
+        ...(existing?.replyDelivery || input.replyDelivery ? { replyDelivery: existing?.replyDelivery ?? input.replyDelivery } : {}),
+        ...ownerEventRouteFields(existing, existing?.status !== "open"),
       };
+      if (route.replyDelivery === "events_only") enableOwnerEventCapture(route);
       const changed = !existing
         || existing.status !== "open"
         || route.lastInboundMessageSeq !== existing.lastInboundMessageSeq
@@ -941,6 +989,7 @@ export class ControlState {
     const routeKey = requiredString(input.routeKey, "routeKey", 256);
     return this.#write((state) => {
       const existing = state.ownerRoutes[routeKey];
+      if (existing?.windowCapture === true) throw new OwnerWindowEventsError("OWNER_WINDOW_SCOPE_MISMATCH", "window路由须使用独立关闭接口与CAS");
       if (!existing) {
         throw new ControlStateError("OWNER_ROUTE_NOT_FOUND", `所有者路由不存在：${routeKey}`, { routeKey });
       }
@@ -976,6 +1025,7 @@ export class ControlState {
     }
     return this.#write((state) => {
       const existing = state.ownerRoutes[routeKey];
+      if (existing?.windowCapture === true) throw new OwnerWindowEventsError("OWNER_WINDOW_SCOPE_MISMATCH", "window路由由稳定Core组件持有，模型改绑使用独立注册接口");
       if (!existing) {
         throw new ControlStateError("OWNER_ROUTE_NOT_FOUND", `所有者路由不存在：${routeKey}`, { routeKey });
       }
@@ -1005,6 +1055,7 @@ export class ControlState {
         );
       }
       existing.conversationId = conversationId;
+      Object.assign(existing, ownerEventRouteFields(existing, true));
       existing.status = "open";
       existing.openedAt = resolveNow(this.now, input);
       existing.closedAt = null;
@@ -1028,6 +1079,33 @@ export class ControlState {
       route.lastInboundMessageSeq = messageSeq;
       return { changed: true, value: clone(route) };
     });
+  }
+
+  enableOwnerReplyEvents(routeKey) {
+    const normalizedKey = requiredString(routeKey, "routeKey", 256);
+    return this.#write((state) => {
+      const route = state.ownerRoutes[normalizedKey];
+      if (route?.windowCapture === true) throw new OwnerWindowEventsError("OWNER_WINDOW_SCOPE_MISMATCH", "window路由不接受quote事件设置");
+      if (!route || route.status !== "open") throw new ControlStateError("OWNER_ROUTE_NOT_FOUND", "引用回复路由未打开");
+      const changed = enableOwnerEventCapture(route);
+      return { changed, value: clone(route) };
+    });
+  }
+
+  recordOwnerReplyEvent(input) {
+    const routeKey = requiredString(input.routeKey, "routeKey", 256);
+    return this.#write((state) => {
+      const route = state.ownerRoutes[routeKey];
+      const alert = state.ownerAlertMessages[String(input.quotedMessageId ?? "")];
+      if (!route || route.status !== "open") return { changed: false, value: null };
+      const changed = appendOwnerReplyEvent(route, alert, input, this.maxSeen);
+      return { changed, value: null };
+    });
+  }
+
+  readOwnerReplyEvents(input) {
+    const snapshot = readState(this.statePath, this.maxSeen).state;
+    return readOwnerReplyEventsPage(snapshot.ownerRoutes[input.routeKey], snapshot.ownerAlertMessages[input.originalMessageId], input);
   }
 
   getOwnerAlertMessage(messageId) {
@@ -1059,6 +1137,9 @@ export class ControlState {
       if (route.status !== "open") throw new ControlStateError("OWNER_ROUTE_CLOSED", `所有者路由已关闭：${routeKey}`, { routeKey });
       const existing = route.bufferedOwnerMessages.find((message) => message.messageKey === messageKey);
       if (existing) return { changed: false, value: clone(existing) };
+      if (input.ownerReplyEvent) {
+        appendOwnerReplyEvent(route, state.ownerAlertMessages[String(input.ownerReplyEvent.quotedMessageId ?? "")], input.ownerReplyEvent, this.maxSeen);
+      }
       const message = {
         messageKey,
         messageSeq,
@@ -1086,8 +1167,20 @@ export class ControlState {
       const route = state.ownerRoutes[routeKey];
       if (!route) throw new ControlStateError("OWNER_ROUTE_NOT_FOUND", `所有者路由不存在：${routeKey}`, { routeKey });
       if (route.status !== "open") throw new ControlStateError("OWNER_ROUTE_CLOSED", `所有者路由已关闭：${routeKey}`, { routeKey });
+      if (route.replyDelivery === "events_only") {
+        const event = input.ownerReplyEvent;
+        const alert = state.ownerAlertMessages[String(event?.quotedMessageId ?? "")];
+        if (!event || event.routeKey !== routeKey || event.messageKey !== messageKey || event.messageSeq !== messageSeq
+          || alert?.ownerEventGeneration !== route.ownerEventGeneration || alert.conversationId !== route.conversationId
+          || alert.targetKey !== route.targetKey || alert.routeKey !== routeKey) {
+          throw new ControlStateError("OWNER_EVENT_SCOPE_MISMATCH", `引用回复与当前事件路线不匹配：${routeKey}`, { routeKey });
+        }
+      }
       route.lastInboundMessageSeq = messageSeq;
       route.bufferedOwnerMessages = [];
+      if (input.ownerReplyEvent) {
+        appendOwnerReplyEvent(route, state.ownerAlertMessages[String(input.ownerReplyEvent.quotedMessageId ?? "")], input.ownerReplyEvent, this.maxSeen);
+      }
       if (!state.seenControlMessages.includes(messageKey)) state.seenControlMessages.push(messageKey);
       if (state.seenControlMessages.length > this.maxSeen) {
         state.seenControlMessages.splice(0, state.seenControlMessages.length - this.maxSeen);
@@ -1120,6 +1213,7 @@ export class ControlState {
     const targetKey = requiredString(input.targetKey, "targetKey", 256);
     return this.#write((state) => {
       const route = state.ownerRoutes[routeKey];
+      if (route?.windowCapture === true) throw new OwnerWindowEventsError("OWNER_WINDOW_SCOPE_MISMATCH", "window路由只接收无既有通知引用的新消息");
       if (!route) {
         throw new ControlStateError("OWNER_ROUTE_NOT_FOUND", `所有者路由不存在：${routeKey}`, { routeKey });
       }
@@ -1149,6 +1243,11 @@ export class ControlState {
         routeKey,
         targetKey,
         sentAt: resolveNow(this.now, input),
+        ...(route.ownerEventGeneration === undefined ? {} : {
+          conversationId: route.conversationId,
+          ownerEventGeneration: route.ownerEventGeneration,
+          ownerEventStartSequence: route.ownerReplyEventCounter,
+        }),
       };
       state.ownerAlertMessages[messageId] = message;
       return { changed: true, value: clone(message) };

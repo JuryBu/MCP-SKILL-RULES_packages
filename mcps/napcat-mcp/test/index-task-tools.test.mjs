@@ -67,7 +67,7 @@ function startMcp() {
     });
     fs.rmSync(temporaryRoot, { recursive: true, force: true });
   }
-  return { child, request, close };
+  return { child, request, close, root: temporaryRoot };
 }
 
 function toolPayload(response) {
@@ -76,6 +76,31 @@ function toolPayload(response) {
   assert.equal(typeof text, "string");
   return JSON.parse(text);
 }
+
+test("MCP owner event reader advertises exact scope and fails closed without mutating state", async (context) => {
+  const server = startMcp();
+  context.after(() => server.close());
+  await server.request("initialize", { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "owner-event-test", version: "1.0.0" } });
+  server.child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" })}\n`);
+  const listed = await server.request("tools/list", {});
+  const definition = listed.result.tools.find((tool) => tool.name === "napcat_owner_events_read");
+  assert.ok(definition);
+  const ownerRoute = listed.result.tools.find((tool) => tool.name === "napcat_owner_route_register");
+  assert.deepEqual(ownerRoute.inputSchema.properties.reply_delivery.enum, ["events_only"]);
+  assert.equal(definition.annotations.readOnlyHint, true);
+  assert.equal(definition.annotations.destructiveHint, false);
+  assert.deepEqual(definition.inputSchema.required, ["route_key", "conversation_id", "original_qq_message_id", "expected_route_generation"]);
+  const controlStatePath = path.join(server.root, "control-state.json");
+  assert.equal(fs.existsSync(controlStatePath), false);
+  const response = await server.request("tools/call", { name: "napcat_owner_events_read", arguments: {
+    route_key: "isolated-missing-route", conversation_id: "isolated-test-chat", original_qq_message_id: "500", expected_route_generation: 1,
+  } });
+  assert.equal(response.result.isError, true);
+  const payload = toolPayload(response);
+  assert.equal(payload.ok, false);
+  assert.match(payload.code, /^(OWNER_EVENTS_|BINDING_MISSING)/);
+  assert.equal(fs.existsSync(controlStatePath), false);
+});
 
 function createPreviewNotifier() {
   const temporaryRoot = fs.mkdtempSync(path.join(os.tmpdir(), "napcat-task-preview-"));
