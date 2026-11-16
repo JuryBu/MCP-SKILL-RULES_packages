@@ -15,7 +15,7 @@ description: >-
 
 ## 一、Antigravity 2.0 Lazy MCP 机制、宿主 `10 KiB` 落盘与本机脚本避坑
 
-- **共享网关与可选门面拓扑**：`exa`（可选）、`memory-store`、`sandbox`、`sequential-thinking`、`web-fetcher` 经本机常驻 HTTP 网关 `http://127.0.0.1:14588/<endpoint>/mcp` 接入；若已启用 `communication-core`，经本地 Node stdio 门面（`broker-stdio.mjs` + `COMMUNICATION_CORE_FACADE_REGISTRY` 私有登记）接入（配于 `C:/Users/<USER>/.gemini/config/mcp_config.json`，六工具契约与外部渠道回信规范必读 `guidance/communication-bridges.md`）。复杂多假设权衡可调 `sequential-thinking`。
+- **共享网关与可选门面拓扑**：`exa`（可选）、`memory-store`、`sandbox`、`sequential-thinking`、`web-fetcher` 经本机常驻 HTTP 网关 `http://127.0.0.1:14588/<endpoint>/mcp` 接入；若已启用 `communication-core`，经本地 Node stdio 门面（`broker-stdio.mjs` + `COMMUNICATION_CORE_FACADE_REGISTRY` 私有登记）接入（配于 `C:/Users/<USER>/.gemini/config/mcp_config.json`，八工具契约与外部渠道回信规范必读 `guidance/communication-bridges.md`）。复杂多假设权衡可调 `sequential-thinking`。
 - **Lazy Loading 调用铁律**：MCP 工具默认懒加载。首次使用某工具或传入非默认参数前，必须先用 `read_file` 查看 `C:/Users/<USER>/.gemini/antigravity/mcp/<serverName>/<toolName>.json` 确认真实字段与枚举，再用 `call_mcp_tool` 调用，严禁凭记忆猜参数名。
 - **⚠️ 宿主 `call_mcp_tool` `10 KiB` 自动转存机制（必知，非 MCP 截断故障！）**：
   - **Antigravity 2.0 宿主对 `call_mcp_tool`（及 `read_board` 等）硬编码了 `10 KiB`（`10,240 B`）内联阈值**：超出时完整无损落盘至 `C:/Users/<USER>/.gemini/antigravity/brain/<当前会话ID>/.system_generated/steps/<步号>/output.txt` 并返回路径/预览。

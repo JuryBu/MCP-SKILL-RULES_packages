@@ -89,6 +89,6 @@ foreach ($entry in $Map.GetEnumerator()) {
 
 1. **本地调整项与双机角色自知（`development` vs `training`）**：
    - **双机角色标记（多机用户必配）**：若同时维护开发机（`development`）与训练机（`training`），安装后请在各自机器的 `%USERPROFILE%\.gemini\GEMINI.md` 第七节及仓库外的 `%USERPROFILE%\.gemini\guidance\personal-care.local.md` 中明确标出本机 `local_role`（使助手清楚自己是「开发机的反重力」还是「训练机的反重力」，并在 Git 提交时分别使用 `[Antigravity/dev]` 与 `[Antigravity/training]` 正交双标，不混用署名）。后续若训练机需增加条件式训练监督规则，建议独立存为 `guidance\training-machine.md` 按需读取，不覆盖跨机共享的 `GEMINI.template.md`。
-   - **语气与模型/MCP 列表**：可在本地 `GEMINI.md` 第一节调整语气风格，按实际订阅与 `templates/config.antigravity.example.json` 调整可用模型档位与 MCP 服务（未配 `exa` 时自动降级 `search_web`；启用 `communication-core` 时在私有门面配置登记当前会话 `caller` 与授权绑定）。
+   - **语气与模型/MCP 列表**：可在本地 `GEMINI.md` 第一节调整语气风格，按实际订阅与 `templates/config.antigravity.example.json` 调整可用模型档位与 MCP 服务（未配 `exa` 时自动降级 `search_web`；启用 `communication-core` 时在私有门面配置登记宿主统一连接或会话绑定）。
 2. **生效验证**：
-   - 保存后在 Antigravity 2.0 新开一条对话（无需重启宿主），用一个纯只读小问题验证：让助手确认已注入 `GEMINI.md`（2.0 模块化版），复述本机机器角色（若已配置 `development` / `training`）及对应 Git 双标格式、单文件 `24,000 bytes` 预算线、`call_mcp_tool` `10 KiB` 落盘位置、`communication-core` 六工具调用红线与 `schedule` 双模式的区别。
+   - 保存后在 Antigravity 2.0 新开一条对话（无需重启宿主），用一个纯只读小问题验证：让助手确认已注入 `GEMINI.md`（2.0 模块化版），复述本机机器角色（若已配置 `development` / `training`）及对应 Git 双标格式、单文件 `24,000 bytes` 预算线、`call_mcp_tool` `10 KiB` 落盘位置、`communication-core` 八工具调用红线与 `schedule` 双模式的区别。
