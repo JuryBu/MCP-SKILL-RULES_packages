@@ -67,11 +67,31 @@ function structuredWindowResult(result, requestSent) {
   return { value };
 }
 
+function structuredChannelResult(result, requestSent) {
+  const response = windowRecord(result);
+  if (response.isError !== undefined && typeof response.isError !== "boolean") throw unavailable(requestSent);
+  const value = structuredResult({ ...response, isError: false });
+  const payload = windowRecord(value);
+  if (payload.ok === false && payload.outcomeUnknown === false && typeof payload.code === "string"
+    && /^[A-Z][A-Z0-9_]{0,95}$/.test(payload.code) && payload.code !== "UNEXPECTED_ERROR") {
+    const cleanupPending = payload.details?.cleanupPending;
+    if (cleanupPending !== undefined && typeof cleanupPending !== "boolean") throw unavailable(requestSent);
+    return { error: new CoreError("channel_operation_failed", "QQ窗口操作返回明确失败", {
+      request_sent: requestSent, outcome_unknown: false, provider_code: payload.code,
+      ...(cleanupPending === true ? { cleanup_pending: true,
+        ...(boundedText(payload.details?.temporaryPath, 4096) ? { temporary_path: payload.details.temporaryPath } : {}) } : {}),
+    }) };
+  }
+  if (response.isError || payload.ok === false) throw unavailable(requestSent);
+  return { value };
+}
+
 export class NapcatMcpTransport {
   #baseUrl;
   #conversationId;
   #clientFactory;
   #connection = null;
+  #channelConnections = new Map();
   #closing = new Set();
   #shutdown = new AbortController();
   #closed = false;
@@ -96,6 +116,7 @@ export class NapcatMcpTransport {
     if (!connection || connection.closed) return;
     connection.closed = true;
     if (this.#connection === connection) this.#connection = null;
+    if (this.#channelConnections.get(connection.lane) === connection) this.#channelConnections.delete(connection.lane);
     const closing = Promise.allSettled([
       Promise.resolve().then(() => connection.transport.close()),
       Promise.resolve().then(() => connection.client.close()),
@@ -104,15 +125,16 @@ export class NapcatMcpTransport {
     void closing.then(() => this.#closing.delete(closing));
   }
 
-  #connect(options) {
+  #connect(options, lane) {
     const client = this.#clientFactory();
     if (typeof client?.connect !== "function" || typeof client?.callTool !== "function" || typeof client?.close !== "function") throw unavailable();
     const transport = new StreamableHTTPClientTransport(new URL(this.#baseUrl), {
       requestInit: { redirect: "error", headers: { "x-conversation-id": this.#conversationId } },
       reconnectionOptions: { maxRetries: 0, initialReconnectionDelay: 1000, maxReconnectionDelay: 1000, reconnectionDelayGrowFactor: 1 },
     });
-    const connection = { client, transport, closed: false };
-    this.#connection = connection;
+    const connection = { client, transport, lane, closed: false };
+    if (lane) this.#channelConnections.set(lane, connection);
+    else this.#connection = connection;
     connection.ready = Promise.resolve().then(() => {
       if (connection.closed || this.#closed || options.signal.aborted) throw unavailable();
       return client.connect(transport, options);
@@ -123,16 +145,16 @@ export class NapcatMcpTransport {
     return connection;
   }
 
-  async #call(name, args, signal, onRequestStarted, preserveWindowErrors = false) {
+  async #call(name, args, signal, onRequestStarted, preserveWindowErrors = false, timeoutMs = TIMEOUT_MS, preserveChannelErrors = false, lane) {
     if (this.#closed || signal?.aborted) throw unavailable();
     let connection;
     let requestSent = false;
     let providerFailure = null;
     let onAbort;
     const deadline = new AbortController();
-    const timer = setTimeout(() => deadline.abort(), TIMEOUT_MS);
+    const timer = setTimeout(() => deadline.abort(), timeoutMs);
     const requestSignal = AbortSignal.any([deadline.signal, this.#shutdown.signal, ...(signal ? [signal] : [])]);
-    const options = { signal: requestSignal, timeout: TIMEOUT_MS, maxTotalTimeout: TIMEOUT_MS, resetTimeoutOnProgress: false };
+    const options = { signal: requestSignal, timeout: timeoutMs, maxTotalTimeout: timeoutMs, resetTimeoutOnProgress: false };
     const interrupted = new Promise((resolve, reject) => {
       onAbort = () => {
         this.#disconnect(connection);
@@ -141,7 +163,7 @@ export class NapcatMcpTransport {
       requestSignal.addEventListener("abort", onAbort, { once: true });
     });
     try {
-      connection = this.#connection ?? this.#connect(options);
+      connection = (lane ? this.#channelConnections.get(lane) : this.#connection) ?? this.#connect(options, lane);
       await Promise.race([connection.ready, interrupted]);
       if (requestSignal.aborted || connection.closed || this.#closed) throw unavailable();
       if (["napcat_owner_alert", "napcat_owner_window_route_register", "napcat_owner_window_route_close"].includes(name)) onRequestStarted?.();
@@ -152,6 +174,12 @@ export class NapcatMcpTransport {
         interrupted,
       ]);
       if (requestSignal.aborted || this.#closed) throw unavailable(true);
+      if (preserveChannelErrors) {
+        const parsed = structuredChannelResult(result, requestSent);
+        providerFailure = parsed.error ?? null;
+        if (providerFailure) throw providerFailure;
+        return parsed.value;
+      }
       if (preserveWindowErrors) {
         const parsed = structuredWindowResult(result, requestSent);
         providerFailure = parsed.error ?? null;
@@ -160,8 +188,8 @@ export class NapcatMcpTransport {
       }
       return structuredResult(result);
     } catch (error) {
-      this.#disconnect(connection);
       if (providerFailure && error === providerFailure) throw error;
+      this.#disconnect(connection);
       throw unavailable(requestSent);
     } finally {
       clearTimeout(timer);
@@ -171,6 +199,41 @@ export class NapcatMcpTransport {
 
   async status({ signal } = {}) {
     return this.#call("napcat_status", { include_group: false }, signal);
+  }
+
+  async readConfiguredRecent(parameters = {}, context = {}) {
+    let args;
+    let signal;
+    try {
+      const request = windowRecord(parameters, ["target_key", "count", "before_message_id", "include_owner_event_content"]);
+      ({ signal } = windowRecord(context, ["signal"]));
+      if (signal !== undefined && (!(signal instanceof AbortSignal) || signal.aborted)) throw unavailable();
+      const targetKey = windowIdentifier(request.target_key, 256);
+      const count = request.count === undefined ? 20 : request.count;
+      if (!Number.isSafeInteger(count) || count < 1 || count > 50
+        || (request.include_owner_event_content !== undefined && request.include_owner_event_content !== true)) throw unavailable();
+      args = { target_key: targetKey, count, include_owner_event_content: true,
+        ...(request.before_message_id === undefined ? {} : { before_message_id: windowIdentifier(request.before_message_id, 256) }) };
+    } catch {
+      throw unavailable();
+    }
+    return this.#call("napcat_read_configured_recent", args, signal, undefined, false, TIMEOUT_MS, true, "channel_history");
+  }
+
+  async downloadConfiguredFile(parameters = {}, context = {}) {
+    let args;
+    let signal;
+    try {
+      const request = windowRecord(parameters, ["target_key", "message_id", "attachment_ref", "destination_dir", "name"]);
+      ({ signal } = windowRecord(context, ["signal"]));
+      if (signal !== undefined && (!(signal instanceof AbortSignal) || signal.aborted)) throw unavailable();
+      args = Object.fromEntries([["target_key", 256], ["message_id", 256], ["attachment_ref", 4096], ["destination_dir", 4096]]
+        .map(([field, maximum]) => [field, windowIdentifier(request[field], maximum)]));
+      if (request.name !== undefined) args.name = windowIdentifier(request.name, 255);
+    } catch {
+      throw unavailable();
+    }
+    return this.#call("napcat_download_configured_file", args, signal, undefined, false, 45000, true, "channel_download");
   }
 
   async sendOwnerAlert({ route_key, dedupe_key, summary, reply_hint } = {}, { signal, onRequestStarted } = {}) {
@@ -276,6 +339,7 @@ export class NapcatMcpTransport {
     this.#closed = true;
     this.#shutdown.abort();
     this.#disconnect(this.#connection);
+    for (const connection of this.#channelConnections.values()) this.#disconnect(connection);
     await Promise.allSettled([...this.#closing]);
   }
 }

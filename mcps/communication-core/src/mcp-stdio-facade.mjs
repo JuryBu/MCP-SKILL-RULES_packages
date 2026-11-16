@@ -8,7 +8,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { CallToolRequestSchema, CallToolResultSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import { communicationTools } from "./mcp-server.mjs";
 
-export const FACADE_INSTRUCTIONS = "每次调用填写本地真实caller四字段：machine_id、host、surface、conversation_id，对话ID须具体。已登记的宿主统一入口可供该宿主各对话使用，无需逐个登记CID。目标按端和对话ID寻址，参数以工具schema为准。发送默认next_model_boundary，能中途插入就插入；仅明确延后时用when_idle。Codex新消息默认hidden，显示全部气泡可选message_visibility=visible。QQ来信回原QQ。等待投递或回复与确认处理分开，实际处理后才ACK确认。结果未知时查原请求ID，保持原dedupe_key，不自动重发。门面只连接原核心，不启动服务。caller由本机可信入口声明，broker未提供可信宿主CID，门面按登记选连接，未鉴别实际宿主来源。";
+export const FACADE_INSTRUCTIONS = "每次调用填写本地真实caller四字段：machine_id、host、surface、conversation_id，对话ID须具体。已登记的宿主统一入口可供该宿主各对话使用，无需逐个登记CID。目标按端和对话ID寻址，参数以工具schema为准。发送默认next_model_boundary，能中途插入就插入；仅明确延后时用when_idle。Codex新消息默认hidden，显示全部气泡可选message_visibility=visible。QQ来信回原QQ。等待投递或回复与确认处理分开，实际处理后才ACK确认。结果未知时查原请求ID，保持原dedupe_key，不自动重发。门面只连接原核心，不启动服务。caller由本机可信入口声明，broker未提供可信宿主CID，门面按登记选连接，未鉴别实际宿主来源。普通代理发送的origin.kind填写agent_message，source_ref通常填当前真实对话ID，不能自行声明human_message。QQ最近内容无需绑定或启用采集；下载使用本调用者从对应窗口取得的attachment_ref，结果未知先核对原请求与目录，不换引用重下。";
 
 const CONNECT_TIMEOUT_MS = 4000;
 const CALL_TIMEOUT_MS = 49000;

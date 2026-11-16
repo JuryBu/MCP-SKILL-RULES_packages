@@ -3,6 +3,7 @@ import { isAbsolute, join, resolve } from "node:path";
 import { CoreError, assertExactKeys, digest, identityKey, normalizeIdentity, normalizeTarget, requireInteger, requireText } from "./contracts.mjs";
 import { CommunicationCore } from "./core.mjs";
 import { MessageStore } from "./store.mjs";
+import { createChannelDownloadLedger } from "./channel-download-ledger.mjs";
 import { createMcpHttpServer } from "./mcp-server.mjs";
 import { AntigravityDeliveryAdapter } from "./adapters/antigravity.mjs";
 import { AntigravityLsTransport } from "./transports/antigravity-ls.mjs";
@@ -15,7 +16,7 @@ import { acquireRuntimeLease } from "./runtime-lease.mjs";
 import { normalizeReplyForwardingRules } from "./reply-forwarding.mjs";
 import { normalizeHostScope } from "./conversation-directory.mjs";
 import { HostStatusProvider, createAntigravityStatusReader, createCodexStatusReader } from "./host-status.mjs";
-import { createWindsurfPresenceReader } from "./windsurf-presence.mjs";
+import { createWindsurfDesktopStatusReader } from "./windsurf-desktop-status.mjs";
 import { WindowIngressController } from "./window-ingress.mjs";
 
 const MAX_ENTRIES = 256;
@@ -191,7 +192,7 @@ async function readConfiguration(configPath) {
     const principalIds = new Set();
     const tokens = new Set();
     const principals = boundedList(configuration.principals).map(entry => {
-      assertExactKeys(entry, ["id", "token", "identity", "allowed_targets", "origin_kinds", "channel_component", "caller_scope", "allowed_target_scopes"], "连接授权");
+      assertExactKeys(entry, ["id", "token", "identity", "allowed_targets", "origin_kinds", "channel_component", "caller_scope", "allowed_target_scopes", "allowed_channel_reads", "allowed_channel_downloads"], "连接授权");
       assertExactKeys(entry.identity, IDENTITY_FIELDS, "来源对话身份");
       const id = requireText(entry.id, "principal.id", 128);
       const token = requireText(entry.token, "principal.token", 4096);
@@ -200,6 +201,13 @@ async function readConfiguration(configPath) {
       tokens.add(token);
       const allowedTargets = uniqueTextList(entry.allowed_targets, "allowed_target", MAX_ENTRIES, 0, 128);
       if (allowedTargets.some(bindingId => !bindingIds.has(bindingId))) throw invalidConfiguration();
+      const channelReads = entry.allowed_channel_reads === undefined ? undefined
+        : uniqueTextList(entry.allowed_channel_reads, "allowed_channel_read", MAX_ENTRIES, 0, 128);
+      const channelDownloads = entry.allowed_channel_downloads === undefined ? undefined
+        : uniqueTextList(entry.allowed_channel_downloads, "allowed_channel_download", MAX_ENTRIES, 0, 128);
+      if ([...(channelReads ?? []), ...(channelDownloads ?? [])].some(bindingId => !targets.some(target => target.binding_id === bindingId && target.host === "qq"))) {
+        throw invalidConfiguration();
+      }
       const identity = normalizeIdentity(entry.identity);
       const callerScope = entry.caller_scope === undefined ? undefined : normalizeHostScope(entry.caller_scope);
       if (callerScope && (identity.conversation_id !== "*" || Object.entries(callerScope).some(([field, value]) => identity[field] !== value))) throw invalidConfiguration();
@@ -213,6 +221,8 @@ async function readConfiguration(configPath) {
         token,
         identity,
         allowed_targets: allowedTargets,
+        ...(channelReads === undefined ? {} : { allowed_channel_reads: channelReads }),
+        ...(channelDownloads === undefined ? {} : { allowed_channel_downloads: channelDownloads }),
         ...(callerScope ? { caller_scope: callerScope } : {}),
         ...(targetScopes ? { allowed_target_scopes: targetScopes } : {}),
         origin_kinds: originKinds,
@@ -280,8 +290,9 @@ export async function startLiveFromConfig({ configPath, stateDir, endpointFile, 
   const transports = new Set();
   const windowTransports = new Map();
   const statusProvider = new HostStatusProvider();
-  if (configuration.statusHosts.includes("windsurf")) statusProvider.providers.set("windsurf", createWindsurfPresenceReader());
+  if (configuration.statusHosts.includes("windsurf")) statusProvider.providers.set("windsurf", createWindsurfDesktopStatusReader());
   let store;
+  let downloadLedger;
   let core;
   let http;
   let windowIngress;
@@ -301,7 +312,7 @@ export async function startLiveFromConfig({ configPath, stateDir, endpointFile, 
       try { await windowIngress?.close(); } catch { failed = true; }
       const stopped = await Promise.allSettled([Promise.resolve().then(() => statusProvider.close()), Promise.resolve().then(() => core?.close()), Promise.resolve().then(() => http?.close())]);
       if (stopped.some(result => result.status === "rejected")) failed = true;
-      for (const cleanup of [() => scheduledWork, ...[...ownedAdapters].map(adapter => () => adapter.close?.()), ...[...transports].map(transport => () => transport.close()), () => store?.close()]) {
+      for (const cleanup of [() => scheduledWork, ...[...ownedAdapters].map(adapter => () => adapter.close?.()), ...[...transports].map(transport => () => transport.close()), () => downloadLedger?.close(), () => store?.close()]) {
         try { await cleanup(); } catch { failed = true; }
       }
       if (failed) throw new CoreError("shutdown_failed", "真实测试服务退出清理失败");
@@ -375,9 +386,17 @@ export async function startLiveFromConfig({ configPath, stateDir, endpointFile, 
       if (!adapter || typeof adapter.deliver !== "function" || typeof adapter.query !== "function" || (adapter.close !== undefined && typeof adapter.close !== "function")) throw invalidConfiguration();
       adapters.set(entry.id, adapter);
     }
+    let channelDownloadFailure = false;
+    if (configuration.principals.some(principal => principal.allowed_channel_reads?.length || principal.allowed_channel_downloads?.length)) {
+      try { downloadLedger = await createChannelDownloadLedger({ stateDir: join(directory, "channel-downloads") }); }
+      catch {
+        channelDownloadFailure = true;
+        report("附件原操作记录未就绪，已停止新下载；普通消息、历史读取与状态继续可用\n");
+      }
+    }
     core = new CommunicationCore({ targets: configuration.targets, principals: configuration.principals, adapters, replyForwarding: configuration.replyForwarding,
       conversationRoutes: configuration.conversationRoutes, automaticReplyForwarding: configuration.automaticReplyForwarding, channelWindows: configuration.channelWindows,
-      ownerWindowSources: configuration.ownerWindowSources,
+      ownerWindowSources: configuration.ownerWindowSources, downloadLedger, channelDownloadFailure,
       statusProvider, deliveryTimeoutMs: configuration.deliveryTimeoutMs });
     if (typeof core.pollReplies !== "function") throw new CoreError("startup_failed", "真实测试核心依赖尚未就绪");
     await mkdir(directory, { recursive: true, mode: 0o700 });

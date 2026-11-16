@@ -2,35 +2,90 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { join, win32 } from "node:path";
 import { CoreError, requireInteger, requireText } from "../contracts.mjs";
+import { readAntigravityRendererModel } from "../host-model-observation.mjs";
 
 const execute = promisify(execFile);
+const discoveryFlights = new Map();
 const SERVICE = "exa.language_server_pb.LanguageServerService";
-const METHODS = new Set(["GetAllCascadeTrajectories", "GetCascadeTrajectorySteps", "SendUserCascadeMessage"]);
+const METHODS = new Set(["GetAllCascadeTrajectories", "GetCascadeTrajectorySteps", "GetCascadeModelConfigData", "SendUserCascadeMessage"]);
 
 function failure(code = "ls_unavailable") {
   return new CoreError(code, "反重力对话接口未取得可核对结果");
 }
 
-export async function discoverAntigravityProcesses({ signal, executablePath } = {}) {
+function discoveryPath(executablePath) {
   const requested = executablePath ?? join(process.env.LOCALAPPDATA ?? "", "Programs", "antigravity", "resources", "bin", "language_server.exe");
   if (typeof requested !== "string" || !/^[A-Za-z]:[\\/]/.test(requested) || /[\u0000-\u001f\u007f]/.test(requested)) throw failure("ls_path_missing");
   const expected = win32.normalize(requested);
   const executableName = win32.basename(expected);
   if (!/^[A-Za-z0-9_-][A-Za-z0-9_.-]*\.exe$/i.test(executableName)) throw failure("ls_path_missing");
+  return expected;
+}
+
+function waitForDiscovery(promise, signal) {
+  const pending = Promise.resolve(promise);
+  if (!signal) return pending;
+  return new Promise((resolve, reject) => {
+    const onAbort = () => reject(failure("ls_cancelled"));
+    if (signal.aborted) onAbort();
+    else signal.addEventListener("abort", onAbort, { once: true });
+    pending.then(resolve, reject).finally(() => signal.removeEventListener("abort", onAbort));
+  });
+}
+
+export async function discoverAntigravityProcesses({ signal, executablePath } = {}) {
+  const expected = discoveryPath(executablePath);
+  if (signal?.aborted) throw failure("ls_cancelled");
+  const key = expected.toLowerCase();
+  let flight = discoveryFlights.get(key);
+  if (flight?.controller.signal.aborted) {
+    await waitForDiscovery(flight.promise.catch(() => {}), signal);
+    return discoverAntigravityProcesses({ signal, executablePath: expected });
+  }
+  if (!flight) {
+    flight = { controller: new AbortController(), waiters: 0, settled: false };
+    const current = flight;
+    flight.promise = queryAntigravityProcesses(expected, flight.controller.signal).finally(() => {
+      current.settled = true;
+      if (discoveryFlights.get(key) === current) discoveryFlights.delete(key);
+    });
+    discoveryFlights.set(key, flight);
+  }
+  flight.waiters += 1;
+  try {
+    return structuredClone(await waitForDiscovery(flight.promise, signal));
+  } finally {
+    flight.waiters -= 1;
+    if (!flight.waiters && !flight.settled) flight.controller.abort();
+  }
+}
+
+async function queryAntigravityProcesses(expected, signal) {
+  const executableName = win32.basename(expected);
   const escaped = expected.replaceAll("'", "''");
   const escapedName = executableName.replaceAll("'", "''");
-  const script = `$ErrorActionPreference='Stop'; $items=@(); foreach($process in Get-CimInstance Win32_Process -Filter "Name='${escapedName}'"){if($process.ExecutablePath -ne '${escaped}'){continue}; $match=[regex]::Match($process.CommandLine,'--csrf_token(?:=|\\s+)([^\\s]+)'); if(-not $match.Success){continue}; $ports=@(Get-NetTCPConnection -OwningProcess $process.ProcessId -State Listen -ErrorAction SilentlyContinue | Select-Object -ExpandProperty LocalPort -Unique); $items+=[PSCustomObject]@{pid=$process.ProcessId;csrf=$match.Groups[1].Value.Trim('"');ports=$ports}}; ConvertTo-Json -InputObject @($items) -Compress -Depth 4`;
+  const hostExecutable = win32.join(win32.dirname(win32.dirname(win32.dirname(expected))), "Antigravity.exe").replaceAll("'", "''");
+  const script = `$ErrorActionPreference='Stop'; $items=@(); $processes=@(Get-CimInstance Win32_Process -Filter "Name='${escapedName}'"); $listening=@(); if($processes.Count){$listening=@(Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue)}; foreach($process in $processes){if($process.ExecutablePath -ne '${escaped}'){continue}; $match=[regex]::Match($process.CommandLine,'--csrf_token(?:=|\\s+)([^\\s]+)'); if(-not $match.Success){continue}; $ports=@($listening | Where-Object OwningProcess -eq $process.ProcessId | Select-Object -ExpandProperty LocalPort -Unique); $hostId=$null; $hostPorts=@(); try{$hostProcess=Get-Process -Id $process.ParentProcessId -ErrorAction SilentlyContinue; if($hostProcess -and $hostProcess.Path -eq '${hostExecutable}'){$hostId=$hostProcess.Id; $hostPorts=@($listening | Where-Object OwningProcess -eq $hostId | Select-Object -ExpandProperty LocalPort -Unique)}}catch{$hostId=$null; $hostPorts=@()}; $items+=[PSCustomObject]@{pid=$process.ProcessId;csrf=$match.Groups[1].Value.Trim('"');ports=$ports;host_pid=$hostId;host_ports=$hostPorts}}; ConvertTo-Json -InputObject @($items) -Compress -Depth 4`;
+  let closed;
   try {
-    const { stdout } = await execute("powershell.exe", ["-NoProfile", "-Command", script], { signal, windowsHide: true, timeout: 8000, maxBuffer: 128 * 1024, encoding: "utf8" });
+    const pending = execute("powershell.exe", ["-NoProfile", "-Command", script], { signal, windowsHide: true, timeout: 8000, maxBuffer: 128 * 1024, encoding: "utf8" });
+    if (pending.child) closed = new Promise(resolve => pending.child.once("close", resolve));
+    const { stdout } = await pending;
     const decoded = JSON.parse(stdout.replace(/^\uFEFF/, "").trim());
     if (!Array.isArray(decoded) || decoded.length > 8) throw failure();
     return decoded.map(candidate => ({
       pid: requireInteger(candidate.pid, "pid", 1, 2147483647),
       csrf: requireText(candidate.csrf, "csrf", 4096),
       ports: [...new Set(candidate.ports)].slice(0, 8).map(port => requireInteger(port, "port", 1, 65535)),
+      ...(Number.isSafeInteger(candidate.host_pid) && candidate.host_pid > 0 && Array.isArray(candidate.host_ports) ? {
+        host_pid: candidate.host_pid,
+        host_ports: [...new Set(candidate.host_ports)].filter(port => Number.isInteger(port) && port > 0 && port <= 65535).sort((left, right) => left - right).slice(0, 4),
+      } : {}),
     }));
   } catch {
     throw failure("ls_discovery_failed");
+  } finally {
+    await closed;
   }
 }
 
@@ -69,19 +124,22 @@ export function compactAntigravitySteps(body, stepOffset = 0) {
 }
 
 export class AntigravityLsTransport {
-  constructor({ discover = discoverAntigravityProcesses, fetchImpl = fetch, timeoutMs = 8000, maxResponseBytes = 8 * 1024 * 1024 } = {}) {
+  constructor({ discover = discoverAntigravityProcesses, fetchImpl = fetch, WebSocketImpl = WebSocket, timeoutMs = 8000, maxResponseBytes = 8 * 1024 * 1024 } = {}) {
     this.discover = discover;
     this.fetchImpl = fetchImpl;
+    this.WebSocketImpl = WebSocketImpl;
     this.timeoutMs = requireInteger(timeoutMs, "timeoutMs", 50, 30000);
     this.maxResponseBytes = requireInteger(maxResponseBytes, "maxResponseBytes", 1024, 16 * 1024 * 1024);
     this.endpoints = new Map();
+    this.closeController = new AbortController();
     this.closed = false;
     this.submissionTracking = true;
   }
 
   async request(endpoint, method, payload, signal) {
     if (this.closed || !METHODS.has(method)) throw failure("ls_method_rejected");
-    const combined = signal ? AbortSignal.any([signal, AbortSignal.timeout(this.timeoutMs)]) : AbortSignal.timeout(this.timeoutMs);
+    const combined = AbortSignal.any([this.closeController.signal, AbortSignal.timeout(this.timeoutMs), ...(signal ? [signal] : [])]);
+    if (combined.aborted) throw failure("ls_cancelled");
     try {
       const response = await this.fetchImpl(`http://127.0.0.1:${endpoint.port}/${SERVICE}/${method}`, {
         method: "POST", redirect: "error", signal: combined,
@@ -117,12 +175,16 @@ export class AntigravityLsTransport {
 
   async resolve(target, { signal } = {}) {
     const cascadeId = requireText(target?.conversation_id, "conversation_id", 256);
-    const operationSignal = signal ? AbortSignal.any([signal, AbortSignal.timeout(this.timeoutMs)]) : AbortSignal.timeout(this.timeoutMs);
-    const candidates = await this.discover({ signal: operationSignal });
+    const operationSignal = AbortSignal.any([this.closeController.signal, AbortSignal.timeout(this.timeoutMs), ...(signal ? [signal] : [])]);
+    if (operationSignal.aborted) throw failure("ls_cancelled");
+    const candidates = await waitForDiscovery(this.discover({ signal: operationSignal }), operationSignal);
+    if (operationSignal.aborted) throw failure("ls_cancelled");
     const matches = [];
     for (const candidate of candidates) {
       for (const port of candidate.ports) {
-        const endpoint = { pid: candidate.pid, csrf: candidate.csrf, port };
+        const endpoint = { pid: candidate.pid, csrf: candidate.csrf, port, ls_ports: candidate.ports,
+          ...(candidate.host_pid ? { host_pid: candidate.host_pid, host_ports: candidate.host_ports } : {}),
+        };
         try {
           const body = await this.request(endpoint, "GetAllCascadeTrajectories", {}, operationSignal);
           const summary = body.trajectorySummaries?.[cascadeId];
@@ -152,7 +214,7 @@ export class AntigravityLsTransport {
       }
     }
     if (matches.length !== 1) throw failure(matches.length ? "ls_target_ambiguous" : "ls_target_unavailable");
-    this.endpoints.set(cascadeId, matches[0].endpoint);
+    this.endpoints.set(cascadeId, { ...matches[0].endpoint, trajectory_id: matches[0].description.trajectory_id, observed_at: Date.now() });
     return matches[0];
   }
 
@@ -160,13 +222,77 @@ export class AntigravityLsTransport {
     return (await this.resolve(target, options)).description;
   }
 
+  async describeModel(target, { signal, description, kind } = {}) {
+    const source = kind === "current_selection" ? "antigravity_renderer_model_selection" : "antigravity_ls_model_usage";
+    const missing = code => ({ model: "unknown", source, code });
+    const operationSignal = signal ? AbortSignal.any([signal, AbortSignal.timeout(1500)]) : AbortSignal.timeout(1500);
+    const endpoint = this.endpoints.get(target?.conversation_id);
+    if (this.closed || operationSignal.aborted || description?.cascade_id !== target?.conversation_id
+      || typeof description?.trajectory_id !== "string" || description.trajectory_id !== endpoint?.trajectory_id
+      || !Number.isFinite(endpoint?.observed_at) || Date.now() - endpoint.observed_at < 0 || Date.now() - endpoint.observed_at > 8000) return missing("model_observation_unavailable");
+    if (kind === "current_selection") return readAntigravityRendererModel(target, endpoint, {
+      fetchImpl: this.fetchImpl, WebSocketImpl: this.WebSocketImpl, signal: operationSignal,
+    });
+    if (kind !== "last_invocation" || !Number.isSafeInteger(description.step_count) || description.step_count < 1) return missing("model_tail_unavailable");
+    const offset = Math.max(0, description.step_count - 32);
+    try {
+      const body = await this.request(endpoint, "GetCascadeTrajectorySteps", { cascadeId: target.conversation_id, stepOffset: offset }, operationSignal);
+      if (!Array.isArray(body.steps) || body.steps.length > 32) return missing("model_tail_mismatch");
+      let latest;
+      for (const [index, step] of body.steps.entries()) {
+        const identity = step.metadata?.sourceTrajectoryStepInfo;
+        if (identity?.cascadeId !== target.conversation_id || identity?.trajectoryId !== description.trajectory_id
+          || identity.stepIndex !== offset + index) return missing("model_tail_mismatch");
+        if (typeof step.metadata?.modelUsage?.model === "string") latest = { step, index: identity.stepIndex };
+      }
+      if (!latest) return missing("model_tail_unavailable");
+      return {
+        model: latest.step.metadata.modelUsage.model, source, field: "steps.metadata.modelUsage.model", observed_at: new Date().toISOString(),
+        conversation_id: target.conversation_id, trajectory_id: description.trajectory_id, step_index: latest.index,
+        tail_offset: offset, tail_count: body.steps.length,
+        ...(typeof latest.step.metadata.createdAt === "string" ? { step_created_at: latest.step.metadata.createdAt } : {}),
+        ...(typeof latest.step.metadata.startedAt === "string" ? { step_started_at: latest.step.metadata.startedAt } : {}),
+        ...(typeof latest.step.metadata.completedAt === "string" ? { step_completed_at: latest.step.metadata.completedAt } : {}),
+        ...(typeof latest.step.metadata.modelUsage.apiProvider === "string" ? { provider: latest.step.metadata.modelUsage.apiProvider } : {}),
+      };
+    } catch {
+      return missing(operationSignal.aborted ? "model_observation_timeout" : "model_observation_unavailable");
+    }
+  }
+
+  async describeModelCatalog(target, { signal, description, model } = {}) {
+    const source = "antigravity_ls_model_config_data";
+    const missing = code => ({ catalog_source: source, catalog_code: code });
+    const endpoint = this.endpoints.get(target?.conversation_id);
+    if (this.closed || signal?.aborted || typeof model !== "string" || !model.trim() || model === "unknown"
+      || description?.cascade_id !== target?.conversation_id || description?.trajectory_id !== endpoint?.trajectory_id
+      || !Number.isFinite(endpoint?.observed_at) || Date.now() - endpoint.observed_at < 0 || Date.now() - endpoint.observed_at > 8000) return missing("model_catalog_unavailable");
+    const operationSignal = signal ? AbortSignal.any([signal, AbortSignal.timeout(1500)]) : AbortSignal.timeout(1500);
+    try {
+      const body = await this.request(endpoint, "GetCascadeModelConfigData", {}, operationSignal);
+      const configs = body.clientModelConfigs;
+      if (!Array.isArray(configs) || configs.length > 512) return missing("model_catalog_unavailable");
+      const matches = configs.filter(config => config.modelOrAlias?.model === model);
+      if (matches.length !== 1) return missing("model_catalog_match_missing");
+      return {
+        catalog_source: source, catalog_observed_at: new Date().toISOString(),
+        catalog_field: "clientModelConfigs.modelOrAlias.model",
+        ...(typeof matches[0].modelId === "string" ? { catalog_model_id: matches[0].modelId } : {}),
+        ...(typeof matches[0].label === "string" ? { catalog_label: matches[0].label } : {}),
+      };
+    } catch {
+      return missing(operationSignal.aborted ? "model_observation_timeout" : "model_catalog_unavailable");
+    }
+  }
+
   async describeHost({ signal } = {}) {
     const source = "antigravity_ls";
     if (this.closed) return { source, host_online: "unknown", code: "ls_closed" };
     if (signal?.aborted) return { source, host_online: "unknown", code: "ls_cancelled" };
     const controller = new AbortController();
-    const onAbort = () => controller.abort("ls_cancelled");
-    signal?.addEventListener("abort", onAbort, { once: true });
+    const operationSignal = AbortSignal.any([this.closeController.signal, ...(signal ? [signal] : [])]);
+    const onAbort = () => controller.abort(this.closed ? "ls_closed" : "ls_cancelled");
+    operationSignal.addEventListener("abort", onAbort, { once: true });
     const timer = setTimeout(() => controller.abort("ls_timeout"), Math.min(this.timeoutMs, 8000));
     const aborted = new Promise((resolve, reject) => {
       controller.signal.addEventListener("abort", () => reject(failure(controller.signal.reason)), { once: true });
@@ -190,7 +316,7 @@ export class AntigravityLsTransport {
       return { source, host_online: "unknown", ...(instanceCount === undefined ? {} : { instance_count: instanceCount }), code };
     } finally {
       clearTimeout(timer);
-      signal?.removeEventListener("abort", onAbort);
+      operationSignal.removeEventListener("abort", onAbort);
       controller.abort("ls_probe_finished");
     }
   }
@@ -213,6 +339,7 @@ export class AntigravityLsTransport {
 
   async close() {
     this.closed = true;
+    this.closeController.abort();
     this.endpoints.clear();
   }
 }

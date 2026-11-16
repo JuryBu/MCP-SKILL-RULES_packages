@@ -17,6 +17,10 @@ const messages = {
   caller_mismatch: "来源对话与当前连接授权不一致",
   forbidden: "当前连接没有这项操作的授权",
   source_unverified: "消息来源缺少对应授权",
+  channel_download_state_unavailable: "附件原操作记录未就绪，已停止新下载，请核对原操作与目录",
+  invalid_attachment_ref: "附件引用已失效或属于其它调用者及窗口，请重读原窗口最近记录",
+  channel_content_unavailable: "QQ最近内容入口尚未就绪，请核对提供方实际加载状态",
+  channel_content_capacity: "附件引用已达到当前容量，请先核对已有操作",
   binding_changed: "目标绑定已经变化，请重新解析目标",
   not_found: "没有找到可访问的消息或目标",
   server_closed: "服务正在关闭，等待已经结束",
@@ -26,9 +30,9 @@ const messages = {
   internal_error: "服务暂时无法完成操作，请核对原消息状态",
 };
 
-function textField(maximum) {
+function textField(maximum, description) {
   return {
-    schema: { type: "string", minLength: 1, maxLength: maximum },
+    schema: { type: "string", minLength: 1, maxLength: maximum, ...(description ? { description } : {}) },
     validator: z.string().min(1).max(maximum).refine(value => Boolean(value.trim()) && Buffer.byteLength(value, "utf8") <= maximum),
   };
 }
@@ -107,7 +111,11 @@ const tools = [
     machine_id: optional(textField(128)), host: optional(textField(64)), surface: optional(textField(64)), conversation_id: optional(textField(256)),
   }, true),
   tool("send_message", "sendMessage", "向端和对话ID或已有绑定发消息，默认next_model_boundary，在宿主支持的下一接收边界中途送入，保留原工具。when_idle仅用于明确延后。Codex默认hidden；未知结果沿原ID查询。", {
-    origin: objectField({ kind: textField(64), channel: textField(64), source_ref: textField(512) }),
+    origin: objectField({
+      kind: textField(64, "普通代理协作填写agent_message；本人消息仅由已授权的渠道入口使用human_message，其它来源类型须已在当前连接授权。"),
+      channel: textField(64, "原始来源渠道，例如codex或antigravity；保留实际来源。"),
+      source_ref: textField(512, "可核对的原来源引用；代理协作通常填写当前真实对话ID。"),
+    }),
     target: targetField,
     dedupe_key: textField(128),
     text: textField(262144),
@@ -135,9 +143,26 @@ const tools = [
     binding_generation: integerField(1),
     processing: { schema: { type: "string", enum: ["processing", "done", "failed"] }, validator: z.enum(["processing", "done", "failed"]) },
   }, false),
-  tool("get_status", "getStatus", "只读查询宿主在线、目标对话运行与中途投递能力，返回真实采样时间及来源；未知明确保留。不得根据旧回复或主人休息猜代理休眠。", {
+  tool("get_status", "getStatus", "只读查询宿主在线、目标对话运行与中途投递能力；具体对话另含可取得的模型观察及其来源、时间，区分当前配置与最近实际调用。未知明确保留，不从旧回复或本人休息推断状态。", {
     binding_id: optional(textField(128)), machine_id: optional(textField(128)), host: optional(textField(64)), surface: optional(textField(64)), conversation_id: optional(textField(256)),
   }, true),
+  tool("read_channel_messages", "readChannelMessages", "只读查询已获准QQ窗口的最近消息，包含未@或未引用的普通内容。无需登记采集，不确认原事件；完整宿主历史继续使用原文读取入口。", {
+    channel: { schema: { type: "string", enum: ["qq"] }, validator: z.enum(["qq"]) },
+    window_type: { schema: { type: "string", enum: ["private", "group"] }, validator: z.enum(["private", "group"]) },
+    window_id: textField(256),
+    count: optional(integerField(1, 50)),
+    cursor: optional(textField(4096)),
+  }, true),
+  tool("download_attachment", "downloadAttachment", "下载已从获准QQ窗口最近消息取得的附件引用，核原消息和窗口归属。默认存本任务临时目录，拒绝覆盖；不接受URL或裸文件ID，结果未知不自动重下。", {
+    channel: { schema: { type: "string", enum: ["qq"] }, validator: z.enum(["qq"]) },
+    window_type: { schema: { type: "string", enum: ["private", "group"] }, validator: z.enum(["private", "group"]) },
+    window_id: textField(256),
+    attachment_ref: textField(256),
+    destination_dir: optional(textField(4096)),
+    name: optional(textField(255)),
+    retry_failed: optional(booleanField),
+    expected_operation_id: optional(textField(128, "显式重试时填写刚才已确认失败的原operation_id；保留未知操作，不自动建立替代请求。")),
+  }, false),
   tool("manage_channel_binding", "manageChannelBinding", "当前对话自行登记、查询或移除QQ及已启用微信聊天窗口对应的模型对话。普通发送无需先建立窗口绑定；更新按原代次核对，保留其它对话归属。", {
     action: { schema: { type: "string", enum: ["bind", "get", "list", "remove"] }, validator: z.enum(["bind", "get", "list", "remove"]) },
     channel: optional({ schema: { type: "string", enum: ["qq", "wechat"] }, validator: z.enum(["qq", "wechat"]) }),

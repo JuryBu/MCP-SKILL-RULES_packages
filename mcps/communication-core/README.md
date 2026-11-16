@@ -1,8 +1,8 @@
 # 交流核心
 
-交流核心提供八项MCP工具，用于按宿主和对话ID定位目标、发送消息、等待关联回信、查询状态及管理聊天窗口对应的模型对话。核心保存准确来源与目标、待送消息、投递尝试和精确处理确认，宿主连接通过独立接入模块实现。
+交流核心提供十项MCP工具，用于按宿主和对话ID定位目标、发送消息、等待关联回信、查询状态、读取获准QQ窗口的最近消息和下载其中的附件，以及管理聊天窗口对应的模型对话。核心保存准确来源与目标、待送消息、投递尝试和精确处理确认，宿主连接通过独立接入模块实现。
 
-默认启动入口使用mock隔离接入，测试目标与回执标记为simulated。显式live_test入口支持Antigravity、Codex控制端和NapCat通知、引用回信及可选QQ窗口采集；同一核心可通过stdio门面注册为宿主常驻MCP。Windsurf可配置只读状态探测，当前没有发送接入。客户端契约见[宿主接入模块契约](docs/ADAPTER_CONTRACT.md)，配置见[真实接入说明](docs/LIVE_TESTING.md)。NapCat、微信的原账本、账号、附件和发送授权继续由原组件负责。
+默认启动入口使用mock隔离接入，测试目标与回执标记为simulated。显式live_test入口支持Antigravity、Codex控制端和NapCat通知、引用回信及可选QQ窗口采集；同一核心可通过stdio门面注册为宿主常驻MCP。Windsurf/Devin Desktop可配置只读进程与目标SQLite状态探测，支持会话slug及Desktop摘要ID；当前没有发送接入。客户端契约见[宿主接入模块契约](docs/ADAPTER_CONTRACT.md)，配置见[真实接入说明](docs/LIVE_TESTING.md)。NapCat、微信的原账本、账号、附件和发送授权继续由原组件负责。
 
 ## 运行
 
@@ -33,7 +33,7 @@ CLI支持Ctrl+C，以及由启动者持有的stdin管道输入shutdown后正常�
 
 ## 常驻MCP与broker
 
-`scripts/broker-stdio.mjs`提供相同的八项工具，只转交到已运行的原HTTP核心。关闭门面会关闭自身连接，核心及原消息库继续由原运行器持有。
+`scripts/broker-stdio.mjs`提供相同的十项工具，只转交到已运行的原HTTP核心。关闭门面会关闭自身连接，核心及原消息库继续由原运行器持有。
 
 宿主使用stdio配置启动该脚本，通过环境变量`COMMUNICATION_CORE_FACADE_REGISTRY`指向仓库外的绝对路径JSON：
 
@@ -60,6 +60,11 @@ CLI支持Ctrl+C，以及由启动者持有的stdin管道输入shutdown后正常�
 | communication_ack_processing | 确认本人对话处理的精确消息 | caller、message_id、delivery_id、原代次、processing |
 | communication_get_status | 查询整宿主或指定对话的状态 | caller、host；指定对话时再带conversation_id，兼容binding_id |
 | communication_manage_channel_binding | 管理QQ及预留微信窗口对应的模型对话 | caller、action；按动作提供窗口地址和expected_generation |
+
+| 工具 | 动作 | 主要输入 |
+|---|---|---|
+| communication_read_channel_messages | 读取获准QQ窗口最近消息，包含普通未@内容 | caller、channel、window_type、window_id；可选count、cursor |
+| communication_download_attachment | 按原消息中的受限引用下载附件 | caller、窗口地址、attachment_ref；可选destination_dir、name |
 
 ## 按宿主和对话ID发送
 
@@ -101,7 +106,9 @@ CLI支持Ctrl+C，以及由启动者持有的stdin管道输入shutdown后正常�
 
 Codex新消息的`message_visibility`默认`hidden`，可显式选`visible`。hidden沿宿主原有投影隐藏同轮中途气泡，空闲开启新轮时保留首条简短消息，模型仍收到正文；visible保留全部气泡。显示以简短来源和正文为主，完整来源与追踪字段保存在原记录中。旧存量缺少该字段时按原visible行为查询，同键恢复保持原身份。
 
-`communication_get_status`可查询整宿主，或加入具体CID查询该对话。结果分别给出传输、控制入口和接收能力，`unknown`表示本次证据尚不足。字段含义及只读查询示例见[状态查询说明](docs/LIVE_TESTING.md#状态查询)。
+`communication_get_status`可查询整宿主，或加入具体CID查询该对话。结果分别给出传输、控制入口和接收能力，指定对话另含可取得的当前模型配置及最近调用观察，各自保留来源和时间。`unknown`表示该项本次未取得可核对结果，模型观察失败保留已取得的在线和运行状态。字段及示例见[状态查询说明](docs/LIVE_TESTING.md#状态查询)。
+
+QQ最近内容直接复用NapCat的已配置目标历史与下载接口，包含未@或未引用的普通消息。读取无需绑定窗口或开启持续采集，也不会确认原事件。完整宿主历史、搜索和未知对话ID仍由已有原文读取服务提供；QQ权限、游标与附件恢复边界见[最近内容与附件](docs/CHANNEL_CONTENT.md)。
 
 ## 验证
 
@@ -111,7 +118,7 @@ npm test --prefix mcps/communication-core
 npm run demo --prefix mcps/communication-core
 ```
 
-隔离验证覆盖直接寻址、来源与发送许可、消息去重、未知受理、精确处理确认、回信身份、有界等待、状态查询、窗口归属及重开恢复。当前冻结候选的完整回归为1191/1191通过，未绑定窗口get的MCP空结果封装已有正式HTTP回归；原生MCP已完成窗口登记、读取、分页列表和撤销，并确认原生路由打开后关闭。另有独立检查、合成原生窗口和同版双冷启恢复证据。真实Windows登录、系统重启及自然新QQ窗口消息到Codex的样本仍待验证，历史真实AG、Codex与QQ引用回信的范围见验证记录。
+隔离验证覆盖直接寻址、来源与发送许可、消息去重、未知受理、精确处理确认、回信身份、有界等待、状态查询、窗口归属及重开恢复。1191项属于窗口采集版本，模型观察与QQ内容版本为1317/1317；随后加入WSF只读状态及发现资源修复的完整回归为1372/1372，93个模块语法检查通过，各次构建与后续变更分别见[验证记录](docs/VERIFICATION.md)。未绑定窗口get的MCP空结果封装已有正式HTTP回归；原生MCP已完成窗口登记、读取、分页列表和撤销，并确认原生路由打开后关闭。另有独立检查、合成原生窗口和同版冷启恢复证据。真实Windows登录、系统重启及自然新QQ窗口消息到Codex的样本仍待验证，历史真实AG、Codex与QQ引用回信按各自原件范围保留。
 
 本次实际运行结果及剩余边界见[独立测试版验证](docs/VERIFICATION.md)。
 

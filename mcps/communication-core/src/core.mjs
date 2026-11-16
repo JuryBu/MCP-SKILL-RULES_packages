@@ -19,6 +19,7 @@ import { normalizeReplyForwardingRules, planOwnerReplyForward, replyForwardBindi
 import { ConversationDirectory, normalizeConversationAddress, normalizeHostScope } from "./conversation-directory.mjs";
 import { ChannelBindingManager } from "./channel-bindings.mjs";
 import { OwnerWindowMessages } from "./owner-window-messages.mjs";
+import { ChannelContentReader } from "./channel-content.mjs";
 
 const DELIVERY_RESULTS = new Set(["accepted", "busy", "failed_before_send", "unknown"]);
 const DELIVERY_BOUNDARIES = new Set(["accepted", "failed_before_send", "unknown", "expired", "unsupported"]);
@@ -158,7 +159,7 @@ function safeObservedReply(result, target, delivery) {
 }
 
 export class CommunicationCore {
-  constructor({ store, targets, principals, adapters, replyForwarding = [], conversationRoutes = [], channelWindows = [], ownerWindowSources = [], statusProvider, automaticReplyForwarding = [], now = () => Date.now(), deliveryTimeoutMs = 5000, maxConcurrent = 2 }) {
+  constructor({ store, targets, principals, adapters, replyForwarding = [], conversationRoutes = [], channelWindows = [], ownerWindowSources = [], downloadLedger, channelDownloadFailure = false, statusProvider, automaticReplyForwarding = [], now = () => Date.now(), deliveryTimeoutMs = 5000, maxConcurrent = 2 }) {
     this.store = store;
     this.targets = targets ?? [];
     this.principals = principals ?? [];
@@ -169,6 +170,11 @@ export class CommunicationCore {
     this.channelBindings = new ChannelBindingManager({ store, windows: channelWindows, resolveCallerTarget: principal => this.directory
       ? this.directory.byIdentity(principal.identity) : this.resolveAddress(principal, principal.identity) });
     this.ownerWindows = new OwnerWindowMessages({ core: this, sources: ownerWindowSources });
+    const channelAdapters = this.adapters instanceof Map ? this.adapters : new Map(Object.entries(this.adapters));
+    this.createChannelHistoryFallback = () => new ChannelContentReader({ sources: ownerWindowSources, adapters: channelAdapters, now });
+    this.channelContent = new ChannelContentReader({ sources: ownerWindowSources, adapters: channelAdapters, now, downloadLedger });
+    this.channelDownloadsAvailable = !channelDownloadFailure;
+    this.channelHistoryFallback = channelDownloadFailure ? this.channelContent : null;
     this.replyForwarding = Array.isArray(replyForwarding) && replyForwarding.length === 0 ? []
       : normalizeReplyForwardingRules({ rules: replyForwarding, targets: registryValues(this.targets), principals: registryValues(this.principals) });
     this.replyForwardPrincipals = this.replyForwarding.map(rule => ({
@@ -592,6 +598,43 @@ export class CommunicationCore {
     const snapshot = { ...this.result(persisted.message_id), duplicate: persisted.duplicate };
     if (!persisted.duplicate) this.enqueue(persisted.delivery_id).catch(error => { this.backgroundError = error; });
     return snapshot;
+  }
+
+  async readChannelMessages(context, input) {
+    const principal = this.principal(context, input.caller);
+    let result;
+    try {
+      result = await (this.channelHistoryFallback ?? this.channelContent).read(principal, input, { signal: context.signal });
+    } catch (error) {
+      if (!(error instanceof CoreError) || !/^channel_download_ledger_(?:io|changed|closed)$/.test(error.code)) throw error;
+      this.channelDownloadsAvailable = false;
+      this.channelHistoryFallback ??= this.createChannelHistoryFallback();
+      result = await this.channelHistoryFallback.read(principal, input, { signal: context.signal });
+    }
+    if (!this.channelDownloadsAvailable) {
+      result.download_service = { available: false, code: "channel_download_state_unavailable" };
+      for (const message of result.messages) for (const attachment of message.attachments) {
+        attachment.downloadable = false;
+        attachment.download_unavailable = "channel_download_state_unavailable";
+        delete attachment.attachment_ref;
+        delete attachment.attachment_ref_expires_at;
+      }
+    }
+    return result;
+  }
+
+  async downloadAttachment(context, input) {
+    const principal = this.principal(context, input.caller);
+    if (!this.channelDownloadsAvailable) throw new CoreError("channel_download_state_unavailable", "下载原操作记录未就绪，已保留原件并停止新下载", { request_sent: false });
+    try {
+      return await this.channelContent.download(principal, input, { signal: context.signal });
+    } catch (error) {
+      if (error instanceof CoreError && /^channel_download_ledger_(?:io|changed|closed)$/.test(error.code)) {
+        this.channelDownloadsAvailable = false;
+        this.channelHistoryFallback ??= this.createChannelHistoryFallback();
+      }
+      throw error;
+    }
   }
 
   getMessage(context, input) {
@@ -1033,6 +1076,8 @@ export class CommunicationCore {
         job.resolve();
       }
       for (const controller of this.controllers) controller.abort({ code: "closed" });
+      await this.channelContent.close();
+      if (this.channelHistoryFallback && this.channelHistoryFallback !== this.channelContent) await this.channelHistoryFallback.close();
       await Promise.allSettled([this.replyPollPromise, ...this.replyInvocations]);
       await this.drain();
       return { closed: true };

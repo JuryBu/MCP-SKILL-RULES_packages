@@ -26,7 +26,7 @@
 | `napcat-mcp` | 0.3.14 | 可选 QQ 群通知、任务账本、双机送达回执、可信路由、Codex 原生未读唤醒、自然私聊回复路由、热升级历史基线、群文件传输、监督器与安全更新 |
 | `wechat-docs-mcp` | 0.6.3 | 可选本地微信与腾讯文档双 M:N 订阅、独立投递/ACK、文档只读合并提醒、安全 outbound 骨架与当前用户监督器 |
 
-另有可选的 [`communication-core` 0.1.0](mcps/communication-core/README.md)，提供八项工具，按宿主和对话ID收发、查询接收状态及自行管理QQ窗口对应的模型对话。该模块独立安装，可注册常驻stdio门面，或显式开启broker的`/communication-core/mcp`入口；QQ窗口采集需配套支持四项窗口接口的Provider，账号和绑定留在私有配置。
+另有可选的 [`communication-core` 0.1.0](mcps/communication-core/README.md)，提供十项工具，按宿主和对话ID收发、观察运行与模型状态、读取获准QQ窗口的最近消息和附件，以及自行管理窗口对应的模型对话。该模块独立安装，可注册常驻stdio门面，或显式开启broker的`/communication-core/mcp`入口；窗口采集和最近内容各需对应Provider接口，账号和绑定留在私有配置。
 
 ## 重点能力
 
@@ -190,7 +190,7 @@ The project started as an Antigravity toolset and now supports Codex, Antigravit
 | `napcat-mcp` | 0.3.14 | Optional QQ group messaging, task ledger, cross-machine delivery receipts, trusted routing, native Codex unread wakeups, natural private-reply routing, hot-upgrade history baselines, file transfer, supervisor, and guarded updates |
 | `wechat-docs-mcp` | 0.6.3 | Optional governed local WeChat and Tencent Docs M:N subscriptions, independent delivery/ACK, read-only coalesced document wakes, safe outbound scaffolding, and a per-user supervisor |
 
-The optional [`communication-core` 0.1.0](mcps/communication-core/README.md) adds eight tools for host/conversation messaging, receive-status inspection, and self-service QQ window mappings. Install it separately and register its resident stdio facade, or explicitly enable the broker's `/communication-core/mcp` endpoint. QQ window capture requires a compatible four-interface provider; accounts and bindings remain private.
+The optional [`communication-core` 0.1.0](mcps/communication-core/README.md) adds ten tools for host/conversation messaging, runtime and model observation, authorized recent QQ content and attachments, and self-service window mappings. Install it separately and register its resident stdio facade, or explicitly enable the broker's `/communication-core/mcp` endpoint. Window capture and recent content each require compatible provider interfaces; accounts and bindings remain private.
 
 ## Highlights
 

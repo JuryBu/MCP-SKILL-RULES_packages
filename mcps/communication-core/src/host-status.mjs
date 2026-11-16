@@ -1,3 +1,5 @@
+import { codexModelObservation, projectModelObservation, unknownModelObservation } from "./host-model-observation.mjs";
+
 const UNKNOWN = "unknown";
 const MODES = ["next_model_boundary", "when_idle"];
 const RUNNING = new Set(["RUNNING", "CASCADE_RUN_STATUS_RUNNING"]);
@@ -134,7 +136,7 @@ function diagnostic(code) {
   return reasons[code] ?? "宿主接口未确认目标状态，详见code";
 }
 
-function read(reader, method, target, signal, unsupported) {
+function read(reader, method, target, signal, unsupported, options = {}) {
   if (signal.aborted) return Promise.resolve({ code: cancellationCode(signal) });
   if (typeof reader[method] !== "function") return Promise.resolve({ code: unsupported });
   return new Promise(resolve => {
@@ -149,7 +151,7 @@ function read(reader, method, target, signal, unsupported) {
     signal.addEventListener("abort", onAbort, { once: true });
     Promise.resolve().then(() => {
       signal.throwIfAborted();
-      return reader[method](target, { signal });
+      return reader[method](target, { ...options, signal });
     }).then(value => finish(record(value) ? { value } : { code: "status_invalid_response" }), error => {
       finish({ code: signal.aborted ? cancellationCode(signal) : errorCode(error) });
     });
@@ -176,14 +178,32 @@ export function createAntigravityStatusReader(transport, { configured_delivery_m
       if (description?.cascade_id !== target.conversation_id || typeof description?.trajectory_id !== "string" || !description.trajectory_id.trim()) {
         return { conversation_exists: UNKNOWN, conversation_running: UNKNOWN, code: "ls_target_mismatch" };
       }
-      return { host_online: true, conversation_exists: true, status: description.status };
+      return {
+        host_online: true, conversation_exists: true, status: description.status,
+        model_observation: unknownModelObservation(target.host === "windsurf" ? "windsurf_ls_describe" : "antigravity_ls_describe", "model_metadata_not_exposed"),
+        ...(typeof transport.describeModel === "function" ? { model_context: {
+          cascade_id: description.cascade_id, trajectory_id: description.trajectory_id, step_count: description.step_count,
+        } } : {}),
+      };
     },
+    ...(typeof transport.describeModel === "function" ? {
+      async observeModel(target, { signal, context, kind } = {}) {
+        return transport.describeModel(target, { signal, description: context, kind });
+      },
+    } : {}),
+    ...(typeof transport.describeModelCatalog === "function" ? {
+      async observeModelCatalog(target, { signal, context, model } = {}) {
+        return transport.describeModelCatalog(target, { signal, description: context, model });
+      },
+    } : {}),
   };
 }
 
 export function createWindsurfStatusReader(transport) {
   const reader = createAntigravityStatusReader(transport, { configured_delivery_modes: { next_model_boundary: false, when_idle: false } });
   reader.source = "windsurf_ls";
+  delete reader.observeModel;
+  delete reader.observeModelCatalog;
   return reader;
 }
 
@@ -223,6 +243,7 @@ export function createCodexStatusReader({ readHostStatus, inspectThread, configu
       return {
         host_online: true, conversation_exists: true, conversation_running: running,
         can_accept_direct_input: truth(value.thread.canAcceptDirectInput),
+        model_observation: codexModelObservation(value.thread),
         ...(rawStatus({ status }) === undefined ? { code: "codex_thread_status_missing" } : { raw_status: status }),
         ...(status === "systemError" ? { code: "codex_thread_system_error" } : {}),
       };
@@ -231,12 +252,14 @@ export function createCodexStatusReader({ readHostStatus, inspectThread, configu
 }
 
 export class HostStatusProvider {
-  constructor({ providers = {}, now = () => Date.now(), timeoutMs = 8000 } = {}) {
+  constructor({ providers = {}, now = () => Date.now(), timeoutMs = 8000, modelTimeoutMs = 500 } = {}) {
     if (!record(providers) || typeof now !== "function") throw new TypeError("Invalid status providers or clock");
     if (!Number.isInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 8000) throw new RangeError("timeoutMs must be an integer in 1..8000");
+    if (!Number.isInteger(modelTimeoutMs) || modelTimeoutMs < 1 || modelTimeoutMs > 2000) throw new RangeError("modelTimeoutMs must be an integer in 1..2000");
     this.providers = new Map(Object.entries(providers));
     this.now = now;
     this.timeoutMs = timeoutMs;
+    this.modelTimeoutMs = modelTimeoutMs;
     this.inflight = new Map();
     this.active = new Set();
     this.closed = false;
@@ -247,6 +270,7 @@ export class HostStatusProvider {
     return {
       target: structuredClone(target), observed_at: new Date(this.now()).toISOString(), source,
       host_online: UNKNOWN, conversation_exists: UNKNOWN, conversation_running: UNKNOWN, can_deliver: UNKNOWN,
+      model_observation: unknownModelObservation(source, target?.conversation_id === undefined ? "model_conversation_required" : "model_metadata_not_observed"),
       transport_ready: UNKNOWN, control_enabled: UNKNOWN, control_ready: UNKNOWN,
       host_can_receive: receptionConfigured === false ? false : UNKNOWN,
       configured_delivery_modes: configured,
@@ -255,7 +279,7 @@ export class HostStatusProvider {
     };
   }
 
-  async probe(target, reader, signal, source) {
+  async probe(target, reader, signal, source, hostObserved = () => {}) {
     const hasConversation = target.conversation_id !== undefined;
     const configured = configurationFor(reader, target);
     const result = this.snapshot(target, source, undefined, configured, sendingConfigured(reader));
@@ -263,6 +287,7 @@ export class HostStatusProvider {
       read(reader, "getHostStatus", target, signal, "status_host_unsupported"),
       hasConversation ? read(reader, "describeConversation", target, signal, "status_conversation_unsupported") : Promise.resolve({}),
     ]);
+    hostObserved();
     result.host_online = truth(host.value?.host_online);
     result.transport_ready = truth(host.value?.transport_ready);
     result.control_enabled = truth(host.value?.control_enabled);
@@ -282,6 +307,7 @@ export class HostStatusProvider {
       if (status !== undefined) result.raw_status = status;
       if (result.conversation_exists === false) result.conversation_running = false;
       else if (result.conversation_exists === true) {
+        result.model_observation = projectModelObservation(conversation.value?.model_observation, source);
         result.conversation_running = truth(conversation.value?.conversation_running);
         if (result.conversation_running === UNKNOWN) result.conversation_running = runningStatus(status);
       }
@@ -313,6 +339,44 @@ export class HostStatusProvider {
     } else codes.push("status_host_scope");
     const code = codes.find(Boolean);
     if (code) Object.assign(result, { code, reason: diagnostic(code) });
+    if (hasConversation && result.conversation_exists === true && typeof reader.observeModel === "function") {
+      const observeKind = async kind => {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort("status_timeout"), this.modelTimeoutMs);
+        const modelSignal = AbortSignal.any([signal, controller.signal]);
+        try {
+          const observation = await read(reader, "observeModel", target, modelSignal, "status_conversation_unsupported", { kind, context: conversation.value?.model_context });
+          result.model_observation[kind] = observation.value
+            ? projectModelObservation({ [kind]: observation.value }, source)[kind]
+            : unknownModelObservation(source, modelSignal.aborted ? "model_observation_timeout" : "model_observation_unavailable")[kind];
+        } catch {
+          result.model_observation[kind] = unknownModelObservation(source, "model_observation_unavailable")[kind];
+        } finally {
+          clearTimeout(timer);
+        }
+      };
+      await observeKind("last_invocation");
+      if (result.model_observation.last_invocation.model !== UNKNOWN && typeof reader.observeModelCatalog === "function") {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort("status_timeout"), this.modelTimeoutMs);
+        const modelSignal = AbortSignal.any([signal, controller.signal]);
+        const previous = result.model_observation.last_invocation;
+        try {
+          const catalogue = await read(reader, "observeModelCatalog", target, modelSignal, "status_conversation_unsupported", {
+            context: conversation.value?.model_context, model: previous.model,
+          });
+          const fields = ["catalog_source", "catalog_model_id", "catalog_label", "catalog_field", "catalog_observed_at", "catalog_code"];
+          const extra = catalogue.value ? Object.fromEntries(fields.filter(field => Object.hasOwn(catalogue.value, field)).map(field => [field, catalogue.value[field]]))
+            : { catalog_code: modelSignal.aborted ? "model_observation_timeout" : "model_catalog_unavailable" };
+          result.model_observation.last_invocation = projectModelObservation({ last_invocation: { ...previous, ...extra } }, source).last_invocation;
+        } catch {
+          result.model_observation.last_invocation = { ...previous, catalog_code: "model_catalog_unavailable" };
+        } finally {
+          clearTimeout(timer);
+        }
+      }
+      await observeKind("current_selection");
+    }
     return result;
   }
 
@@ -322,7 +386,7 @@ export class HostStatusProvider {
     const timer = setTimeout(() => controller.abort("status_timeout"), this.timeoutMs);
     this.active.add(entry);
     this.inflight.set(key, entry);
-    entry.promise = this.probe(target, reader, controller.signal, source).catch(() => this.snapshot(target, source, "status_probe_failed", configurationFor(reader, target), sendingConfigured(reader))).finally(() => {
+    entry.promise = this.probe(target, reader, controller.signal, source, () => clearTimeout(timer)).catch(() => this.snapshot(target, source, "status_probe_failed", configurationFor(reader, target), sendingConfigured(reader))).finally(() => {
       entry.settled = true;
       clearTimeout(timer);
       this.active.delete(entry);

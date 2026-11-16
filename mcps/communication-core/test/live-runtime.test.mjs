@@ -484,7 +484,7 @@ test("UTF8 BOM、单个AG目标和仅来源principal可走真实MCP，关闭重�
     requestInit: { headers: { Authorization: `Bearer ${files.value.principals[0].token}` } },
   }));
   const tools = (await client.listTools()).tools;
-  assert.equal(tools.length, 8);
+  assert.equal(tools.length, 10);
   assert.ok(!tools.some(tool => /inject|fake|forge/i.test(tool.name)));
   const request = sendInput(files.value);
   const sent = await client.callTool({ name: "communication_send_message", arguments: request });
