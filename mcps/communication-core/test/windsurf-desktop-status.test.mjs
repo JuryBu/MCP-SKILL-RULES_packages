@@ -87,10 +87,10 @@ function sqliteFixture(context, { slug = SLUG, model = "ui-selected-model", cliM
   let cli;
   let desktop;
   if (includeCli) {
-    cli = sample.database(cliPath, `CREATE TABLE sessions(id TEXT PRIMARY KEY, model TEXT NOT NULL, agent_mode TEXT NOT NULL, last_activity_at INTEGER NOT NULL);
+    cli = sample.database(cliPath, `CREATE TABLE sessions(id TEXT PRIMARY KEY, model TEXT NOT NULL, agent_mode TEXT NOT NULL, last_activity_at INTEGER NOT NULL, main_chain_id INTEGER DEFAULT 1);
       CREATE TABLE message_nodes(row_id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL, node_id INTEGER NOT NULL, parent_node_id INTEGER, chat_message TEXT NOT NULL, created_at INTEGER NOT NULL, metadata TEXT, UNIQUE(session_id,node_id));`);
     cli.exec(`PRAGMA journal_mode=${journal}`);
-    cli.prepare("INSERT INTO sessions VALUES (?, ?, 'bypass', 1)").run(slug, cliModel);
+    cli.prepare("INSERT INTO sessions(id,model,agent_mode,last_activity_at) VALUES (?, ?, 'bypass', 1)").run(slug, cliModel);
     cli.prepare("INSERT INTO message_nodes(session_id,node_id,chat_message,created_at) VALUES (?,1,?,1)").run(slug, "private-cli-message-and-thought");
   }
   if (includeDesktop) {
@@ -195,6 +195,176 @@ test("UI persisted selection, CLI configured model and actual invocation remain 
   const offline = await sample.reader().describeConversation(sample.target);
   assert.equal(offline.model_observation.current_selection.model, "unknown");
   assert.equal(offline.conversation_running, false);
+});
+
+function invocationMessage(overrides = {}) {
+  return { role: "assistant", content: "private-invocation-content", thinking: "private-invocation-thought",
+    metadata: { generation_model: "swe-2-max", request_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      started_generation_at: "2026-11-16T19:29:32.208391400Z", created_at: "2026-11-16T19:29:39.438195400Z",
+      finish_reason: "stop", ...overrides } };
+}
+
+function invocationNode(sample, nodeId, parentId, message = invocationMessage(), slug = sample.slug) {
+  sample.cli.prepare("INSERT INTO message_nodes(session_id,node_id,parent_node_id,chat_message,created_at) VALUES (?,?,?,?,?)")
+    .run(slug, nodeId, parentId, typeof message === "string" ? message : JSON.stringify(message), 1794857379);
+}
+
+test("CLI invocation follows the selected main chain, deduplicates requests and survives the existing model projector", async context => {
+  const sample = sqliteFixture(context);
+  invocationNode(sample, 2, null);
+  invocationNode(sample, 3, 2);
+  invocationNode(sample, 4, null, invocationMessage({ generation_model: "swe-2-flash-max", request_id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb" }));
+  invocationNode(sample, 999, null, invocationMessage({ generation_model: "off-session-model" }), "other-session");
+  sample.cli.prepare("UPDATE sessions SET main_chain_id=3 WHERE id=?").run(sample.slug);
+  const before = digestTree(sample.directory);
+  const reader = sample.reader({ listProcesses: async () => [sample.main(), sample.helper(), sample.acp()] });
+  const provider = new HostStatusProvider({ providers: { windsurf: reader } });
+  context.after(() => provider.close());
+  const status = await provider.getStatus(sample.target);
+  const last = status.model_observation.last_invocation;
+  assert.equal(last.model, "swe-2-max");
+  assert.equal(last.source, "windsurf_devin_cli_message_nodes_metadata");
+  assert.equal(last.field, "message_nodes/3/request/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/chat_message.metadata.generation_model");
+  assert.equal(last.step_index, 3);
+  assert.equal(last.conversation_id, sample.slug);
+  assert.equal(last.observed_at, OBSERVED_AT);
+  assert.equal(last.step_started_at, "2026-11-16T19:29:32.208391400Z");
+  assert.equal(last.step_completed_at, "2026-11-16T19:29:39.438195400Z");
+  assert.equal(status.model_observation.current_selection.model, "unknown");
+  assert.equal(status.conversation_running, "unknown");
+  assert.deepEqual(digestTree(sample.directory), before);
+  for (const secret of ["private-invocation-content", "private-invocation-thought", "off-session-model", "swe-2-flash-max", "metrics"]) assert.equal(JSON.stringify(status).includes(secret), false);
+});
+
+test("CLI invocation rejects malformed, oversized, missing and conflicting duplicate metadata without losing disk identity", async context => {
+  for (const invalid of ["{", JSON.stringify({ role: "assistant", metadata: {} }), invocationMessage({ generation_model: "sk-private" }),
+    invocationMessage({ request_id: "private/not-a-request" }), invocationMessage({ finish_reason: null }),
+    invocationMessage({ started_generation_at: "2027-11-16T19:29:32Z" }),
+    { ...invocationMessage(), content: "private-large-".repeat(6000) }, null, "duplicate-conflict", "cycle", "missing-node"]) {
+    const sample = sqliteFixture(context);
+    if (invalid === "missing-node") sample.cli.prepare("UPDATE sessions SET main_chain_id=999 WHERE id=?").run(sample.slug);
+    else {
+      invocationNode(sample, 2, invalid === "cycle" ? 2 : null, invalid === "duplicate-conflict" || invalid === "cycle" ? invocationMessage() : invalid === null ? { role: "tool" } : invalid);
+      if (invalid === "duplicate-conflict") invocationNode(sample, 3, 2, invocationMessage({ generation_model: "swe-2-flash-max" }));
+      sample.cli.prepare("UPDATE sessions SET main_chain_id=? WHERE id=?").run(invalid === "duplicate-conflict" ? 3 : 2, sample.slug);
+    }
+    const before = digestTree(sample.directory);
+    const status = await sample.reader().describeConversation(sample.target);
+    assert.equal(status.conversation_exists, true);
+    assert.equal(status.model_observation.last_invocation.model, "unknown");
+    assert.deepEqual(digestTree(sample.directory), before);
+  }
+});
+
+test("CLI invocation has a 32-node ancestor budget and no timestamp or off-branch fallback", async context => {
+  const sample = sqliteFixture(context);
+  invocationNode(sample, 2, null);
+  for (let nodeId = 3; nodeId <= 34; nodeId += 1) invocationNode(sample, nodeId, nodeId - 1, { role: "tool" });
+  sample.cli.prepare("UPDATE sessions SET main_chain_id=34 WHERE id=?").run(sample.slug);
+  assert.equal((await sample.reader().describeConversation(sample.target)).model_observation.last_invocation.model, "unknown");
+  sample.cli.prepare("UPDATE sessions SET main_chain_id=NULL WHERE id=?").run(sample.slug);
+  assert.equal((await sample.reader().describeConversation(sample.target)).model_observation.last_invocation.model, "unknown");
+});
+
+test("CLI invocation is read from WAL using the same single CLI query child and preserves its files", async context => {
+  const sample = sqliteFixture(context, { journal: "wal" });
+  invocationNode(sample, 2, null);
+  sample.cli.prepare("UPDATE sessions SET main_chain_id=2 WHERE id=?").run(sample.slug);
+  let cliExecutions = 0;
+  const execute = promisify(execFile);
+  const reader = sample.reader({ executeDatabase: (executable, argumentsList, options) => {
+    if (JSON.parse(argumentsList.at(-1)).kind === "cli_session") cliExecutions += 1;
+    return execute(executable, argumentsList, options);
+  } });
+  const before = digestTree(sample.directory);
+  const sharedMemory = [sample.cliPath, sample.desktopPath].map(databasePath => ({
+    file: `${databasePath}-shm`, bytes: readFileSync(`${databasePath}-shm`),
+  }));
+  const status = await reader.describeConversation(sample.target);
+  assert.equal(status.model_observation.last_invocation.model, "swe-2-max");
+  assert.equal(cliExecutions, 1);
+  const stableFiles = rows => rows.map(entry => entry.path.endsWith("-shm") ? { ...entry, hash: "sqlite-read-marks" } : entry);
+  assert.deepEqual(stableFiles(digestTree(sample.directory)), stableFiles(before));
+  for (const memory of sharedMemory) {
+    const after = readFileSync(memory.file);
+    const changed = Array.from(memory.bytes.keys()).filter(offset => memory.bytes[offset] !== after[offset]);
+    assert.ok(changed.every(offset => offset >= 104 && offset < 120), JSON.stringify(changed));
+  }
+});
+
+test("CLI invocation cancellation retains the database slot until the actual child exits", async context => {
+  const sample = sqliteFixture(context);
+  const began = deferred();
+  const completion = deferred();
+  const child = new EventEmitter();
+  let cliExecutions = 0;
+  let closed = false;
+  const execute = promisify(execFile);
+  const reader = sample.reader({ executeDatabase: (executable, argumentsList, options) => {
+    if (JSON.parse(argumentsList.at(-1)).kind !== "cli_session") return execute(executable, argumentsList, options);
+    cliExecutions += 1;
+    options.signal.addEventListener("abort", () => completion.reject(new Error("cancelled")), { once: true });
+    completion.promise.child = child;
+    began.resolve();
+    return completion.promise;
+  } });
+  const controller = new AbortController();
+  const pending = reader.describeConversation(sample.target, { signal: controller.signal });
+  await began.promise;
+  controller.abort();
+  await assert.rejects(pending, { code: "ls_cancelled" });
+  const closing = reader.close().then(() => { closed = true; });
+  try {
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(closed, false);
+    assert.equal(cliExecutions, 1);
+  } finally {
+    child.emit("close", null, "SIGTERM");
+    await closing;
+  }
+  assert.equal(closed, true);
+});
+
+test("CLI invocation real child abort is reaped before reader close completes", async context => {
+  const sample = sqliteFixture(context);
+  const began = deferred();
+  const execute = promisify(execFile);
+  let child;
+  let childClosed = false;
+  const reader = sample.reader({ executeDatabase: (executable, argumentsList, options) => {
+    if (JSON.parse(argumentsList.at(-1)).kind !== "cli_session") return execute(executable, argumentsList, options);
+    const completion = execute(executable, ["-e", "setInterval(()=>{},1000)"], options);
+    child = completion.child;
+    child.once("close", () => { childClosed = true; });
+    child.once("spawn", () => began.resolve());
+    return completion;
+  } });
+  const controller = new AbortController();
+  const pending = reader.describeConversation(sample.target, { signal: controller.signal });
+  try {
+    await began.promise;
+    assert.equal(childClosed, false);
+    controller.abort();
+    await assert.rejects(pending, { code: "ls_cancelled" });
+  } finally {
+    controller.abort();
+    await reader.close();
+  }
+  assert.equal(childClosed, true);
+  assert.throws(() => process.kill(child.pid, 0), { code: "ESRCH" });
+  sample.cli.exec("BEGIN EXCLUSIVE; ROLLBACK");
+});
+
+test("CLI invocation missing tables, oversized projected fields and tiny output budgets keep old existence results", async context => {
+  for (const mode of ["missing-table", "oversized-model", "tiny-budget"]) {
+    const sample = sqliteFixture(context);
+    invocationNode(sample, 2, null, invocationMessage(mode === "oversized-model" ? { generation_model: "a".repeat(129) } : {}));
+    sample.cli.prepare("UPDATE sessions SET main_chain_id=2 WHERE id=?").run(sample.slug);
+    if (mode === "missing-table") sample.cli.exec("DROP TABLE message_nodes");
+    const status = await sample.reader(mode === "tiny-budget" ? { maxRecordBytes: 256 } : {}).describeConversation(sample.target);
+    assert.equal(status.conversation_exists, true);
+    assert.equal(status.model_observation.last_invocation.model, "unknown");
+  }
 });
 
 test("duplicate, invalid, oversized and missing model metadata never become observations", async context => {

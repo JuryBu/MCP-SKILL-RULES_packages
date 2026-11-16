@@ -18,6 +18,8 @@ const MAPPING_PREFIX = "windsurf.acp.messageStore.session.acp/devin-cli/";
 const QUERY_ARGUMENT = "--windsurf-desktop-status-readonly-query";
 const MAX_DESKTOP_INFO_BYTES = 1024 * 1024;
 const MAX_CONFIG_OPTIONS = 64;
+const MAX_INVOCATION_NODES = 32;
+const INVOCATION_SOURCE = "windsurf_devin_cli_message_nodes_metadata";
 const PROCESS_SCRIPT = "$ErrorActionPreference='Stop'; [Console]::OutputEncoding=[System.Text.UTF8Encoding]::new($false); $items=@(Get-CimInstance Win32_Process -Filter \"Name='Devin.exe' OR Name='Windsurf.exe'\"); if($items.Count -gt 256){throw 'process_budget'}; $rows=@($items | ForEach-Object {[PSCustomObject]@{pid=[int]$_.ProcessId; parent_pid=[int]$_.ParentProcessId; name=$_.Name; executable_path=$_.ExecutablePath; command_line=$_.CommandLine; created_at=if($_.CreationDate){$_.CreationDate.ToUniversalTime().ToString('o')}else{$null}}}); [PSCustomObject]@{complete=$true; processes=$rows} | ConvertTo-Json -Compress -Depth 4";
 
 function record(value) {
@@ -229,6 +231,9 @@ function sqlitePointQuery(request) {
       if (action === sqlite.SQLITE_TRANSACTION && ["BEGIN", "ROLLBACK"].includes(first)) return sqlite.SQLITE_OK;
       if (action === sqlite.SQLITE_FUNCTION && ["length", "typeof", "json_valid", "json_type", "json_array_length", "json_extract"].includes(second)) return sqlite.SQLITE_OK;
       if (action === sqlite.SQLITE_READ && first === query.table && ["id", "key", "value"].includes(second)) return sqlite.SQLITE_OK;
+      if (action === sqlite.SQLITE_READ && request.kind === "cli_session"
+        && (first === "sessions" && second === "main_chain_id"
+          || first === "message_nodes" && ["session_id", "node_id", "parent_node_id", "created_at", "chat_message"].includes(second))) return sqlite.SQLITE_OK;
       return sqlite.SQLITE_DENY;
     });
     database.exec("BEGIN DEFERRED");
@@ -240,7 +245,43 @@ function sqlitePointQuery(request) {
     };
     const row = point(query.sql, query.parameters);
     if (!row) return { state: "ready", found: false };
-    if (request.kind === "cli_session") return { state: "ready", found: row.id === request.key };
+    if (request.kind === "cli_session") {
+      let invocation;
+      try {
+        const head = point("SELECT main_chain_id FROM sessions WHERE id = ?", [request.key]);
+        let nodeId = head?.main_chain_id;
+        const visited = new Set();
+        for (let offset = 0; nodeId !== null && offset < MAX_INVOCATION_NODES; offset += 1) {
+          if (!Number.isSafeInteger(nodeId) || nodeId < 0 || visited.has(nodeId)) throw new Error("invocation_chain_invalid");
+          visited.add(nodeId);
+          const node = point("SELECT node_id, parent_node_id, created_at, CASE WHEN length(CAST(chat_message AS BLOB)) BETWEEN 2 AND ? THEN json_valid(chat_message) ELSE 0 END AS valid FROM message_nodes WHERE session_id = ? AND node_id = ?", [request.maxRecordBytes, request.key, nodeId]);
+          if (!node || node.valid !== 1 || node.node_id !== nodeId
+            || node.parent_node_id !== null && (!Number.isSafeInteger(node.parent_node_id) || node.parent_node_id < 0 || node.parent_node_id >= nodeId)) throw new Error("invocation_node_invalid");
+          const fields = { role: "$.role", model: "$.metadata.generation_model", request_id: "$.metadata.request_id",
+            started_at: "$.metadata.started_generation_at", completed_at: "$.metadata.created_at", finish_reason: "$.metadata.finish_reason" };
+          const projection = Object.entries(fields).map(([name, field]) => `CASE WHEN json_type(chat_message, '${field}') = 'text' AND length(CAST(json_extract(chat_message, '${field}') AS BLOB)) BETWEEN 1 AND 128 THEN json_extract(chat_message, '${field}') END AS ${name}`);
+          const selected = point(`SELECT ${projection.join(", ")} FROM message_nodes WHERE session_id = ? AND node_id = ?`, [request.key, nodeId]);
+          if (!["assistant", "user", "tool", "system"].includes(selected?.role)) throw new Error("invocation_role_invalid");
+          if (selected.role === "assistant") {
+            const timestamp = value => typeof value === "string" && /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d{1,9})?Z$/u.test(value) && Number.isFinite(Date.parse(value));
+            if (!persistedModel(selected.model) || [UNKNOWN, "model_observed"].includes(selected.model.toLowerCase())
+              || !/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/iu.test(selected.request_id ?? "")
+              || !timestamp(selected.started_at) || !timestamp(selected.completed_at)
+              || Date.parse(selected.started_at) > Date.parse(selected.completed_at)
+              || !persistedModel(selected.finish_reason)
+              || !Number.isSafeInteger(node.created_at) || node.created_at < 0 || !Number.isFinite(new Date(node.created_at * 1000).getTime())) throw new Error("invocation_metadata_invalid");
+            if (invocation && selected.request_id !== invocation.request_id) break;
+            if (invocation && ["model", "started_at", "completed_at", "finish_reason"].some(field => selected[field] !== invocation[field])) throw new Error("invocation_duplicate_conflict");
+            invocation ??= { ...selected, node_id: nodeId, created_at: new Date(node.created_at * 1000).toISOString() };
+          }
+          nodeId = node.parent_node_id;
+        }
+        if (invocation && Buffer.byteLength(JSON.stringify(invocation), "utf8") > request.maxRecordBytes) invocation = undefined;
+      } catch {
+        invocation = undefined;
+      }
+      return { state: "ready", found: row.id === request.key, ...(invocation ? { invocation } : {}) };
+    }
     if (request.kind === "desktop_info") {
       if (row.storage !== "text" || !Number.isSafeInteger(row.bytes) || row.bytes < 2 || row.bytes > MAX_DESKTOP_INFO_BYTES) return { state: "unavailable" };
       const shape = point("SELECT CASE WHEN json_valid(value) = 1 THEN CASE WHEN json_type(value) = 'object' AND json_type(value, '$.configOptions') = 'array' THEN json_array_length(value, '$.configOptions') END END AS option_count FROM meta WHERE key = ?", ["info"]);
@@ -529,6 +570,13 @@ export function createWindsurfDesktopStatusReader({
       source: "windsurf_devin_meta_info_configOptions_model_currentValue_persisted", observed_at: observedAt,
       conversation_id: identity.desktopId, ...(boundedString(selection, 128) ? { raw_model: selection } : {}) };
     observation.last_invocation = { model: UNKNOWN, source: "windsurf_devin_invocation_metadata_not_observed", code: "model_invocation_not_exposed", observed_at: observedAt };
+    if (record(cli.invocation)) {
+      const invocation = cli.invocation;
+      observation.last_invocation = { model: invocation.model, source: INVOCATION_SOURCE,
+        field: `message_nodes/${invocation.node_id}/request/${invocation.request_id}/chat_message.metadata.generation_model`,
+        conversation_id: identity.slug, step_index: invocation.node_id, observed_at: observedAt,
+        step_created_at: invocation.created_at, step_started_at: invocation.started_at, step_completed_at: invocation.completed_at };
+    }
     result.model_observation = projectModelObservation(observation, SOURCE);
     result.session_lock_evidence = await lockEvidence(identity.slug, snapshot, signal);
     if (result.conversation_exists === UNKNOWN) result.code = "ls_target_unavailable";

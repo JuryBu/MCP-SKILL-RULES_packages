@@ -2,7 +2,7 @@
 
 交流核心提供十项MCP工具，用于按宿主和对话ID定位目标、发送消息、等待关联回信、查询状态、读取获准QQ窗口的最近消息和下载其中的附件，以及管理聊天窗口对应的模型对话。核心保存准确来源与目标、待送消息、投递尝试和精确处理确认，宿主连接通过独立接入模块实现。
 
-默认启动入口使用mock隔离接入，测试目标与回执标记为simulated。显式live_test入口支持Antigravity、Codex控制端和NapCat通知、引用回信及可选QQ窗口采集；同一核心可通过stdio门面注册为宿主常驻MCP。Windsurf/Devin Desktop可配置只读进程与目标SQLite状态探测，支持会话slug及Desktop摘要ID；当前没有发送接入。客户端契约见[宿主接入模块契约](docs/ADAPTER_CONTRACT.md)，配置见[真实接入说明](docs/LIVE_TESTING.md)。NapCat、微信的原账本、账号、附件和发送授权继续由原组件负责。
+默认启动入口使用mock隔离接入，测试目标与回执标记为simulated。显式live_test入口支持Antigravity、Codex控制端和NapCat通知、引用回信及可选QQ窗口采集；同一核心可通过stdio门面注册为宿主常驻MCP。Windsurf/Devin Desktop可配置只读进程与目标SQLite状态探测，支持会话slug、Desktop摘要ID和主链上的最近实际调用模型；原生MCP调用者可向已支持的目标发信，核心到WSF的入站尚未接线。客户端契约见[宿主接入模块契约](docs/ADAPTER_CONTRACT.md)，配置见[真实接入说明](docs/LIVE_TESTING.md)。NapCat、微信的原账本、账号、附件和发送授权继续由原组件负责。
 
 ## 运行
 

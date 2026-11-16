@@ -37,6 +37,6 @@ transport返回同一delivery_id、同一完整target及outcome，可附turn_id�
 
 ## 当前运行范围
 
-默认CLI只允许显式mock隔离配置，独立`live_test`入口支持明确配置的真实AG、QQ引用往返及Codex通用HTTP客户端。AG真实空闲、忙碌、缺席恢复、QQ回信自动归还和宿主常驻工具到Codex主线已有证据。各候选版本的实际加载、页面显示与应用完整重开分别见验证记录；Windsurf尚未接入。
+默认CLI只允许显式mock隔离配置，独立`live_test`入口支持明确配置的真实AG、QQ引用往返及Codex通用HTTP客户端。AG真实空闲、忙碌、缺席恢复、QQ回信自动归还和宿主常驻工具到Codex主线已有证据。Windsurf/Devin已有只读状态和原生MCP调用者出站证据，核心到该宿主的入站、忙中插话与模型切换仍待独立验收。各候选版本的实际加载、页面显示与应用完整重开分别见验证记录。
 
 AG查询与回信共用准确原输入定位：非空原生client ID必须等于原delivery；缺少原生ID时仅接受原发送完整正文。单独引用双ID标记不能确认原输入。原生root/trajectory必须与准确目标一致，重复原输入保持未解决状态。

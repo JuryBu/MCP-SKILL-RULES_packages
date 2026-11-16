@@ -129,9 +129,9 @@ NapCat账号、目标、发送核验、去重和原渠道回复仍由原组件�
 
 字段使用true、false或`"unknown"`。unknown表示本次证据不足，例如未配置读取器、字段缺失、探测超时或宿主返回了未知枚举；结合`observed_at`、`source`及可用的`code`、`reason`、`raw_status`核对原因。各字段按自身含义阅读，例如发送接线关闭时`host_can_receive=false`，宿主接口仍可能在线。conversation_running取本次宿主返回的运行状态。
 
-Codex通过私有连接中的`status_source`加载经路径和SHA校验的只读状态模块；v2分别提供原生启用状态与实例核对结果，缺失值保持unknown。Antigravity通过LS只读接口取状态。可选`status_hosts:["windsurf"]`提供Windsurf/Devin Desktop只读状态，当前没有Windsurf发送接线，其`host_can_receive=false`。具体部署的状态读取器及版本须在该部署的验收记录中核对。
+Codex通过私有连接中的`status_source`加载经路径和SHA校验的只读状态模块；v2分别提供原生启用状态与实例核对结果，缺失值保持unknown。Antigravity通过LS只读接口取状态。可选`status_hosts:["windsurf"]`提供Windsurf/Devin Desktop只读状态；WSF原生MCP调用者可在获准范围内向已支持目标发送，核心到WSF的入站尚未接线，其`host_can_receive=false`。具体部署的状态读取器及版本须在该部署的验收记录中核对。
 
-Windsurf/Devin Desktop读取器核对安装位置、UI主进程和ACP子进程身份，支持CLI会话slug与Desktop的40位摘要ID。指定slug时以确定性摘要和本地显式映射交叉核对，SQLite只按目标主键读取存在及持久模型选择，不扫描消息正文或复制会话库。正常只读连接包含已提交WAL；SQLite协调可能更新既有SHM文件的时间。无法核实的进程、映射、锁或字段保留unknown，单个锁文件不作为正在运行的证据。
+Windsurf/Devin Desktop读取器核对安装位置、UI主进程和ACP子进程身份，支持CLI会话slug与Desktop的40位摘要ID。指定slug时以确定性摘要和本地显式映射交叉核对，SQLite只按会话与节点索引读取存在、持久模型选择和白名单调用元数据，不导出聊天正文、不扫描或复制会话库。正常只读连接包含已提交WAL；SQLite协调可能更新既有SHM文件的读标记或时间。无法核实的进程、映射、锁或字段保留unknown，单个锁文件不作为正在运行的证据。
 
 ### 模型观察
 
@@ -139,7 +139,7 @@ Windsurf/Devin Desktop读取器核对安装位置、UI主进程和ACP子进程�
 
 Codex当前配置来自现有thread inspect的`thread.model`、`modelProvider`和`reasoningEffort`，摘要未给出最近调用时保留该项未知。AG最近调用只读取身份已核对轨迹的最多32个尾部步骤，保留原模型枚举、步骤身份和创建时间；另用只读`GetCascadeModelConfigData`查询当前目录，唯一匹配时附友好名称。可取得的当前模型配置单独核对具体CID，不采用全局默认值替代。
 
-Windsurf的磁盘模型选择附在`current_selection.raw_model`并标明持久来源，当前GUI选择与最近实际调用尚未取得独立证据时，两项`model`均保持unknown。宿主离线时仍可核对保存的目标是否存在，真实运行态及接收能力按各自证据返回。新Devin ACP与旧LS对话接口的能力分开，实际消息接入须另做原生发送和忙碌投递验收。
+Windsurf的磁盘模型选择附在`current_selection.raw_model`并标明持久来源，当前GUI选择缺少独立证据时`current_selection.model`保持unknown。`last_invocation`从指定会话的`main_chain_id`沿主链最多回溯32个节点，只投影模型、原请求与调用时间等白名单元数据，核对最近一组同请求调用记录的一致性，遇到前一不同请求时结束；其它分支和其它会话不参与选择。返回来源字段、节点和调用起止时间，缺失、已检查记录冲突或超出预算时该项保持unknown。该读取不负责全历史请求去重。宿主离线时仍可核对保存的目标是否存在；真实运行态及接收能力按各自证据返回。新Devin ACP与旧LS对话接口的能力分开，实际入站和忙碌插话仍须另验，模型观察不会开启发送能力。
 
 模型读取有独立短期限，一项超时只改变对应模型观察，已经得到的宿主在线、对话运行和投递结果继续返回。完整历史和搜索继续由原文读取服务负责。QQ最近内容和附件的独立授权见[最近内容与附件](CHANNEL_CONTENT.md)。
 
