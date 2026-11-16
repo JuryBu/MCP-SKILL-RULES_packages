@@ -63,6 +63,8 @@ const sandboxRoot = process.env.SANDBOX_MCP_ROOT || path.join(toolkitMcpRoot, "s
 const subagentRoot = process.env.SUBAGENT_MCP_ROOT || path.join(toolkitMcpRoot, "mcp-subagent");
 const napcatRoot = process.env.NAPCAT_MCP_ROOT || path.join(toolkitMcpRoot, "napcat-mcp");
 const napcatEnabled = process.env.CODEX_TOOLKIT_ENABLE_NAPCAT_MCP === "1";
+const communicationCoreRoot = process.env.COMMUNICATION_CORE_MCP_ROOT || path.join(toolkitMcpRoot, "communication-core");
+const communicationCoreEnabled = process.env.CODEX_TOOLKIT_ENABLE_COMMUNICATION_CORE_MCP === "1";
 const wechatDocsRoot = process.env.WECHAT_DOCS_MCP_ROOT || path.join(toolkitMcpRoot, "wechat-docs-mcp");
 const wechatDocsPython = process.env.WECHAT_DOCS_MCP_PYTHON || "python";
 const wechatDocsEnabled = process.env.CODEX_TOOLKIT_ENABLE_WECHAT_DOCS_MCP === "1";
@@ -254,6 +256,20 @@ const endpoints = {
       SANDBOX_ENABLE_DUPLICATE_RETIREMENT: "0",
     },
   },
+  ...(communicationCoreEnabled ? {
+    "communication-core": {
+      path: "/communication-core/mcp",
+      command: nodeCommand,
+      args: [path.join(communicationCoreRoot, "scripts", "broker-stdio.mjs")],
+      cwd: communicationCoreRoot,
+      resources: false,
+      env: {
+        CODEX_MCP_WRAPPER: "1",
+        CODEX_MCP_TOOL_NAME: "communication-core",
+        COMMUNICATION_CORE_FACADE_REGISTRY: process.env.COMMUNICATION_CORE_FACADE_REGISTRY || "",
+      },
+    },
+  } : {}),
   ...(napcatEnabled ? {
     napcat: {
       path: "/napcat/mcp",

@@ -1,0 +1,21 @@
+{
+  "name": "communication-core-mcp",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node src/cli.mjs",
+    "start:broker": "node scripts/broker-stdio.mjs",
+    "test": "node --test --test-concurrency=1 test/*.test.mjs",
+    "check": "node scripts/check.mjs",
+    "demo": "node scripts/isolation-demo.mjs",
+    "live": "node scripts/live.mjs",
+    "probe:live": "node scripts/live-probe.mjs"
+  },
+  "engines": { "node": ">=24.12.0" },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.27.1",
+    "express": "5.2.1",
+    "zod": "3.25.76"
+  }
+}

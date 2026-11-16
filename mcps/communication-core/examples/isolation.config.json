@@ -1,0 +1,55 @@
+{
+  "adapter_mode": "mock",
+  "host": "127.0.0.1",
+  "port": 0,
+  "principals": [
+    {
+      "id": "synthetic-source",
+      "token": "synthetic-source-token-for-isolated-tests-only",
+      "identity": {
+        "machine_id": "synthetic-machine",
+        "host": "synthetic-host",
+        "surface": "desktop",
+        "conversation_id": "synthetic-source-conversation"
+      },
+      "allowed_targets": ["synthetic-receiver-binding"],
+      "origin_kinds": ["agent_message"]
+    },
+    {
+      "id": "synthetic-receiver",
+      "token": "synthetic-receiver-token-for-isolated-tests-only",
+      "identity": {
+        "machine_id": "synthetic-machine",
+        "host": "synthetic-host",
+        "surface": "desktop",
+        "conversation_id": "synthetic-receiver-conversation"
+      },
+      "allowed_targets": ["synthetic-source-binding"],
+      "origin_kinds": ["agent_message"]
+    }
+  ],
+  "targets": [
+    {
+      "machine_id": "synthetic-machine",
+      "host": "synthetic-host",
+      "surface": "desktop",
+      "conversation_id": "synthetic-source-conversation",
+      "binding_id": "synthetic-source-binding",
+      "binding_generation": 1,
+      "adapter_id": "mock-source",
+      "capabilities": { "next_model_boundary": true, "when_idle": true },
+      "evidence": "simulated"
+    },
+    {
+      "machine_id": "synthetic-machine",
+      "host": "synthetic-host",
+      "surface": "desktop",
+      "conversation_id": "synthetic-receiver-conversation",
+      "binding_id": "synthetic-receiver-binding",
+      "binding_generation": 1,
+      "adapter_id": "mock-receiver",
+      "capabilities": { "next_model_boundary": true, "when_idle": true },
+      "evidence": "simulated"
+    }
+  ]
+}
