@@ -14,15 +14,19 @@
 
 仅在接收方已安装并启用交流核心服务 `communication-core` 时适用，工具命名空间为 `communication_core`。交流核心连接已登记的宿主与原有消息渠道，按可信绑定转交消息、保留来源与投递/处理记录；各宿主、NapCat与微信入口仍由各自组件负责。按已安装工具和私有配置选择路径，保留原来有效的消息通道，不擅自迁移路由或关闭其它对话。各端接入与验收状态分别核对。
 
-采用已安装的八工具接口时，可读取获准绑定的分页列表、解析准确目标、发送与读取消息、等待事件、确认处理，并查询真实状态和管理聊天窗口对应关系。`communication_list_conversations`列出本连接获准访问的绑定，`communication_resolve_target`返回当前身份和代次。历史正文继续使用原文读取工具并选择准确宿主；绑定列表与宿主完整历史各按自己的入口读取。
+采用已安装的十工具接口时，可读取获准绑定的分页列表、解析准确目标、发送与读取消息、等待事件、确认处理、查询真实状态、管理聊天窗口对应关系，以及读取获准QQ窗口的近期消息和下载其中的文件附件。`communication_list_conversations`列出本连接获准访问的绑定，`communication_resolve_target`返回当前身份和代次。完整宿主历史与按正文查找对话仍使用memory-store的原文工具，显式选择准确宿主；QQ窗口近期消息沿下方两个专用工具读取。当前工具目录仍显示旧八项时，保留实际可用范围，正常刷新后的目录另行核对。
 
 每次调用显式填写当前调用者真实的`machine_id`、`host`、`surface`与稳定`conversation_id`。machine_id逐字取当前连接的私有登记值，不用操作系统主机名或机器角色自行生成；host、surface取实际宿主，conversation_id填本对话，不借用其它对话。已登记的宿主统一入口供该宿主各对话使用，每条对话直接填写自己的具体CID，无需逐CID登记。门面按宿主登记选择连接，caller仍由调用方声明，broker尚未提供可信宿主CID；该入口限已获授权的本机可信调用方使用，实际来源与授权沿私有登记和原操作范围核对。新宿主尚未接入时沿已有获准入口继续独立工作。
 
 已确认目标宿主与真实对话ID时，`communication_send_message`可直接使用`target={host,conversation_id}`，额外的机器或surface按实际目标及schema填写；普通代理协作无需先建立QQ窗口绑定。需要使用既有绑定时，解析后选取`machine_id`、`host`、`surface`、`conversation_id`、`binding_id`和`binding_generation`六项，保留准确代次；adapter_id、capabilities、evidence等解析元数据留作判断。发送保留原`origin`、有效期限、稳定`dedupe_key`及需要时的`in_reply_to`；本人消息、代理协作和引用转述分别保留来源，代理转述沿原授权判断。跨渠道原始回执由负责入口核对，不伪造消息ID、generation或wake。
 
-`communication_get_status`不带CID时查询宿主整体，指定CID时另核该对话是否存在、正在运行及能否中途接收。采用返回的实际采样时间、来源与各项状态，未知字段保留unknown；不从宿主在线推断所有对话运行，也不从旧回复或用户休息猜代理休眠。
+`communication_get_status`不带CID时查询宿主整体，指定CID时另核该对话是否存在、正在运行及能否中途接收。采用返回的实际采样时间、来源与各项状态，未知字段保留unknown；不从宿主在线推断所有对话运行，也不从旧回复或用户休息猜代理休眠。返回`model_observation`时，分别读取`current_selection`（当前选定的模型）和`last_invocation`（最近一次实际调用的模型），保留各自的观察来源与采样时间。缺少对应记录时保留`unknown`和具体原因，宿主及对话健康仍取本次原状态结果。模型容量只用当前来源实际给出的字段，缺失时保持未知。
 
 `communication_manage_channel_binding`用bind/get/list/remove管理当前对话与QQ、已启用微信窗口的对应关系，更新和移除带原expected_generation，保留其它对话归属。绑定记录、原生窗口路由、持续采集与实际来信分别核对；采集尚未启用时记为「绑定已保存、原生采集未启用」。新窗口启用后核原事件、冻结目标和原消息ID，故障恢复保留兼容解析器、完整最新记录与旧队列，只撤回对应的新采集，不回灌旧状态或改投原消息。
+
+只查看获准QQ窗口的近期消息时，使用`communication_read_channel_messages`，从接收方的私有授权登记取得准确`channel`、`window_type`和`window_id`，显式传真实caller及需要的`count`（1至50）。普通未@、未引用的消息按原内容读取，保留原消息编号、正文与附件元数据；`cursor`只沿实际返回值使用。读取无需创建模型窗口绑定，不启用持续采集，也不提交来信ACK；读取权限与下载权限分别检查。
+
+下载使用原读取结果中的`attachment_ref`和`communication_download_attachment`，保持同一真实caller及原窗口三字段，可选`destination_dir`与单个文件名`name`，默认保存到本任务系统临时目录。提供方再次核对原消息和附件关系，不能下载的类型保留`downloadable=false`，不接受URL或裸文件ID，也不覆盖已有文件。返回后核大小、哈希和实际目的文件，保留`operation_id`、结果及`cleanup_pending`。超时或结果未知时，沿原操作记录和目录核对，保持原引用与目的参数，不另建替代下载；重复同一原请求由服务端查回持久记录。只有原操作已明确失败、临时清理完成时，才使用`retry_failed=true`并填写原`expected_operation_id`显式重试，按已核原因决定是否另选文件名。
 
 发送结果区分接纳、投递、原生注入、实际回复及业务处理。结果未知时用`communication_get_message`查询原message_id，或用`communication_wait`沿原游标继续，单次等待不超过45秒；保持原去重身份，不自动提交第二份业务。等待投递或回复与确认处理分别执行，超时也按原请求状态处理。
 
