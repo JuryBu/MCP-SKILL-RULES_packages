@@ -117,6 +117,31 @@ const groupFileStatusInputSchema = {
   additionalProperties: false,
 };
 
+const configuredRecentInputSchema = {
+  type: "object",
+  properties: {
+    target_key: { type: "string", minLength: 1, maxLength: 64, description: "私有 binding.controlPlane.targets 中的获准目标键，必须显式指定。" },
+    count: { type: "integer", minimum: 1, maximum: 50, default: 20, description: "读取近期消息条数，默认 20，最多 50。" },
+    before_message_id: { type: "string", minLength: 1, maxLength: 128, description: "保留的原消息游标参数；当前尚未验证，传入会明确返回 HISTORY_CURSOR_UNVERIFIED。" },
+    include_owner_event_content: { type: "boolean", default: true, description: "默认保留原生消息正文，沿用原保留上限。" },
+  },
+  required: ["target_key"],
+  additionalProperties: false,
+};
+
+const configuredDownloadInputSchema = {
+  type: "object",
+  properties: {
+    target_key: configuredRecentInputSchema.properties.target_key,
+    message_id: { type: "string", minLength: 1, maxLength: 128, description: "近期读取结果的原 messageId。" },
+    attachment_ref: { type: "string", pattern: "^ncf1:[a-f0-9]{64}$", description: "原消息中可下载附件的绑定引用，不能传 URL 或 file_id。" },
+    destination_dir: { type: "string", minLength: 1, maxLength: 4096, description: "本机绝对目录，建议当前任务的临时目录。" },
+    name: { type: "string", minLength: 1, maxLength: 255, description: "可选单个文件名；同名文件与并发发布均拒绝覆盖。" },
+  },
+  required: ["target_key", "message_id", "attachment_ref", "destination_dir"],
+  additionalProperties: false,
+};
+
 const canonicalMachineRoleSchema = {
   type: "string",
   enum: ["development", "training"],
@@ -497,6 +522,18 @@ const tools = [
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
   },
   {
+    name: "napcat_read_configured_recent",
+    description: "只读获取获准群聊或私聊的近期普通消息，不要求 @ 或引用，不创建采集绑定；保留正文、原消息编号与附件，文件附件带绑定 target 与原消息的 attachment_ref。游标能力明确返回 unknown。",
+    inputSchema: configuredRecentInputSchema,
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+  },
+  {
+    name: "napcat_download_configured_file",
+    description: "重新核对获准目标、原消息及 attachment_ref 后下载文件；群聊和私聊各走原生文件 API，禁止任意 URL/file_id/群号，不降级到其它群，不覆盖已有文件，未知执行不自动重试。",
+    inputSchema: configuredDownloadInputSchema,
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+  },
+  {
     name: "napcat_download_file",
     description: "通过最近消息或任务文件索引返回的原始 file_id/fileUuid 下载固定 ExampleGroup 群文件；首次 URL 查询失败时会刷新对应群历史后重试，不能指定群号或下载 URL，也不会覆盖已有文件。",
     inputSchema: downloadInputSchema,
@@ -709,6 +746,39 @@ function errorResult(error) {
   return textResult(safe, true);
 }
 
+function configuredFileErrorResult(error) {
+  const code = error instanceof NapCatNotifierError ? error.code : "CONFIGURED_FILE_OPERATION_FAILED";
+  const messages = {
+    INVALID_ARGUMENT: "请按此工具声明填写参数，并显式选择获准的 target_key。",
+    HISTORY_CURSOR_UNVERIFIED: "当前尚未验证 before_message_id 游标，请省略该参数读取近期消息。",
+    INVALID_ATTACHMENT_REF: "请使用近期读取结果中原附件的 attachment_ref。",
+    ATTACHMENT_REF_MISMATCH: "附件引用与原消息不匹配，请重新读取该目标的原消息。",
+    MESSAGE_TARGET_MISMATCH: "原消息与选定目标不匹配，请核对 target_key 和 message_id。",
+    MESSAGE_TARGET_UNVERIFIED: "原消息的私聊归属暂未核实，请从该目标近期消息中重新选择。",
+    MESSAGE_ID_MISMATCH: "接口返回的消息编号未匹配，请核对原 messageId。",
+    DOWNLOAD_TARGET_EXISTS: "目标文件已存在，保留原文件，请选择其它文件名。",
+    DOWNLOAD_DIRECTORY_NOT_ABSOLUTE: "destination_dir 需要填写本机绝对目录。",
+    INVALID_FILE_NAME: "name 需要填写有效的单个文件名。",
+    FILE_TOO_LARGE: "附件超过当前下载大小上限。",
+    FILE_SIZE_MISMATCH: "下载字节数与原附件不一致，临时下载已结束。",
+    FILE_DOWNLOAD_TIMEOUT: "文件下载超时，请先核对目的目录和原请求状态。",
+    CONFIGURED_OPERATION_TIMEOUT: "本次操作达到内部总期限，发布状态请按原操作核对。",
+    CONFIGURED_OPERATION_CANCELLED: "本次操作已取消，发布状态请按原操作核对。",
+    FILE_PUBLICATION_UNKNOWN: "文件发布已经开始，请按原操作和目标路径核对最终结果，保留原请求。",
+  };
+  return textResult({
+    ok: false,
+    code,
+    message: messages[code] ?? "本次操作未完成，请核对获准目标、登录状态与目的目录。",
+    outcomeUnknown: Boolean(error?.outcomeUnknown),
+    retryRecommended: false,
+    ...(error?.details?.operationResult ?? {}),
+    ...(error?.details?.publicationState ? { publicationState: error.details.publicationState, published: error.details.published } : {}),
+    ...(error?.details?.cleanupPending ? { cleanupPending: true, temporaryPath: error.details.temporaryPath } : {}),
+    ...(code === "HISTORY_CURSOR_UNVERIFIED" ? { pagination: error.details?.pagination } : {}),
+  }, true);
+}
+
 const notifier = createNapCatNotifier({ cwd: path.resolve(__dirname, "..") });
 const taskRegistryStatePath = process.env.NAPCAT_TASK_REGISTRY_PATH
   || path.resolve(__dirname, "..", "state", "task-registry.json");
@@ -739,7 +809,7 @@ const server = new Server(
 
 server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools }));
 
-server.setRequestHandler(CallToolRequestSchema, async (request) => {
+server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
   const name = request.params.name;
   const args = request.params.arguments || {};
   try {
@@ -751,6 +821,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     }
     if (name === "napcat_read_recent") {
       return textResult({ ok: true, ...(await notifier.readRecentMessages(args)) });
+    }
+    if (name === "napcat_read_configured_recent") {
+      return textResult({ ok: true, ...(await notifier.readConfiguredRecent(args, { signal: extra?.signal })) });
+    }
+    if (name === "napcat_download_configured_file") {
+      return textResult({ ok: true, ...(await notifier.downloadConfiguredFile(args, { signal: extra?.signal })) });
     }
     if (name === "napcat_group_file_status") {
       return textResult({ ok: true, ...(await notifier.groupFileStatus(args)) });
@@ -928,6 +1004,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     }
     throw new NapCatNotifierError("UNKNOWN_TOOL", `未知工具：${name}`);
   } catch (error) {
+    if (name === "napcat_read_configured_recent" || name === "napcat_download_configured_file") {
+      return configuredFileErrorResult(error);
+    }
     return errorResult(error);
   }
 });

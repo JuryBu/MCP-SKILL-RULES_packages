@@ -6,6 +6,7 @@ import { pipeline } from "node:stream/promises";
 import { canonicalMachineRole } from "./machine-role.mjs";
 import { renameReplaceSync } from "./atomic-file.mjs";
 import { OWNER_REPLY_EVENT_LIMITS } from "./owner-reply-events.mjs";
+import { createConfiguredFileAccess } from "./configured-files.mjs";
 
 const DEFAULT_ALLOWED_EVENTS = [
   "started",
@@ -1136,7 +1137,80 @@ export function createNapCatNotifier(options = {}) {
     }
   }
 
-  async function callOneBot(action, params = {}, requestTimeoutMs = timeoutMs) {
+  async function callOneBotWithContext(action, params, requestTimeoutMs, context) {
+    requireConnectionConfiguration();
+    const controller = new AbortController();
+    const hasSideEffects = ["send_group_msg", "send_private_msg", "upload_group_file", "upload_private_file"].includes(action);
+    const abortFromCaller = () => controller.abort(context.signal.reason);
+    context.signal.addEventListener("abort", abortFromCaller, { once: true });
+    if (context.signal.aborted) abortFromCaller();
+    const timeout = setTimeout(() => controller.abort(new NapCatNotifierError("ONEBOT_TIMEOUT", `OneBot 请求 ${action} 超时`, {
+      outcomeUnknown: hasSideEffects,
+    })), requestTimeoutMs);
+    function wait(start) {
+      if (controller.signal.aborted) return Promise.reject(controller.signal.reason);
+      return new Promise((resolve, reject) => {
+        let settled = false;
+        const onAbort = () => { settled = true; reject(controller.signal.reason); };
+        controller.signal.addEventListener("abort", onAbort, { once: true });
+        Promise.resolve().then(() => {
+          controller.signal.throwIfAborted();
+          return start();
+        }).then((value) => {
+          controller.signal.removeEventListener("abort", onAbort);
+          if (settled) { Promise.resolve().then(() => value?.body?.cancel()).catch(() => {}); return; }
+          settled = true;
+          controller.signal.aborted ? reject(controller.signal.reason) : resolve(value);
+        }, (error) => {
+          controller.signal.removeEventListener("abort", onAbort);
+          if (!settled) { settled = true; reject(error); }
+        });
+      });
+    }
+    try {
+      const response = await wait(() => fetchImpl(`${baseUrl}/${action}`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          ...(accessToken ? { Authorization: `Bearer ${accessToken}` } : {}),
+        },
+        body: JSON.stringify(params),
+        signal: controller.signal,
+      }));
+      const responseText = await wait(() => response.text());
+      let envelope;
+      try { envelope = JSON.parse(responseText); } catch (error) {
+        throw new NapCatNotifierError("ONEBOT_INVALID_JSON", `OneBot ${action} 返回了无效 JSON`, {
+          cause: error, outcomeUnknown: response.ok,
+        });
+      }
+      if (!response.ok) throw new NapCatNotifierError("ONEBOT_HTTP_ERROR", `OneBot ${action} 返回 HTTP ${response.status}`, {
+        outcomeUnknown: hasSideEffects && response.status >= 500,
+        details: { status: response.status, retcode: envelope?.retcode ?? null },
+      });
+      if (envelope?.status !== "ok" || Number(envelope?.retcode ?? 0) !== 0) {
+        throw new NapCatNotifierError("ONEBOT_ACTION_FAILED", `OneBot ${action} 执行失败`, {
+          outcomeUnknown: hasSideEffects,
+          details: { retcode: envelope?.retcode ?? null, wording: envelope?.wording ?? "" },
+        });
+      }
+      controller.signal.throwIfAborted();
+      return envelope.data ?? null;
+    } catch (error) {
+      if (controller.signal.aborted && controller.signal.reason instanceof NapCatNotifierError) throw controller.signal.reason;
+      if (error instanceof NapCatNotifierError) throw error;
+      throw new NapCatNotifierError(controller.signal.aborted ? "ONEBOT_TIMEOUT" : "ONEBOT_NETWORK_ERROR",
+        controller.signal.aborted ? `OneBot 请求 ${action} 超时` : `OneBot 请求 ${action} 失败`, {
+          cause: error, outcomeUnknown: true,
+        });
+    } finally {
+      clearTimeout(timeout);
+      context.signal.removeEventListener("abort", abortFromCaller);
+    }
+  }
+
+  async function callOneBot(action, params = {}, requestTimeoutMs = timeoutMs, context) {
+    if (context?.signal) return callOneBotWithContext(action, params, requestTimeoutMs, context);
     requireConnectionConfiguration();
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), requestTimeoutMs);
@@ -1571,7 +1645,8 @@ export function createNapCatNotifier(options = {}) {
     return binding.controlPlane;
   }
 
-  async function checkConfiguredTarget(binding, targetKey) {
+  async function checkConfiguredTarget(binding, targetKey, context = {}) {
+    const scopedCall = (action, params = {}) => callOneBot(action, params, undefined, context);
     const controlPlane = requireControlPlane(binding);
     const resolvedKey = boundedString(
       targetKey || controlPlane.defaultTargetKey,
@@ -1583,13 +1658,13 @@ export function createNapCatNotifier(options = {}) {
     if (!target) {
       throw new NapCatNotifierError("CONTROL_TARGET_NOT_FOUND", `binding 未定义控制目标：${resolvedKey}`);
     }
-    const runtimeStatus = await callOneBot("get_status");
+    const runtimeStatus = await scopedCall("get_status");
     if (runtimeStatus?.online !== true || runtimeStatus?.good !== true) {
       throw new NapCatNotifierError("NAPCAT_NOT_READY", "NapCat 当前不在线或状态异常");
     }
-    const login = verifyLogin(binding, await callOneBot("get_login_info"));
+    const login = verifyLogin(binding, await scopedCall("get_login_info"));
     if (target.type === "private") {
-      const friends = await callOneBot("get_friend_list", { no_cache: true });
+      const friends = await scopedCall("get_friend_list", { no_cache: true });
       const friend = (Array.isArray(friends) ? friends : [])
         .find((item) => String(item?.user_id ?? "") === target.id);
       if (!friend) {
@@ -1606,7 +1681,10 @@ export function createNapCatNotifier(options = {}) {
         },
       };
     }
-    const groupInfo = await callOneBot("get_group_info", { group_id: target.id, no_cache: true });
+    const groupInfo = await scopedCall("get_group_info", { group_id: target.id, no_cache: true });
+    if (context.strictGroupIdentity === true && String(groupInfo?.group_id ?? "") !== target.id) {
+      throw new NapCatNotifierError("CONTROL_GROUP_ID_MISMATCH", `控制群号与 binding 不一致：${resolvedKey}`);
+    }
     const actualName = String(groupInfo?.group_name ?? "");
     const actualMemberCount = Number(groupInfo?.member_count ?? 0);
     if (target.name && actualName !== target.name) {
@@ -3485,6 +3563,17 @@ export function createNapCatNotifier(options = {}) {
     }, targetKey);
   }
 
+  const configuredFiles = createConfiguredFileAccess({
+    loadBinding,
+    checkConfiguredTarget,
+    callOneBot,
+    summarizeMessage: summarizeGroupMessage,
+    fetchImpl,
+    maximumFileBytes,
+    fileDownloadTimeoutMs,
+    ErrorClass: NapCatNotifierError,
+  });
+
   return {
     bindingPath,
     statePath,
@@ -3494,6 +3583,8 @@ export function createNapCatNotifier(options = {}) {
     getControlPlaneConfig,
     readRecentMessages,
     readConfiguredTargetMessages,
+    readConfiguredRecent: configuredFiles.readConfiguredRecent,
+    downloadConfiguredFile: configuredFiles.downloadConfiguredFile,
     groupFileStatus,
     previewTrainingEvent,
     previewTextMessage,

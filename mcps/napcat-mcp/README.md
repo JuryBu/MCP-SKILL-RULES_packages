@@ -58,6 +58,14 @@
 
 跨进程发送锁超过 15 分钟时，服务返回 `STALE_SEND_LOCK` 和锁文件路径，不会自动删锁。先确认旧进程已退出，再检查数据目录中的 `state/dedupe.json`；存在 `pending_send` 时不得自动补发，没有对应状态时可把旧锁改名留证后重试。
 
+## 预配置窗口的近期消息与文件
+
+`napcat_read_configured_recent(target_key, count=20, before_message_id?, include_owner_event_content=true)` 只读查询私有 `binding.controlPlane.targets` 中已获准的群聊或私聊，最多返回50条。普通消息无需@或引用，也无需创建采集绑定；结果保留原消息编号、正文和附件元数据，可下载的文件附件带 `attachment_ref`。当前 `before_message_id` 分页能力尚未验证，传入会返回 `HISTORY_CURSOR_UNVERIFIED`，分页状态为 `unknown`。
+
+`napcat_download_configured_file(target_key, message_id, attachment_ref, destination_dir, name?)` 再次核对登录账号、目标、原消息与附件关系，分别使用群聊或私聊的原生文件接口。`destination_dir` 必须是本机绝对目录，`name` 是可选的单个文件名；不接受URL或裸文件ID，不覆盖已有文件，同名并发只允许一个发布成功。非文件媒体保留元数据并标记 `downloadable=false`；无法核实私聊归属的原消息返回明确错误，且不会改查其它目标。
+
+这两个新入口的内部总期限最多40秒，MCP取消信号贯穿OneBot请求、下载正文和文件管道，旧固定群下载期限保持原行为。结果未知时先核原操作与目标目录，禁止自动重下；文件发布已开始但结果未确认时返回 `outcomeUnknown=true`，清理未完成时带 `cleanupPending` 与临时路径。调用方应保存原结果和文件的大小、SHA256，确认失败与清理完成后再安排显式重试。
+
 ## 固定群文件上传
 
 `napcat_send_file` 是「群文件区上传」工具，只接受本机绝对文件路径、可选显示文件名和去重键，不接受群号。上传前会确认文件存在、不是空文件、大小未超限，计算 SHA256，再次校验登录账号和固定绑定群；上传后调用 `get_group_root_files`，按文件名、大小和可用的上传者信息核验。它对应 QQ 群文件窗口里的文件，不等同于聊天消息流里的文件气泡。
