@@ -19,8 +19,8 @@
    - `communication_wait`：从指定消息游标（`after_cursor`）之后分页等待后续事件（`until="reply"|"delivery"|"processing"|"any"`），**单次 `wait_ms` 上限 `45000`（45 秒）**；
    - `communication_ack_processing`：由接收对话提交指定 `message_id`、`delivery_id` 与 `binding_generation` 的实际业务处理状态（`processing` / `done` / `failed`）；
    - `communication_get_status`：**只读实时查询宿主在线状态（仅传 `host` 等整端范围，探测在线时标 `code="status_host_scope"`）或目标对话存在/运行状态与投递能力（传 `host + conversation_id` 或单独传 `binding_id`，禁混传且不对被查目标对话产生懒登记写库）**，返回真实采样时间 `observed_at`、状态来源 `source`（如 `antigravity_ls`、`codex_proxy_status_and_thread_inspect`、`windsurf_*`）、`host_online`、`conversation_exists`、`conversation_running`、`can_deliver`、`configured_delivery_modes`、`delivery_modes` 及 `raw_status`；未知字段明确保留 `"unknown"`；
-   - `communication_manage_channel_binding`：供当前对话按代次自行登记、查询、列出或移除（`action="bind"|"get"|"list"|"remove"`，各动作严格限制允许字段且 `remove` 必传 `expected_generation`）QQ 及已启用微信聊天窗口对应的模型对话记录（普通发送无需先建窗口绑定，更新按代次核对并保留其它对话归属）。**⚠️ 当前边界：该工具目前仅管理绑定记录，服务端当前 `channel_windows=[]`、外部窗口无引用原生入站仍在接线中（调用带 `channel` 的操作会返回 `channel_not_enabled`），严禁写成已开启窗口原生监听！**
-   - **⚠️ 仍属未上线能力红线**：列出宿主全部未登记历史对话、经 `communication-core` 分页读取任意对话历史正文，以及外部聊天窗口无引用原生入站监听（`channel_windows` 实际启用），**当前均未上线**；读取同机/跨端历史对话原文仍按 `tools-reference/SKILL.md` 走 `memory-store` 的 `conversation_read_original` 或本对话 `transcript.jsonl`。
+   - `communication_manage_channel_binding`：供当前对话按代次自行登记、查询、列出或移除（`action="bind"|"get"|"list"|"remove"`，各动作严格限制允许字段且 `remove` 必传当前准确 `expected_generation`）服务端配置已获准的 QQ 或微信聊天窗口对应的模型对话（普通发送无需先建窗口绑定；未绑定时 `get` 返回 `{"binding": null}`，已被其它对话绑定时保留原归属不强抢；**登记或查询后必核返回的 `capture` 实际状态——如 `consumer_enabled: true`、`status: "ready"`、`native_status: "open"` 方为原生采集已就绪，`remove` 后核实变为 `"closed"`，未配置窗口返回 `channel_not_enabled`，严禁不核 `capture` 假定已采集**）。
+   - **⚠️ 仍属未上线能力红线**：列出宿主全部未登记历史对话与经 `communication-core` 分页读取任意对话历史正文**当前尚未实现**（未在服务端 `channel_windows` 配置启用的外部渠道亦不可采集）；读取同机/跨端历史对话原文仍按 `tools-reference/SKILL.md` 走 `memory-store` 的 `conversation_read_original` 或本对话 `transcript.jsonl`。
 3. **显式真实具体四字段 `caller` 与宿主统一入口铁律**：
    - 每次调用八工具均须显式填写当前调用者的真实四字段：`machine_id`（取本机私有门面登记的稳定机器标识；机器角色可与 `machine_id` 不同，当前值一律沿用私有登记）、`host`（固定 `"antigravity"`）、`surface`（桌面会话为 `"desktop"`，经 `broker-stdio.mjs` 门面调用时四字段均必填，省略 `surface` 会报 `invalid_input`）与**当前对话真实具体的 `conversation_id`**（严禁填通配符 `"*"`）。
    - 已登记的宿主级统一门面连接（`caller_scope`）可供该宿主各具体对话直接使用，无需逐个对话手工登记 `conversation_id`，但四字段值必须严格代表**当前对话自身**，**严禁借用测试对话或其它会话身份调用**。本地门面按声明的 `caller` 选择已登记连接（broker 未鉴别实际宿主来源），实际可访问范围与操作权限仍须匹配私有登记与原授权范围。
@@ -37,7 +37,7 @@
 ## 三、QQ 等外部渠道交流、主动通知克制与健康验收
 
 1. **本人 QQ／IM 来信回原渠道与引用归还原对话**：
-   - QQ 或微信等外部渠道来源的本人询问，**从哪个渠道收到，调查前的简短说明与最终结果就回到哪个渠道**——沿原消息引用关系（收到如 `human_message` 引用回信时，`in_reply_to` 填本条入站 `message_id` 而非其引用的旧消息 ID，正文直接写自然文本、**严禁手搓原始 CQ 码等协议标签**；`delivery_policy` 保持默认 `next_model_boundary`，无需再等回复时设 `reply_required=false`）或核心登记的回送绑定送回原渠道及正确原对话，**严禁只在 Antigravity 桌面窗口留回复让对方在原渠道空等**。
+   - QQ 或微信等外部渠道来源的本人询问，**从哪个渠道收到，调查前的简短说明与最终结果就回到哪个渠道**——沿原消息关联关系（收到如 `human_message` 引用回信或已绑定窗口原生来信时，`in_reply_to` 均填**本条入站 `message_id`**，正文直接写自然文本、**严禁手搓原始 CQ 码等协议标签**；`delivery_policy` 保持默认 `next_model_boundary`，无需再等回复时设 `reply_required=false`）及核心登记的原渠道绑定送回原渠道，**严禁只在 Antigravity 桌面窗口留回复让对方在原渠道空等**。
    - 能立即答清的小问题直接简短答；需要调查或验证时先在原渠道简短说明正在查什么，再继续工作并把最终结果交回原渠道。无发送授权、身份不明或渠道故障时如实记录明确缺口，严禁把平台窗口内回复冒充已送达原渠道。
 2. **面向人的短消息规范与自报对话身份**：
    - 面向人的 QQ／微信消息按接收者的渠道习惯组织，保持简短、少量分条，**具体消息字数、频次、称呼与语气沿用接收方私有偏好**；长文、详细补丁与报告改用附件或链接，**严禁把整份长报告拆成消息轰炸**。
