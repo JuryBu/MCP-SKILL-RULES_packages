@@ -1,6 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { createServer } from "node:http";
 import { setImmediate as nextTurn } from "node:timers/promises";
+import { StreamableHTTPError } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { CoreError } from "../src/contracts.mjs";
 import { NapcatMcpTransport } from "../src/transports/napcat-mcp.mjs";
 
@@ -38,6 +40,120 @@ function unconfirmed(requestSent) {
     return true;
   };
 }
+
+function missingBrokerSession(statusCode = 404) {
+  return new StreamableHTTPError(statusCode, 'Error POSTing to endpoint: {"error":"Missing or invalid MCP session. Send initialize first."}');
+}
+
+test("an evicted broker session reconnects once for concurrent configured history on the real SDK transport", async context => {
+  const sessions = new Set();
+  const dispatched = [];
+  let initializationCount = 0;
+  let evictedCalls = 0;
+  const server = createServer(async (request, response) => {
+    if (request.method !== "POST") {
+      response.writeHead(405).end();
+      return;
+    }
+    let input = "";
+    for await (const chunk of request) input += chunk.toString("utf8");
+    const envelope = JSON.parse(input);
+    const send = (status, data, headers = {}) => {
+      response.writeHead(status, { "content-type": "application/json", ...headers }).end(JSON.stringify(data));
+    };
+    if (envelope.method === "initialize") {
+      const session = `synthetic-${++initializationCount}`;
+      sessions.add(session);
+      send(200, {
+        jsonrpc: "2.0", id: envelope.id,
+        result: { protocolVersion: envelope.params.protocolVersion, capabilities: { tools: {} }, serverInfo: { name: "synthetic-broker", version: "1" } },
+      }, { "mcp-session-id": session });
+      return;
+    }
+    if (!sessions.has(request.headers["mcp-session-id"])) {
+      if (envelope.method === "tools/call") evictedCalls += 1;
+      send(404, { error: "Missing or invalid MCP session. Send initialize first." });
+      return;
+    }
+    if (envelope.method === "notifications/initialized") {
+      response.writeHead(202).end();
+      return;
+    }
+    dispatched.push(envelope.params);
+    send(200, {
+      jsonrpc: "2.0", id: envelope.id,
+      result: { content: [{ type: "text", text: '{"ok":true,"messages":[]}' }] },
+    });
+  });
+  await new Promise(resolve => server.listen(0, "127.0.0.1", resolve));
+  const transport = new NapcatMcpTransport({ baseUrl: `http://127.0.0.1:${server.address().port}/napcat/mcp`, conversationId: "synthetic-eviction-caller" });
+  context.after(async () => {
+    await transport.close();
+    server.closeAllConnections();
+    await new Promise(resolve => server.close(resolve));
+  });
+  assert.deepEqual(await transport.readConfiguredRecent(readArguments), { ok: true, messages: [] });
+  sessions.clear();
+  const groupArguments = { ...readArguments, target_key: "synthetic-group-window" };
+  assert.deepEqual(await Promise.all([transport.readConfiguredRecent(readArguments), transport.readConfiguredRecent(groupArguments)]),
+    [{ ok: true, messages: [] }, { ok: true, messages: [] }]);
+  assert.equal(initializationCount, 2);
+  assert.ok(evictedCalls >= 1 && evictedCalls <= 2);
+  assert.equal(dispatched.length, 3);
+  assert.deepEqual(dispatched.slice(1).sort((left, right) => left.arguments.target_key.localeCompare(right.arguments.target_key)), [
+    { name: "napcat_read_configured_recent", arguments: groupArguments },
+    { name: "napcat_read_configured_recent", arguments: readArguments },
+  ]);
+});
+
+test("a second evicted history session fails after one reconnect", async context => {
+  const { transport, calls } = fixture(context, () => { throw missingBrokerSession(); });
+  await assert.rejects(transport.readConfiguredRecent(readArguments), unconfirmed(true));
+  assert.equal(calls.created, 2);
+  assert.equal(calls.tools.length, 2);
+  assert.strictEqual(calls.tools[0].options.signal, calls.tools[1].options.signal);
+});
+
+test("history reconnect finishes within the first request's ten-second budget", async context => {
+  context.mock.timers.enable({ apis: ["setTimeout"] });
+  let rejectFirst;
+  let invocations = 0;
+  const { transport, calls } = fixture(context, () => {
+    invocations += 1;
+    if (invocations === 1) return new Promise((_, reject) => { rejectFirst = reject; });
+    return new Promise(() => {});
+  });
+  const history = transport.readConfiguredRecent(readArguments);
+  await nextTurn();
+  context.mock.timers.tick(9000);
+  rejectFirst(missingBrokerSession());
+  await nextTurn();
+  assert.equal(calls.tools.length, 2);
+  context.mock.timers.tick(999);
+  assert.equal(calls.tools[1].options.signal.aborted, false);
+  context.mock.timers.tick(1);
+  await assert.rejects(history, unconfirmed(true));
+  assert.equal(calls.tools[1].options.signal.aborted, true);
+  assert.equal(calls.tools.length, 2);
+});
+
+test("evicted sessions never replay a configured download or an owner alert", async context => {
+  const { transport, calls } = fixture(context, () => { throw missingBrokerSession(); });
+  await assert.rejects(transport.downloadConfiguredFile(downloadArguments), unconfirmed(true));
+  await assert.rejects(transport.sendOwnerAlert({ route_key: "synthetic-route", dedupe_key: "synthetic-evicted-alert", summary: "synthetic-only" }), unconfirmed(true));
+  assert.deepEqual(calls.tools.map(entry => entry.input.name), ["napcat_download_configured_file", "napcat_owner_alert"]);
+});
+
+test("ordinary 404 and non-404 failures never trigger a history reconnect", async context => {
+  const failures = [new StreamableHTTPError(404, "Error POSTing to endpoint: unknown endpoint"), missingBrokerSession(400), missingBrokerSession(503)];
+  const { transport, calls } = fixture(context, () => { throw failures[calls.tools.length - 1]; });
+  for (const failure of failures) {
+    assert.ok(failure instanceof StreamableHTTPError);
+    await assert.rejects(transport.readConfiguredRecent(readArguments), unconfirmed(true));
+  }
+  assert.equal(calls.tools.length, failures.length);
+  assert.equal(calls.created, failures.length);
+});
 
 test("configured history reuses one SDK connection and forwards only the exact scoped contract", async context => {
   const expected = { ok: true, messages: [], next_cursor: "74212" };

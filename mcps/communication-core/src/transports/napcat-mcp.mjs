@@ -1,5 +1,5 @@
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import { StreamableHTTPClientTransport, StreamableHTTPError } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { types } from "node:util";
 import { CoreError } from "../contracts.mjs";
 import { normalizeOwnerWindowBinding } from "../owner-window-ingress.mjs";
@@ -14,6 +14,18 @@ const OWNER_WINDOW_PROVIDER_CODES = new Set([
 
 function unavailable(requestSent = false) {
   return new CoreError("napcat_mcp_unconfirmed", "NapCat MCP尚未取得可核对结果", { request_sent: requestSent });
+}
+
+function brokerSessionMissing(error) {
+  const prefix = "Streamable HTTP error: Error POSTing to endpoint: ";
+  if (!(error instanceof StreamableHTTPError) || error.code !== 404 || !error.message.startsWith(prefix)) return false;
+  const body = error.message.slice(prefix.length);
+  if (body.length > 256) return false;
+  try {
+    return JSON.parse(body)?.error === "Missing or invalid MCP session. Send initialize first.";
+  } catch {
+    return false;
+  }
 }
 
 function boundedText(value, maximum) {
@@ -163,34 +175,42 @@ export class NapcatMcpTransport {
       requestSignal.addEventListener("abort", onAbort, { once: true });
     });
     try {
-      connection = (lane ? this.#channelConnections.get(lane) : this.#connection) ?? this.#connect(options, lane);
-      await Promise.race([connection.ready, interrupted]);
-      if (requestSignal.aborted || connection.closed || this.#closed) throw unavailable();
-      if (["napcat_owner_alert", "napcat_owner_window_route_register", "napcat_owner_window_route_close"].includes(name)) onRequestStarted?.();
-      if (requestSignal.aborted || connection.closed || this.#closed) throw unavailable();
-      requestSent = true;
-      const result = await Promise.race([
-        connection.client.callTool({ name, arguments: args }, undefined, options),
-        interrupted,
-      ]);
-      if (requestSignal.aborted || this.#closed) throw unavailable(true);
-      if (preserveChannelErrors) {
-        const parsed = structuredChannelResult(result, requestSent);
-        providerFailure = parsed.error ?? null;
-        if (providerFailure) throw providerFailure;
-        return parsed.value;
+      for (let attempt = 0; ; attempt += 1) {
+        try {
+          connection = (lane ? this.#channelConnections.get(lane) : this.#connection) ?? this.#connect(options, lane);
+          await Promise.race([connection.ready, interrupted]);
+          if (requestSignal.aborted || connection.closed || this.#closed) throw unavailable();
+          if (["napcat_owner_alert", "napcat_owner_window_route_register", "napcat_owner_window_route_close"].includes(name)) onRequestStarted?.();
+          if (requestSignal.aborted || connection.closed || this.#closed) throw unavailable();
+          requestSent = true;
+          const result = await Promise.race([
+            connection.client.callTool({ name, arguments: args }, undefined, options),
+            interrupted,
+          ]);
+          if (requestSignal.aborted || this.#closed) throw unavailable(true);
+          if (preserveChannelErrors) {
+            const parsed = structuredChannelResult(result, requestSent);
+            providerFailure = parsed.error ?? null;
+            if (providerFailure) throw providerFailure;
+            return parsed.value;
+          }
+          if (preserveWindowErrors) {
+            const parsed = structuredWindowResult(result, requestSent);
+            providerFailure = parsed.error ?? null;
+            if (providerFailure) throw providerFailure;
+            return parsed.value;
+          }
+          return structuredResult(result);
+        } catch (error) {
+          if (providerFailure && error === providerFailure) throw error;
+          const expiredHistory = name === "napcat_read_configured_recent" && connection
+            && (connection.sessionMissing === true || (requestSent && brokerSessionMissing(error)));
+          if (expiredHistory) connection.sessionMissing = true;
+          this.#disconnect(connection);
+          if (expiredHistory && attempt === 0 && !requestSignal.aborted && !this.#closed) continue;
+          throw unavailable(requestSent);
+        }
       }
-      if (preserveWindowErrors) {
-        const parsed = structuredWindowResult(result, requestSent);
-        providerFailure = parsed.error ?? null;
-        if (providerFailure) throw providerFailure;
-        return parsed.value;
-      }
-      return structuredResult(result);
-    } catch (error) {
-      if (providerFailure && error === providerFailure) throw error;
-      this.#disconnect(connection);
-      throw unavailable(requestSent);
     } finally {
       clearTimeout(timer);
       requestSignal.removeEventListener("abort", onAbort);
