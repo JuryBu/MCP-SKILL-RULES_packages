@@ -69,7 +69,7 @@ const HEARTBEAT_BROWSER_TIMEOUT = 20 * 60 * 1000; // 20 分钟无活动 → 关�
 // 创建 MCP Server 实例
 const server = new McpServer({
     name: "web-fetcher-mcp-server",
-    version: "7.4.1",
+    version: "7.4.2",
 });
 
 // 注册所有工具
@@ -239,7 +239,7 @@ server.registerResource(
         contents: [
             {
                 uri: "web-fetcher://test/hello",
-                text: "MCP Web Fetcher v7.4.1 - Resource 机制正常\n\n可用于将抓取结果存储为 resource，AI 按需读取。",
+                text: "MCP Web Fetcher v7.4.2 - Resource 机制正常\n\n可用于将抓取结果存储为 resource，AI 按需读取。",
                 mimeType: "text/plain",
             },
         ],
@@ -342,7 +342,7 @@ async function heartbeatCheck(): Promise<void> {
 
 // 启动 stdio 传输
 async function main(): Promise<void> {
-    console.error(`[web-fetcher] MCP Server v7.4.1 启动中... (ppid=${process.ppid})`);
+    console.error(`[web-fetcher] MCP Server v7.4.2 启动中... (ppid=${process.ppid})`);
     logStdinEvent("STARTED");
 
     // 清理遗留的临时目录（防止意外中断导致堆积）

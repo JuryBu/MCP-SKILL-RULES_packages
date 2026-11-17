@@ -224,6 +224,14 @@ web_fetch_page(taskId="...", waitSeconds=30)
 
 Codex 模型桥默认值保持 `gpt-5.5` + `model_reasoning_effort=medium` + `model_speed_tier=fast`，可覆盖 `WEB_FETCHER_CODEX_MODEL`、`WEB_FETCHER_CODEX_REASONING`、`WEB_FETCHER_CODEX_SPEED`。Claude Code CLI 默认值保持 `sonnet` + `--effort low`，可用 `WEB_FETCHER_CLAUDE_CODE_MODEL`、`WEB_FETCHER_CLAUDE_CODE_EFFORT`、`WEB_FETCHER_CLAUDE_CODE_TIMEOUT_MS`、`WEB_FETCHER_CLAUDE_CODE_MAX_BUDGET_USD` 覆盖；`auto` 末跳仍需 `WEB_FETCHER_CLAUDE_CODE_AUTO_FALLBACK=1`。
 
+### 7.4.2 正文等待、截图预检与内存
+
+静态正文就绪后缩短观察时间，动态正文仍等待加载信号。读取正文时，显式 `waitFor` 已命中可见内容就不再等额外的稳定时段。提取 Markdown 后立即关闭临时解析文档。截图继续检查可见图片、字体和全页懒加载；超出检查预算时，结果会注明覆盖不完整。视觉检查逐步遍历页面，限制同一轮正在探测的图片数，并在结束后释放探测资源，适合反复截图和复用页面。
+
+同一页面需要先读取再截图时，可以复用 `sessionId`，或者在一次 `web_pipeline` 中接续这两步。
+
+`web_fetch_screenshot` 的 `viewport` 用于 HTML 网页的响应式布局。预览 SVG、图片、PDF 或 Office 文件时省略这个字段，输出大小仍按原有参数设置。如果混用了参数，工具会返回说明和 `structuredContent.status="needs_input"`，其中 `executionStarted=false`、`imageCount=0`，按 `retry.omitArguments` 调整后再调用一次。真正执行失败、会话失效或不支持的预览入口仍返回错误。
+
 ## v7.0: 视觉检查与 AI Review
 
 ### `web_fetch_screenshot` 视觉增强

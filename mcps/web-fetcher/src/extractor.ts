@@ -559,7 +559,15 @@ export function extractContent(
     url: string
 ): { title: string; content: string } {
     const dom = new JSDOM(html, { url });
-    const document = dom.window.document;
+    const window = dom.window;
+    try {
+        return extractDocument(window.document, html, url);
+    } finally {
+        window.close();
+    }
+}
+
+function extractDocument(document: Document, html: string, url: string): { title: string; content: string } {
     const docTitle = document.title || "无标题";
 
     // === 第0步：预清洗 DOM ===

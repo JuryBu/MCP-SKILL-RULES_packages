@@ -32,6 +32,18 @@ test("headless Edge responsive viewport through real MCP HTTP tools", { timeout:
     await service.connect(serverTransport);
     const fixtureHtml = `<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>Responsive viewport fixture</title><style>*{box-sizing:border-box}html,body{margin:0;font:20px sans-serif;background:#e6edf4}main{min-height:1800px;padding:20px}h1{font-size:32px;line-height:40px;margin:0 0 16px}p{line-height:24px;margin:16px 0}.cards{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}.card{min-height:200px;padding:20px;background:linear-gradient(45deg,#278bcc,#17314d);color:white}#crop{width:160px;height:100px;background:linear-gradient(90deg,#e33,#cc2)}@media(max-width:600px){.cards{grid-template-columns:1fr}}@media(orientation:landscape){h1{color:#246}}</style><main><h1>Responsive layout fixture</h1><p id="mode"></p><section class="cards"><article class="card">First card with realistic visible text.</article><article class="card">Second card preserves readable responsive text.</article><article class="card">Third card and page footer are available on full page.</article></section><div id="crop">Crop region</div><p>Long webpage verifies fullPage without changing responsive CSS width.</p></main><script>window.initialWidth=innerWidth;function update(){document.getElementById('mode').textContent='CSS '+innerWidth+' x '+innerHeight+' '+(innerWidth<=600?'mobile':'desktop')}update();addEventListener('resize',update);</script>`;
     const httpServer = http.createServer((request, response) => {
+        if (request.url === "/late-svg-image.svg") {
+            setTimeout(() => {
+                response.writeHead(200, { "content-type": "image/svg+xml", "cache-control": "no-store" });
+                response.end('<svg xmlns="http://www.w3.org/2000/svg" width="480" height="260"><rect width="480" height="260" fill="#33a66f"/></svg>');
+            }, 1700);
+            return;
+        }
+        if (request.url === "/svg-with-late-image.svg") {
+            response.writeHead(200, { "content-type": "image/svg+xml", "cache-control": "no-store" });
+            response.end('<svg xmlns="http://www.w3.org/2000/svg" width="480" height="260"><rect width="480" height="260" fill="#cb5b4d"/><image id="cover" width="480" height="260"/><script>setTimeout(() =&gt; document.getElementById("cover").setAttribute("href", "/late-svg-image.svg"), 220)</script></svg>');
+            return;
+        }
         if (request.url === "/tiny") {
             response.setHeader("Content-Type", "text/html; charset=utf-8");
             response.setHeader("Cache-Control", "no-store");
@@ -205,7 +217,7 @@ test("headless Edge responsive viewport through real MCP HTTP tools", { timeout:
             }
         });
 
-        await contextTest.test("local HTML supports viewport while document tools reject explicit viewport", async () => {
+        await contextTest.test("local HTML supports viewport and screenshot preflight explains document viewport", async () => {
             const htmlPath = path.join(temporaryRoot, "fixture.html");
             await fs.writeFile(htmlPath, fixtureHtml, "utf8");
             const viewport = { width: 390, height: 844 };
@@ -215,9 +227,45 @@ test("headless Edge responsive viewport through real MCP HTTP tools", { timeout:
             for (const name of toolNames) {
                 const extra = name === "web_interact" ? { action: "content", ownerId } : name === "web_pipeline" ? { steps: [{ action: "content" }], ownerId } : name === "web_inspect" ? { mode: "structure" } : {};
                 const result = await call(name, { url: documentUrl, viewport, ...extra }, true);
-                assert.equal(result.isError, true, `${name}: ${textOf(result)}`);
                 assert.match(textOf(result), /ERR_VIEWPORT_UNSUPPORTED_TARGET/);
+                if (name === "web_fetch_screenshot") {
+                    assert.equal(Boolean(result.isError), false, textOf(result));
+                    assert.deepEqual(result.structuredContent, {
+                        status: "needs_input",
+                        code: "ERR_VIEWPORT_UNSUPPORTED_TARGET",
+                        executionStarted: false,
+                        imageCount: 0,
+                        retry: { omitArguments: ["viewport"] },
+                    });
+                    assert.equal(result.content.filter(item => item.type === "image").length, 0);
+                    assert.match(textOf(result), /本次未截图/);
+                    assert.ok(!result._meta?.webFetcherTiming?.stages?.some(stage => stage.stage === "page.create"));
+                } else {
+                    assert.equal(result.isError, true, `${name}: ${textOf(result)}`);
+                }
             }
+        });
+
+        await contextTest.test("standalone SVG is ready without an HTML body and still yields an image", async () => {
+            const svgPath = path.join(temporaryRoot, "preview.svg");
+            await fs.writeFile(svgPath, '<svg xmlns="http://www.w3.org/2000/svg" width="480" height="260"><rect width="480" height="260" fill="#663399"/></svg>', "utf8");
+            const result = await call("web_fetch_screenshot", { url: pathToFileURL(svgPath).href, selector: "svg", quality: "fast", ownerId });
+            assert.deepEqual(await dimensions(result), { width: 480, height: 260 });
+            assert.doesNotMatch(textOf(result), /就绪检查未完整通过|仍在解析/);
+            const missingSession = await call("web_fetch_screenshot", { sessionId: "session_missing", ownerId }, true);
+            assert.equal(missingSession.isError, true);
+            const epub = await call("web_fetch_screenshot", { url: pathToFileURL(path.join(temporaryRoot, "preview.epub")).href, viewport: { width: 480, height: 260 } }, true);
+            assert.equal(epub.isError, true);
+            assert.match(textOf(epub), /ERR_UNSUPPORTED_SCREENSHOT_ROUTE/);
+        });
+
+        await contextTest.test("standalone SVG screenshot waits for a late visible image", async () => {
+            const result = await call("web_fetch_screenshot", { url: `${base}/svg-with-late-image.svg`, selector: "svg", quality: "fast", ownerId });
+            const payload = result.content.find(item => item.type === "image");
+            assert.ok(payload, textOf(result));
+            const pixel = await sharp(Buffer.from(payload.data, "base64")).extract({ left: 200, top: 100, width: 1, height: 1 }).raw().toBuffer();
+            assert.ok(pixel[0] < 105 && pixel[1] > 125, `expected loaded green SVG image, got ${Array.from(pixel)}`);
+            assert.doesNotMatch(textOf(result), /就绪检查未完整通过/);
         });
         assert.equal(manualWindows, 0);
         assert.equal(sessionManager.list(ownerId).length, 0);

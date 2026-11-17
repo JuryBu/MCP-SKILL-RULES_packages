@@ -1,6 +1,6 @@
 {
   "name": "web-fetcher-mcp-server",
-  "version": "7.4.1",
+  "version": "7.4.2",
   "description": "MCP Server - 使用已登录浏览器 Cookie 抓取网页内容",
   "type": "module",
   "main": "dist/index.js",

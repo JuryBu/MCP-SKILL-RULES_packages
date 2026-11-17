@@ -109,7 +109,8 @@ export class RuntimeLifecycle {
     decorate<Result>(result: Result): Result {
         if (!result || typeof result !== 'object') return result;
         const value = result as Record<string, any>;
-        const first = this.firstSuccessPending && value.isError !== true && Array.isArray(value.content);
+        const first = this.firstSuccessPending && value.isError !== true
+            && value.structuredContent?.status !== 'needs_input' && Array.isArray(value.content);
         if (first) this.firstSuccessPending = false;
         const resumed = first && this.persistence !== 'other-instance' && this.snapshot.previousExit?.reason === 'idle-timeout';
         const text = `后端已从空闲休眠自动唤醒，启动就绪用时 ${this.snapshot.startupMs ?? 0} ms；原工具结果继续返回。`;

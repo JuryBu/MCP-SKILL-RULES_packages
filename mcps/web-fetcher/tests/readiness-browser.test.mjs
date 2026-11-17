@@ -4,7 +4,7 @@ import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
 import { chromium } from 'playwright';
-import { waitForPageReadiness } from '../dist/readiness.js';
+import { waitForPageReadiness, withContentReadinessTarget } from '../dist/readiness.js';
 
 const enabled = process.env.WEB_FETCHER_BROWSER_TESTS === '1';
 const picture = '<svg xmlns="http://www.w3.org/2000/svg" width="400" height="240"><rect width="400" height="240" fill="green"/></svg>';
@@ -52,6 +52,24 @@ test('real browser readiness keeps pixels ready without networkidle or minimum t
             await run('<h1>Ready</h1><button>OK</button>', { mode: 'content', maxWait: 4000 }, result => {
                 assert.equal(result.complete, true); assert.ok(result.waited < 2500);
             });
+        });
+        await suite.test('explicit longer content observation remains in force on a static page', async () => {
+            await run('<h1>Short article</h1><p>Ready</p>', { mode: 'content', maxWait: 4000, minimumObserveMs: 1000 }, result => {
+                assert.equal(result.complete, true);
+                assert.ok(result.waited >= 1000);
+            });
+        });
+        await suite.test('an explicit visible content target does not need a second quiet period', async () => {
+            await run('<main><h1>Waiting for the article</h1></main><script>setTimeout(() => document.querySelector("main").insertAdjacentHTML("beforeend", "<p id=ready-article>Target body</p>"), 260)</script>',
+                { mode: 'content', maxWait: 4000, minimumObserveMs: 1100 }, async normal => {
+                    assert.ok(normal.waited >= 1100);
+                });
+            await withContentReadinessTarget('#ready-article', () => run('<main><h1>Waiting for the article</h1></main><script>setTimeout(() => document.querySelector("main").insertAdjacentHTML("beforeend", "<p id=ready-article>Target body</p>"), 260)</script>',
+                { mode: 'content', maxWait: 4000, minimumObserveMs: 1100 }, async (result, page) => {
+                    assert.equal(result.complete, true);
+                    assert.equal(await page.locator('#ready-article').innerText(), 'Target body');
+                    assert.ok(result.waited < 1000);
+                }));
         });
         await suite.test('late inserted cover must finish, not just stop changing', async () => {
             await run(`<h1>Article</h1><script>setTimeout(()=>{const picture=new Image();picture.src='${origin}/image?delay=1800';document.body.append(picture)},1200)</script>`, { mode: 'visual', maxWait: 6000 }, async (result, page) => {

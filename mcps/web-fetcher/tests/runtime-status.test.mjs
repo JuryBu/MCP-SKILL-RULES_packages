@@ -236,6 +236,16 @@ test('idle exit retains the strict one-hour boundary and active-request exclusio
     }
 });
 
+test('a preflight receipt leaves the first successful wake notice for the resulting screenshot', context => {
+    const { create } = fixture(context, savedSnapshot());
+    const lifecycle = create();
+    lifecycle.ready();
+    const needsInput = { content: [{ type: 'text', text: 'No screenshot was taken' }], structuredContent: { status: 'needs_input', imageCount: 0 } };
+    assert.equal(wakeNoticeCount(lifecycle.decorate(needsInput)), 0);
+    assert.equal(wakeNoticeCount(lifecycle.decorate(successResult())), 1);
+    assert.equal(wakeNoticeCount(lifecycle.decorate(successResult())), 0);
+});
+
 test('wake decoration preserves text/image order, metadata, structured content, and immutable input', context => {
     const { create, clock } = fixture(context, savedSnapshot());
     const lifecycle = create();

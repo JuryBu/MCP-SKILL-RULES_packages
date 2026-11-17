@@ -8,6 +8,7 @@ import { pageReadFailure, formatPageReadFailure, readDuringNavigation } from '..
 import { throwIfRequestExpired, remainingRequestMs } from '../request-context.js';
 import { detectHumanVerificationSignals } from "../human-verification.js";
 import { viewportSchema, assertViewportTarget, applyExplicitViewport } from "../viewport.js";
+import { withContentReadinessTarget } from "../readiness.js";
 import { extractContent, truncateContent, compactContent, cleanFooterGarbage, detectSPAIssue, detectEncodingIssue, type OutputMode } from "../extractor.js";
 import { pageCache } from "../cache.js";
 import { touchActivity } from "../lifecycle.js";
@@ -340,12 +341,12 @@ export function registerFetchPage(server: McpServer): void {
                     if (params.scrollCount) await browserManager.scrollPage(page, params.scrollCount);
                 } else {
                     assertViewportTarget(sourceUrl, params.viewport);
-                    page = await browserManager.navigateTo(sourceUrl, {
+                    page = await withContentReadinessTarget(params.waitFor, () => browserManager.navigateTo(sourceUrl, {
                         viewport: params.viewport,
                         waitFor: params.waitFor,
                         timeout: params.timeout,
                         scrollCount: params.scrollCount,
-                    });
+                    }));
                 }
                 await applyExplicitViewport(page, params.viewport);
 

@@ -1,7 +1,10 @@
 import type { Page } from 'playwright';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { performance } from 'node:perf_hooks';
+import { randomUUID } from 'node:crypto';
 import { remainingRequestMs, throwIfRequestExpired, withRequestStage } from './request-context.js';
 import { isNavigationReadError, NavigationReadError, readDuringNavigation } from './navigation-read.js';
+import { releaseReadinessProbeRun, sampleReadinessDocument } from './readiness-sample.js';
 
 export interface ReadinessResult {
     waited: number;
@@ -26,6 +29,11 @@ export interface ReadinessOptions {
 }
 
 const latestResults = new WeakMap<Page, ReadinessResult>();
+const contentTarget = new AsyncLocalStorage<string>();
+
+export function withContentReadinessTarget<Result>(selector: string | undefined, run: () => Result): Result {
+    return selector ? contentTarget.run(selector, run) : run();
+}
 
 export function getPageReadiness(page: Page): ReadinessResult | undefined {
     return latestResults.get(page);
@@ -79,6 +87,8 @@ export async function waitForPageReadiness(page: Page, options: ReadinessOptions
         const deadline = started + budget;
         const minimumObserve = options.minimumObserveMs ?? (options.mode === 'visual' ? 1500 : 500);
         const quietMs = options.quietMs ?? (options.mode === 'visual' ? 500 : 350);
+        const requestedSelector = options.mode === 'content' ? contentTarget.getStore() : undefined;
+        const probeRunId = options.mode === 'visual' ? randomUUID() : undefined;
         let lazyComplete = options.mode !== 'visual' || !options.fullPage;
         let lazyDocumentVersion: number | undefined;
         if (!lazyComplete) {
@@ -97,174 +107,78 @@ export async function waitForPageReadiness(page: Page, options: ReadinessOptions
             waited: 0, total: 0, ready: 0, pending: 0, failed: 0,
             complete: false, fontsReady: false, scanLimited: false,
         };
-        while (performance.now() < deadline) {
-            throwIfRequestExpired();
-            const sampling = readDuringNavigation(page, () => page.evaluate(({ visual, fullPage }) => {
-                const probeKey = '__webFetcherVisualProbes_v1';
-                const host = window as typeof window & { [probeKey]?: Map<string, HTMLImageElement> };
-                const probes = host[probeKey] ??= new Map<string, HTMLImageElement>();
-                const usedUrls = new Set<string>();
-                let total = 0;
-                let ready = 0;
-                let failed = 0;
-                let scanLimited = false;
-                let visibleCount = 0;
-                let uninspectedFrames = 0;
-                let frameTextLength = 0;
-                let fontsReady = !document.fonts || document.fonts.status === 'loaded';
-                const layout: string[] = [];
-                const inScope = (element: Element): boolean => {
-                    const bounds = element.getBoundingClientRect();
-                    const pendingIntrinsicImage = element.tagName === 'IMG' && !(element as HTMLImageElement).complete && element.getClientRects().length > 0;
-                    if ((bounds.width <= 0 || bounds.height <= 0) && !pendingIntrinsicImage) return false;
-                    const view = element.ownerDocument.defaultView ?? window;
-                    if ((!fullPage || element.ownerDocument !== document) && (bounds.bottom < 0 || bounds.top > view.innerHeight || bounds.right < 0 || bounds.left > view.innerWidth)) return false;
-                    const style = getComputedStyle(element);
-                    if (typeof element.checkVisibility === 'function' && !element.checkVisibility({ opacityProperty: true, visibilityProperty: true })) return false;
-                    return style.visibility !== 'hidden' && style.display !== 'none' && Number(style.opacity) !== 0;
-                };
-                const checkImage = (picture: HTMLImageElement): void => {
-                    if (!picture.currentSrc && !picture.getAttribute('src') && !picture.getAttribute('srcset')) return;
-                    total++;
-                    if (picture.complete) {
-                        if (picture.naturalWidth > 0) ready++;
-                        else failed++;
+        try {
+            while (performance.now() < deadline) {
+                throwIfRequestExpired();
+                const sampling = readDuringNavigation(page, () => page.evaluate(sampleReadinessDocument, {
+                    visual: options.mode === 'visual',
+                    fullPage: !!options.fullPage,
+                    probeRunId,
+                    requestedSelector,
+                    probeLifetimeMs: Math.round(Math.max(1, deadline - performance.now()) + 150),
+                }), { phase: `readiness.${options.mode}.sample`, timeoutMs: Math.max(0, deadline - performance.now()) });
+                let snapshot: Awaited<typeof sampling>;
+                try { snapshot = await sampling; }
+                catch (error) {
+                    if (error instanceof NavigationReadError && error.diagnostics.code === 'page_read_timeout' && performance.now() >= deadline) break;
+                    if ((isNavigationReadError(error) || (error instanceof NavigationReadError && error.diagnostics.code === 'navigation_read_interrupted')) && performance.now() < deadline) {
+                        lastSignature = '';
+                        stableSince = performance.now();
+                        final.complete = false;
+                        final.documentReady = false;
+                        await pause(Math.min(200, Math.max(0, deadline - performance.now())));
+                        continue;
                     }
-                };
-                const checkUrl = (url: string): void => {
-                    if (!url || usedUrls.has(url)) return;
-                    usedUrls.add(url);
-                    let picture = probes.get(url);
-                    if (!picture) {
-                        if (probes.size >= 512) {
-                            scanLimited = true;
-                            return;
+                    throw error;
+                }
+                if (options.mode === 'visual' && options.fullPage && lazyDocumentVersion !== snapshot.documentVersion) {
+                    lazyComplete = false;
+                    if (performance.now() + 300 < deadline) {
+                        try {
+                            const primed = await primeLazyImages(page, Math.min(deadline, performance.now() + 3000));
+                            lazyComplete = primed.complete;
+                            lazyDocumentVersion = primed.documentVersion;
+                        } catch (error) {
+                            if (!isNavigationReadError(error) && !(error instanceof NavigationReadError && error.diagnostics.code === 'page_read_timeout')) throw error;
                         }
-                        picture = new Image();
-                        picture.src = url;
-                        probes.set(url, picture);
+                        lastSignature = '';
+                        stableSince = performance.now();
+                        continue;
                     }
-                    checkImage(picture);
+                }
+                const now = performance.now();
+                if (snapshot.signature !== lastSignature) {
+                    lastSignature = snapshot.signature;
+                    stableSince = now;
+                }
+                const settled = snapshot.documentReady !== false && (options.mode === 'visual'
+                    ? snapshot.pending === 0 && snapshot.fontsReady && !snapshot.primaryBusy && !snapshot.emptyRoot
+                    : snapshot.meaningful && snapshot.pending === 0);
+                const fastText = snapshot.staticText && minimumObserve <= 500 && options.quietMs === undefined;
+                const observeMs = fastText ? Math.min(minimumObserve, 120) : minimumObserve;
+                const settleMs = fastText ? Math.min(quietMs, 100) : quietMs;
+                const stable = snapshot.targetReady
+                    || (now - stableSince >= settleMs && now - started >= observeMs && snapshot.documentAgeMs >= observeMs);
+                final = {
+                    waited: Math.round(now - started), total: snapshot.total, ready: snapshot.ready,
+                    pending: snapshot.pending, failed: snapshot.failed, fontsReady: snapshot.fontsReady,
+                    scanLimited: snapshot.scanLimited,
+                    documentReady: snapshot.documentReady,
+                    uninspectedFrames: snapshot.uninspectedFrames,
+                    complete: settled && stable && snapshot.failed === 0 && !snapshot.scanLimited && lazyComplete && snapshot.uninspectedFrames === 0,
                 };
-                const nodes = document.body?.querySelectorAll('*') ?? [];
-                const limit = 6000;
-                scanLimited = nodes.length > limit;
-                const frameNodes: Element[] = [];
-                for (const frame of document.querySelectorAll('iframe')) {
-                    if (!inScope(frame)) continue;
-                    try {
-                        const frameDocument = frame.contentDocument;
-                        if (!frameDocument) { uninspectedFrames++; continue; }
-                        total++;
-                        const navigating = !!frame.getAttribute('src') && frame.src !== 'about:blank' && frameDocument.URL === 'about:blank';
-                        if (!navigating && frameDocument.readyState !== 'loading') ready++;
-                        if (frameDocument.body) {
-                            frameTextLength += frameDocument.body.innerText.length;
-                            for (const element of frameDocument.body.querySelectorAll('*')) {
-                                if (nodes.length + frameNodes.length >= limit) { scanLimited = true; break; }
-                                frameNodes.push(element);
-                            }
-                            uninspectedFrames += frameDocument.querySelectorAll('iframe').length;
-                        }
-                        fontsReady = fontsReady && (!frameDocument.fonts || frameDocument.fonts.status === 'loaded');
-                    } catch { uninspectedFrames++; }
-                }
-                const inspectedNodes: Element[] = [];
-                for (let index = 0; index < Math.min(nodes.length, limit); index++) inspectedNodes.push(nodes[index]);
-                inspectedNodes.push(...frameNodes);
-                for (let index = 0; index < inspectedNodes.length; index++) {
-                    const element = inspectedNodes[index];
-                    if (!inScope(element)) continue;
-                    visibleCount++;
-                    const bounds = element.getBoundingClientRect();
-                    if (layout.length < 200 && /^(IMG|VIDEO|P|H[1-6]|BUTTON|INPUT|CANVAS|SVG|MAIN|ARTICLE)$/.test(element.tagName)) {
-                        layout.push(`${element.tagName}:${Math.round(bounds.x)},${Math.round(bounds.y)},${Math.round(bounds.width)},${Math.round(bounds.height)}`);
-                    }
-                    if (!visual) continue;
-                    if (element.tagName === 'IMG') checkImage(element as HTMLImageElement);
-                    if (element.tagName === 'VIDEO') {
-                        const video = element as HTMLVideoElement;
-                        if (video.poster) checkUrl(video.poster);
-                        else if (video.currentSrc || video.src || video.querySelector('source')) {
-                            total++;
-                            if (video.readyState >= 2) ready++;
-                            else if (video.error) failed++;
-                        }
-                    }
-                    const style = getComputedStyle(element);
-                    const matches = style.backgroundImage.matchAll(/url\(["']?([^"')]+)["']?\)/g);
-                    for (const match of matches) checkUrl(match[1]);
-                }
-                if (visual) {
-                    for (const [url] of probes) {
-                        if (!usedUrls.has(url)) probes.delete(url);
-                    }
-                }
-                const text = (document.body?.innerText ?? '').trim();
-                const root = document.querySelector('#root, #app, #__next');
-                const busyRoots = document.querySelectorAll('body[aria-busy="true"], main[aria-busy="true"], [role="main"][aria-busy="true"], #root[aria-busy="true"], #app[aria-busy="true"], #__next[aria-busy="true"]');
-                const primaryBusy = Array.from(busyRoots).some(element => inScope(element));
-                const emptyRoot = !!root && root.children.length === 0 && !root.textContent?.trim();
-                const documentReady = !!document.body && document.readyState !== 'loading';
-                const meaningful = !primaryBusy && !emptyRoot && (text.length > 0 || frameTextLength > 0 || !!document.querySelector('img[src],video,canvas,svg,input,button')
-                    || (!!root && root.children.length > 0 && visibleCount > 0));
-                return {
-                    total, ready, failed, pending: total - ready - failed,
-                    fontsReady,
-                    scanLimited, meaningful, uninspectedFrames, primaryBusy, emptyRoot,
-                    documentReady,
-                    documentVersion: performance.timeOrigin, documentAgeMs: performance.now(),
-                    signature: `${performance.timeOrigin}|${location.href}|${documentReady}|${primaryBusy}|${emptyRoot}|${nodes.length + frameNodes.length}|${text.length + frameTextLength}|${text.slice(0, 300)}|${text.slice(-100)}|${total}|${ready}|${failed}|${layout.join(';')}`,
-                };
-            }, { visual: options.mode === 'visual', fullPage: !!options.fullPage }), { phase: `readiness.${options.mode}.sample`, timeoutMs: Math.max(0, deadline - performance.now()) });
-            let snapshot: Awaited<typeof sampling>;
-            try { snapshot = await sampling; }
-            catch (error) {
-                if (error instanceof NavigationReadError && error.diagnostics.code === 'page_read_timeout' && performance.now() >= deadline) break;
-                if ((isNavigationReadError(error) || (error instanceof NavigationReadError && error.diagnostics.code === 'navigation_read_interrupted')) && performance.now() < deadline) {
-                    lastSignature = '';
-                    stableSince = performance.now();
-                    final.complete = false;
-                    final.documentReady = false;
-                    await pause(Math.min(200, Math.max(0, deadline - performance.now())));
-                    continue;
-                }
-                throw error;
+                if (settled && stable) break;
+                await pause(Math.min(fastText ? 60 : 200, Math.max(0, deadline - performance.now())));
             }
-            if (options.mode === 'visual' && options.fullPage && lazyDocumentVersion !== snapshot.documentVersion) {
-                lazyComplete = false;
-                if (performance.now() + 300 < deadline) {
-                    try {
-                        const primed = await primeLazyImages(page, Math.min(deadline, performance.now() + 3000));
-                        lazyComplete = primed.complete;
-                        lazyDocumentVersion = primed.documentVersion;
-                    } catch (error) {
-                        if (!isNavigationReadError(error) && !(error instanceof NavigationReadError && error.diagnostics.code === 'page_read_timeout')) throw error;
-                    }
-                    lastSignature = '';
-                    stableSince = performance.now();
-                    continue;
+        } finally {
+            if (probeRunId && !page.isClosed()) {
+                const cleanupBudget = remainingRequestMs(100);
+                if (cleanupBudget > 0) {
+                    await readDuringNavigation(page, () => page.evaluate(releaseReadinessProbeRun, probeRunId), {
+                        phase: 'readiness.visual.cleanup', maxRetries: 0, timeoutMs: cleanupBudget,
+                    }).catch(() => undefined);
                 }
             }
-            const now = performance.now();
-            if (snapshot.signature !== lastSignature) {
-                lastSignature = snapshot.signature;
-                stableSince = now;
-            }
-            const settled = snapshot.documentReady !== false && (options.mode === 'visual'
-                ? snapshot.pending === 0 && snapshot.fontsReady && !snapshot.primaryBusy && !snapshot.emptyRoot
-                : snapshot.meaningful && snapshot.pending === 0);
-            const stable = now - stableSince >= quietMs && now - started >= minimumObserve && snapshot.documentAgeMs >= minimumObserve;
-            final = {
-                waited: Math.round(now - started), total: snapshot.total, ready: snapshot.ready,
-                pending: snapshot.pending, failed: snapshot.failed, fontsReady: snapshot.fontsReady,
-                scanLimited: snapshot.scanLimited,
-                documentReady: snapshot.documentReady,
-                uninspectedFrames: snapshot.uninspectedFrames,
-                complete: settled && stable && snapshot.failed === 0 && !snapshot.scanLimited && lazyComplete && snapshot.uninspectedFrames === 0,
-            };
-            if (settled && stable) break;
-            await pause(Math.min(200, Math.max(0, deadline - performance.now())));
         }
         final.waited = Math.round(performance.now() - started);
         if (!final.complete) {

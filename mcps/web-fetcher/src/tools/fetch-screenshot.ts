@@ -10,7 +10,7 @@ import { fileURLToPath } from "url";
 import { browserManager } from "../browser.js";
 import { sessionManager } from "../session.js";
 import { samePageTarget } from "../page-access.js";
-import { viewportSchema, assertViewportTarget, applyExplicitViewport } from "../viewport.js";
+import { viewportSchema, assertViewportTarget, applyExplicitViewport, UnsupportedViewportTargetError } from "../viewport.js";
 import { categorizeFile } from "../converter.js";
 import { extractPdfStructure, resolvePdfPathFromUrl, renderPdfRegion, searchPdfTextRegion } from "../inspector/pdf-inspector.js";
 import { searchPptxTextRegion } from "../inspector/pptx-inspector.js";
@@ -680,14 +680,7 @@ export function registerFetchScreenshot(server: McpServer): void {
             }
             const params: FetchScreenshotInput = { ...input, url: sourceUrl };
 
-            try {
-                assertViewportTarget(params.url, params.viewport);
-                if (params.diff) assertViewportTarget(params.diff, params.viewport);
-            } catch (error) {
-                return { isError: true, content: [{ type: "text" as const, text: String(error) }] };
-            }
-
-            if (isEpubUrl(params.url)) {
+            if (isEpubUrl(params.url) || (params.diff && isEpubUrl(params.diff))) {
                 return {
                     isError: true,
                     content: [{
@@ -695,6 +688,30 @@ export function registerFetchScreenshot(server: McpServer): void {
                         text: "ERR_UNSUPPORTED_SCREENSHOT_ROUTE: EPUB 截图需要后续 HTML preview renderer；当前阶段请先使用 web_fetch_page 提取正文，或 web_inspect(mode=\"structure\") 查看目录和章节结构。",
                     }],
                 };
+            }
+
+            try {
+                assertViewportTarget(params.url, params.viewport);
+                if (params.diff) assertViewportTarget(params.diff, params.viewport);
+            } catch (error) {
+                if (error instanceof UnsupportedViewportTargetError
+                    && !(params.selector && params.target)
+                    && !(params.pages && (params.target || params.diff))) {
+                    return {
+                        content: [{
+                            type: "text" as const,
+                            text: "**本次未截图。** `viewport` 用于调整网页或 HTML 的布局；预览文件时请去掉 `viewport`，保留其余截图参数。若要检查某个窗口尺寸下的布局，请截图承载此文件的 HTML 页面。\n\n状态：需要调整参数（`ERR_VIEWPORT_UNSUPPORTED_TARGET`）",
+                        }],
+                        structuredContent: {
+                            status: "needs_input",
+                            code: error.code,
+                            executionStarted: false,
+                            imageCount: 0,
+                            retry: { omitArguments: ["viewport"] },
+                        },
+                    };
+                }
+                return { isError: true, content: [{ type: "text" as const, text: String(error) }] };
             }
 
             if (params.selector && params.target) {
