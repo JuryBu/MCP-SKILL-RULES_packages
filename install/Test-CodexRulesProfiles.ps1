@@ -32,6 +32,9 @@ function Assert-Guidance {
     $agentsText = Get-Content -LiteralPath $agentsPath -Raw -Encoding UTF8
     $engineeringText = Get-Content -LiteralPath (Join-Path $Root "guidance\engineering-workflow.md") -Raw -Encoding UTF8
     $bridgeText = Get-Content -LiteralPath (Join-Path $Root "guidance\communication-bridges.md") -Raw -Encoding UTF8
+    Assert-Contains $agentsText ([regex]::Unescape('\u4f18\u5148\u4f7f\u7528\u539f\u751f`send_message_to_thread`\u6216`handoff_thread`')) "$Profile native thread priority"
+    Assert-Contains $bridgeText ([regex]::Unescape('`communication_get_message`\u4e0e`communication_wait`\u67e5\u5df2\u77e5\u6838\u5fc3\u6d88\u606f\u7684\u6295\u9012\u3001\u5904\u7406\u4e0e\u56de\u590d')) "$Profile known core receipt boundary"
+    Assert-Contains $bridgeText ([regex]::Unescape('\u5f53\u524d\u5341\u5de5\u5177\u6ca1\u6709\u5bbf\u4e3b\u5bf9\u8bdd\u6b63\u6587\u5c3e\u90e8\u6216\u5386\u53f2\u8bfb\u53d6\u5165\u53e3')) "$Profile host history boundary"
     foreach ($modelRow in @('`gpt-6-luna` | `max`', '`gpt-6.1-sol` | `max`', '`gpt-6-astra` | `max`')) {
         Assert-Contains $agentsText $modelRow "$Profile model policy"
     }
@@ -191,8 +194,15 @@ function Assert-Guidance {
     $audienceWord = if ($Profile -eq "neutral") { [regex]::Unescape('\u7528\u6237') } else { $ownerWord }
     $designText = Get-Content -LiteralPath (Join-Path $Root "guidance\design-writing.md") -Raw -Encoding UTF8
     $observerText = Get-Content -LiteralPath (Join-Path $Root "guidance\model-observer.md") -Raw -Encoding UTF8
-    Assert-Contains $agentsText "2026-11-16.4" "$Profile core content revision"
-    Assert-Contains $promptText "2026-11-16.4" "$Profile prompt content revision"
+    Assert-Contains $agentsText "2026-11-17.1" "$Profile core content revision"
+    Assert-Contains $promptText "2026-11-17.1" "$Profile prompt content revision"
+    foreach ($reliabilityMarker in @(
+        '\u6309\u5df2\u7ea6\u5b9a\u7684\u573a\u666f\u3001\u89c4\u6a21\u548c\u6545\u969c\u6062\u590d\u8981\u6c42',
+        '\u56de\u7b54\u5b9e\u9645\u652f\u6301\u7684\u884c\u4e3a\u4e0e\u4f9d\u636e',
+        '\u5177\u4f53\u7f3a\u53e3\u5199\u660e\u5bf9\u672c\u6b21\u4f7f\u7528\u7684\u5f71\u54cd\u5e76\u7ee7\u7eed\u5904\u7406'
+    )) {
+        Assert-Contains $promptText ([regex]::Unescape($reliabilityMarker)) "$Profile scoped reliability answers"
+    }
     foreach ($encodedMarker in @('\u9884\u7b97\u5305\u542b\u771f\u5b9e\u64cd\u4f5c', '\u4e24\u9879\u5ba1\u67e5\u90fd\u987b\u76f4\u63a5\u8bfb\u53d6', '\u5177\u4f53\u5dee\u989d\u3001\u5f71\u54cd\u4e0e\u9009\u62e9\u5e76\u53d6\u5f97\u540c\u610f')) {
         Assert-Contains $engineeringText ([regex]::Unescape($encodedMarker)) "$Profile scope and review decisions"
     }

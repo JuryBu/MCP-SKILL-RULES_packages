@@ -14,7 +14,9 @@
 
 仅在接收方已安装并启用交流核心服务 `communication-core` 时适用，工具命名空间为 `communication_core`。交流核心连接已登记的宿主与原有消息渠道，按可信绑定转交消息、保留来源与投递/处理记录；各宿主、NapCat与微信入口仍由各自组件负责。按已安装工具和私有配置选择路径，保留原来有效的消息通道，不擅自迁移路由或关闭其它对话。各端接入与验收状态分别核对。
 
-采用已安装的十工具接口时，可读取获准绑定的分页列表、解析准确目标、发送与读取消息、等待事件、确认处理、查询真实状态、管理聊天窗口对应关系，以及读取获准QQ窗口的近期消息和下载其中的文件附件。`communication_list_conversations`列出本连接获准访问的绑定，`communication_resolve_target`返回当前身份和代次。完整宿主历史与按正文查找对话仍使用memory-store的原文工具，显式选择准确宿主；QQ窗口近期消息沿下方两个专用工具读取。当前工具目录仍显示旧八项时，保留实际可用范围，正常刷新后的目录另行核对。
+采用已安装的十工具接口时，交流核心提供联络前后的实时状态与近期消息快照：`communication_get_status`查宿主或对话状态，`communication_get_message`与`communication_wait`查已知核心消息的投递、处理与回复，`communication_read_channel_messages`只读获准QQ窗口近期原文。当前十工具没有宿主对话正文尾部或历史读取入口。宿主原文、用户原话与批注、正文检索和未知对话ID定位使用memory-store的`conversation_read_original`，按具体宿主、目标ID和所需范围选择`read_fast/prepare`、搜索或缓存读取；末N轮参数取当前schema的`lastRounds`。本机Codex联络、近期状态和短对话读取的优先顺序沿全局「Codex进程工具」段执行。
+
+`communication_list_conversations`列出本连接获准访问的绑定，`communication_resolve_target`返回当前身份和代次；发送、确认处理、窗口对应关系与QQ附件下载分别沿下方工具执行。当前工具目录仍显示旧八项时，保留实际可用范围，正常刷新后的目录另行核对。
 
 每次调用显式填写当前调用者真实的`machine_id`、`host`、`surface`与稳定`conversation_id`。machine_id逐字取当前连接的私有登记值，不用操作系统主机名或机器角色自行生成；host、surface取实际宿主，conversation_id填本对话，不借用其它对话。已登记的宿主统一入口供该宿主各对话使用，每条对话直接填写自己的具体CID，无需逐CID登记。门面按宿主登记选择连接，caller仍由调用方声明，broker尚未提供可信宿主CID；该入口限已获授权的本机可信调用方使用，实际来源与授权沿私有登记和原操作范围核对。新宿主尚未接入时沿已有获准入口继续独立工作。
 
