@@ -35,19 +35,19 @@ function Assert-Guidance {
     Assert-Contains $agentsText ([regex]::Unescape('\u4f18\u5148\u4f7f\u7528\u539f\u751f`send_message_to_thread`\u6216`handoff_thread`')) "$Profile native thread priority"
     Assert-Contains $bridgeText ([regex]::Unescape('`communication_get_message`\u4e0e`communication_wait`\u67e5\u5df2\u77e5\u6838\u5fc3\u6d88\u606f\u7684\u6295\u9012\u3001\u5904\u7406\u4e0e\u56de\u590d')) "$Profile known core receipt boundary"
     Assert-Contains $bridgeText ([regex]::Unescape('\u5f53\u524d\u5341\u5de5\u5177\u6ca1\u6709\u5bbf\u4e3b\u5bf9\u8bdd\u6b63\u6587\u5c3e\u90e8\u6216\u5386\u53f2\u8bfb\u53d6\u5165\u53e3')) "$Profile host history boundary"
-    foreach ($modelRow in @('`gpt-6-luna` | `max`', '`gpt-6.1-sol` | `max`', '`gpt-6-astra` | `max`')) {
+    foreach ($modelRow in @('`gpt-6-luna` | `max`', '`gpt-6.2-sol` | `max`', '`gpt-6.2-astra` | `max`')) {
         Assert-Contains $agentsText $modelRow "$Profile model policy"
     }
     foreach ($taskRow in @(
-        ([regex]::Unescape('| \u9700\u8981\u7406\u89e3\u53d6\u820d\u7684\u8c03\u67e5\u3001\u4e00\u822c\u5b9e\u73b0\u4e0e\u6750\u6599\u5236\u4f5c | `gpt-6.1-sol` | `max` |')),
-        ([regex]::Unescape('| \u590d\u6742\u5b9e\u73b0\u3001\u7814\u7a76\u5206\u6790\u3001\u4ee3\u7801\u5ba1\u67e5\u3001\u5de5\u7a0b\u89c4\u5212\u4e0e\u89c6\u89c9\u9a8c\u6536 | `gpt-6.1-sol` | `max` |')),
-        ([regex]::Unescape('| \u9ad8\u7cbe\u5ea6\u5efa\u6a21\u4e0e\u7ec6\u8282\u5fae\u8c03\u3001\u56f0\u96be\u6574\u4f53\u7b56\u7565\u601d\u8003\u3001\u8d85\u9ad8\u8981\u6c42\u7684\u72ec\u7acb\u5ba1\u67e5\uff0c\u4ee5\u53ca\u5de5\u7a0b\u4e13\u9898\u89c4\u5b9a\u7684\u5468\u671f\u590d\u6838 | `gpt-6-astra` | `max` |'))
+        ([regex]::Unescape('| \u9700\u8981\u7406\u89e3\u53d6\u820d\u7684\u8c03\u67e5\u3001\u4e00\u822c\u5b9e\u73b0\u4e0e\u6750\u6599\u5236\u4f5c | `gpt-6.2-sol` | `max` |')),
+        ([regex]::Unescape('| \u590d\u6742\u5b9e\u73b0\u3001\u7814\u7a76\u5206\u6790\u3001\u4ee3\u7801\u5ba1\u67e5\u3001\u5de5\u7a0b\u89c4\u5212\u4e0e\u89c6\u89c9\u9a8c\u6536 | `gpt-6.2-sol` | `max` |')),
+        ([regex]::Unescape('| \u9ad8\u7cbe\u5ea6\u5efa\u6a21\u4e0e\u7ec6\u8282\u5fae\u8c03\u3001\u56f0\u96be\u6574\u4f53\u7b56\u7565\u601d\u8003\u3001\u8d85\u9ad8\u8981\u6c42\u7684\u72ec\u7acb\u5ba1\u67e5\uff0c\u4ee5\u53ca\u5de5\u7a0b\u4e13\u9898\u89c4\u5b9a\u7684\u5468\u671f\u590d\u6838 | `gpt-6.2-astra` | `max` |'))
     )) {
         Assert-Contains $agentsText $taskRow "$Profile task-to-effort binding"
     }
     if ($agentsText -match '`gpt-(?:6\.1-sol|6-astra)`\s*\|\s*`xhigh`') { throw "$Profile retains obsolete model effort bindings" }
     if ($agentsText.Contains('`gpt-6-sol`')) { throw "$Profile retains the previous Sol default" }
-    Assert-Contains $engineeringText 'GPT-6.1 Sol max' "$Profile routine independent reviews"
+    Assert-Contains $engineeringText 'GPT-6.2 Sol max' "$Profile routine independent reviews"
     Assert-Contains $engineeringText 'Astra max' "$Profile key-point independent reviews"
     foreach ($boundary in @(
         ([regex]::Unescape('\u786e\u9700\u56f0\u96be\u6574\u4f53\u7b56\u7565\u5224\u65ad\u6216\u8d85\u9ad8\u8981\u6c42\u5ba1\u67e5\u65f6')),
@@ -65,12 +65,19 @@ function Assert-Guidance {
         Assert-Contains $engineeringText $boundary "$Profile review cadence and escalation"
     }
     if ($engineeringText -match 'Astra xhigh|3\+1') { throw "$Profile retains obsolete review cadence or effort" }
-    Assert-Contains $engineeringText "automation_update" "$Profile persistent continuation tool"
-    Assert-Contains $engineeringText "10$([char]0xff5e)30" "$Profile recurring continuation interval"
+    Assert-Contains $engineeringText ([regex]::Unescape('\u6838\u5bf9\u80fd\u56de\u5230\u539f\u5bf9\u8bdd\u3001\u67e5\u539f\u4efb\u52a1\u548c\u6062\u590d\u6267\u884c\u7684\u5b9e\u9645\u5165\u53e3')) "$Profile kickoff recovery checks the live entry"
+    Assert-Contains $engineeringText ([regex]::Unescape('\u7ed1\u5b9a\u5bf9\u8c61\u3001\u542f\u7528\u72b6\u6001\u3001\u5b9e\u9645\u5468\u671f\u548c\u4e0b\u4e00\u6b21\u89e6\u53d1\u65f6\u95f4')) "$Profile standing recovery verifies scheduler state"
+    Assert-Contains $engineeringText ([regex]::Unescape('\u4e0d\u521b\u5efa\u81ea\u52a8\u5316\u8ddf\u8e2a\u67d0\u4e2a\u4efb\u52a1\u7684\u91cc\u7a0b\u7891\u3001\u5931\u8d25\u6216\u5b8c\u6210')) "$Profile concrete tasks stay in the current chat"
+    Assert-Contains $engineeringText ([regex]::Unescape('\u672a\u914d\u5bf9\u6216\u5bf9\u7aef\u6682\u4e0d\u53ef\u8fbe')) "$Profile independent work during disconnection"
+    Assert-Contains $engineeringText ([regex]::Unescape('\u6838\u5bf9\u5bf9\u65b9\u5b9e\u9645\u63a5\u4e0b\u54ea\u4e9b\u4e8b\u9879')) "$Profile confirmed low-quota handoff"
+    Assert-Contains $engineeringText ([regex]::Unescape('\u53ea\u6709\u53cc\u65b9\u90fd\u786e\u8ba4\u8be5\u51b3\u5b9a\u5f71\u54cd\u6781\u5927')) "$Profile separate consequential decisions from independent work"
+    if ($engineeringText.Contains(([regex]::Unescape('\u5fc5\u987b\u6210\u529f\u767b\u8bb0\u6216\u590d\u7528\u4e00\u6761')))) {
+        throw "$Profile retains an unconditional per-task schedule"
+    }
     foreach ($continuationMarker in @(
-        '\u4e0d\u628a\u53ef\u6267\u884c\u5de5\u4f5c\u7559\u5230\u4e0b\u6b21\u5b9a\u65f6\u5524\u9192',
-        '\u542f\u505c\u5747\u6309\u8be5\u4e13\u9898\u6838\u9a8c',
-        '\u4e00\u6b21\u6027\u56de\u5305\u63d0\u9192\u4e0d\u80fd\u66ff\u4ee3\u6574\u6761\u4e3b\u7ebf\u6062\u590d\u5b89\u6392'
+        '\u5f53\u524d\u8f6e\u4fdd\u6301\u63a8\u8fdb',
+        '\u6309\u8be5\u8282\u6838\u9a8c\u542f\u505c',
+        '\u7559\u597d\u539f\u4efb\u52a1\u4e0e\u68c0\u67e5\u70b9'
     )) {
         Assert-Contains $agentsText ([regex]::Unescape($continuationMarker)) "$Profile mainline continuation contract"
     }
@@ -79,10 +86,10 @@ function Assert-Guidance {
         '\u771f\u5b9e\u6267\u884c\u533a\u95f4',
         '\u6bcf\u6b21\u4e2d\u671f\u8def\u7ebf\u5ba1\u67e5',
         '\u5f53\u8f6e\u64a4\u9500\u9519\u8bef\u7b49\u5f85',
-        '\u7981\u6b62\u4e3b\u52a8\u7ed3\u675f\u5f53\u524d\u8f6e\u6b21',
+        '\u53ef\u63a8\u8fdb\u7684\u5de5\u4f5c\u5f53\u8f6e\u505a',
         '\u6709\u53ef\u63a8\u8fdb\u5de5\u4f5c\uff0c\u6216\u5065\u5eb7\u4efb\u52a1\u4ecd\u5728\u8fd0\u884c',
         '\u6c47\u62a5\u540e\u6682\u505c',
-        '\u5b9e\u9645\u6682\u505c\u5bf9\u5e94\u7eed\u63a5\u4efb\u52a1\u5e76\u8bfb\u56de\u72b6\u6001',
+        '\u5b9e\u9645\u4fdd\u6301\u3001\u6682\u505c\u6216\u505c\u7528\uff0c\u5e76\u8bfb\u56de\u72b6\u6001',
         '\u4e0d\u5173\u95ed\u534f\u4f5c\u901a\u9053\u3001\u4e0d\u786e\u8ba4\u672a\u5b8c\u6210\u6d88\u606f\u3001\u4e0d\u5f71\u54cd\u5176\u5b83\u5065\u5eb7\u5de5\u4f5c'
     )) {
         Assert-Contains $engineeringText ([regex]::Unescape($continuationMarker)) "$Profile continuation lifecycle and effective review"
@@ -91,7 +98,8 @@ function Assert-Guidance {
     if ($agentsText.Contains($obsoleteLifetime) -or $engineeringText.Contains($obsoleteLifetime)) {
         throw "$Profile retains an unconditional continuation lifetime"
     }
-    Assert-Contains $bridgeText ([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String("5pS25Yiw5Zue5YyF5ZCO5pu05paw5qOA5p+l54K5"))) "$Profile bridge updates mainline checkpoint"
+    Assert-Contains $bridgeText ([regex]::Unescape('\u6536\u5230\u56de\u5305\u540e\u66f4\u65b0\u539f\u4efb\u52a1\u68c0\u67e5\u70b9')) "$Profile bridge updates mainline checkpoint"
+    Assert-Contains $bridgeText ([regex]::Unescape('\u5404\u81ea\u6536\u672c\u5bbf\u4e3b\u7684\u53cd\u9988\u4e0e\u6837\u672c')) "$Profile paired feedback ownership"
     foreach ($marker in @("stage_guard", "sandbox_council")) {
         Assert-Contains $agentsText $marker "$Profile core boundary"
     }
@@ -194,8 +202,11 @@ function Assert-Guidance {
     $audienceWord = if ($Profile -eq "neutral") { [regex]::Unescape('\u7528\u6237') } else { $ownerWord }
     $designText = Get-Content -LiteralPath (Join-Path $Root "guidance\design-writing.md") -Raw -Encoding UTF8
     $observerText = Get-Content -LiteralPath (Join-Path $Root "guidance\model-observer.md") -Raw -Encoding UTF8
-    Assert-Contains $agentsText "2026-11-17.1" "$Profile core content revision"
-    Assert-Contains $promptText "2026-11-17.1" "$Profile prompt content revision"
+    Assert-Contains $agentsText "2026-11-18.2" "$Profile core content revision"
+    Assert-Contains $promptText "2026-11-18.2" "$Profile prompt content revision"
+    Assert-Contains $agentsText ([regex]::Unescape('\u5bf9\u53e3\u642d\u6863\u534f\u4f5c')) "$Profile paired-work topic entry"
+    Assert-Contains $agentsText ([regex]::Unescape('\u6838\u5bf9\u53ef\u7528\u7684\u63a5\u7eed\u5165\u53e3\u548c\u6709\u6548\u5b89\u6392')) "$Profile kickoff recovery entry"
+    Assert-Contains $promptText ([regex]::Unescape('\u9ed8\u8ba4\u76f4\u63a5\u5728\u5bf9\u8bdd\u4e2d\u8bf4\u6e05')) "$Profile discussion in chat"
     foreach ($reliabilityMarker in @(
         '\u6309\u5df2\u7ea6\u5b9a\u7684\u573a\u666f\u3001\u89c4\u6a21\u548c\u6545\u969c\u6062\u590d\u8981\u6c42',
         '\u56de\u7b54\u5b9e\u9645\u652f\u6301\u7684\u884c\u4e3a\u4e0e\u4f9d\u636e',
@@ -224,7 +235,10 @@ function Assert-Guidance {
     )) {
         Assert-Contains $promptText ([regex]::Unescape($recentExchangeMarker)) "$Profile bounded recent exchanges and archive readability"
     }
-    Assert-Contains $agentsText ([regex]::Unescape('\u540c\u4e00\u57fa\u7ebf\u4e0b\u7684\u5185\u5bb9\u66f4\u65b0\u4e5f\u6309\u65b0\u4fee\u8ba2\u5b8c\u6574\u8bfb\u53d6')) "$Profile same-baseline reread guard"
+    Assert-Contains $agentsText ([regex]::Unescape('\u5df2\u77e5\u89c4\u5219\u66f4\u65b0\u4e14\u5f53\u524d\u6b63\u6587\u4ecd\u662f\u65e7\u7248')) "$Profile same-baseline reread guard"
+    Assert-Contains $agentsText ([regex]::Unescape('\u65e5\u5e38\u4efb\u52a1\u4e0e\u5b50\u4ee3\u7406\u65e0\u9700\u4f8b\u884c\u6838\u5bf9\u89c4\u5219\u7248\u672c\u6216\u8ba1\u7b97\u89c4\u5219\u6587\u4ef6\u54c8\u5e0c')) "$Profile ordinary work skips rule self-check"
+    Assert-Contains $promptText ([regex]::Unescape('\u8fd0\u884c\u80fd\u5224\u65ad\u672c\u6b21\u53d8\u5316\u7684\u6700\u5c0f\u6709\u6548\u68c0\u67e5')) "$Profile targeted verification"
+    if ([regex]::Matches($promptText, '`update_plan`').Count -ne 1) { throw "$Profile must contain one planning-tool entry" }
     Assert-Contains $observerText "nextProbeAt" "$Profile observer due time"
     Assert-Contains $observerText ([regex]::Unescape('20\u5206\u949f\u7eed\u63a5\u4f1a\u4f7f\u5230\u671f\u68c0\u67e5\u63a8\u8fdf\u523040\u5206\u949f')) "$Profile observer cadence mismatch"
     Assert-Contains $observerText ([regex]::Unescape('\u7f3a\u5931\u7684\u65e7\u5230\u671f\u70b9\u4e0d\u96c6\u4e2d\u8865\u53d1')) "$Profile observer delayed wake guard"
@@ -234,7 +248,8 @@ function Assert-Guidance {
         ([regex]::Unescape('\u540c\u4e00\u5bf9\u8c61\u6301\u7eed\u4fdd\u6301\u540c\u4e00\u540d\u79f0')),
         ([regex]::Unescape('\u7d27\u8ddf\u4e00\u53e5\u7b80\u77ed\u62ec\u53f7\u8bf4\u660e')),
         ([regex]::Unescape('\u5199MEMORY')),
-        ([regex]::Unescape('\u95ee\u9898\u6709\u6548\u72b6\u6001'))
+        ([regex]::Unescape('\u7ed3\u675f\u524d\u6838\u5b9e\u5b83\u662f\u5426\u4ecd\u6709\u6548')),
+        ([regex]::Unescape('\u6539\u5728\u666e\u901a\u5bf9\u8bdd\u627f\u63a5'))
     )) {
         Assert-Contains $promptText $marker "$Profile prompt update contract"
     }
