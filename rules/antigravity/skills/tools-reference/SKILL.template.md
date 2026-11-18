@@ -35,7 +35,7 @@ description: >-
 
 | 维度 | 原生 `invoke_subagent` | 原生 `swarm` |
 |---|---|---|
-| **模型与思考档控制** | 枚举仅 `inherit / flash_lite / flash / pro`；传 `Model="inherit"` 即继承当前主线模型与高思考档（常规任务不传 `flash_lite`/`flash`） | 支持精确指定模型与思考档：如 `gemini-4-carbon-high`、`gemini-4-hydrogen-xhigh`；`action="models", all=true` 可查实时可用列表与配额 |
+| **模型与思考档控制** | 枚举仅 `inherit / flash_lite / flash / pro`；传 `Model="inherit"` 继承当前主线模型与高思考档（常规不传 `flash_lite`/`flash`） | Worker 支持指定 `gemini-4-carbon-high` / `gemini-4-hydrogen-xhigh`（`action="models", all=true` 查配额）；⚠️ 已见主对话调 `action="model"` 跨轮不持久、且无模型参数的 `SendUserCascadeMessage` 入站新轮实际调用可能与界面手选不同：保留手选，分别核记选项与同轮实际调用，勿自动往返切模 |
 | **可用工具箱（关键差异！）** | `TypeName="self"` **完整继承读写 + MCP 工具（`call_mcp_tool`）**；`TypeName="research"` **拥有只读 + MCP 工具（`call_mcp_tool`）**；`TypeName="browser"` 专职内置网页交互（禁发模糊循环任务） | Worker **默认无 MCP 工具（没有 `call_mcp_tool`！）**，仅具内置 `read_file`、`write_file`、`edit_file`、`run_command` 与消息板 `read_board`/`post_message`/`swarm_wait` |
 | **上下文与生命周期** | 干净无历史启动，靠 Prompt 投喂；用完 `manage_subagents(Action="kill")` 回收 | 默认干净启动（或 `fork="coordinator"` 继承上下文）；`waiting` 态零 token 消耗，用完核验后 `swarm(action="kill", name=...)` 回收 |
 | **状态与日志统一巡检** | `manage_subagents(Action="list")`（**同时返回 `invoke_subagent` 与 `swarm` worker 的实时 `state`、`stateDetail` 与 `lastStepTime`**）+ `brain/<subagentId>/.system_generated/logs/transcript.jsonl` | 除 `manage_subagents(Action="list")` 外，配合 `swarm(action="status")` + `read_board(since=...)` + `brain/<workerId>/.system_generated/logs/transcript.jsonl`（识别半截续写睡入 `waiting` 或流挂起） |
