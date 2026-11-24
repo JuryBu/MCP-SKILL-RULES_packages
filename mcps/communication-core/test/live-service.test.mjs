@@ -129,7 +129,7 @@ test("独立服务不因stdin EOF退出，同状态可正常关闭重开且旧�
     assert.equal(endpoint.state, "listening");
     assert.equal(endpoint.pid, child.pid);
     const client = new Client({ name: "synthetic-service-client", version: "0.1.0" });
-    try { await client.connect(new StreamableHTTPClientTransport(new URL(ready.url), { requestInit: { headers: { Authorization: "Bearer synthetic-service-token" } } })); assert.equal((await client.listTools()).tools.length, 10); } finally { await client.close(); }
+    try { await client.connect(new StreamableHTTPClientTransport(new URL(ready.url), { requestInit: { headers: { Authorization: "Bearer synthetic-service-token" } } })); assert.equal((await client.listTools()).tools.length, 11); } finally { await client.close(); }
     child.send("shutdown");
     const stopped = await Promise.race([exited, new Promise((resolveTimeout, rejectTimeout) => { const timer = setTimeout(() => rejectTimeout(new Error("独立服务退出超时")), 5000); timer.unref(); })]);
     assert.equal(stopped.code, 0);

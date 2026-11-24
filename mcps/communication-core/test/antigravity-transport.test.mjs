@@ -125,6 +125,18 @@ test("真实步骤请求沿root并保留独立轨迹身份", async () => {
   assert.equal(result.steps[0].index, 12);
 });
 
+test("带后续工具调用的 STOP_PATTERN 口播不能作为最终回信", () => {
+  const base = { response: "synthetic visible text", stopReason: "STOP_REASON_STOP_PATTERN" };
+  const result = compactAntigravitySteps({ steps: [
+    { plannerResponse: { ...base, toolCalls: [{ function: "synthetic tool" }] } },
+    { plannerResponse: { ...base, toolCalls: [] } },
+    { plannerResponse: base },
+    { plannerResponse: { ...base, toolCalls: {} } },
+  ] });
+  assert.deepEqual(result.steps.map(step => step.assistant_response.final), [false, true, true, false]);
+  assert.equal(result.steps[0].assistant_response.has_tool_calls, true);
+});
+
 test("protobuf省略空repeated步骤时按真实空页处理，异常形状仍拒绝", () => {
   assert.deepEqual(compactAntigravitySteps({}, 30), { steps: [] });
   for (const body of [{ steps: null }, { steps: {} }, { error: "invalid" }, null]) {

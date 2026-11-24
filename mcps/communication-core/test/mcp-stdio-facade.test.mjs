@@ -14,7 +14,7 @@ import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { CommunicationCore } from "../src/core.mjs";
 import { MessageStore } from "../src/store.mjs";
 import { MockAdapter } from "../src/adapters/mock.mjs";
-import { communicationTools, createMcpHttpServer } from "../src/mcp-server.mjs";
+import { communicationTools, createMcpHttpServer, listCommunicationToolDefinitions } from "../src/mcp-server.mjs";
 import { createMcpStdioFacade, FACADE_INSTRUCTIONS } from "../src/mcp-stdio-facade.mjs";
 
 const moduleRoot = dirname(dirname(fileURLToPath(import.meta.url)));
@@ -116,7 +116,7 @@ test("initialize instructions and schemas/annotations exactly reuse the current 
   const client = await attachClient(files, facade);
   const tools = await client.listTools();
   assert.equal(tools.tools.length, communicationTools.length);
-  assert.deepEqual(tools.tools, communicationTools.map(entry => entry.definition));
+  assert.deepEqual(tools.tools, listCommunicationToolDefinitions());
   assert.equal(client.getInstructions(), FACADE_INSTRUCTIONS);
   for (const word of ["caller", "machine_id", "host", "surface", "conversation_id", "登记", "QQ", "等待", "确认", "未知", "dedupe_key", "可信宿主CID"]) assert.ok(FACADE_INSTRUCTIONS.slice(0, 512).includes(word));
   assert.equal(mocks.created.length, 0);
@@ -178,6 +178,28 @@ test("caller must have all four exact fields; extra paths and business fields ca
   assert.equal(errorCode(await facade.callTool("unknown", { caller })), "invalid_input");
   assert.equal(errorCode(await facade.callTool("communication_wait", { caller, message_id: "synthetic", wait_ms: 45001 })), "invalid_input");
   assert.equal(mocks.created.length, 0);
+});
+
+test("an unsupported model field never reaches a backend, even for an exact profile", async context => {
+  const files = await fixture(context);
+  const mocks = mockClients();
+  const facade = await files.facade(mocks);
+  const client = await attachClient(files, facade);
+  const send = (await client.listTools()).tools.find(tool => tool.name === "communication_send_message");
+  assert.equal(Object.hasOwn(send.inputSchema.properties, "model_override"), false);
+  const args = {
+    caller,
+    target: { host: receiver.host, conversation_id: receiver.conversation_id },
+    origin: { kind: "agent_message", channel: "codex", source_ref: caller.conversation_id },
+    dedupe_key: "facade-model-override",
+    expires_at: "2026-11-18T07:00:00Z",
+    text: "synthetic test",
+  };
+  const guarded = await facade.callTool("communication_send_message", { ...args, model_override: { model_id: "approved-model", expected_selection_revision: "1".repeat(64) } });
+  assert.equal(errorCode(guarded), "invalid_input");
+  assert.equal(mocks.created.length, 0);
+  assert.equal(errorCode(await facade.callTool("communication_send_message", args)), undefined);
+  assert.equal(mocks.created.length, 1);
 });
 
 test("interleaved origins have distinct credential/client caches and preserve structured results", async context => {
@@ -253,6 +275,36 @@ test("cancellation reaches only the selected request, including concurrent calls
   for (const entry of pending.filter(entry => !entry.signal.aborted)) entry.resolve(result({ caller: entry.caller }));
   assert.notEqual((await same).isError, true);
   assert.notEqual((await other).isError, true);
+});
+
+test("restricting the legacy registry rejects new reads while an already forwarded read must drain", { timeout: 5000 }, async context => {
+  const files = await fixture(context);
+  const started = Promise.withResolvers();
+  const release = Promise.withResolvers();
+  let settled = false;
+  const mocks = mockClients(async () => {
+    started.resolve();
+    await release.promise;
+    return result({ epoch: "legacy" });
+  });
+  const facade = await files.facade(mocks);
+  const input = { caller, host: "codex", scope: "host" };
+  const oldRead = facade.callTool(listTool, input).finally(() => { settled = true; });
+  try {
+    await started.promise;
+    await writeJson(files.registryFile, { version: 1, connections: [files.registry.connections[1]] });
+    assert.equal(errorCode(await facade.callTool(listTool, input)), "caller_unregistered");
+    assert.equal(settled, false);
+    assert.equal(mocks.created[0].closed, 0);
+    assert.equal(mocks.created[0].calls.length, 1);
+  } finally {
+    release.resolve();
+    const original = await oldRead;
+    assert.equal(original.structuredContent.epoch, "legacy");
+  }
+  assert.equal(settled, true);
+  assert.equal(mocks.created[0].closed, 1);
+  assert.equal(errorCode(await facade.callTool(listTool, input)), "caller_unregistered");
 });
 
 test("cancelled connection waiters do not cancel another caller's shared initialize", async context => {

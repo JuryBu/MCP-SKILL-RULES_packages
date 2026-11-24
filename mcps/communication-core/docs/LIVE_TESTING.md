@@ -1,6 +1,6 @@
 # 宿主与渠道真实接入
 
-真实入口使用仓库外的显式配置、宿主授权和独立状态目录。宿主可注册同一stdio门面为常驻MCP，十项工具连接原HTTP核心与消息库；默认npm start保持mock隔离入口。原渠道迁移按其维护流程执行。
+真实入口使用仓库外的显式配置、宿主授权和独立状态目录。宿主可注册同一stdio门面为常驻MCP，十一项工具连接原HTTP核心与消息库；默认npm start保持mock隔离入口。原渠道迁移按其维护流程执行。
 
 ## 可选的Codex控制入口恢复
 
@@ -52,6 +52,12 @@ node scripts/mcp-client.mjs --connection <来源连接.json> --request <原请�
 ## 配置边界
 
 顶层`adapter_mode`为`live_test`，`host`只允许本机回环。`targets`中的静态目标须列入`allowed_conversation_ids`，身份、接入模块及binding代次相互匹配。动态宿主对话通过`conversation_routes`提供接线，并由principal的`allowed_target_scopes`授权；该范围精确到`machine_id`、`host`和`surface`。原有`allowed_targets`继续授权指定静态绑定，QQ私聊或已授权群出站使用这些渠道目标。密钥及真实账号、群和对话ID保存在仓库外。
+
+宿主目录与近期内容使用独立的私有读授权。`allowed_host_lists`登记准许的`machine_id`、`host`和`surface`；`allowed_host_snapshots`另登记准许读正文的具体对话或明确的整端范围。启用整端读取前核实读入口和所配置桌面资料的账户归属。反重力接入可选`conversation_index_file`，只配置已获准的本机原生`conversation_summaries.db`绝对路径；只开核过的一次性副本做分页，原宿主目录保持。Codex需先在本机控制口启用独立读取凭据和可读范围，再在Core的私有连接文件设置`content_read_token`；读凭据与原投递凭据分开。原生未确认整轮可见性时保留能核实的状态和时间。
+
+验收读取入口时，核对该进程实际能选到的连接范围，来源以已登记的可信宿主入口为准。反重力测试应包括桌面主对话、无头命令行与子代理行、已载入及未载入的授权目标。未载入目标只有在桌面目录存在、唯一原生来源返回同一身份后才尝试尾步查询；请求不保留定位响应正文。并行修改目录导致分页无法核对时，保留原读取边界，按原目录重新查询。
+
+Codex 私有只读来源应按轮核完原生条目和可见性，终态轮次的 `body_visibility` 为 `verified`，可展示正文的 `visibility` 为 `visible`。原生分页未读完、读预算不足、轮次进行中或可见性未知时，此轮仅传状态与可取得的时间；其它已核准轮次仍可展示。对照同一份快照中不同轮次的这两种实际输出。
 
 宿主统一入口的principal配置`caller_scope`，`identity`使用同一机器、宿主及surface，配置中的`conversation_id`为`*`，`origin_kinds`为`["agent_message"]`。门面的connection文件使用相同identity、token和caller_scope，例如：
 

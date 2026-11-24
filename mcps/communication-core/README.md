@@ -1,6 +1,6 @@
 # 交流核心
 
-交流核心提供十项MCP工具，用于按宿主和对话ID定位目标、发送消息、等待关联回信、查询状态、读取获准QQ窗口的最近消息和下载其中的附件，以及管理聊天窗口对应的模型对话。核心保存准确来源与目标、待送消息、投递尝试和精确处理确认，宿主连接通过独立接入模块实现。
+交流核心提供十一项MCP工具，用于按宿主和对话ID定位目标、发送消息、等待关联回信、查询状态、读一眼近期对话、读取获准QQ窗口的最近消息和下载其中的附件，以及管理聊天窗口对应的模型对话。核心保存准确来源与目标、待送消息、投递尝试和精确处理确认，宿主连接通过独立接入模块实现。
 
 默认启动入口使用mock隔离接入，测试目标与回执标记为simulated。显式live_test入口支持Antigravity、Codex控制端和NapCat通知、引用回信及可选QQ窗口采集；同一核心可通过stdio门面注册为宿主常驻MCP。Windsurf/Devin Desktop可配置只读进程与目标SQLite状态探测，支持会话slug、Desktop摘要ID和主链上的最近实际调用模型；原生MCP调用者可向已支持的目标发信，核心到WSF的入站尚未接线。客户端契约见[宿主接入模块契约](docs/ADAPTER_CONTRACT.md)，配置见[真实接入说明](docs/LIVE_TESTING.md)。NapCat、微信的原账本、账号、附件和发送授权继续由原组件负责。
 
@@ -33,7 +33,7 @@ CLI支持Ctrl+C，以及由启动者持有的stdin管道输入shutdown后正常�
 
 ## 常驻MCP与broker
 
-`scripts/broker-stdio.mjs`提供相同的十项工具，只转交到已运行的原HTTP核心。关闭门面会关闭自身连接，核心及原消息库继续由原运行器持有。
+`scripts/broker-stdio.mjs`使用同一份工具目录，只转交到已运行的原HTTP核心。关闭门面会关闭自身连接，核心及原消息库继续由原运行器持有。
 
 宿主使用stdio配置启动该脚本，通过环境变量`COMMUNICATION_CORE_FACADE_REGISTRY`指向仓库外的绝对路径JSON：
 
@@ -49,7 +49,7 @@ CLI支持Ctrl+C，以及由启动者持有的stdin管道输入shutdown后正常�
 
 | 工具 | 动作 | 主要输入 |
 |---|---|---|
-| communication_list_conversations | 分页列出已知且获授权的目标 | caller；可选host、limit、cursor |
+| communication_list_conversations | 默认列已授权绑定；获准时可单独分页列宿主对话 | caller；可选host、limit、cursor、scope |
 | communication_resolve_target | 解析对话地址或旧绑定 | caller、host＋conversation_id，或binding_id |
 | communication_send_message | 持久保存并提交原消息 | caller、origin、target、dedupe_key、text、expires_at |
 | communication_get_message | 查询原消息与投递状态 | caller、message_id |
@@ -63,8 +63,15 @@ CLI支持Ctrl+C，以及由启动者持有的stdin管道输入shutdown后正常�
 
 | 工具 | 动作 | 主要输入 |
 |---|---|---|
+| communication_read_recent_snapshot | 将获准的近期对话整理成有界Markdown | caller、target；可选last_rounds |
 | communication_read_channel_messages | 读取获准QQ窗口最近消息，包含普通未@内容 | caller、channel、window_type、window_id；可选count、cursor |
 | communication_download_attachment | 按原消息中的受限引用下载附件 | caller、窗口地址、attachment_ref；可选destination_dir、name |
+
+### 列对话和看最近内容
+
+`communication_list_conversations` 默认仍列已授权绑定。`scope="host"` 并指定 `host` 时查询相应的本机目录，单页最多50条，使用返回的游标继续。目录查询与正文读取分别授权。反重力桌面摘要目录列出桌面主对话，包括较早未载入的对话；命令行和子代理对话不在该目录内。缺少桌面目录时只列原生入口当前取得的部分对话，旧对话的实时状态查不到时显示未知。Codex 目录范围由本机控制服务的当前账户索引和接入授权共同决定，列表不带正文预览。
+
+`communication_read_recent_snapshot` 默认看最近3轮，最多5轮，整个工具结果不超过8 KiB。快照区分当前选型和最近实际用模，仅整理已确认可见的文字；只核到时间和状态的轮次保留这些信息，缺范围会标明。反重力未载入的对话需要先从已配置桌面目录确认准确身份，再由原生入口定位并读取有界尾步。找原文、搜完整历史或精读用 memory-store 的 `conversation_read_original`。
 
 ## 按宿主和对话ID发送
 

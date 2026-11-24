@@ -11,6 +11,33 @@ function receipt(overrides = {}) {
 
 function transport(fetchImpl) { return new CodexProxyTransport({ baseUrl: "http://127.0.0.1:12345", token: "private-sentinel-token", fetchImpl }); }
 
+test("Codex reads use only their separate credential and no recovery or fallback when authorization fails", async () => {
+  const calls = [];
+  const absent = transport(async (...args) => { calls.push(args); throw new Error("unexpected upstream request"); });
+  await assert.rejects(absent.readHostContent("list", { limit: 2 }), { code: "host_content_unavailable" });
+  assert.deepEqual(calls, []);
+  const options = { baseUrl: "http://127.0.0.1:12345", token: "synthetic-delivery", contentReadToken: "synthetic-read" };
+  assert.throws(() => new CodexProxyTransport({ ...options, contentReadToken: options.token }), { code: "invalid_config" });
+  const client = new CodexProxyTransport({ ...options, fetchImpl: async (url, options) => {
+    const pathname = new URL(url).pathname;
+    calls.push({ pathname, authorization: options.headers.Authorization });
+    if (pathname.endsWith("/snapshot")) {
+      const targetId = JSON.parse(options.body).thread_id;
+      const status = targetId === "busy-fixture" ? 429 : targetId === "timeout-fixture" ? 504 : 403;
+      return Response.json({ error: "synthetic-error" }, { status });
+    }
+    if (pathname.endsWith("/list")) return Response.json({ threads: [], coverage: { partial: false } });
+    return Response.json({ ok: true, delivery: receipt() });
+  } });
+  assert.deepEqual((await client.readHostContent("list", { limit: 2 })).threads, []);
+  await assert.rejects(client.readHostContent("snapshot", { thread_id: "test-target" }), { code: "forbidden" });
+  await assert.rejects(client.readHostContent("snapshot", { thread_id: "busy-fixture" }), { code: "host_content_busy" });
+  await assert.rejects(client.readHostContent("snapshot", { thread_id: "timeout-fixture" }), { code: "host_content_timeout" });
+  await client.query({ delivery_id: request.delivery_id }, { request });
+  assert.deepEqual(calls.map(call => call.authorization), [...Array(4).fill("Bearer synthetic-read"), "Bearer synthetic-delivery"]);
+  await Promise.all([client.close(), absent.close()]);
+});
+
 test("submission tracking precedes only POST and an aborted request cannot enter fetch", async () => {
   let reported = 0;
   let requests = 0;
@@ -139,6 +166,68 @@ test("未完成、错轮次、重复游标或未支持均不伪造回信", async
   }
   const repeating = transport(async () => Response.json({ ok: true, delivery: receipt({ injection_method: "turn/start" }), replies: { ...normal, partial: true, cursor: "same_cursor", replies: [] } }));
   assert.equal(await repeating.observeReply(request), null);
+});
+
+const unresolvedTurnPage = { supported: true, outcome: "ok", thread_id: "test-target", turn_id: "test-turn",
+  turn_status: null, replies: [], cursor: "unresolved_cursor", partial: true };
+
+test("原轮尚未出现在一批历史页时沿同一原身份继续，直到确认完成", async () => {
+  const calls = [];
+  const client = transport(async url => {
+    const address = new URL(url);
+    calls.push(address.searchParams.get("cursor"));
+    assert.ok(address.pathname.endsWith("/delivery-original/replies"));
+    assert.equal(address.searchParams.get("target_conversation_id"), target.conversation_id);
+    const replies = calls.length === 1 ? unresolvedTurnPage : {
+      ...unresolvedTurnPage, turn_status: "completed", replies: [{ item_id: "expected-old-reply", text: "旧轮回复", turn_status: "completed" }],
+      partial: false, cursor: null,
+    };
+    return Response.json({ ok: true, delivery: receipt({ injection_method: "turn/start" }), replies });
+  });
+  const result = await client.observeReply(request);
+  assert.equal(result.native_message_id, "expected-old-reply");
+  assert.equal(result.native_turn_id, "test-turn");
+  assert.equal(result.text, "旧轮回复");
+  assert.deepEqual(calls, [null, "unresolved_cursor"]);
+});
+
+test("未找到原轮时只接纳没有正文且有效的续页", async () => {
+  for (const changed of [
+    { outcome: "unavailable" }, { turn_status: "inProgress" }, { turn_id: "other" }, { thread_id: "other" },
+    { replies: [{ item_id: "unverified", text: "unverified", turn_status: "completed" }] },
+    { cursor: null }, { cursor: "not a cursor" }, { partial: false }, { supported: false },
+  ]) {
+    let reads = 0;
+    const client = transport(async () => {
+      reads += 1;
+      return Response.json({ ok: true, delivery: receipt({ injection_method: "turn/start" }),
+        replies: { ...unresolvedTurnPage, ...changed } });
+    });
+    assert.equal(await client.observeReply(request), null);
+    assert.equal(reads, 1);
+    await client.close();
+  }
+});
+
+test("原轮续页不延长原查询上限，已确认的轮次不得反向降为未确认", async () => {
+  let reads = 0;
+  const bounded = transport(async () => {
+    reads += 1;
+    return Response.json({ ok: true, delivery: receipt({ injection_method: "turn/start" }),
+      replies: { ...unresolvedTurnPage, cursor: "page_" + reads } });
+  });
+  assert.equal(await bounded.observeReply(request), null);
+  assert.equal(reads, 8);
+  let attempt = 0;
+  const downgrading = transport(async () => {
+    attempt += 1;
+    return Response.json({ ok: true, delivery: receipt({ injection_method: "turn/start" }),
+      replies: attempt === 1 ? { ...unresolvedTurnPage, turn_status: "completed", cursor: "confirmed_cursor",
+        replies: [{ item_id: "first", text: "已确认但未取全", turn_status: "completed" }] } : unresolvedTurnPage });
+  });
+  assert.equal(await downgrading.observeReply(request), null);
+  assert.equal(attempt, 2);
+  await Promise.all([bounded.close(), downgrading.close()]);
 });
 
 test("steer回合的旧助手正文不作为本次消息回信", async () => {

@@ -27,14 +27,20 @@ function connectionRefused(error, depth = 0) {
 export class CodexProxyTransport {
   #relay;
   #sourceRecovery;
+  #contentReadToken;
 
-  constructor({ baseUrl, token, relay, sourceRecovery, fetchImpl = fetch, timeoutMs = 10000 } = {}) {
+  constructor({ baseUrl, token, contentReadToken, relay, sourceRecovery, fetchImpl = fetch, timeoutMs = 10000 } = {}) {
     let address;
     try { address = new URL(baseUrl); } catch { throw unavailable("invalid_config"); }
     if (address.protocol !== "http:" || !["127.0.0.1", "localhost"].includes(address.hostname)
       || address.username || address.password || address.search || address.hash || address.pathname !== "/" || !address.port) throw unavailable("invalid_config");
     this.baseUrl = address.origin;
     this.token = requireText(token, "token", 4096);
+    if (contentReadToken !== undefined) {
+      const readToken = requireText(contentReadToken, "content_read_token", 4096);
+      if (readToken === this.token || !/^[A-Za-z0-9._~+/-]+=*$/u.test(readToken)) throw unavailable("invalid_config");
+      this.#contentReadToken = readToken;
+    }
     this.fetchImpl = fetchImpl;
     this.timeoutMs = requireInteger(timeoutMs, "timeoutMs", 50, 30000);
     this.#relay = relay === undefined ? null : Object.freeze(normalizeCodexRelay(relay));
@@ -87,8 +93,10 @@ export class CodexProxyTransport {
     }
   }
 
-  async request(path, { method = "GET", body, signal, envelope = false, onRequestStarted } = {}) {
+  async request(path, { method = "GET", body, signal, envelope = false, hostContent = false, onRequestStarted } = {}) {
     if (this.closed) throw unavailable("closed");
+    const credential = hostContent ? this.#contentReadToken : this.token;
+    if (!credential) throw unavailable("host_content_unavailable");
     let responseReceived = false;
     try {
       const requestSignal = signal ? AbortSignal.any([signal, AbortSignal.timeout(this.timeoutMs)]) : AbortSignal.timeout(this.timeoutMs);
@@ -96,11 +104,18 @@ export class CodexProxyTransport {
       if (method === "POST") onRequestStarted?.();
       const response = await this.fetchImpl(this.baseUrl + path, {
         method, redirect: "error",
-        headers: { Authorization: `Bearer ${this.token}`, "content-type": "application/json" },
+        headers: { Authorization: `Bearer ${credential}`, "content-type": "application/json" },
         ...(body === undefined ? {} : { body: JSON.stringify(body) }),
         signal: requestSignal,
       });
       responseReceived = true;
+      if (hostContent && !response.ok) {
+        await response.body?.cancel().catch(() => {});
+        const code = response.status === 401 || response.status === 403 ? "forbidden"
+          : response.status === 429 ? "host_content_busy"
+            : response.status === 504 ? "host_content_timeout" : "host_content_unavailable";
+        throw unavailable(code);
+      }
       if (!response.ok) throw unavailable("codex_control_http_error");
       const reader = response.body?.getReader();
       if (!reader) throw unavailable();
@@ -111,7 +126,7 @@ export class CodexProxyTransport {
           const { done, value } = await reader.read();
           if (done) break;
           size += value.byteLength;
-          if (size > 2 * 1024 * 1024) throw unavailable("codex_response_too_large");
+          if (size > (hostContent ? 64 * 1024 : 2 * 1024 * 1024)) throw unavailable("codex_response_too_large");
           chunks.push(value);
         }
       } finally {
@@ -119,6 +134,10 @@ export class CodexProxyTransport {
         reader.releaseLock();
       }
       const result = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+      if (hostContent) {
+        if (!result || typeof result !== "object" || Array.isArray(result) || result.ok === false) throw unavailable("codex_host_content_unavailable");
+        return result;
+      }
       if (result?.ok !== true || !result.delivery) throw unavailable();
       return envelope ? result : result.delivery;
     } catch (error) {
@@ -134,6 +153,12 @@ export class CodexProxyTransport {
       }
       throw unavailable();
     }
+  }
+
+  async readHostContent(operation, body, { signal } = {}) {
+    const path = operation === "list" ? "/v1/threads/list" : operation === "snapshot" ? "/v1/threads/snapshot" : null;
+    if (path === null || Buffer.byteLength(JSON.stringify(body), "utf8") > 8 * 1024) throw rejected("invalid_input");
+    return this.request(path, { method: "POST", body, signal, hostContent: true });
   }
 
   normalize(delivery, request, expected) {
@@ -229,28 +254,33 @@ export class CodexProxyTransport {
       const normalized = this.normalize(response.delivery, request, expected);
       const observed = response.replies;
       if (normalized.outcome !== "accepted" || normalized.injection_method !== "turn/start" || !observed || observed.supported !== true
-        || observed.thread_id !== expected.target.conversation_id || observed.turn_status !== "completed"
+        || observed.thread_id !== expected.target.conversation_id
         || typeof observed.turn_id !== "string" || observed.turn_id !== normalized.turn_id
         || (turnId && turnId !== observed.turn_id) || !Array.isArray(observed.replies) || observed.replies.length > 1000) return null;
-      turnId = observed.turn_id;
-      for (const item of observed.replies) {
-        if (item.turn_status !== "completed") return null;
-        const itemId = requireText(item.item_id, "native_item_id", 256);
-        const text = requireText(item.text, "reply_text");
-        if (itemIds.has(itemId)) return null;
-        itemIds.add(itemId);
-        items.push({ itemId, text });
-        if (items.length > 1000) return null;
-      }
-      if (observed.partial !== true) {
-        if (!items.length) return null;
-        return {
-          native_message_id: items.at(-1).itemId,
-          native_conversation_id: observed.thread_id,
-          native_turn_id: turnId,
-          source_step_index: items.length - 1,
-          text: requireText(items.map(item => item.text).join("\n\n"), "reply_text"),
-        };
+      const searchingTurn = !turnId && observed.outcome === "ok" && observed.turn_status === null
+        && observed.partial === true && observed.replies.length === 0;
+      if (!searchingTurn) {
+        if (observed.turn_status !== "completed") return null;
+        turnId = observed.turn_id;
+        for (const item of observed.replies) {
+          if (item.turn_status !== "completed") return null;
+          const itemId = requireText(item.item_id, "native_item_id", 256);
+          const text = requireText(item.text, "reply_text");
+          if (itemIds.has(itemId)) return null;
+          itemIds.add(itemId);
+          items.push({ itemId, text });
+          if (items.length > 1000) return null;
+        }
+        if (observed.partial !== true) {
+          if (!items.length) return null;
+          return {
+            native_message_id: items.at(-1).itemId,
+            native_conversation_id: observed.thread_id,
+            native_turn_id: turnId,
+            source_step_index: items.length - 1,
+            text: requireText(items.map(item => item.text).join("\n\n"), "reply_text"),
+          };
+        }
       }
       if (typeof observed.cursor !== "string" || !/^[A-Za-z0-9_-]{1,4096}$/.test(observed.cursor) || cursors.has(observed.cursor)) return null;
       cursor = observed.cursor;
@@ -262,6 +292,7 @@ export class CodexProxyTransport {
   async close() {
     this.closed = true;
     this.token = "";
+    this.#contentReadToken = undefined;
     await this.#sourceRecovery?.close();
   }
 }

@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
-import { communicationTools } from "../src/mcp-server.mjs";
+import { listCommunicationToolDefinitions } from "../src/mcp-server.mjs";
 import { createMcpStdioFacade, FACADE_INSTRUCTIONS } from "../src/mcp-stdio-facade.mjs";
 
 const caller = { machine_id: "synthetic-host-scope-machine", host: "codex", surface: "synthetic-test", conversation_id: "synthetic-legacy-cid" };
@@ -95,7 +95,7 @@ test("initialize and listTools reuse current communicationTools definitions with
   files.own(() => client.close());
   await facade.connect(serverTransport);
   await client.connect(clientTransport);
-  assert.deepEqual((await client.listTools()).tools, communicationTools.map(entry => entry.definition));
+  assert.deepEqual((await client.listTools()).tools, listCommunicationToolDefinitions());
   assert.equal(client.getInstructions(), FACADE_INSTRUCTIONS);
   assert.equal(mocks.created.length, 0);
 });

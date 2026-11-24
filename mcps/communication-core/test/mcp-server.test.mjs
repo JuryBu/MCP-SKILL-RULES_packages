@@ -26,6 +26,7 @@ const methods = {
   communication_wait: "wait",
   communication_ack_processing: "ackProcessing",
   communication_get_status: "getStatus",
+  communication_read_recent_snapshot: "readRecentSnapshot",
   communication_read_channel_messages: "readChannelMessages",
   communication_download_attachment: "downloadAttachment",
   communication_manage_channel_binding: "manageChannelBinding",
@@ -34,7 +35,10 @@ const initializeBody = JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initiali
 
 function stubCore(overrides = {}) {
   return {
-    ...Object.fromEntries(Object.values(methods).map(method => [method, async (context, input) => ({ method, context: { principal_id: context.principal_id }, input })])),
+    ...Object.fromEntries(Object.values(methods).map(method => [method, async (context, input) => ({
+      method, context: { principal_id: context.principal_id }, input,
+      ...(method === "readRecentSnapshot" ? { markdown: "**用户**\n\n> 最近测试输入" } : {}),
+    })])),
     ...overrides,
   };
 }
@@ -167,10 +171,11 @@ test("CLI收到shutdown行后退出，父端保持stdin管道开启仍不会挂�
   assert.deepEqual(result, { code: 0, signal: null });
 });
 
-test("SDK真实初始化、发现十个工具并逐项转发可信context与参数", async context => {
+test("SDK真实初始化、发现十一个工具并逐项转发可信context与参数", async context => {
   const fixture = await harness(context);
   const client = await fixture.client();
   const listed = await client.listTools();
+  assert.equal(Object.hasOwn(listed.tools.find(entry => entry.name === "communication_send_message").inputSchema.properties, "model_override"), false);
   assert.deepEqual(listed.tools.map(entry => entry.name).sort(), Object.keys(methods).sort());
   for (const entry of listed.tools) {
     assert.equal(entry.inputSchema.additionalProperties, false);
@@ -197,6 +202,7 @@ test("SDK真实初始化、发现十个工具并逐项转发可信context与参�
     communication_wait: { caller, message_id: "synthetic-message", after_cursor: "synthetic-cursor", until: "reply", wait_ms: 10, limit: 3 },
     communication_ack_processing: { caller, message_id: "synthetic-message", delivery_id: "synthetic-delivery", binding_generation: 3, processing: "processing" },
     communication_get_status: { caller, host: "synthetic-host", conversation_id: "synthetic-receiver" },
+    communication_read_recent_snapshot: { caller, target: { host: "codex", conversation_id: "synthetic-receiver" }, last_rounds: 3 },
     communication_read_channel_messages: { caller, channel: "qq", window_type: "private", window_id: "synthetic-private-window", count: 7 },
     communication_download_attachment: { caller, channel: "qq", window_type: "private", window_id: "synthetic-private-window", attachment_ref: "synthetic-attachment-ref" },
     communication_manage_channel_binding: { caller, action: "list", limit: 7 },
@@ -205,7 +211,12 @@ test("SDK真实初始化、发现十个工具并逐项转发可信context与参�
     const result = await client.callTool({ name, arguments: input });
     assert.notEqual(result.isError, true);
     assert.deepEqual(result.structuredContent, { method: methods[name], context: { principal_id: principals[0].id }, input });
-    assert.match(result.content[0].text, /交流操作结果/);
+    if (name === "communication_read_recent_snapshot") {
+      assert.equal(result.content[0].text, "**用户**\n\n> 最近测试输入");
+      assert.ok(Buffer.byteLength(JSON.stringify(result), "utf8") <= 8192);
+    } else {
+      assert.match(result.content[0].text, /交流操作结果/);
+    }
   }
 });
 
