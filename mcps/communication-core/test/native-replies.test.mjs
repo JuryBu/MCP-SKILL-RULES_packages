@@ -53,13 +53,14 @@ function replyEvents(store, messageId) {
 async function fixture(testContext, options = {}) {
   const directory = mkdtempSync(join(tmpdir(), "communication-native-replies-"));
   const filePath = join(directory, "messages.sqlite");
+  const receiver = options.receiver ?? RECEIVER;
   const targets = [
-    { ...RECEIVER, binding_id: "receiver-binding", binding_generation: 7, adapter_id: "native-adapter", capabilities: { next_model_boundary: true, when_idle: true }, evidence: "test-only" },
+    { ...receiver, binding_id: "receiver-binding", binding_generation: 7, adapter_id: "native-adapter", capabilities: { next_model_boundary: true, when_idle: true }, evidence: "test-only" },
     { ...SOURCE, binding_id: "source-binding", binding_generation: 3, adapter_id: "native-adapter", capabilities: { next_model_boundary: true, when_idle: true }, evidence: "test-only" },
   ];
   const principals = [
     { id: SOURCE_CONTEXT.principal_id, identity: SOURCE, allowed_targets: ["receiver-binding"], origin_kinds: ["agent_message"] },
-    { id: RECEIVER_CONTEXT.principal_id, identity: RECEIVER, allowed_targets: ["source-binding"], origin_kinds: ["agent_message"] },
+    { id: RECEIVER_CONTEXT.principal_id, identity: receiver, allowed_targets: ["source-binding"], origin_kinds: ["agent_message"] },
   ];
   const state = { writes: [], reads: [], queries: [] };
   const adapter = {
@@ -81,7 +82,7 @@ async function fixture(testContext, options = {}) {
     stores.push(store);
     const core = new CommunicationCore({
       store, targets, principals, adapters,
-      now: () => Date.parse("2030-01-01T00:00:00Z"),
+      now: options.now ?? (() => Date.parse("2030-01-01T00:00:00Z")),
       ...(options.deliveryTimeoutMs === undefined ? {} : { deliveryTimeoutMs: options.deliveryTimeoutMs }),
       maxConcurrent: options.maxConcurrent ?? 2,
     });
@@ -100,7 +101,9 @@ async function fixture(testContext, options = {}) {
   await core.start();
   await core.drain();
   const send = async (dedupeKey, patch) => {
-    const sent = await core.sendMessage(SOURCE_CONTEXT, sendInput(dedupeKey, patch));
+    const sent = await core.sendMessage(SOURCE_CONTEXT, sendInput(dedupeKey, {
+      target: { ...receiver, binding_id: "receiver-binding", binding_generation: 7 }, ...patch,
+    }));
     await core.drain();
     return core.getMessage(SOURCE_CONTEXT, { caller: SOURCE, message_id: sent.message.message_id });
   };
@@ -613,6 +616,181 @@ test("close immediately after poll coalescing prevents the first observer invoca
   assert.deepEqual(await polling, { checked: 0, replies: 0 });
   assert.equal(context.state.reads.length, 0);
   assert.equal(replyEvents(context.store, original.message.message_id).length, 0);
+});
+
+const CODEX_RECEIVER = { ...RECEIVER, host: "codex" };
+
+function replyClock() {
+  let now = Date.parse("2030-01-01T00:00:00Z");
+  return { now: () => now, advance: milliseconds => { now += milliseconds; } };
+}
+
+async function readReplyKeys(context) {
+  context.state.reads.length = 0;
+  await context.core.pollReplies();
+  return context.state.reads.map(request => request.message.envelope.dedupe_key).sort();
+}
+
+test("aged Codex notifications rotate across pages while newer and explicitly requested replies stay eligible", async testContext => {
+  const clock = replyClock();
+  const context = await fixture(testContext, { receiver: CODEX_RECEIVER, now: clock.now, observeReply: () => null });
+  const old = Array.from({ length: 26 }, (_, index) => "old-notice-" + index);
+  for (const key of old) await context.send(key, { reply_required: false });
+  await context.send("explicit-reply");
+  clock.advance(60 * 60 * 1000 + 1);
+  await context.send("new-notice", { reply_required: false });
+  const expected = new Set(old);
+  for (const key of old) {
+    const reads = await readReplyKeys(context);
+    assert.ok(reads.includes("explicit-reply") && reads.includes("new-notice"));
+    const [aged] = reads.filter(name => name.startsWith("old-notice-"));
+    assert.equal(reads.length, 3, key);
+    assert.equal(expected.delete(aged), true, "one different old delivery is visited in each round");
+    assert.deepEqual(await readReplyKeys(context), ["explicit-reply", "new-notice"]);
+    clock.advance(10000);
+  }
+  assert.equal(expected.size, 0);
+  assert.deepEqual(await readReplyKeys(context), ["explicit-reply", "new-notice"]);
+  assert.equal((await readReplyKeys(context)).length, 3);
+  assert.equal(context.state.writes.length, old.length + 2);
+});
+
+test("passive Codex pacing accepts each clock representation supported by the core", async testContext => {
+  for (const [label, represent] of [["ISO", value => new Date(value).toISOString()], ["Date", value => new Date(value)]]) {
+    await testContext.test(label, async clockTest => {
+      const clock = replyClock();
+      const context = await fixture(clockTest, { receiver: CODEX_RECEIVER, now: () => represent(clock.now()), observeReply: () => null });
+      await context.send("clock-older-alpha", { reply_required: false });
+      await context.send("clock-older-beta", { reply_required: false });
+      clock.advance(60 * 60 * 1000 + 1);
+      const first = await readReplyKeys(context);
+      assert.equal(first.length, 1);
+      assert.deepEqual(await readReplyKeys(context), []);
+      clock.advance(10000);
+      const second = await readReplyKeys(context);
+      assert.equal(second.length, 1);
+      assert.deepEqual([...first, ...second].sort(), ["clock-older-alpha", "clock-older-beta"]);
+    });
+  }
+});
+
+test("an active authorized wait for an old Codex notice uses one existing poll opportunity", async testContext => {
+  const clock = replyClock();
+  let replyAvailable = false;
+  const context = await fixture(testContext, {
+    receiver: CODEX_RECEIVER, now: clock.now, observeReply(request) {
+      return replyAvailable ? nativeReply(request) : null;
+    },
+  });
+  const notice = await context.send("old-no-reply", { reply_required: false });
+  clock.advance(60 * 60 * 1000 + 1);
+  assert.deepEqual(await readReplyKeys(context), ["old-no-reply"]);
+  const inputs = { caller: SOURCE, message_id: notice.message.message_id, until: "reply", after_cursor: notice.next_cursor };
+  assert.equal((await context.core.wait(SOURCE_CONTEXT, { ...inputs, wait_ms: 0 })).matched, false);
+  assert.deepEqual(await readReplyKeys(context), []);
+  const controller = new AbortController();
+  const abandoned = context.core.wait({ ...SOURCE_CONTEXT, signal: controller.signal }, { ...inputs, wait_ms: 1000 });
+  controller.abort();
+  assert.equal((await abandoned).matched_by, "cancelled");
+  assert.deepEqual(await readReplyKeys(context), []);
+  const waiting = context.core.wait(SOURCE_CONTEXT, { ...inputs, wait_ms: 1000 });
+  replyAvailable = true;
+  assert.deepEqual(await readReplyKeys(context), ["old-no-reply"]);
+  assert.equal((await waiting).matched, true);
+  assert.equal(replyEvents(context.store, notice.message.message_id).length, 1);
+  assert.deepEqual(await readReplyKeys(context), []);
+  assert.equal(context.state.writes.length, 1);
+});
+
+test("a wait for an old Codex notice beyond the first page is observed before the ordinary page scan", async testContext => {
+  const clock = replyClock();
+  let requestedDeliveryId;
+  const context = await fixture(testContext, {
+    receiver: CODEX_RECEIVER, now: clock.now, maxConcurrent: 1,
+    observeReply(request) { return request.delivery.delivery_id === requestedDeliveryId ? nativeReply(request) : null; },
+  });
+  const notices = [];
+  for (let index = 0; index < 28; index += 1) notices.push(await context.send(`past-page-${index}`, { reply_required: false }));
+  notices.sort((left, right) => left.delivery.delivery_id < right.delivery.delivery_id ? -1 : 1);
+  const requested = notices.at(-1);
+  requestedDeliveryId = requested.delivery.delivery_id;
+  clock.advance(60 * 60 * 1000 + 1);
+  const waiting = context.core.wait(SOURCE_CONTEXT, {
+    caller: SOURCE, message_id: requested.message.message_id, until: "reply", after_cursor: requested.next_cursor, wait_ms: 1000,
+  });
+  await context.core.pollReplies();
+  assert.deepEqual(context.state.reads.map(request => request.delivery.delivery_id), [requestedDeliveryId, notices[0].delivery.delivery_id]);
+  assert.equal((await waiting).matched, true);
+  assert.equal(replyEvents(context.store, requested.message.message_id).length, 1);
+  assert.equal(context.state.writes.length, notices.length);
+});
+
+test("newly aged Codex notices cannot extend the current passive read sweep", async testContext => {
+  const clock = replyClock();
+  const context = await fixture(testContext, { receiver: CODEX_RECEIVER, now: clock.now, observeReply: () => null });
+  const notices = [];
+  for (let index = 0; index < 3; index += 1) notices.push(await context.send(`cohort-${index}`, { reply_required: false }));
+  notices.sort((left, right) => left.delivery.delivery_id < right.delivery.delivery_id ? -1 : 1);
+  const [first, second, newcomer] = notices;
+  context.store.updateDelivery(newcomer.delivery.delivery_id, { updated_at: new Date(clock.now() + 5000).toISOString() });
+  clock.advance(60 * 60 * 1000 + 1);
+  assert.deepEqual(await readReplyKeys(context), [first.message.envelope.dedupe_key, newcomer.message.envelope.dedupe_key].sort());
+  clock.advance(10000);
+  assert.deepEqual(await readReplyKeys(context), [second.message.envelope.dedupe_key]);
+  clock.advance(10000);
+  assert.deepEqual(await readReplyKeys(context), []);
+  assert.deepEqual(await readReplyKeys(context), [first.message.envelope.dedupe_key]);
+  clock.advance(10000);
+  assert.deepEqual(await readReplyKeys(context), [second.message.envelope.dedupe_key]);
+  clock.advance(10000);
+  assert.deepEqual(await readReplyKeys(context), [newcomer.message.envelope.dedupe_key]);
+  assert.equal(context.state.writes.length, notices.length);
+});
+
+test("a Codex reply that has timed out keeps the delivery and its slow lane until the adapter settles", async testContext => {
+  const clock = replyClock();
+  const release = deferred();
+  let stalled = true;
+  const context = await fixture(testContext, {
+    receiver: CODEX_RECEIVER, now: clock.now, maxConcurrent: 2, deliveryTimeoutMs: 20,
+    async observeReply() { if (stalled) await release.promise; return null; },
+  });
+  await context.send("old-one", { reply_required: false });
+  await context.send("old-two", { reply_required: false });
+  clock.advance(60 * 60 * 1000 + 1);
+  try {
+    assert.equal((await readReplyKeys(context)).length, 1);
+    assert.equal(context.core.replyInvocations.size, 1);
+    clock.advance(20000);
+    assert.deepEqual(await readReplyKeys(context), []);
+  } finally {
+    stalled = false;
+    release.resolve();
+  }
+  await Promise.allSettled([...context.core.replyInvocations]);
+  assert.deepEqual(await readReplyKeys(context), []);
+  clock.advance(10000);
+  assert.equal((await readReplyKeys(context)).length, 1);
+  assert.equal(context.state.writes.length, 2);
+});
+
+test("the same timed-out Codex delivery is not read twice even with one global slot free", async testContext => {
+  const release = deferred();
+  const context = await fixture(testContext, {
+    receiver: CODEX_RECEIVER, maxConcurrent: 2, deliveryTimeoutMs: 20,
+    async observeReply() { await release.promise; return null; },
+  });
+  try {
+    await context.send("active-codex-read");
+    assert.deepEqual(await readReplyKeys(context), ["active-codex-read"]);
+    assert.equal(context.core.replyInvocations.size, 1);
+    assert.deepEqual(await readReplyKeys(context), []);
+  } finally {
+    release.resolve();
+  }
+  await Promise.allSettled([...context.core.replyInvocations]);
+  assert.deepEqual(await readReplyKeys(context), ["active-codex-read"]);
+  assert.equal(context.state.writes.length, 1);
 });
 
 test("a timed-out uncooperative observer retains its concurrency slot and close waits for its late resource release", async testContext => {

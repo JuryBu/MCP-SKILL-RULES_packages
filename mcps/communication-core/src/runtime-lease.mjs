@@ -1,8 +1,9 @@
+import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { copyFile, lstat, mkdir, readFile, realpath, rename, rmdir, unlink, writeFile } from "node:fs/promises";
 import { constants } from "node:fs";
-import { createConnection } from "node:net";
-import { basename, dirname, join, resolve } from "node:path";
+import { createConnection, isIP } from "node:net";
+import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { CoreError } from "./contracts.mjs";
 
 function locked() {
@@ -61,15 +62,91 @@ export function processStatus(pid) {
   }
 }
 
-export function loopbackPortStatus(port, host) {
+function inspectLoopbackPort(port, host) {
   return new Promise(resolveStatus => {
-    let result = "unknown";
+    let result = { state: "unknown" };
+    let timedOut = false;
     const socket = createConnection({ host, port, timeout: 750 });
-    socket.once("connect", () => { result = "listening"; socket.destroy(); });
-    socket.once("timeout", () => socket.destroy());
-    socket.once("error", error => { result = error.code === "ECONNREFUSED" ? "closed" : "unknown"; });
+    socket.once("connect", () => { result = { state: "listening" }; socket.destroy(); });
+    socket.once("timeout", () => { timedOut = true; socket.destroy(); });
+    socket.once("error", error => {
+      if (timedOut || result.state === "listening") return;
+      result = { state: error.code === "ECONNREFUSED" ? "closed" : "unknown" };
+      if (error.syscall === "connect" && error.address === host && error.port === port) result.connectCode = error.code;
+    });
     socket.once("close", () => resolveStatus(result));
   });
+}
+
+export async function loopbackPortStatus(port, host) {
+  return (await inspectLoopbackPort(port, host)).state;
+}
+
+const WINDOWS_LISTENER_QUERY_MS = 5_000;
+const WINDOWS_LISTENER_PROOF_MS = WINDOWS_LISTENER_QUERY_MS + 1_000;
+const WINDOWS_LISTENER_CLOCK_SKEW_MS = 250;
+const WINDOWS_LISTENER_MIN_GAP_MS = 25;
+const WINDOWS_LISTENER_SCRIPT = [
+  "$ErrorActionPreference='Stop'",
+  "$WarningPreference='Stop'",
+  "[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false)",
+  "if (-not [Net.Sockets.Socket]::OSSupportsIPv4 -or -not [Net.Sockets.Socket]::OSSupportsIPv6) { throw 'Both TCP families are required' }",
+  "$properties=[Net.NetworkInformation.IPGlobalProperties]::GetIPGlobalProperties()",
+  "$clock=[Diagnostics.Stopwatch]::StartNew()",
+  "function Read-Listeners { $entries=@($properties.GetActiveTcpListeners()); $rows=@(foreach($entry in $entries){ @{LocalAddress=$entry.Address.ToString();LocalPort=$entry.Port} }); @{count=$entries.Count; at_ms=$clock.ElapsedMilliseconds; rows=$rows} }",
+  "$first=Read-Listeners",
+  "Start-Sleep -Milliseconds 40",
+  "$second=Read-Listeners",
+  "@{samples=@($first,$second)} | ConvertTo-Json -Depth 5 -Compress"
+].join("; ");
+
+function listenerObservationTime() {
+  return { wall: Date.now(), monotonic: performance.now() };
+}
+
+function requireFreshListenerObservation(started, finished, limitMs) {
+  const wallMs = finished.wall - started.wall;
+  const elapsedMs = finished.monotonic - started.monotonic;
+  if (wallMs < 0 || elapsedMs < 0 || wallMs > limitMs || elapsedMs > limitMs || Math.abs(wallMs - elapsedMs) > WINDOWS_LISTENER_CLOCK_SKEW_MS) throw locked();
+}
+
+function listenerSampleIsComplete(sample) {
+  return sample && Array.isArray(sample.rows) && sample.count === sample.rows.length
+    && Number.isSafeInteger(sample.at_ms) && sample.at_ms >= 0 && sample.at_ms <= WINDOWS_LISTENER_QUERY_MS
+    && sample.rows.every(row => isIP(row?.LocalAddress) && Number.isInteger(row.LocalPort) && row.LocalPort >= 1 && row.LocalPort <= 65535);
+}
+
+async function readWindowsTcpListenerPair() {
+  const systemRoot = process.env.SystemRoot;
+  if (!systemRoot || !isAbsolute(systemRoot)) throw locked();
+  try {
+    const executable = join(systemRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
+    const options = {
+      encoding: "utf8", windowsHide: true, timeout: WINDOWS_LISTENER_QUERY_MS, maxBuffer: 256 * 1024,
+    };
+    const { stdout, stderr } = await new Promise((resolveOutput, rejectOutput) => {
+      execFile(executable, ["-NoProfile", "-NonInteractive", "-Command", WINDOWS_LISTENER_SCRIPT], options, (error, stdout, stderr) => {
+        if (error) rejectOutput(error);
+        else resolveOutput({ stdout, stderr });
+      });
+    });
+    if (stderr.trim()) throw locked();
+    const { samples } = JSON.parse(stdout);
+    if (!Array.isArray(samples) || samples.length !== 2 || !samples.every(listenerSampleIsComplete)
+        || samples[1].at_ms - samples[0].at_ms < WINDOWS_LISTENER_MIN_GAP_MS) throw locked();
+    return samples;
+  } catch { throw locked(); }
+}
+
+async function verifyWindowsListenerAbsence(port, started) {
+  const queryStarted = listenerObservationTime();
+  requireFreshListenerObservation(started, queryStarted, WINDOWS_LISTENER_PROOF_MS);
+  const samples = await readWindowsTcpListenerPair();
+  const observed = listenerObservationTime();
+  requireFreshListenerObservation(queryStarted, observed, WINDOWS_LISTENER_QUERY_MS);
+  requireFreshListenerObservation(started, observed, WINDOWS_LISTENER_PROOF_MS);
+  if (samples.some(sample => sample.rows.some(listener => listener.LocalPort === port))) throw locked();
+  return observed;
 }
 
 function endpointPort(record) {
@@ -84,15 +161,28 @@ function endpointPort(record) {
 async function verifyTerminated(record, identity, probes) {
   if (!await matchesIdentity(record, identity) || !Number.isSafeInteger(record.pid) || record.pid < 1) throw locked();
   const inspectProcess = probes.processStatus ?? processStatus;
-  const inspectPort = probes.loopbackPortStatus ?? loopbackPortStatus;
+  const stringPortProbe = probes.loopbackPortStatus;
+  const inspectPort = stringPortProbe == null ? inspectLoopbackPort : async (port, host) => ({ state: await stringPortProbe(port, host) });
+  const started = listenerObservationTime();
   if (await inspectProcess(record.pid) !== "absent") throw locked();
   if (record.url === undefined && (record.state === "starting" || (record.state === "closed" && typeof record.closed_at === "string" && Number.isFinite(Date.parse(record.closed_at))))) {
     if (await inspectProcess(record.pid) !== "absent") throw locked();
     return;
   }
   const port = endpointPort(record);
-  const states = await Promise.all(["127.0.0.1", "::1"].map(host => inspectPort(port, host)));
-  if (states.some(state => state !== "closed") || await inspectProcess(record.pid) !== "absent") throw locked();
+  const [ipv4, ipv6] = await Promise.all(["127.0.0.1", "::1"].map(host => inspectPort(port, host)));
+  if (ipv4.state !== "closed") throw locked();
+  let windowsProof;
+  if (ipv6.state !== "closed") {
+    if (process.platform !== "win32" || probes.processStatus != null || ipv6.state !== "unknown" || ipv6.connectCode !== "EACCES") throw locked();
+    windowsProof = await verifyWindowsListenerAbsence(port, started);
+  }
+  if (await inspectProcess(record.pid) !== "absent") throw locked();
+  if (windowsProof) {
+    const finished = listenerObservationTime();
+    requireFreshListenerObservation(windowsProof, finished, WINDOWS_LISTENER_PROOF_MS);
+    requireFreshListenerObservation(started, finished, WINDOWS_LISTENER_PROOF_MS);
+  }
 }
 
 async function claimFile(filePath, identity, { recoverTerminated = false, probes = {}, retainClosed = false } = {}) {

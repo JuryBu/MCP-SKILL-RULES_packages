@@ -28,6 +28,9 @@ const WAIT_CONDITIONS = new Set(["reply", "delivery", "processing", "any"]);
 const DELIVERY_PAGE_SIZE = 100;
 const REPLY_PAGE_SIZE = 25;
 const REPLY_EVENT_PAGE_SIZE = 100;
+const CODEX_REPLY_RECENT_MS = 60 * 60 * 1000;
+const CODEX_REPLY_PASSIVE_GAP_MS = 10000;
+const CODEX_REPLY_WAIT_GAP_MS = 1000;
 const ADAPTER_ERROR_MESSAGES = {
   adapter_error: "适配器调用失败，发送结果待核实",
   delivery_timeout: "适配器调用超时，发送结果待核实",
@@ -86,8 +89,13 @@ function safeAdapterOutcome(result, delivery, method) {
   const suppliedEvidence = result.evidence;
   const kind = suppliedEvidence?.kind;
   if (ADAPTER_EVIDENCE_KINDS.has(kind)) evidence.kind = kind;
-  if (delivery.target_snapshot?.host === "codex" && outcome === "busy" && kind === "receipt" && suppliedEvidence.request_sent === false) {
+  if (["codex", "windsurf"].includes(delivery.target_snapshot?.host) && outcome === "busy" && kind === "receipt" && suppliedEvidence.request_sent === false) {
     evidence.request_sent = false;
+  }
+  if (delivery.target_snapshot?.host === "windsurf" && kind === "receipt") {
+    if (suppliedEvidence.connector_id === "devin-cli") evidence.connector_id = "devin-cli";
+    if (typeof suppliedEvidence.connection_id === "string" && suppliedEvidence.connection_id.length <= 128) evidence.connection_id = suppliedEvidence.connection_id;
+    if (Number.isSafeInteger(suppliedEvidence.protocol_version) && suppliedEvidence.protocol_version >= 2) evidence.protocol_version = suppliedEvidence.protocol_version;
   }
   const observedAt = suppliedEvidence?.observed_at;
   if (typeof observedAt === "string" && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?Z$/.test(observedAt) && Number.isFinite(Date.parse(observedAt))) {
@@ -158,15 +166,86 @@ function safeObservedReply(result, target, delivery) {
   }
 }
 
+class CodexReplyPacer {
+  constructor(now) {
+    this.now = now;
+    this.waiters = new WeakSet();
+    this.reading = new Set();
+    this.passive = { cursor: null, cohortBefore: null, reading: false, nextAt: 0, gap: CODEX_REPLY_PASSIVE_GAP_MS };
+    this.waiting = { cursor: null, reading: false, nextAt: 0, gap: CODEX_REPLY_WAIT_GAP_MS };
+  }
+
+  begin() {
+    const now = this.now();
+    return { now, passive: { lane: this.passive, used: false }, waiting: { lane: this.waiting, used: false } };
+  }
+
+  available(pass) {
+    return !pass.used && !pass.lane.reading && pass.lane.nextAt <= this.now();
+  }
+
+  activelyWaiting(listeners) {
+    for (const listener of listeners) if (this.waiters.has(listener)) return true;
+    return false;
+  }
+
+  isOld(pass, message, delivery) {
+    const acceptedAt = Date.parse(delivery.updated_at ?? delivery.created_at);
+    return message.envelope.reply_required !== true && Number.isFinite(acceptedAt)
+      && pass.now - acceptedAt > CODEX_REPLY_RECENT_MS;
+  }
+
+  claim(pass, deliveryId) {
+    if (!this.available(pass) || pass.lane.cursor !== null && deliveryId <= pass.lane.cursor) return null;
+    pass.used = true;
+    pass.lane.cursor = deliveryId;
+    pass.lane.reading = true;
+    return pass.lane;
+  }
+
+  reserve(pass, message, delivery, listeners = []) {
+    const deliveryId = delivery.delivery_id;
+    if (this.reading.has(deliveryId)) return null;
+    let lane = null;
+    if (this.isOld(pass, message, delivery)) {
+      if (this.activelyWaiting(listeners)) lane = this.claim(pass.waiting, deliveryId);
+      const cohort = this.passive.cohortBefore ?? pass.now - CODEX_REPLY_RECENT_MS;
+      if (lane === null && Date.parse(delivery.updated_at ?? delivery.created_at) <= cohort) {
+        lane = this.claim(pass.passive, deliveryId);
+        if (lane !== null) lane.cohortBefore = cohort;
+      }
+      if (lane === null) return null;
+    }
+    this.reading.add(deliveryId);
+    for (const listener of listeners) this.waiters.delete(listener);
+    return () => {
+      this.reading.delete(deliveryId);
+      if (lane !== null) {
+        lane.reading = false;
+        lane.nextAt = this.now() + lane.gap;
+      }
+    };
+  }
+
+  finish(pass, scanned) {
+    if (scanned && this.available(pass.passive)) {
+      this.passive.cursor = null;
+      this.passive.cohortBefore = null;
+    }
+  }
+}
+
 export class CommunicationCore {
-  constructor({ store, targets, principals, adapters, replyForwarding = [], conversationRoutes = [], channelWindows = [], ownerWindowSources = [], downloadLedger, channelDownloadFailure = false, statusProvider, automaticReplyForwarding = [], now = () => Date.now(), deliveryTimeoutMs = 5000, maxConcurrent = 2 }) {
+  constructor({ store, targets, principals, adapters, replyForwarding = [], conversationRoutes = [], channelWindows = [], ownerWindowSources = [], downloadLedger, channelDownloadFailure = false, statusProvider, hostContentProvider, automaticReplyForwarding = [], autoCompleteOnReply = false, now = () => Date.now(), deliveryTimeoutMs = 5000, maxConcurrent = 2 }) {
     this.store = store;
     this.targets = targets ?? [];
     this.principals = principals ?? [];
     this.adapters = adapters ?? {};
     this.directory = conversationRoutes.length ? new ConversationDirectory({ store, targets: registryValues(this.targets), routes: conversationRoutes }) : null;
     this.statusProvider = statusProvider;
+    this.hostContentProvider = hostContentProvider;
     this.automaticReplyForwarding = automaticReplyForwarding;
+    this.autoCompleteOnReply = autoCompleteOnReply === true;
     this.channelBindings = new ChannelBindingManager({ store, windows: channelWindows, resolveCallerTarget: principal => this.directory
       ? this.directory.byIdentity(principal.identity) : this.resolveAddress(principal, principal.identity) });
     this.ownerWindows = new OwnerWindowMessages({ core: this, sources: ownerWindowSources });
@@ -184,6 +263,7 @@ export class CommunicationCore {
       origin_kinds: ["human_message"],
     }));
     this.now = now;
+    this.codexReplies = new CodexReplyPacer(() => this.nowMs());
     this.deliveryTimeoutMs = requireInteger(deliveryTimeoutMs, "deliveryTimeoutMs", 1, 2147483647);
     this.maxConcurrent = requireInteger(maxConcurrent, "maxConcurrent", 1);
     this.closed = false;
@@ -205,18 +285,25 @@ export class CommunicationCore {
     if (this.closed) throw new CoreError("closed", "交流核心已关闭");
   }
 
-  timestamp() {
-    return new Date(this.now()).toISOString();
+  nowMs() {
+    const value = this.now();
+    const ms = value instanceof Date ? value.getTime() : typeof value === "number" ? value : Date.parse(value);
+    if (!Number.isFinite(ms)) throw new CoreError("invalid_input", "时钟时间无效");
+    return ms;
   }
 
-  principal(context, caller) {
+  timestamp() {
+    return new Date(this.nowMs()).toISOString();
+  }
+
+  principal(context, caller, { remember = true } = {}) {
     this.assertOpen();
     const principalId = requireText(context?.principal_id, "principal_id", 128);
     const matches = [...registryValues(this.principals), ...this.replyForwardPrincipals].filter(principal => principal.id === principalId);
     if (matches.length !== 1) throw new CoreError("unauthorized", "当前连接没有唯一有效的来源授权");
     const principal = matches[0];
     const effective = principalForCaller(principal, caller);
-    if (principal.caller_scope) this.directory?.rememberCaller(effective.identity);
+    if (remember && principal.caller_scope) this.directory?.rememberCaller(effective.identity);
     return effective;
   }
 
@@ -312,9 +399,16 @@ export class CommunicationCore {
   }
 
   listConversations(context, input) {
-    assertExactKeys(input, ["caller", "host", "limit", "cursor"], "对话列表查询");
+    assertExactKeys(input, ["caller", "host", "limit", "cursor", "scope"], "对话列表查询");
+    if (input.scope === "host") {
+      const principal = this.principal(context, input.caller, { remember: false });
+      if (!this.hostContentProvider) throw new CoreError("host_content_unavailable", "宿主列表入口未就绪");
+      return this.hostContentProvider.list(principal, input, { signal: context.signal });
+    }
+    if (input.scope !== undefined && input.scope !== "bindings") throw new CoreError("invalid_input", "不支持的列表范围");
+    const { scope: unusedScope, ...bindingInput } = input;
     const principal = this.principal(context, input.caller);
-    if (this.directory) return this.directory.list(principal, input);
+    if (this.directory) return this.directory.list(principal, bindingInput);
     const limit = requireInteger(input.limit ?? 100, "limit", 1, 100);
     const host = input.host === undefined ? null : requireText(input.host, "host", 64);
     const targets = registryValues(this.targets)
@@ -327,6 +421,12 @@ export class CommunicationCore {
     const page = targets.slice(offset, offset + limit);
     const hasMore = offset + page.length < targets.length;
     return copy({ targets: page, next_cursor: hasMore ? encodeCursor(scope, offset + page.length) : null, has_more: hasMore });
+  }
+
+  readRecentSnapshot(context, input) {
+    const principal = this.principal(context, input?.caller, { remember: false });
+    if (!this.hostContentProvider) throw new CoreError("host_content_unavailable", "宿主近期内容入口未就绪");
+    return this.hostContentProvider.snapshot(principal, input, { signal: context.signal });
   }
 
   resolveTarget(context, input) {
@@ -377,9 +477,22 @@ export class CommunicationCore {
       if (!permitted) throw new CoreError("forbidden", "当前来源没有该宿主状态的读取授权");
       target = { machine_id: machineId, host, surface };
     }
-    if (!this.statusProvider) return { target, observed_at: this.timestamp(), host_online: "unknown", conversation_exists: "unknown", conversation_running: "unknown", can_deliver: "unknown",
-      delivery_modes: { next_model_boundary: "unknown", when_idle: "unknown" }, source: "status_provider_not_enabled" };
-    return this.statusProvider.getStatus(target, { signal: context.signal });
+    const status = !this.statusProvider
+      ? { target, observed_at: this.timestamp(), host_online: "unknown", conversation_exists: "unknown", conversation_running: "unknown", can_deliver: "unknown",
+          delivery_modes: { next_model_boundary: "unknown", when_idle: "unknown" }, source: "status_provider_not_enabled" }
+      : await this.statusProvider.getStatus(target, { signal: context.signal });
+    if (!this.closed && target.conversation_id !== undefined && typeof this.store?.latestDeliveryIssueForTarget === "function") {
+      const issue = this.store.latestDeliveryIssueForTarget(identityKey(target));
+      if (issue) {
+        const issueMessage = typeof this.store.getMessage === "function" ? this.store.getMessage(issue.message_id) : null;
+        if (issueMessage && canAccessMessage(principal, issueMessage)) {
+          return { ...status, recent_delivery_issue: copy(issue) };
+        }
+        const { delivery_id: omittedDeliveryId, message_id: omittedMessageId, ...redactedIssue } = issue;
+        return { ...status, recent_delivery_issue: copy(redactedIssue) };
+      }
+    }
+    return status;
   }
 
   automaticReplyBinding(principal, target) {
@@ -535,17 +648,44 @@ export class CommunicationCore {
   }
 
   async sendMessage(context, input) {
-    const principal = this.principal(context, input?.caller);
+    if (!input || typeof input !== "object" || Array.isArray(input)) throw new CoreError("invalid_input", "消息必须是对象");
+    const principal = this.principal(context, input.caller);
     const sourceKey = identityKey(principal.identity);
-    const dedupeKey = requireText(input.dedupe_key, "dedupe_key", 128);
-    const existing = this.store.findMessageByDedupe(sourceKey, dedupeKey);
     const addressed = input.target?.binding_id === undefined;
-    const target = existing ? existing.envelope.target : addressed ? this.resolveAddress(principal, input.target) : this.target(input.target.binding_id);
+    let dedupeKey;
+    let existing;
+    let target;
     let normalizedInput = input;
-    if (addressed) {
-      const identity = normalizeConversationAddress({ ...input.target, surface: input.target?.surface ?? target.surface }, principal.identity.machine_id);
-      if (identityKey(identity) !== identityKey(target)) throw new CoreError("dedupe_conflict", "原去重键已经用于另一个对话地址");
-      normalizedInput = { ...input, target: { ...normalizeIdentity(target), binding_id: target.binding_id, binding_generation: target.binding_generation } };
+    if (input.dedupe_key !== undefined) {
+      dedupeKey = requireText(input.dedupe_key, "dedupe_key", 128);
+      existing = this.store.findMessageByDedupe(sourceKey, dedupeKey);
+      target = existing ? existing.envelope.target : addressed ? this.resolveAddress(principal, input.target) : this.target(input.target.binding_id);
+      if (addressed) {
+        const identity = normalizeConversationAddress({ ...input.target, surface: input.target?.surface ?? target.surface }, principal.identity.machine_id);
+        if (identityKey(identity) !== identityKey(target)) throw new CoreError("dedupe_conflict", "原去重键已经用于另一个对话地址");
+        normalizedInput = { ...normalizedInput, target: { ...normalizeIdentity(target), binding_id: target.binding_id, binding_generation: target.binding_generation } };
+      }
+      if (input.expires_at === undefined) {
+        const expiresAt = existing
+          ? existing.envelope.expires_at
+          : new Date((Math.floor(this.nowMs() / 60000) + 1) * 60000 + 86400000).toISOString();
+        normalizedInput = { ...normalizedInput, expires_at: expiresAt };
+      }
+    } else {
+      const resolvedTarget = addressed ? this.resolveAddress(principal, input.target) : this.target(input.target.binding_id);
+      const bucket = Math.floor(this.nowMs() / 60000);
+      const defaultExpiresAt = new Date((bucket + 1) * 60000 + 86400000).toISOString();
+      if (addressed) {
+        normalizedInput = { ...normalizedInput, target: { ...normalizeIdentity(resolvedTarget), binding_id: resolvedTarget.binding_id, binding_generation: resolvedTarget.binding_generation } };
+      }
+      if (input.expires_at === undefined) {
+        normalizedInput = { ...normalizedInput, expires_at: defaultExpiresAt };
+      }
+      const canonicalDraft = normalizeSendInput({ ...normalizedInput, dedupe_key: "__auto__" }, principal, resolvedTarget);
+      dedupeKey = `auto-${digest({ ...canonicalDraft, dedupe_key: null, minute_bucket: bucket }).slice(0, 24)}`;
+      existing = this.store.findMessageByDedupe(sourceKey, dedupeKey);
+      target = existing ? existing.envelope.target : resolvedTarget;
+      normalizedInput = { ...normalizedInput, dedupe_key: dedupeKey };
     }
     const envelope = copy(normalizeSendInput(normalizedInput, principal, target, {
       preserveLegacyVisibility: Boolean(existing && !Object.hasOwn(existing.envelope, "message_visibility")),
@@ -592,6 +732,35 @@ export class CommunicationCore {
       append(messageId, "message_created", { delivery_id: deliveryId });
       if (envelope.in_reply_to) {
         append(envelope.in_reply_to, "reply", { message_id: messageId, delivery_id: deliveryId, text: envelope.text });
+        if (this.autoCompleteOnReply) {
+          const origMsg = this.store.getMessage(envelope.in_reply_to);
+          const origDel = this.store.getDeliveryForMessage(envelope.in_reply_to);
+          if (origMsg && origDel && (origDel.status === "accepted" || origDel.status === "unknown")) {
+            const origGeneration = origDel.target_snapshot?.binding_generation ?? origMsg.envelope.target.binding_generation;
+            if (origDel.status === "unknown") {
+              this.changeDelivery(origDel.delivery_id, "accepted", {
+                outcome: "accepted",
+                error: null,
+                evidence: { source: "reply_ack", binding_generation: origGeneration },
+              }, append);
+            }
+            if (origMsg.processing === "pending") {
+              this.store.updateMessage(origMsg.message_id, {
+                processing: "done",
+                ...(origMsg.model_observed === "unknown" ? { model_observed: "observed" } : {}),
+              });
+              append(origMsg.message_id, "processing", {
+                processing: "done",
+                delivery_id: origDel.delivery_id,
+                binding_generation: origGeneration,
+                auto_completed_by_reply: true,
+                reply_message_id: messageId,
+              });
+            } else if (origMsg.model_observed === "unknown") {
+              this.store.updateMessage(origMsg.message_id, { model_observed: "observed" });
+            }
+          }
+        }
       }
       return { message_id: messageId, delivery_id: deliveryId, duplicate: false };
     });
@@ -708,6 +877,7 @@ export class CommunicationCore {
         }
       };
       listeners.add(notify);
+      if (until === "reply" && waitMs > 0) this.codexReplies.waiters.add(notify);
       signal?.addEventListener("abort", onAbort, { once: true });
       if (signal?.aborted) onAbort();
       if (settled) return;
@@ -717,29 +887,82 @@ export class CommunicationCore {
   }
 
   ackProcessing(context, input) {
-    assertExactKeys(input, ["caller", "message_id", "delivery_id", "binding_generation", "processing"], "处理回执");
+    assertExactKeys(input, ["caller", "message_id", "delivery_id", "binding_generation", "processing", "note"], "处理回执");
     const principal = this.principal(context, input.caller);
     const message = this.authorizedMessage(principal, input.message_id);
-    requireText(input.delivery_id, "delivery_id", 256);
-    requireInteger(input.binding_generation, "binding_generation", 1);
     if (identityKey(principal.identity) !== message.target_key) throw new CoreError("forbidden", "只有原接收对话可以确认处理状态");
     if (!["processing", "done", "failed"].includes(input.processing)) throw new CoreError("invalid_input", "处理回执状态无效");
-    const delivery = this.store.getDeliveryForMessage(message.message_id);
-    if (!delivery || input.delivery_id !== delivery.delivery_id || delivery.message_id !== message.message_id) {
-      throw new CoreError("delivery_mismatch", "处理回执没有对应原投递");
+    let note;
+    if (input.note !== undefined) {
+      if (typeof input.note !== "string" || Buffer.byteLength(input.note, "utf8") > 1200) {
+        throw new CoreError("invalid_input", "note必须是非空且不超过280字符和1200字节的文本");
+      }
+      const trimmedNote = input.note.trim();
+      if (!trimmedNote || [...trimmedNote].length > 280) {
+        throw new CoreError("invalid_input", "note必须是非空且不超过280字符和1200字节的文本");
+      }
+      note = trimmedNote;
     }
-    if (input.binding_generation !== message.envelope.target.binding_generation) throw new CoreError("binding_changed", "处理回执没有对应原绑定代次");
+    const delivery = this.store.getDeliveryForMessage(message.message_id);
+    let deliveryId;
+    if (input.delivery_id !== undefined) {
+      deliveryId = requireText(input.delivery_id, "delivery_id", 256);
+      if (!delivery || deliveryId !== delivery.delivery_id || delivery.message_id !== message.message_id) {
+        throw new CoreError("delivery_mismatch", "处理回执没有对应原投递");
+      }
+    } else {
+      if (!delivery || delivery.message_id !== message.message_id) {
+        throw new CoreError("delivery_mismatch", "处理回执没有对应原投递");
+      }
+      deliveryId = delivery.delivery_id;
+    }
+    const expectedGeneration = delivery.target_snapshot?.binding_generation ?? message.envelope.target.binding_generation;
+    let bindingGeneration;
+    if (input.binding_generation !== undefined) {
+      bindingGeneration = requireInteger(input.binding_generation, "binding_generation", 1);
+      if (bindingGeneration !== expectedGeneration) {
+        throw new CoreError("binding_changed", "处理回执没有对应原绑定代次");
+      }
+    } else {
+      bindingGeneration = expectedGeneration;
+    }
     const duplicate = this.transaction(append => {
       const current = this.store.getMessage(message.message_id);
-      if (current.processing === input.processing) return true;
-      if (PROCESSING_TERMINALS.has(current.processing)) throw new CoreError("processing_conflict", "原消息已经取得终态处理回执");
-      const currentDelivery = this.store.getDelivery(delivery.delivery_id);
-      if (!["accepted", "dispatching", "unknown"].includes(currentDelivery.status)) throw new CoreError("invalid_state", "该投递尚无接收依据");
-      if (currentDelivery.status !== "accepted") {
-        this.changeDelivery(delivery.delivery_id, "accepted", { outcome: "accepted", error: null, evidence: { source: "processing_ack", binding_generation: input.binding_generation } }, append);
+      if (current.processing === input.processing) {
+        if (input.processing === "processing" && note !== undefined && note !== current.processing_note) {
+          const currentDelivery = this.store.getDelivery(deliveryId);
+          if (!currentDelivery || !["accepted", "dispatching", "unknown"].includes(currentDelivery.status)) {
+            throw new CoreError("invalid_state", "该投递尚无接收依据");
+          }
+          if (currentDelivery.status !== "accepted") {
+            this.changeDelivery(deliveryId, "accepted", { outcome: "accepted", error: null, evidence: { source: "processing_ack", binding_generation: bindingGeneration } }, append);
+          }
+          this.store.updateMessage(message.message_id, {
+            processing_note: note,
+            ...(this.autoCompleteOnReply && current.model_observed === "unknown" ? { model_observed: "observed" } : {}),
+          });
+          append(message.message_id, "processing", { processing: input.processing, delivery_id: deliveryId, binding_generation: bindingGeneration, note });
+          return false;
+        }
+        return true;
       }
-      this.store.updateMessage(message.message_id, { processing: input.processing });
-      append(message.message_id, "processing", { processing: input.processing, delivery_id: delivery.delivery_id, binding_generation: input.binding_generation });
+      if (PROCESSING_TERMINALS.has(current.processing)) throw new CoreError("processing_conflict", "原消息已经取得终态处理回执");
+      const currentDelivery = this.store.getDelivery(deliveryId);
+      if (!currentDelivery || !["accepted", "dispatching", "unknown"].includes(currentDelivery.status)) throw new CoreError("invalid_state", "该投递尚无接收依据");
+      if (currentDelivery.status !== "accepted") {
+        this.changeDelivery(deliveryId, "accepted", { outcome: "accepted", error: null, evidence: { source: "processing_ack", binding_generation: bindingGeneration } }, append);
+      }
+      this.store.updateMessage(message.message_id, {
+        processing: input.processing,
+        ...(note !== undefined ? { processing_note: note } : {}),
+        ...(this.autoCompleteOnReply && current.model_observed === "unknown" ? { model_observed: "observed" } : {}),
+      });
+      append(message.message_id, "processing", {
+        processing: input.processing,
+        delivery_id: deliveryId,
+        binding_generation: bindingGeneration,
+        ...(note !== undefined ? { note } : {}),
+      });
       return false;
     });
     return { ...this.result(message.message_id), duplicate };
@@ -811,7 +1034,7 @@ export class CommunicationCore {
       return;
     }
     if (!["prepared", "unsupported"].includes(delivery.status)) return;
-    if (Date.parse(message.envelope.expires_at) <= this.now()) {
+    if (Date.parse(message.envelope.expires_at) <= this.nowMs()) {
       this.transaction(append => this.changeDelivery(deliveryId, "expired", { error: { code: "expired", message: "消息已超过有效期" } }, append));
       return;
     }
@@ -823,7 +1046,7 @@ export class CommunicationCore {
       if (!(error instanceof CoreError)) throw error;
       if (error.code === "target_not_found") {
         if (delivery.status === "prepared" && delivery.evidence?.outcome === "busy" && Number.isSafeInteger(retryAfterMs)
-          && this.now() < Date.parse(delivery.updated_at) + retryAfterMs) return;
+          && this.nowMs() < Date.parse(delivery.updated_at) + retryAfterMs) return;
         this.transaction(append => this.changeDelivery(deliveryId, "prepared", {
           error: { code: "target_not_found", message: "准确目标绑定暂时不可用，原消息已保存等待恢复" },
           evidence: { outcome: "busy", delivery_id: deliveryId, target_key: delivery.target_key, evidence: { operation: "resolve", kind: "query", retry_after_ms: 5000 } },
@@ -834,7 +1057,7 @@ export class CommunicationCore {
       return;
     }
     if (delivery.status === "prepared" && delivery.evidence?.outcome === "busy" && Number.isSafeInteger(retryAfterMs)
-      && retryAfterMs > 0 && retryAfterMs <= 45000 && this.now() < Date.parse(delivery.updated_at) + retryAfterMs) return;
+      && retryAfterMs > 0 && retryAfterMs <= 45000 && this.nowMs() < Date.parse(delivery.updated_at) + retryAfterMs) return;
     const adapter = lookupAdapter(this.adapters, target.adapter_id);
     if (!target.capabilities[message.envelope.delivery_policy] || typeof adapter?.deliver !== "function") {
       if (delivery.status !== "unsupported") {
@@ -901,9 +1124,14 @@ export class CommunicationCore {
     this.transaction(append => {
       const current = this.store.getDelivery(deliveryId);
       if (!current || !["dispatching", "unknown"].includes(current.status)) return;
-      const confirmedUnsentQuery = queried && current.status === "unknown" && current.target_snapshot?.host === "codex"
+      const confirmedUnsentQuery = queried && current.status === "unknown" && ["codex", "windsurf"].includes(current.target_snapshot?.host)
         && outcome.evidence?.kind === "receipt" && outcome.evidence.operation === "query" && outcome.evidence.request_sent === false;
       const status = outcome.outcome === "busy" ? queried && !confirmedUnsentQuery ? "unknown" : "prepared" : outcome.outcome;
+      if (queried && current.status === "unknown" && status === "unknown"
+        && current.evidence?.outcome === outcome.outcome
+        && (current.error?.code ?? null) === (outcome.error?.code ?? null)) {
+        return;
+      }
       this.changeDelivery(deliveryId, status, { outcome: outcome.outcome, error: outcome.error ?? null, evidence: copy(outcome) }, append);
     });
   }
@@ -948,7 +1176,7 @@ export class CommunicationCore {
     }
   }
 
-  async callReplyObserver(adapter, message, delivery, target) {
+  async callReplyObserver(adapter, message, delivery, target, release) {
     const controller = new AbortController();
     this.controllers.add(controller);
     let onAbort;
@@ -963,6 +1191,7 @@ export class CommunicationCore {
     }).then(result => controller.signal.aborted ? null : safeObservedReply(result, target, delivery), () => null).finally(() => {
       this.controllers.delete(controller);
       this.replyInvocations.delete(invocation);
+      release?.();
     });
     this.replyInvocations.add(invocation);
     try {
@@ -973,32 +1202,69 @@ export class CommunicationCore {
     }
   }
 
+  replyCandidate(delivery) {
+    if (!delivery || delivery.status !== "accepted") return null;
+    const message = this.store.getMessage(delivery.message_id);
+    if (!message || this.hasReply(message.message_id)) return null;
+    let target;
+    try {
+      target = this.currentDispatchTarget(message, delivery);
+    } catch (error) {
+      if (!(error instanceof CoreError)) throw error;
+      return null;
+    }
+    const adapter = lookupAdapter(this.adapters, target.adapter_id);
+    return typeof adapter?.observeReply === "function" ? { delivery, message, target, adapter } : null;
+  }
+
+  waitingCodexReply(pass, prioritized) {
+    if (!this.codexReplies.available(pass.waiting)) return null;
+    let first = null;
+    let next = null;
+    for (const [messageId, listeners] of this.waiters.entries()) {
+      if (!this.codexReplies.activelyWaiting(listeners)) continue;
+      const delivery = this.store.getDeliveryForMessage(messageId);
+      if (!delivery || prioritized.has(delivery.delivery_id) || this.codexReplies.reading.has(delivery.delivery_id)) continue;
+      const candidate = this.replyCandidate(delivery);
+      if (!candidate || candidate.target.host !== "codex" || !this.codexReplies.isOld(pass, candidate.message, delivery)) continue;
+      if (!first || delivery.delivery_id < first.delivery.delivery_id) first = candidate;
+      if ((this.codexReplies.waiting.cursor === null || delivery.delivery_id > this.codexReplies.waiting.cursor)
+        && (!next || delivery.delivery_id < next.delivery.delivery_id)) next = candidate;
+    }
+    if (!next && first) this.codexReplies.waiting.cursor = null;
+    return next ?? first;
+  }
+
   pollReplies() {
     this.assertOpen();
     if (this.replyPollPromise) return this.replyPollPromise;
     const poll = Promise.resolve().then(async () => {
       let checked = 0;
       let replies = 0;
+      const codexPass = this.codexReplies.begin();
+      const prioritized = new Set();
+      let scanned = true;
       for (const deliveries of this.deliveryPages(["accepted"], REPLY_PAGE_SIZE)) {
-        if (this.closed || this.replyInvocations.size >= this.maxConcurrent) break;
+        if (this.closed || this.replyInvocations.size >= this.maxConcurrent) { scanned = false; break; }
         let nextIndex = 0;
         const worker = async () => {
           while (!this.closed && nextIndex < deliveries.length && this.replyInvocations.size < this.maxConcurrent) {
-            const delivery = this.store.getDelivery(deliveries[nextIndex++].delivery_id);
-            if (!delivery || delivery.status !== "accepted") continue;
-            const message = this.store.getMessage(delivery.message_id);
-            if (!message || this.hasReply(message.message_id)) continue;
-            let target;
-            try {
-              target = this.currentDispatchTarget(message, delivery);
-            } catch (error) {
-              if (!(error instanceof CoreError)) throw error;
-              continue;
+            const waiting = this.waitingCodexReply(codexPass, prioritized);
+            let candidate = waiting;
+            if (!candidate) {
+              const deliveryId = deliveries[nextIndex++].delivery_id;
+              if (prioritized.has(deliveryId)) continue;
+              candidate = this.replyCandidate(this.store.getDelivery(deliveryId));
             }
-            const adapter = lookupAdapter(this.adapters, target.adapter_id);
-            if (typeof adapter?.observeReply !== "function") continue;
+            if (!candidate) continue;
+            const { delivery, message, target, adapter } = candidate;
+            if (waiting) prioritized.add(delivery.delivery_id);
+            const release = target.host === "codex"
+              ? this.codexReplies.reserve(codexPass, message, delivery, this.waiters.get(message.message_id))
+              : undefined;
+            if (release === null) continue;
             checked += 1;
-            const reply = await this.callReplyObserver(adapter, message, delivery, target);
+            const reply = await this.callReplyObserver(adapter, message, delivery, target, release);
             if (!reply || this.closed) continue;
             const appended = this.transaction(append => {
               const currentDelivery = this.store.getDelivery(delivery.delivery_id);
@@ -1044,7 +1310,9 @@ export class CommunicationCore {
         const workers = await Promise.allSettled(Array.from({ length: Math.min(this.maxConcurrent, deliveries.length) }, worker));
         const failed = workers.find(result => result.status === "rejected");
         if (failed) throw failed.reason;
+        if (nextIndex < deliveries.length) scanned = false;
       }
+      this.codexReplies.finish(codexPass, scanned && !this.closed);
       return { checked, replies };
     });
     this.replyPollPromise = poll;

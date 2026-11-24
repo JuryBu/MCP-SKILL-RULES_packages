@@ -6,6 +6,7 @@ import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { CallToolRequestSchema, CancelledNotificationSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import { CoreError, normalizeIdentity } from "./contracts.mjs";
+import { formatRecentSnapshotMcp } from "./host-conversation-content.mjs";
 
 const REQUEST_TIMEOUT_MS = 50000;
 const MAX_ACTIVE_REQUESTS = 16;
@@ -21,7 +22,18 @@ const messages = {
   invalid_attachment_ref: "附件引用已失效或属于其它调用者及窗口，请重读原窗口最近记录",
   channel_content_unavailable: "QQ最近内容入口尚未就绪，请核对提供方实际加载状态",
   channel_content_capacity: "附件引用已达到当前容量，请先核对已有操作",
+  host_content_unavailable: "宿主近期内容入口未就绪，请核对提供方和授权",
+  host_content_unverified: "宿主没有返回可核对的有界内容",
+  host_content_busy: "宿主已有一笔只读查询在运行，本次没有发起",
+  host_content_timeout: "宿主只读查询超时，本次未返回正文",
   binding_changed: "目标绑定已经变化，请重新解析目标",
+  dedupe_conflict: "去重键与已有消息参数不一致，请更换新的 dedupe_key 或保持原请求参数查询",
+  invalid_reply: "in_reply_to 只能填写当前对话作为接收方收到的有效入站 message_id（不可填自己发出的消息，且 target 须对应原发送方）；普通发送可省略 in_reply_to",
+  reply_not_found: "未找到 in_reply_to 指定的原消息，请核对入站 message_id",
+  delivery_mismatch: "处理确认的 delivery_id 与当前接收对话的原投递记录不一致，请先用 get_message 核对",
+  processing_conflict: "该消息已完成终态处理确认，不可逆转修改为其它状态",
+  invalid_state: "当前投递状态尚不支持该处理确认操作，请先用 get_message 核对投递状态",
+  target_not_found: "未找到匹配的目标对话或地址需要明确 surface，请核对 host 与 conversation_id",
   not_found: "没有找到可访问的消息或目标",
   server_closed: "服务正在关闭，等待已经结束",
   request_closed: "请求连接已经关闭",
@@ -66,6 +78,23 @@ function arrayField(field, maximum) {
 }
 
 const booleanField = { schema: { type: "boolean" }, validator: z.boolean() };
+const noteField = {
+  schema: { type: "string", minLength: 1, maxLength: 560, description: "可选；进行中或状态流转时的简短进度备注（最多280字符，原始UTF-8不超过1200字节；终态重复确认保持幂等忽略新备注）。" },
+  validator: z.string()
+    .refine(raw => Buffer.byteLength(raw, "utf8") <= 1200, "note 原始 UTF-8 字节不能超过 1200")
+    .transform(value => value.trim())
+    .refine(value => value.length >= 1 && [...value].length <= 280, "note 去首尾空白后须在 1~280 字符内"),
+};
+const SEND_STATUS_HINTS = {
+  accepted: "传输已接纳（尚未代表对端处理完成，可按 query_hint.get_message 或 query_hint.wait 查询处理与回复）",
+  prepared: "消息已持久化入队，尚未证实对端收到（可按 query_hint.get_message 或 query_hint.wait 跟进投递状态）",
+  dispatching: "消息正在投递中，尚未证实对端收到（可按 query_hint.get_message 或 query_hint.wait 跟进投递状态）",
+  unknown: "投递结果尚未确认，请保持原去重键并按 query_hint.get_message 或 query_hint.wait 查询原消息状态，勿盲目重发",
+  failed_before_send: "消息在发送前已失败，尚未送达对端（可按 query_hint.get_message 查看失败原因）",
+  expired: "消息已超过有效期，未继续投递（可按 query_hint.get_message 查看状态）",
+  unsupported: "目标当前暂不支持该投递策略，消息已保存（可按 query_hint.get_message 查看状态）",
+  failed: "消息投递失败（可按 query_hint.get_message 查看失败原因）",
+};
 const identityFields = {
   machine_id: textField(128),
   host: textField(64),
@@ -103,29 +132,33 @@ function tool(name, method, description, fields, readOnly) {
 }
 
 const tools = [
-  tool("list_conversations", "listConversations", "分页列出当前连接获准访问的对话绑定。保留目标的证据状态，模拟目标会标记 simulated。", {
-    host: optional(textField(64)), limit: optional(integerField(1, 100)), cursor: optional(nullable(textField(512))),
-  }, true),
-  tool("resolve_target", "resolveTarget", "按宿主端和对话ID解析目标，或兼容旧binding_id。已启用宿主无需逐对话开通；返回身份及投递接线，实际在线状态另查。", {
-    binding_id: optional(textField(128)),
-    machine_id: optional(textField(128)), host: optional(textField(64)), surface: optional(textField(64)), conversation_id: optional(textField(256)),
-  }, true),
-  tool("send_message", "sendMessage", "向端和对话ID或已有绑定发消息，默认next_model_boundary，在宿主支持的下一接收边界中途送入，保留原工具。when_idle仅用于明确延后。Codex默认hidden；未知结果沿原ID查询。", {
+  tool("send_message", "sendMessage", "向端和对话ID或已有绑定发消息（最小必填4项示例：{caller:{machine_id,host,surface,conversation_id},origin:{kind:\"agent_message\",channel,source_ref},target:{host,conversation_id},text}；dedupe_key与expires_at可选，默认按同分钟自动生成/24h过期）。默认next_model_boundary中途送入并保留原工具；when_idle仅用于明确延后；Codex默认hidden；in_reply_to仅填本对话收到的入站message_id（普通发送可省）；超240字默认返回精简预览回执（verbose_receipt=true返回全文）；未知结果沿原ID查询。", {
     origin: objectField({
       kind: textField(64, "普通代理协作填写agent_message；本人消息仅由已授权的渠道入口使用human_message，其它来源类型须已在当前连接授权。"),
       channel: textField(64, "原始来源渠道，例如codex或antigravity；保留实际来源。"),
       source_ref: textField(512, "可核对的原来源引用；代理协作通常填写当前真实对话ID。"),
     }),
     target: targetField,
-    dedupe_key: textField(128),
+    dedupe_key: optional(textField(128, "可选；省略时按来源、目标、回复对象、正文与当前分钟桶自动生成去重键，显式传入须非空。")),
     text: textField(262144),
     attachment_refs: optional(arrayField(textField(512), 32)),
     delivery_policy: optional({ schema: { type: "string", enum: ["next_model_boundary", "when_idle"], default: "next_model_boundary", description: "默认能中途插入就插入，原工具继续；仅明确要求延后或宿主确实只支持空闲时用when_idle" }, validator: z.enum(["next_model_boundary", "when_idle"]) }),
     message_visibility: optional({ schema: { type: "string", enum: ["hidden", "visible"], description: "仅用于Codex注入，省略时新消息默认hidden；visible保留全部消息气泡" }, validator: z.enum(["hidden", "visible"]) }),
     reply_required: optional(booleanField),
-    expires_at: textField(64),
+    expires_at: optional(textField(64, "可选；省略时默认24小时后过期，显式传入须为有效ISO时间。")),
     in_reply_to: optional(nullable(textField(256))),
     origin_receipt_binding: optional(nullable(receiptField)),
+    verbose_receipt: optional({ ...booleanField, schema: { type: "boolean", description: "传true返回完整长envelope.text，默认超240字返回预览（text_preview/text_length）。" } }),
+  }, false),
+  tool("get_status", "getStatus", "只读查询宿主在线、目标对话运行与中途投递能力；具体对话另含可取得的模型观察及其来源、时间，区分当前配置与最近实际调用。未知明确保留，不从旧回复或本人休息推断状态。", {
+    binding_id: optional(textField(128)), machine_id: optional(textField(128)), host: optional(textField(64)), surface: optional(textField(64)), conversation_id: optional(textField(256)),
+  }, true),
+  tool("ack_processing", "ackProcessing", "由接收对话确认指定消息的处理状态（必填：caller、message_id、processing；delivery_id与binding_generation可选，省略时由核心按已鉴权接收方自动解析；可选note附简短进度备注），具体状态由核心校验。", {
+    message_id: textField(256),
+    delivery_id: optional(textField(256)),
+    binding_generation: optional(integerField(1)),
+    processing: { schema: { type: "string", enum: ["processing", "done", "failed"] }, validator: z.enum(["processing", "done", "failed"]) },
+    note: optional(noteField),
   }, false),
   tool("get_message", "getMessage", "读取当前来源或接收方有权访问的消息、投递状态与后续事件游标。", {
     message_id: textField(256),
@@ -137,14 +170,17 @@ const tools = [
     wait_ms: optional(integerField(0, 45000)),
     limit: optional(integerField(1, 100)),
   }, true),
-  tool("ack_processing", "ackProcessing", "由接收对话确认指定消息、投递ID和绑定代次的处理状态，具体状态由核心校验。", {
-    message_id: textField(256),
-    delivery_id: textField(256),
-    binding_generation: integerField(1),
-    processing: { schema: { type: "string", enum: ["processing", "done", "failed"] }, validator: z.enum(["processing", "done", "failed"]) },
-  }, false),
-  tool("get_status", "getStatus", "只读查询宿主在线、目标对话运行与中途投递能力；具体对话另含可取得的模型观察及其来源、时间，区分当前配置与最近实际调用。未知明确保留，不从旧回复或本人休息推断状态。", {
-    binding_id: optional(textField(128)), machine_id: optional(textField(128)), host: optional(textField(64)), surface: optional(textField(64)), conversation_id: optional(textField(256)),
+  tool("list_conversations", "listConversations", "默认列获准对话绑定。scope=host 时显式指定本机宿主并分页列获准宿主对话，单页最多50条。", {
+    host: optional(textField(64)), limit: optional(integerField(1, 100)), cursor: optional(nullable(textField(1024))),
+    scope: optional({ schema: { type: "string", enum: ["bindings", "host"], default: "bindings" }, validator: z.enum(["bindings", "host"]) }),
+  }, true),
+  tool("read_recent_snapshot", "readRecentSnapshot", "只读扫一眼获准的本机 Codex、反重力或 WSF 对话。按发言者、时间和实际来源整理近期 Markdown；完整历史与搜索使用 memory-store。", {
+    target: addressField,
+    last_rounds: optional(integerField(1, 5)),
+  }, true),
+  tool("resolve_target", "resolveTarget", "按宿主端和对话ID解析目标，或兼容旧binding_id。已启用宿主无需逐对话开通；返回身份及投递接线，实际在线状态另查。", {
+    binding_id: optional(textField(128)),
+    machine_id: optional(textField(128)), host: optional(textField(64)), surface: optional(textField(64)), conversation_id: optional(textField(256)),
   }, true),
   tool("read_channel_messages", "readChannelMessages", "只读查询已获准QQ窗口的最近消息，包含未@或未引用的普通内容。无需登记采集，不确认原事件；完整宿主历史继续使用原文读取入口。", {
     channel: { schema: { type: "string", enum: ["qq"] }, validator: z.enum(["qq"]) },
@@ -175,6 +211,10 @@ const tools = [
 
 export { tools as communicationTools };
 
+export function listCommunicationToolDefinitions() {
+  return tools.map(({ definition }) => structuredClone(definition));
+}
+
 function toolFailure(error) {
   const code = error instanceof CoreError && /^[a-z][a-z0-9_]{0,63}$/.test(error.code) ? error.code : "internal_error";
   const message = messages[code] ?? "交流操作未完成，请核对当前消息与绑定状态";
@@ -193,9 +233,57 @@ function abortable(operation, signal) {
   });
 }
 
+function stripUndefinedFields(data, omitKeys = []) {
+  const omitted = omitKeys.length ? new Set(omitKeys) : null;
+  const cleaned = {};
+  for (const [key, value] of Object.entries(data)) {
+    if (value === undefined) continue;
+    if (omitted?.has(key)) continue;
+    cleaned[key] = value;
+  }
+  return cleaned;
+}
+
+function projectSendMessageResult(result, verboseReceipt) {
+  if (!result || typeof result !== "object" || !result.message || typeof result.message !== "object"
+    || !result.delivery || typeof result.delivery !== "object") {
+    return result;
+  }
+  const statusHint = SEND_STATUS_HINTS[result.delivery.status] ?? "消息已记录（可按 query_hint.get_message 或 query_hint.wait 查询当前投递与处理状态）";
+  const queryHint = {
+    get_message: { message_id: result.message.message_id },
+    wait: {
+      message_id: result.message.message_id,
+      ...(result.next_cursor !== undefined ? { after_cursor: result.next_cursor } : {}),
+    },
+  };
+  const envelope = result.message.envelope;
+  let projectedMessage = result.message;
+  if (!verboseReceipt && envelope && typeof envelope === "object" && typeof envelope.text === "string" && envelope.text.length > 240) {
+    const { text, ...restEnvelope } = envelope;
+    let cut = 200;
+    const lastCode = text.charCodeAt(cut - 1);
+    if (lastCode >= 0xd800 && lastCode <= 0xdbff) cut -= 1;
+    projectedMessage = {
+      ...result.message,
+      envelope: {
+        ...restEnvelope,
+        text_preview: `${text.slice(0, cut)}...`,
+        text_length: text.length,
+      },
+    };
+  }
+  return {
+    ...result,
+    message: projectedMessage,
+    status_hint: statusHint,
+    query_hint: queryHint,
+  };
+}
+
 function makeServer(core, principalId, requestSignal) {
   const server = new Server({ name: "communication-core-mcp", version: "0.1.0" }, { capabilities: { tools: {} } });
-  server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: tools.map(entry => entry.definition) }));
+  server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: listCommunicationToolDefinitions() }));
   server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
     try {
       const entry = tools.find(candidate => candidate.definition.name === request.params.name);
@@ -203,9 +291,13 @@ function makeServer(core, principalId, requestSignal) {
       const parsed = entry.validator.safeParse(request.params.arguments);
       if (!parsed.success) throw new CoreError("invalid_input", "工具参数无效");
       const signal = AbortSignal.any([requestSignal, extra.signal]);
-      const value = await abortable(() => core[entry.method]({ principal_id: principalId, signal }, parsed.data), signal);
-      const result = value === null && entry.method === "manageChannelBinding" && parsed.data.action === "get" ? { binding: null } : value;
-      if (!result || typeof result !== "object" || Array.isArray(result)) throw new Error("Invalid result");
+      const verboseReceipt = entry.method === "sendMessage" && parsed.data.verbose_receipt === true;
+      const coreArgs = stripUndefinedFields(parsed.data, entry.method === "sendMessage" ? ["verbose_receipt"] : []);
+      const value = await abortable(() => core[entry.method]({ principal_id: principalId, signal }, coreArgs), signal);
+      const rawResult = value === null && entry.method === "manageChannelBinding" && parsed.data.action === "get" ? { binding: null } : value;
+      if (!rawResult || typeof rawResult !== "object" || Array.isArray(rawResult)) throw new Error("Invalid result");
+      if (entry.method === "readRecentSnapshot") return formatRecentSnapshotMcp(rawResult);
+      const result = entry.method === "sendMessage" ? projectSendMessageResult(rawResult, verboseReceipt) : rawResult;
       const serialized = JSON.stringify(result);
       return { structuredContent: result, content: [{ type: "text", text: `交流操作结果：\n${serialized}` }] };
     } catch (error) {

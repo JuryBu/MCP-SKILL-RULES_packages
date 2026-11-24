@@ -218,13 +218,13 @@ function sqlitePointQuery(request) {
   };
   const query = queries[request.kind];
   if (!query || !boundedString(request.path) || !path.isAbsolute(request.path)
-    || !Number.isInteger(request.maxRecordBytes) || request.maxRecordBytes < 256 || request.maxRecordBytes > 65536
+    || !Number.isInteger(request.maxRecordBytes) || request.maxRecordBytes < 256 || request.maxRecordBytes > 1048576
     || request.kind === "cli_session" && (!boundedString(request.key, 128) || !SLUG.test(request.key))
     || request.kind === "desktop_mapping" && (!boundedString(request.key, 256) || !request.key.startsWith(MAPPING_PREFIX)
       || !SLUG.test(request.key.slice(MAPPING_PREFIX.length)))) return { state: "unavailable" };
   let database;
   try {
-    database = new DatabaseSync(request.path, { readOnly: true, timeout: 50, allowExtension: false });
+    database = new DatabaseSync(request.path, { readOnly: true, timeout: 350, allowExtension: false });
     database.enableDefensive(true);
     database.setAuthorizer((action, first, second) => {
       if (action === sqlite.SQLITE_SELECT) return sqlite.SQLITE_OK;
@@ -254,25 +254,43 @@ function sqlitePointQuery(request) {
         for (let offset = 0; nodeId !== null && offset < MAX_INVOCATION_NODES; offset += 1) {
           if (!Number.isSafeInteger(nodeId) || nodeId < 0 || visited.has(nodeId)) throw new Error("invocation_chain_invalid");
           visited.add(nodeId);
-          const node = point("SELECT node_id, parent_node_id, created_at, CASE WHEN length(CAST(chat_message AS BLOB)) BETWEEN 2 AND ? THEN json_valid(chat_message) ELSE 0 END AS valid FROM message_nodes WHERE session_id = ? AND node_id = ?", [request.maxRecordBytes, request.key, nodeId]);
+          const node = point("SELECT node_id, parent_node_id, created_at, length(CAST(chat_message AS BLOB)) AS bytes, CASE WHEN length(CAST(chat_message AS BLOB)) BETWEEN 2 AND ? THEN json_valid(chat_message) ELSE json_valid(chat_message) END AS valid FROM message_nodes WHERE session_id = ? AND node_id = ?", [request.maxRecordBytes, request.key, nodeId]);
           if (!node || node.valid !== 1 || node.node_id !== nodeId
             || node.parent_node_id !== null && (!Number.isSafeInteger(node.parent_node_id) || node.parent_node_id < 0 || node.parent_node_id >= nodeId)) throw new Error("invocation_node_invalid");
+          if (Number(node.bytes) > request.maxRecordBytes) {
+            const roleOnly = point("SELECT CASE WHEN json_type(chat_message, '$.role') = 'text' AND length(CAST(json_extract(chat_message, '$.role') AS BLOB)) BETWEEN 1 AND 32 THEN json_extract(chat_message, '$.role') END AS role FROM message_nodes WHERE session_id = ? AND node_id = ?", [request.key, nodeId]);
+            if (!["assistant", "user", "tool", "system"].includes(roleOnly?.role)) throw new Error("invocation_role_invalid");
+            if (roleOnly.role !== "assistant") {
+              nodeId = node.parent_node_id;
+              continue;
+            }
+            throw new Error("invocation_node_invalid");
+          }
           const fields = { role: "$.role", model: "$.metadata.generation_model", request_id: "$.metadata.request_id",
-            started_at: "$.metadata.started_generation_at", completed_at: "$.metadata.created_at", finish_reason: "$.metadata.finish_reason" };
-          const projection = Object.entries(fields).map(([name, field]) => `CASE WHEN json_type(chat_message, '${field}') = 'text' AND length(CAST(json_extract(chat_message, '${field}') AS BLOB)) BETWEEN 1 AND 128 THEN json_extract(chat_message, '${field}') END AS ${name}`);
+            started_at: "$.metadata.started_generation_at", completed_at: "$.metadata.created_at", finish_reason: "$.metadata.finish_reason",
+            telemetry_op: "$.metadata.telemetry.operation" };
+          const projection = [
+            ...Object.entries(fields).map(([name, field]) => `CASE WHEN json_type(chat_message, '${field}') = 'text' AND length(CAST(json_extract(chat_message, '${field}') AS BLOB)) BETWEEN 1 AND 128 THEN json_extract(chat_message, '${field}') END AS ${name}`),
+            "json_type(chat_message, '$.metadata.finish_reason') AS finish_reason_type",
+          ];
           const selected = point(`SELECT ${projection.join(", ")} FROM message_nodes WHERE session_id = ? AND node_id = ?`, [request.key, nodeId]);
           if (!["assistant", "user", "tool", "system"].includes(selected?.role)) throw new Error("invocation_role_invalid");
           if (selected.role === "assistant") {
+            if (typeof selected.model === "string" && selected.model.toLowerCase() === "compactor") {
+              nodeId = node.parent_node_id;
+              continue;
+            }
             const timestamp = value => typeof value === "string" && /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d{1,9})?Z$/u.test(value) && Number.isFinite(Date.parse(value));
             if (!persistedModel(selected.model) || [UNKNOWN, "model_observed"].includes(selected.model.toLowerCase())
               || !/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/iu.test(selected.request_id ?? "")
               || !timestamp(selected.started_at) || !timestamp(selected.completed_at)
               || Date.parse(selected.started_at) > Date.parse(selected.completed_at)
-              || !persistedModel(selected.finish_reason)
+              || !(persistedModel(selected.finish_reason) || (selected.finish_reason === null && selected.finish_reason_type === "null" && selected.telemetry_op === "inference"))
               || !Number.isSafeInteger(node.created_at) || node.created_at < 0 || !Number.isFinite(new Date(node.created_at * 1000).getTime())) throw new Error("invocation_metadata_invalid");
             if (invocation && selected.request_id !== invocation.request_id) break;
             if (invocation && ["model", "started_at", "completed_at", "finish_reason"].some(field => selected[field] !== invocation[field])) throw new Error("invocation_duplicate_conflict");
-            invocation ??= { ...selected, node_id: nodeId, created_at: new Date(node.created_at * 1000).toISOString() };
+            const { telemetry_op: _telemetryOp, finish_reason_type: _finishReasonType, ...invocationFields } = selected;
+            invocation ??= { ...invocationFields, node_id: nodeId, created_at: new Date(node.created_at * 1000).toISOString() };
           }
           nodeId = node.parent_node_id;
         }
@@ -348,18 +366,24 @@ export function createWindsurfDesktopStatusReader({
   executeDatabase = executeFile,
   listProcesses,
   queryDatabase = defaultQueryDatabase,
+  configured_delivery_modes = MODES,
+  transportProbe,
   now = () => Date.now(),
   timeoutMs = 4000,
   databaseTimeoutMs = 750,
   maxRecordBytes = 65536,
+  processCacheTtlMs = 2500,
+  serializeDatabase = false,
 } = {}) {
   if (typeof execute !== "function" || typeof executeDatabase !== "function" || listProcesses !== undefined && typeof listProcesses !== "function"
     || typeof queryDatabase !== "function" || typeof now !== "function" || !Array.isArray(installRoots)
     || installRoots.length > 16 || !installRoots.every(root => boundedString(root) && path.isAbsolute(root))
     || [userDataDir, cliDataDir].some(root => root !== undefined && (!boundedString(root) || !path.isAbsolute(root)))
-    || !Number.isInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 8000
-    || !Number.isInteger(databaseTimeoutMs) || databaseTimeoutMs < 1 || databaseTimeoutMs > 2000
-    || !Number.isInteger(maxRecordBytes) || maxRecordBytes < 256 || maxRecordBytes > 65536) {
+    || !Number.isInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 15000
+    || !Number.isInteger(databaseTimeoutMs) || databaseTimeoutMs < 1 || databaseTimeoutMs > 4000
+    || !Number.isInteger(maxRecordBytes) || maxRecordBytes < 256 || maxRecordBytes > 1048576
+    || !Number.isInteger(processCacheTtlMs) || processCacheTtlMs < 0 || processCacheTtlMs > 10000
+    || typeof serializeDatabase !== "boolean") {
     throw new CoreError("invalid_config", "WSF Desktop只读状态读取器配置无效");
   }
   installRoots = [...installRoots];
@@ -367,7 +391,11 @@ export function createWindsurfDesktopStatusReader({
   const pending = new Set();
   const controllers = new Set();
   const nativeExecutions = new Set();
+  const MAX_DATABASE_QUEUE = 16;
+  const databaseQueue = [];
   let databaseActive = false;
+  const useProcessCache = !listProcesses && execute === executeFile && processCacheTtlMs > 0;
+  let processCache;
   let processFlight;
 
   function dependency(promise, signal, owned = false) {
@@ -427,6 +455,11 @@ export function createWindsurfDesktopStatusReader({
 
   async function processes(signal) {
     signal.throwIfAborted();
+    if (useProcessCache && processCache) {
+      const age = now() - processCache.at;
+      if (age >= 0 && age < processCacheTtlMs) return structuredClone(processCache.snapshot);
+      processCache = undefined;
+    }
     let flight = processFlight;
     while (flight?.controller.signal.aborted) {
       await cancellable(flight.promise.catch(() => {}), signal);
@@ -436,7 +469,13 @@ export function createWindsurfDesktopStatusReader({
     if (!flight) {
       flight = { controller: new AbortController(), waiters: 0, settled: false };
       const current = flight;
-      flight.promise = Promise.resolve().then(() => queryProcesses(current.controller.signal)).finally(() => {
+      flight.promise = Promise.resolve().then(async () => {
+        const result = await queryProcesses(current.controller.signal);
+        if (useProcessCache && !closed && result?.host_online !== UNKNOWN) {
+          processCache = { at: now(), snapshot: structuredClone(result) };
+        }
+        return result;
+      }).finally(() => {
         current.settled = true;
         if (processFlight === current) processFlight = undefined;
       });
@@ -451,13 +490,56 @@ export function createWindsurfDesktopStatusReader({
     }
   }
 
+  function acquireDatabaseSlot(signal) {
+    signal.throwIfAborted();
+    if (!databaseActive) {
+      databaseActive = true;
+      return Promise.resolve(true);
+    }
+    if (!serializeDatabase || databaseQueue.length >= MAX_DATABASE_QUEUE) return Promise.resolve(false);
+    return new Promise((resolve, reject) => {
+      const waiter = {
+        signal,
+        settled: false,
+        resolve,
+        reject,
+        onAbort() {
+          if (waiter.settled) return;
+          waiter.settled = true;
+          const index = databaseQueue.indexOf(waiter);
+          if (index >= 0) databaseQueue.splice(index, 1);
+          reject(signal.reason);
+        },
+      };
+      signal.addEventListener("abort", waiter.onAbort, { once: true });
+      databaseQueue.push(waiter);
+    });
+  }
+
+  function releaseDatabaseSlot() {
+    while (databaseQueue.length > 0) {
+      const next = databaseQueue.shift();
+      if (next.settled) continue;
+      next.settled = true;
+      next.signal.removeEventListener("abort", next.onAbort);
+      if (next.signal.aborted) {
+        next.reject(next.signal.reason);
+        continue;
+      }
+      next.resolve(true);
+      return;
+    }
+    databaseActive = false;
+  }
+
   async function pointQuery(root, parts, kind, key, signal) {
     const file = await safeFile(root, parts, signal);
     if (file.state !== "ready") return file;
-    if (databaseActive) return { state: "busy" };
-    databaseActive = true;
+    const acquired = await acquireDatabaseSlot(signal);
+    if (!acquired) return { state: "busy" };
     let headerHandle;
     try {
+      signal.throwIfAborted();
       const sidecars = {};
       for (const suffix of ["-wal", "-shm", "-journal"]) {
         const entry = await files.lstat(`${file.path}${suffix}`).catch(error => {
@@ -488,7 +570,7 @@ export function createWindsurfDesktopStatusReader({
       try {
         await headerHandle?.close();
       } finally {
-        databaseActive = false;
+        releaseDatabaseSlot();
       }
     }
   }
@@ -566,9 +648,28 @@ export function createWindsurfDesktopStatusReader({
     if (result.conversation_exists === false) result.conversation_running = false;
     const modelOptions = Array.isArray(info?.configOptions) ? info.configOptions.filter(entry => record(entry) && entry.id === "model") : [];
     const selection = modelOptions.length === 1 ? persistedModel(modelOptions[0].currentValue) : undefined;
-    observation.current_selection = { model: UNKNOWN, code: "model_renderer_selection_missing",
-      source: "windsurf_devin_meta_info_configOptions_model_currentValue_persisted", observed_at: observedAt,
-      conversation_id: identity.desktopId, ...(boundedString(selection, 128) ? { raw_model: selection } : {}) };
+    const liveTransport = typeof transportProbe === "function" ? await transportProbe(target, { signal }).catch(() => null) : null;
+    if (liveTransport?.live_model && persistedModel(liveTransport.live_model)) {
+      observation.current_selection = {
+        model: liveTransport.live_model,
+        source: "windsurf_devin_acp_live_config_options",
+        field: "configOptions.model.currentValue",
+        conversation_id: identity.slug ?? identity.desktopId,
+        observed_at: observedAt,
+      };
+    } else if (liveTransport && selection && (liveTransport.persisted_model === selection || liveTransport.persisted_model === null)) {
+      observation.current_selection = {
+        model: selection,
+        source: "windsurf_devin_meta_info_configOptions_model_currentValue_persisted",
+        field: "configOptions.model.currentValue",
+        conversation_id: identity.desktopId,
+        observed_at: observedAt,
+      };
+    } else {
+      observation.current_selection = { model: UNKNOWN, code: "model_renderer_selection_missing",
+        source: "windsurf_devin_meta_info_configOptions_model_currentValue_persisted", observed_at: observedAt,
+        conversation_id: identity.desktopId, ...(boundedString(selection, 128) ? { raw_model: selection } : {}) };
+    }
     observation.last_invocation = { model: UNKNOWN, source: "windsurf_devin_invocation_metadata_not_observed", code: "model_invocation_not_exposed", observed_at: observedAt };
     if (record(cli.invocation)) {
       const invocation = cli.invocation;
@@ -579,20 +680,33 @@ export function createWindsurfDesktopStatusReader({
     }
     result.model_observation = projectModelObservation(observation, SOURCE);
     result.session_lock_evidence = await lockEvidence(identity.slug, snapshot, signal);
+    if (result.conversation_exists === true && liveTransport) {
+      if (typeof liveTransport.conversation_running === "boolean") result.conversation_running = liveTransport.conversation_running;
+      if (snapshot.host_online === true && liveTransport.can_deliver === true) result.can_deliver = true;
+    }
     if (result.conversation_exists === UNKNOWN) result.code = "ls_target_unavailable";
     return result;
   }
 
+  const effectiveModes = Object.freeze({
+    next_model_boundary: configured_delivery_modes?.next_model_boundary === true,
+    when_idle: configured_delivery_modes?.when_idle === true,
+  });
+
   return {
     source: SOURCE,
     requires_host_status: true,
-    configured_delivery_modes: MODES,
+    configured_delivery_modes: effectiveModes,
     getHostStatus(target, { signal } = {}) {
       return operation(async currentSignal => {
         if (!record(target) || target.host !== undefined && target.host !== "windsurf") return { host_online: UNKNOWN, can_deliver: false, code: "ls_target_mismatch" };
         const snapshot = await processes(currentSignal);
+        const liveHost = typeof transportProbe === "function" && snapshot.host_online === true
+          ? await transportProbe(null, { signal: currentSignal }).catch(() => null)
+          : null;
+        const transportReady = Boolean(snapshot.host_online === true && liveHost?.transport_ready === true && (effectiveModes.next_model_boundary || effectiveModes.when_idle));
         return { host_online: snapshot.host_online, observed_at: new Date(now()).toISOString(),
-          transport_ready: false, host_can_receive: false, can_deliver: false,
+          transport_ready: transportReady, host_can_receive: transportReady, can_deliver: false,
           ...(snapshot.host_online === false ? { code: "ls_process_not_found" } : snapshot.host_online === UNKNOWN ? { code: "ls_discovery_failed" } : {}) };
       }, signal);
     },
@@ -601,6 +715,7 @@ export function createWindsurfDesktopStatusReader({
     },
     async close() {
       closed = true;
+      processCache = undefined;
       const discovery = processFlight;
       discovery?.controller.abort("status_closed");
       for (const controller of controllers) controller.abort("status_closed");

@@ -11,7 +11,7 @@ const MAX_BINDING_ID_BYTES = 128;
 const MAX_DIRECTORY_KEY_BYTES = 4096;
 const UNSAFE_DIRECTORY_KEYS = new Set(["__proto__", "prototype", "constructor"]);
 const MESSAGE_PATCH_FIELDS = [
-  "delivery_status", "processing", "model_observed", "ui_observed",
+  "delivery_status", "processing", "processing_note", "model_observed", "ui_observed",
   "error", "last_error", "evidence", "updated_at",
 ];
 const DELIVERY_PATCH_FIELDS = [
@@ -202,6 +202,7 @@ export class MessageStore {
           record_json TEXT NOT NULL CHECK (json_valid(record_json))
         ) STRICT;
         CREATE INDEX IF NOT EXISTS deliveries_status_id ON deliveries (status, delivery_id);
+        CREATE INDEX IF NOT EXISTS deliveries_target ON deliveries (target_key);
         CREATE TABLE IF NOT EXISTS message_events (
           message_id TEXT NOT NULL REFERENCES messages (message_id),
           sequence INTEGER NOT NULL CHECK (sequence BETWEEN 1 AND 9007199254740991),
@@ -520,6 +521,31 @@ export class MessageStore {
   getDeliveryForMessage(messageId) {
     this.#assertOpen();
     return decodeRecord(this.#database.prepare("SELECT record_json FROM deliveries WHERE message_id = ?").get(messageId));
+  }
+
+  latestDeliveryIssueForTarget(targetKey) {
+    this.#assertOpen();
+    requireText(targetKey, "target_key", MAX_DIRECTORY_KEY_BYTES);
+    const row = this.#database.prepare(`
+      SELECT record_json FROM deliveries WHERE target_key = ? ORDER BY rowid DESC LIMIT 1
+    `).get(targetKey);
+    const delivery = decodeRecord(row);
+    if (!delivery) return null;
+    if (delivery.status === "prepared" && delivery.evidence?.outcome === "busy") return null;
+    const error = delivery.error ?? null;
+    const isIssueStatus = delivery.status === "failed"
+      || delivery.status === "failed_before_send"
+      || delivery.status === "expired"
+      || delivery.status === "unknown"
+      || delivery.status === "unsupported";
+    if (error === null && !isIssueStatus) return null;
+    return {
+      delivery_id: delivery.delivery_id,
+      message_id: delivery.message_id,
+      status: delivery.status,
+      updated_at: delivery.updated_at,
+      ...(error !== null ? { error } : {}),
+    };
   }
 
   insertDelivery(record) {

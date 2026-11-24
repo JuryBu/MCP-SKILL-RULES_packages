@@ -1,5 +1,5 @@
 import { mkdir, readFile, stat } from "node:fs/promises";
-import { isAbsolute, join, resolve } from "node:path";
+import { basename, isAbsolute, join, resolve } from "node:path";
 import { CoreError, assertExactKeys, digest, identityKey, normalizeIdentity, normalizeTarget, requireInteger, requireText } from "./contracts.mjs";
 import { CommunicationCore } from "./core.mjs";
 import { MessageStore } from "./store.mjs";
@@ -15,14 +15,21 @@ import { NapcatOwnerAdapter } from "./adapters/napcat-owner.mjs";
 import { acquireRuntimeLease } from "./runtime-lease.mjs";
 import { normalizeReplyForwardingRules } from "./reply-forwarding.mjs";
 import { normalizeHostScope } from "./conversation-directory.mjs";
+import { HostConversationContent, normalizeHostContentGrants } from "./host-conversation-content.mjs";
+import { createCodexConversationContent } from "./codex-conversation-content.mjs";
+import { createAntigravityConversationContent } from "./antigravity-conversation-content.mjs";
+import { createAntigravitySummaryIndex } from "./antigravity-summary-index.mjs";
+import { WindsurfAcpDeliveryAdapter } from "./adapters/windsurf-acp.mjs";
+import { WindsurfAcpTransport } from "./transports/windsurf-acp-transport.mjs";
+import { createWindsurfConversationContent } from "./windsurf-conversation-content.mjs";
 import { HostStatusProvider, createAntigravityStatusReader, createCodexStatusReader } from "./host-status.mjs";
 import { createWindsurfDesktopStatusReader } from "./windsurf-desktop-status.mjs";
 import { WindowIngressController } from "./window-ingress.mjs";
 
 const MAX_ENTRIES = 256;
 const IDENTITY_FIELDS = ["machine_id", "host", "surface", "conversation_id"];
-const ADAPTER_KINDS = new Set(["antigravity", "codex_proxy", "napcat_owner"]);
-const ADAPTER_HOSTS = { antigravity: "antigravity", codex_proxy: "codex", napcat_owner: "qq" };
+const ADAPTER_KINDS = new Set(["antigravity", "codex_proxy", "napcat_owner", "windsurf_acp"]);
+const ADAPTER_HOSTS = { antigravity: "antigravity", codex_proxy: "codex", napcat_owner: "qq", windsurf_acp: "windsurf" };
 
 function invalidConfiguration() {
   return new CoreError("invalid_config", "真实测试配置无效，请核对显式目标、授权与接入列表");
@@ -148,7 +155,9 @@ async function readConfiguration(configPath) {
     const adapterIds = new Set();
     const adapters = boundedList(configuration.adapters).map(entry => {
       const allowed = entry.kind === "codex_proxy" ? ["id", "kind", "connection_file"]
-        : entry.kind === "napcat_owner" ? ["id", "kind", "base_url", "route_key", "conversation_id", "reply_hint", "reply_events"] : ["id", "kind"];
+        : entry.kind === "napcat_owner" ? ["id", "kind", "base_url", "route_key", "conversation_id", "reply_hint", "reply_events"]
+        : entry.kind === "windsurf_acp" ? ["id", "kind", "max_active_clients", "idle_ttl_ms"]
+        : ["id", "kind", "conversation_index_file"];
       assertExactKeys(entry, allowed, "接入模块");
       const id = requireText(entry.id, "adapter.id", 128);
       if (adapterIds.has(id) || !ADAPTER_KINDS.has(entry.kind)) throw invalidConfiguration();
@@ -158,6 +167,11 @@ async function readConfiguration(configPath) {
         if (!isAbsolute(connectionFile)) throw invalidConfiguration();
         return { id, kind: entry.kind, connection_file: connectionFile };
       }
+      if (entry.kind === "windsurf_acp") {
+        const maxActive = entry.max_active_clients === undefined ? 8 : requireInteger(entry.max_active_clients, "max_active_clients", 1, 16);
+        const idleTtl = entry.idle_ttl_ms === undefined ? 180000 : requireInteger(entry.idle_ttl_ms, "idle_ttl_ms", 15000, 3600000);
+        return { id, kind: entry.kind, max_active_clients: maxActive, idle_ttl_ms: idleTtl };
+      }
       if (entry.kind === "napcat_owner") return {
         id, kind: entry.kind,
         base_url: requireText(entry.base_url, "base_url", 2048),
@@ -166,7 +180,10 @@ async function readConfiguration(configPath) {
         ...(entry.reply_hint === undefined ? {} : { reply_hint: requireText(entry.reply_hint, "reply_hint", 512) }),
         ...(entry.reply_events === undefined ? {} : { reply_events: ownerReplyConfiguration(entry.reply_events) }),
       };
-      return { id, kind: entry.kind };
+      if (entry.conversation_index_file === undefined) return { id, kind: entry.kind };
+      const indexFile = requireText(entry.conversation_index_file, "conversation_index_file", 32768);
+      if (!isAbsolute(indexFile) || basename(indexFile) !== "conversation_summaries.db") throw invalidConfiguration();
+      return { id, kind: entry.kind, conversation_index_file: indexFile };
     });
     const bindingIds = new Set();
     const targetIdentities = new Set();
@@ -192,7 +209,7 @@ async function readConfiguration(configPath) {
     const principalIds = new Set();
     const tokens = new Set();
     const principals = boundedList(configuration.principals).map(entry => {
-      assertExactKeys(entry, ["id", "token", "identity", "allowed_targets", "origin_kinds", "channel_component", "caller_scope", "allowed_target_scopes", "allowed_channel_reads", "allowed_channel_downloads"], "连接授权");
+      assertExactKeys(entry, ["id", "token", "identity", "allowed_targets", "origin_kinds", "channel_component", "caller_scope", "allowed_target_scopes", "allowed_channel_reads", "allowed_channel_downloads", "allowed_host_lists", "allowed_host_snapshots"], "连接授权");
       assertExactKeys(entry.identity, IDENTITY_FIELDS, "来源对话身份");
       const id = requireText(entry.id, "principal.id", 128);
       const token = requireText(entry.token, "principal.token", 4096);
@@ -216,6 +233,8 @@ async function readConfiguration(configPath) {
       if (targetScopes && new Set(targetScopes.map(scope => JSON.stringify(scope))).size !== targetScopes.length) throw invalidConfiguration();
       const originKinds = uniqueTextList(entry.origin_kinds ?? ["agent_message"], "origin_kind", 32, 1, 64);
       if (callerScope && originKinds.some(kind => kind !== "agent_message")) throw invalidConfiguration();
+      const hostLists = entry.allowed_host_lists === undefined ? undefined : normalizeHostContentGrants(entry.allowed_host_lists, false);
+      const hostSnapshots = entry.allowed_host_snapshots === undefined ? undefined : normalizeHostContentGrants(entry.allowed_host_snapshots, true);
       return {
         id,
         token,
@@ -223,6 +242,8 @@ async function readConfiguration(configPath) {
         allowed_targets: allowedTargets,
         ...(channelReads === undefined ? {} : { allowed_channel_reads: channelReads }),
         ...(channelDownloads === undefined ? {} : { allowed_channel_downloads: channelDownloads }),
+        ...(hostLists === undefined ? {} : { allowed_host_lists: hostLists }),
+        ...(hostSnapshots === undefined ? {} : { allowed_host_snapshots: hostSnapshots }),
         ...(callerScope ? { caller_scope: callerScope } : {}),
         ...(targetScopes ? { allowed_target_scopes: targetScopes } : {}),
         origin_kinds: originKinds,
@@ -290,6 +311,7 @@ export async function startLiveFromConfig({ configPath, stateDir, endpointFile, 
   const transports = new Set();
   const windowTransports = new Map();
   const statusProvider = new HostStatusProvider();
+  const hostContentProviders = Object.create(null);
   if (configuration.statusHosts.includes("windsurf")) statusProvider.providers.set("windsurf", createWindsurfDesktopStatusReader());
   let store;
   let downloadLedger;
@@ -355,18 +377,53 @@ export async function startLiveFromConfig({ configPath, stateDir, endpointFile, 
         transports.add(transport);
         created = new AntigravityDeliveryAdapter({ transport });
         statusProvider.providers.set("antigravity", createAntigravityStatusReader(transport, { configured_delivery_modes: { next_model_boundary: true, when_idle: true } }));
+        const summaryIndex = entry.conversation_index_file ? createAntigravitySummaryIndex({ filePath: entry.conversation_index_file }) : undefined;
+        if (summaryIndex) transports.add(summaryIndex);
+        hostContentProviders.antigravity = createAntigravityConversationContent(transport, { summaryIndex, getMessageForDelivery: id => {
+          const delivery = store?.getDelivery(id);
+          return delivery ? store.getMessage(delivery.message_id) : null;
+        } });
       } else if (entry.kind === "codex_proxy") {
         const information = await stat(entry.connection_file);
         if (!information.isFile() || information.size > 65536) throw invalidConfiguration();
         const connection = JSON.parse((await readFile(entry.connection_file, "utf8")).replace(/^\uFEFF/, ""));
-        assertExactKeys(connection, ["base_url", "token", "relay", "source_recovery", "status_source"], "Codex控制连接");
+        assertExactKeys(connection, ["base_url", "token", "relay", "source_recovery", "status_source", "content_read_token"], "Codex控制连接");
         const sourceRecovery = Object.hasOwn(connection, "source_recovery") ? await loadCodexSourceRecovery(connection.source_recovery) : undefined;
-        const transport = new CodexProxyTransport({ baseUrl: connection.base_url, token: connection.token, sourceRecovery, ...(connection.relay === undefined ? {} : { relay: connection.relay }) });
+        const transport = new CodexProxyTransport({ baseUrl: connection.base_url, token: connection.token, contentReadToken: connection.content_read_token, sourceRecovery, ...(connection.relay === undefined ? {} : { relay: connection.relay }) });
         transports.add(transport);
         created = new CodexDeliveryAdapter({ transport });
-        if (connection.status_source !== undefined) statusProvider.providers.set("codex", createCodexStatusReader({
-          ...await loadCodexStatusSource(connection.status_source), configured_delivery_modes: { next_model_boundary: true, when_idle: true },
+        const codexStatus = connection.status_source === undefined ? undefined : await loadCodexStatusSource(connection.status_source);
+        if (codexStatus) statusProvider.providers.set("codex", createCodexStatusReader({
+          ...codexStatus, configured_delivery_modes: { next_model_boundary: true, when_idle: true },
         }));
+        if (connection.content_read_token !== undefined) {
+          hostContentProviders.codex = createCodexConversationContent(transport, { inspectThread: codexStatus?.inspectThread });
+        }
+      } else if (entry.kind === "windsurf_acp") {
+        const priorWindsurfReader = statusProvider.providers.get("windsurf");
+        if (priorWindsurfReader) await priorWindsurfReader.close?.().catch(() => {});
+        const transport = new WindsurfAcpTransport({ maxActiveClients: entry.max_active_clients, idleTtlMs: entry.idle_ttl_ms });
+        transports.add(transport);
+        created = new WindsurfAcpDeliveryAdapter({
+          clientForTarget: (target, ctx) => transport.clientForTarget(target, ctx),
+          verifyPersistedDelivery: (target, ctx) => transport.verifyPersistedDelivery(target, ctx),
+        });
+        statusProvider.providers.set("windsurf", createWindsurfDesktopStatusReader({
+          configured_delivery_modes: { next_model_boundary: true, when_idle: true },
+          transportProbe: (target, ctx) => transport.probeStatus(target, ctx),
+          timeoutMs: 8000,
+          databaseTimeoutMs: 2000,
+          maxRecordBytes: 524288,
+          processCacheTtlMs: 5000,
+          serializeDatabase: true,
+        }));
+        hostContentProviders.windsurf = createWindsurfConversationContent({
+          transport,
+          getMessageForDelivery: id => {
+            const delivery = store?.getDelivery(id);
+            return delivery ? store.getMessage(delivery.message_id) : null;
+          },
+        });
       } else {
         const transport = new NapcatMcpTransport({ baseUrl: entry.base_url, conversationId: entry.conversation_id });
         transports.add(transport);
@@ -396,8 +453,8 @@ export async function startLiveFromConfig({ configPath, stateDir, endpointFile, 
     }
     core = new CommunicationCore({ targets: configuration.targets, principals: configuration.principals, adapters, replyForwarding: configuration.replyForwarding,
       conversationRoutes: configuration.conversationRoutes, automaticReplyForwarding: configuration.automaticReplyForwarding, channelWindows: configuration.channelWindows,
-      ownerWindowSources: configuration.ownerWindowSources, downloadLedger, channelDownloadFailure,
-      statusProvider, deliveryTimeoutMs: configuration.deliveryTimeoutMs });
+      ownerWindowSources: configuration.ownerWindowSources, downloadLedger, channelDownloadFailure, autoCompleteOnReply: true,
+      statusProvider, hostContentProvider: new HostConversationContent({ providers: hostContentProviders }), deliveryTimeoutMs: configuration.deliveryTimeoutMs });
     if (typeof core.pollReplies !== "function") throw new CoreError("startup_failed", "真实测试核心依赖尚未就绪");
     await mkdir(directory, { recursive: true, mode: 0o700 });
     store = new MessageStore({ filePath: join(directory, "core.sqlite") });
