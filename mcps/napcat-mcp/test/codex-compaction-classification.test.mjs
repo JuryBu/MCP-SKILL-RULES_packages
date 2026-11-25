@@ -60,13 +60,12 @@ test("classified compaction body reception is bounded before upstream starts", {
   assert.equal(setup.events.some(event => event.type === "compaction_preparation_timeout"), true);
 });
 
-test("reception time is deducted from the classified compaction upstream budget", { timeout: 16000 }, async context => {
+test("reception time is recorded in classified compaction telemetry while each upstream attempt gets its full compaction budget", { timeout: 16000 }, async context => {
   const setup = await fixture(context);
   const result = await setup.send(true);
   assert.equal(setup.calls(), 1);
-  assert.ok(result.status >= 400);
-  assert.doesNotMatch(result.text, /opaque-classified|assistant|response\.completed/u);
-  assert.ok(result.elapsedMs >= 9900 && result.elapsedMs < 11200);
+  assert.equal(result.status, 200);
+  assert.match(result.text, /opaque-classified/u);
   const start = setup.events.find(event => event.type === "compaction_attempt_started");
   assert.ok(start.timeoutMs > 4500 && start.timeoutMs < 6500);
   assert.equal(start.classifiedTimeoutMs, 10000);

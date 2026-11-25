@@ -135,6 +135,8 @@ async function fixture(context, handler, options = {}) {
       response.once("error", error => finish(error));
     });
     clients.add(client);
+    if (settings.idleTimeoutMs) client.setTimeout(settings.idleTimeoutMs,
+      () => client.destroy(Object.assign(new Error("Loopback SSE client idle timeout"), { code: "CLIENT_SSE_IDLE_TIMEOUT" })));
     client.once("close", () => clients.delete(client));
     client.once("error", error => finish(error));
     guard = setTimeout(() => client.destroy(new Error("Loopback fixture exceeded its 17 second request guard")), 17_000);
@@ -306,13 +308,55 @@ test("unary compaction uses its independent 10 second timeout and returns a JSON
     response.flushHeaders();
   }, { buffered: true, maxConsecutiveAttempts: 1 });
   const result = await setup.request({ unary: true, path: "/backend-api/codex/responses/compact" });
-  assert.equal(result.statusCode, 502);
+  assert.equal(result.statusCode, 422);
   assert.match(result.headers["content-type"], /application\/json/u);
-  assert.match(JSON.parse(result.body).error?.code ?? "", /COMPACTION.*TIMEOUT/u);
+  assert.match(JSON.parse(result.body).error?.code ?? "", /COMPACTION_(?:.*TIMEOUT|RESULT_UNCONFIRMED)/u);
   assert.doesNotMatch(result.body, /response\.completed|"role":"assistant"/u);
   assert.ok(result.elapsedMs >= 9800 && result.elapsedMs < 11_800);
   assert.equal(setup.count(), 1);
   await setup.cleanup(true);
+});
+
+test("managed SSE compaction keeps the client alive throughout a quiet recovery attempt", { timeout: 5000 }, async context => {
+  const service = await fixture(context, (request, response, attempt, { send, later }) => {
+    if (attempt === 1) {
+      later(() => {
+        response.writeHead(503, { "content-type": "application/json" });
+        response.end(JSON.stringify({ error: { code: "server_error", message: "temporary" } }));
+      }, 10);
+      return;
+    }
+    later(() => send(wire(created) + compactOutput, true), 750);
+  }, { managedRecovery: true, managedRetryBaseMs: 10, heartbeatIntervalMs: 100 });
+  const result = await service.request({ idleTimeoutMs: 300 });
+  assert.equal(service.count(), 2);
+  assert.ok(result.events.filter(event => event.type === "ping").length >= 3);
+  assert.deepEqual(result.events.find(event => event.item?.type === "compaction")?.item, opaque);
+  assert.equal(result.events.filter(event => event.type === "response.completed").length, 1);
+  assert.ok(service.events.some(event => event.type === "upstream_attempt_finished" && event.kind === "retryable_failure"));
+  await service.cleanup(true);
+});
+
+test("managed SSE compaction cancellation closes its recovery heartbeat and upstream attempt", { timeout: 5000 }, async context => {
+  const service = await fixture(context, (request, response, attempt, { later }) => {
+    if (attempt === 1) later(() => {
+      response.writeHead(503, { "content-type": "application/json" });
+      response.end(JSON.stringify({ error: { code: "server_error", message: "temporary" } }));
+    }, 10);
+  }, { managedRecovery: true, managedRetryBaseMs: 10, heartbeatIntervalMs: 100 });
+  const controller = new AbortController();
+  let observedPings = 0;
+  const rejected = assert.rejects(service.request({ signal: controller.signal, onData: body => {
+    observedPings = parse(body).filter(event => event.type === "ping").length;
+  } }), /abort/iu);
+  await waitFor(() => service.count() === 2 && observedPings >= 2, "the quiet recovery attempt must stay alive");
+  controller.abort();
+  await rejected;
+  await service.cleanup(true);
+  const terminalPings = observedPings;
+  await sleep(250);
+  assert.equal(observedPings, terminalPings);
+  assert.equal(service.count(), 2);
 });
 
 test("existing default budgets keep compaction at 600 seconds independently of ordinary 40 and adaptive 300", async context => {

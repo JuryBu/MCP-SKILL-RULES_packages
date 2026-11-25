@@ -106,9 +106,9 @@ test("two empty turns survive the real HTTP generation switch and the third stay
   const snapshot = old.prepareThreadHandoff("thread-a");
   const next = await fixture.make();
   next.acceptThreadHandoff(snapshot);
-  assert.match((await fixture.request(next, "three")).body, /proxy_repeated_empty_idle/u);
+  assert.match((await fixture.request(next, "three")).body, /连续三个回合没有模型文本或已完成的工具工作，本回合已停止自动继续/u);
   const before = fixture.count();
-  assert.match((await fixture.request(next, "three")).body, /proxy_repeated_empty_idle/u);
+  assert.match((await fixture.request(next, "three")).body, /连续三个回合没有模型文本或已完成的工具工作，本回合已停止自动继续/u);
   assert.equal(fixture.count(), before);
   assert.equal((await fixture.request(old, "four")).status, 503);
   assert.equal((await fixture.request(old, "other-one", "thread-b")).status, 200);
@@ -123,7 +123,7 @@ test("failed acceptance restores the old source without losing its counter", asy
   const next = await fixture.make();
   assert.throws(() => next.acceptThreadHandoff({ ...snapshot, schemaVersion: 99 }));
   old.cancelThreadHandoff("thread-a", snapshot.token);
-  assert.match((await fixture.request(old, "three")).body, /proxy_repeated_empty_idle/u);
+  assert.match((await fixture.request(old, "three")).body, /连续三个回合没有模型文本或已完成的工具工作，本回合已停止自动继续/u);
 });
 
 test("real progress after the transfer resets empty-turn count", async context => {
@@ -136,7 +136,7 @@ test("real progress after the transfer resets empty-turn count", async context =
   fixture.setMode("success");
   assert.match((await fixture.request(next, "good")).body, /actual progress/u);
   fixture.setMode("quota");
-  assert.doesNotMatch((await fixture.request(next, "new-one")).body, /proxy_repeated_empty_idle/u);
-  assert.doesNotMatch((await fixture.request(next, "new-two")).body, /proxy_repeated_empty_idle/u);
-  assert.match((await fixture.request(next, "new-three")).body, /proxy_repeated_empty_idle/u);
+  assert.doesNotMatch((await fixture.request(next, "new-one")).body, /连续三个回合没有模型文本或已完成的工具工作，本回合已停止自动继续/u);
+  assert.doesNotMatch((await fixture.request(next, "new-two")).body, /连续三个回合没有模型文本或已完成的工具工作，本回合已停止自动继续/u);
+  assert.match((await fixture.request(next, "new-three")).body, /连续三个回合没有模型文本或已完成的工具工作，本回合已停止自动继续/u);
 });

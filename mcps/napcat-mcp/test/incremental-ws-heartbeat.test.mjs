@@ -116,6 +116,7 @@ async function heartbeatFixture(context, { bufferedProxy = false, completeRespon
       let queuedBytes = 0;
       let pumping = false;
       let queueOffset = 0;
+      let nextForwardAt = 0;
       const forward = () => {
         if (upstream.destroyed || downstream.destroyed) return;
         if (link.pauseUntil > performance.now()) {
@@ -124,19 +125,23 @@ async function heartbeatFixture(context, { bufferedProxy = false, completeRespon
         }
         if (link.pauseUntil) {
           link.resumedAfterMs = performance.now() - link.pausedAt;
+          nextForwardAt += link.resumedAfterMs;
           link.pauseUntil = 0;
         }
-        const chunk = queue[0];
-        if (!chunk) { pumping = false; return; }
-        const end = Math.min(queueOffset + 64 * 1024, chunk.length);
-        const part = chunk.subarray(queueOffset, end);
-        upstream.write(part);
-        queuedBytes -= part.length;
-        link.queuedBytes = queuedBytes;
-        link.forwardedBytes += part.length;
-        queueOffset = end;
-        if (end === chunk.length) { queue.shift(); queueOffset = 0; }
-        timers.add(setTimeout(forward, Math.max(1, part.length / bytesPerSecond * 1000)));
+        while (queue.length && nextForwardAt <= performance.now()) {
+          const chunk = queue[0];
+          const end = Math.min(queueOffset + 64 * 1024, chunk.length);
+          const part = chunk.subarray(queueOffset, end);
+          upstream.write(part);
+          queuedBytes -= part.length;
+          link.queuedBytes = queuedBytes;
+          link.forwardedBytes += part.length;
+          queueOffset = end;
+          if (end === chunk.length) { queue.shift(); queueOffset = 0; }
+          nextForwardAt += part.length / bytesPerSecond * 1000;
+        }
+        if (!queue.length) { pumping = false; return; }
+        timers.add(setTimeout(forward, Math.max(1, nextForwardAt - performance.now())));
       };
       downstream.setNoDelay(true);
       upstream.setNoDelay(true);
@@ -148,6 +153,7 @@ async function heartbeatFixture(context, { bufferedProxy = false, completeRespon
         link.cachedBytes += chunk.length;
         link.maxQueuedBytes = Math.max(link.maxQueuedBytes, queuedBytes);
         if (!pumping) {
+          nextForwardAt = performance.now() + 100;
           pumping = true;
           timers.add(setTimeout(forward, 100));
         }
@@ -207,10 +213,11 @@ async function heartbeatFixture(context, { bufferedProxy = false, completeRespon
     });
     socket.on("message", (raw, binary) => {
       clearTimeout(deadline);
-      state.messages.push({ raw: Buffer.from(raw), binary });
+      const responseId = `response_${peers.indexOf(state)}_${state.messages.length + 1}`;
+      state.messages.push({ raw: Buffer.from(raw), binary, responseId });
       if (completeResponses) {
-        socket.send(JSON.stringify({ type: "response.created", response: { id: `response_${peers.indexOf(state)}`, status: "in_progress" } }));
-        socket.send(JSON.stringify({ type: "response.completed", response: { id: `response_${peers.indexOf(state)}`, status: "completed", output: [] } }));
+        socket.send(JSON.stringify({ type: "response.created", response: { id: responseId, status: "in_progress" } }));
+        socket.send(JSON.stringify({ type: "response.completed", response: { id: responseId, status: "completed", output: [] } }));
       }
     });
     socket._socket.on("data", chunk => {
@@ -311,6 +318,7 @@ function requestThroughTransport(transport, fixture, operationId, payload, setti
 function realTransport(fixture) {
   return createIncrementalResponsesTransport({ maxMessageBytes: 16 * 1024 * 1024,
     maxSessionBytes: 64 * 1024 * 1024, responseTimeoutMs: 15000,
+    interruptiblePrewarmBytes: 16 * 1024 * 1024,
     createWebSocket: (url, options) => fixture.createClient(url, options).client });
 }
 
@@ -340,15 +348,28 @@ async function sendFragments(socket, wire, remoteBarrierBytes = 0) {
   }
 }
 
-function assertDelivered(state, expected) {
+function assertDelivered(state, expected, prewarm = false) {
   assert.equal(state.peer.timedOut, false);
-  assert.equal(state.peer.messages.length, 1);
+  assert.equal(state.peer.messages.length, prewarm ? 2 : 1);
   assert.equal(state.peer.messages[0].binary, false);
-  assertBytesEqual(state.peer.messages[0].raw, expected);
-  assert.equal(digest(state.peer.messages[0].raw), digest(expected));
+  const firstExpected = prewarm ? Buffer.from(JSON.stringify({ ...JSON.parse(expected), generate: false })) : expected;
+  assertBytesEqual(state.peer.messages[0].raw, firstExpected);
+  assert.equal(digest(state.peer.messages[0].raw), digest(firstExpected));
+  if (prewarm) {
+    const generation = state.peer.messages[1];
+    assert.equal(generation.binary, false);
+    assert.notEqual(generation.responseId, state.peer.messages[0].responseId);
+    assertBytesEqual(generation.raw, Buffer.from(JSON.stringify({ ...JSON.parse(expected), input: [],
+      previous_response_id: state.peer.messages[0].responseId })));
+  }
   assert.ok(state.peer.pongBeforeMessage > 0);
   const frames = state.peer.frames;
-  const dataFrames = frames.filter(frame => frame.opcode <= 2);
+  const allDataFrames = frames.filter(frame => frame.opcode <= 2);
+  const firstFinal = allDataFrames.findIndex(frame => frame.fin);
+  const dataFrames = allDataFrames.slice(0, firstFinal + 1);
+  assert.equal(allDataFrames.length, dataFrames.length + (prewarm ? 1 : 0));
+  if (prewarm) assert.ok(allDataFrames.at(-1).opcode === 1 && allDataFrames.at(-1).fin
+    && allDataFrames.at(-1).masked && allDataFrames.at(-1).length <= fragmentBytes);
   assert.ok(dataFrames.length > 1);
   assert.equal(dataFrames[0].opcode, 1);
   assert.equal(dataFrames[0].fin, false);
@@ -359,7 +380,8 @@ function assertDelivered(state, expected) {
   const pongIndex = frames.findIndex(frame => frame.opcode === 10);
   assert.ok(pongIndex > 0 && pongIndex < frames.lastIndexOf(dataFrames.at(-1)));
   assert.ok(state.link.maxWritableBytes >= fragmentBytes || state.link.maxQueuedBytes >= fragmentBytes);
-  return { wireBytes: expected.length, sha256: digest(expected), dataFrames: dataFrames.length,
+  return { wireBytes: firstExpected.length, sha256: digest(firstExpected), dataFrames: dataFrames.length,
+    messages: state.peer.messages.length, prewarm,
     pongs: state.peer.pongs, maxWritableBytes: state.link.maxWritableBytes };
 }
 
@@ -394,14 +416,17 @@ test("transport sendNext survives two concurrent fast local TCP caches followed 
   context.after(() => transport.close());
   const input = [{ type: "message", role: "user", content: [{ type: "input_text", text: "猫🌸".repeat(100) + "x".repeat(payloadBytes) }] }];
   const payload = { model: "fixture-model", instructions: "Loopback fixture", tools: [], input };
+  const uploadProgress = [];
   const outcomes = await Promise.all([0, 1].map(index => {
     const client = transport.createRequestClient({ sessionKey: `buffered-proxy-${index}`,
-      operationId: `buffered-proxy-${index}`, payload, url: fixture.url });
+      operationId: `buffered-proxy-${index}`, payload, url: fixture.url,
+      onUploadProgress: progress => uploadProgress.push(progress) });
     return new Promise(resolve => {
       const request = client.request(fixture.url);
       request.on("response", response => {
-        response.resume();
-        response.on("end", () => resolve({ code: null }));
+        let sse = "";
+        response.on("data", chunk => { sse += chunk.toString(); });
+        response.on("end", () => resolve({ code: null, sse }));
         response.on("error", error => resolve({ code: error.code }));
       });
       request.on("error", error => resolve({ code: error.code }));
@@ -411,7 +436,7 @@ test("transport sendNext survives two concurrent fast local TCP caches followed 
   await yieldIO();
   for (const [index, peer] of fixture.peers.entries()) {
     const link = peer.link;
-    context.diagnostic(JSON.stringify({ mode: "transport-buffered-proxy", connection: index + 1, outcome: outcomes[index],
+    context.diagnostic(JSON.stringify({ mode: "transport-buffered-proxy", connection: index + 1, outcome: outcomes[index].code,
       timedOut: peer.timedOut, messages: peer.messages.length, pongs: peer.pongs,
       firstPing: peer.firstPing, maxQueuedBytes: link.maxQueuedBytes, sendCallbacks: link.sendCallbacks,
       dataFrames: peer.frames.filter(frame => frame.opcode <= 2).length,
@@ -423,13 +448,19 @@ test("transport sendNext survives two concurrent fast local TCP caches followed 
   assert.equal(transport.status().active, 0);
   assert.equal(transport.status().connections, 0);
   assert.equal(fixture.peers.length, 2);
+  assert.ok(uploadProgress.length > 0);
+  assert.ok(uploadProgress.every(progress => progress.uploadWindow >= 1 && progress.uploadWindow <= 4
+    && progress.outstandingBytes <= 1024 * 1024));
   const expected = Buffer.from(JSON.stringify({ model: payload.model, instructions: payload.instructions,
     tools: payload.tools, store: false, type: "response.create", input }));
   for (const [index, peer] of fixture.peers.entries()) {
     assert.equal(peer.timedOut, false, "server keepalive expired while the local TCP cache still held queued continuation frames");
     assert.equal(outcomes[index].code, null);
+    assert.ok(outcomes[index].sse.includes(peer.messages[1].responseId));
+    assert.ok(!outcomes[index].sse.includes(peer.messages[0].responseId), "warm response stays outside business SSE");
     context.diagnostic(JSON.stringify({ mode: "transport-delivered", connection: index + 1,
-      ...assertDelivered({ peer, link: peer.link }, expected) }));
+      ...assertDelivered({ peer, link: peer.link }, expected, true) }));
+    assert.ok(peer.link.maxQueuedBytes <= 1024 * 1024 + 4096, "adaptive upload bounds the cached data plus frame/control headers");
   }
 });
 
@@ -530,17 +561,10 @@ test("real TCP outage beyond keepalive retains UNKNOWN and follows the existing 
   assert.equal(fixture.peers.length, 1);
   const recovered = await requestThroughTransport(transport, fixture, "long-outage", payload, { retryWithoutOutput: true });
   await yieldIO();
-  assert.equal(recovered.code, null);
-  assert.equal(fixture.peers.length, 2);
-  const peer = fixture.peers[1];
-  context.diagnostic(JSON.stringify({ mode: "real-transport-long-outage-recovery",
-    firstCode: first.code, firstCloseCode: first.error.closeCode, acceptance: failed.acceptance,
-    requiresReconciliation: failed.requiresReconciliation, canRetry: failed.canRetry,
-    classification, duplicateCode: duplicate.code, recoveredCode: recovered.code,
-    ...assertDelivered({ peer, link: peer.link }, expectedWire(payload)) }));
-  assert.equal(fixture.peers.reduce((total, entry) => total + entry.messages.length, 0), 1);
-  assert.equal(transport.getOperation("long-outage").state, "completed");
-  assert.equal(peer.link.client.listenerCount("pong"), peer.link.basePongListeners);
+  assert.equal(recovered.code, "duplicate_operation");
+  assert.equal(fixture.peers.length, 1);
+  assert.equal(fixture.peers.reduce((total, entry) => total + entry.messages.length, 0), 0);
+  assert.equal(transport.getOperation("long-outage").requiresReconciliation, true);
   transport.close();
   await fixture.cleanup();
   assert.equal(transport.status().retainedBytes, 0);

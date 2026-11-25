@@ -56,6 +56,50 @@ async function fixture(context, outputs) {
   return { send, packets, decisions, get connections() { return connections; } };
 }
 
+test("server message statistics preserve incremental tool continuation and the next user turn", async context => {
+  const call = toolCall();
+  const counted = text => ({ ...assistant(text), internal_chat_message_metadata_passthrough: {
+    turn_id: "server-turn", create_time: 123, content_token_count: 19,
+  } });
+  const firstAnswer = counted("Before tool result");
+  const secondAnswer = counted("After tool result");
+  const state = await fixture(context, [[firstAnswer, call], [secondAnswer], []]);
+  const initial = [user("Initial history ".repeat(1500))];
+  await state.send("statistics-first", body(initial));
+  const result = { type: "function_call_output", call_id: call.call_id, output: "count=1" };
+  const continuation = [...initial, nativeItem(firstAnswer), nativeItem(call), result];
+  await state.send("statistics-tool-result", body(continuation));
+  const question = { ...user("Next turn"), internal_chat_message_metadata_passthrough: {
+    turn_id: "next-turn", content_token_count: 3,
+  } };
+  await state.send("statistics-next-turn", body([...continuation, nativeItem(secondAnswer), question]));
+  assert.equal(state.connections, 1);
+  assert.deepEqual(state.decisions.map(entry => entry.reason), ["initial", "reused", "reused"]);
+  assert.deepEqual(state.packets[1].packet.input, [result]);
+  assert.deepEqual(state.packets[2].packet.input, [question]);
+  assert.equal(state.packets[1].packet.previous_response_id, "resp_1");
+  assert.equal(state.packets[2].packet.previous_response_id, "resp_2");
+  assert.equal(firstAnswer.internal_chat_message_metadata_passthrough.content_token_count, 19);
+  assert.equal(state.packets[2].packet.input[0].internal_chat_message_metadata_passthrough.content_token_count, 3);
+});
+
+test("server message statistics and proven omitted ID retain the completed output continuation", async context => {
+  const answer = { ...assistant("Proven output"), internal_chat_message_metadata_passthrough: {
+    turn_id: "server-turn", content_token_count: 7,
+  } };
+  const state = await fixture(context, [[answer], []]);
+  const initial = [user("Initial history")];
+  await state.send("statistics-proven-id-first", body(initial));
+  const echoed = nativeItem(answer);
+  delete echoed.id;
+  const question = user("Continue without repeating the output");
+  await state.send("statistics-proven-id-next", body([...initial, echoed, question]));
+  assert.equal(state.connections, 1);
+  assert.equal(state.decisions[1].reason, "reused");
+  assert.equal(state.packets[1].packet.previous_response_id, "resp_1");
+  assert.deepEqual(state.packets[1].packet.input, [question]);
+});
+
 test("native-added tool and assistant passthrough metadata preserve one connection across tool continuation and second turn", async context => {
   const call = toolCall();
   const answer = assistant("Fixture answer");
@@ -196,14 +240,17 @@ test("native caller provenance changes preserve incremental history and original
   assert.deepEqual(state.packets[1].packet.client_metadata, nextMetadata);
 });
 
-test("unknown nested turn metadata still changes the connection binding", async context => {
+test("unknown nested turn annotations preserve incremental history and original wire metadata", async context => {
   const answer = assistant("Answer");
   const state = await fixture(context, [[answer], []]);
   const initial = [user("Initial")];
   await state.send("first", { ...body(initial), client_metadata: { "x-codex-turn-metadata": JSON.stringify({ turn_id: "first", semantic_policy: "first" }) } });
   await state.send("semantic-config", { ...body([...initial, nativeItem(answer), user("Next")]), client_metadata: { "x-codex-turn-metadata": JSON.stringify({ turn_id: "second", parent_turn_id: "parent", semantic_policy: "changed" }) } });
-  assert.equal(state.connections, 2);
-  assert.equal(state.packets[1].packet.previous_response_id, undefined);
+  assert.equal(state.connections, 1);
+  assert.equal(state.packets[1].packet.previous_response_id, "resp_1");
+  assert.deepEqual(state.packets[1].packet.client_metadata, {
+    "x-codex-turn-metadata": JSON.stringify({ turn_id: "second", parent_turn_id: "parent", semantic_policy: "changed" }),
+  });
 });
 
 test("semantic client metadata still changes the connection binding", async context => {

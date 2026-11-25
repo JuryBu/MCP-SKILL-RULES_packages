@@ -10,6 +10,7 @@ import test from "node:test";
 import { createCodexModelStreamProxy } from "../src/codex-model-stream-proxy.mjs";
 import { createIncrementalResponsesTransport } from "../src/incremental-responses-transport.mjs";
 import { createStreamRecovery } from "../src/codex-stream-recovery.mjs";
+import { classifyModelFailure } from "../src/model-failure-policy.mjs";
 
 const require = createRequire(import.meta.url);
 const { WebSocketServer } = require("ws");
@@ -72,7 +73,13 @@ async function fixture(context, { onPacket, onHttp, transportOptions = {}, proxy
     connections.push(connection);
     socket.on("error", () => {});
     socket.on("message", raw => {
-      const entry = { packet: JSON.parse(raw), socket, connection: connection.index, index: packets.length + 1 };
+      const packet = JSON.parse(raw);
+      if (packet.type === "response.interrupt") {
+        socket.send(JSON.stringify({ type: "response.incomplete", response: { id: packet.response_id,
+          status: "incomplete", output: [], incomplete_details: { reason: "interrupted" } } }));
+        return;
+      }
+      const entry = { packet, socket, connection: connection.index, index: packets.length + 1 };
       packets.push(entry);
       if (onPacket) onPacket(entry);
       else complete(socket, `ws_${entry.index}`, "WS_INTERACTION_OK");
@@ -299,7 +306,7 @@ test("compatibility HTTP completion is recyclable while an independent WS stays 
   assert.equal(setup.connections[0].network.destroyed, false);
 });
 
-test("accepted oversized WS failures completed on HTTP do not exhaust operation capacity", { timeout: 7000 }, async context => {
+test("accepted oversized WS failures require reconciliation without blind HTTP replay", { timeout: 7000 }, async context => {
   const setup = await fixture(context, { transportOptions: { maxOperations: 8 }, onPacket(entry) {
     if (entry.packet.input[0].content[0].text === "HEALTHY_AFTER_PAYLOAD_FALLBACKS") {
       return complete(entry.socket, "healthy_after_payload", "HEALTHY_AFTER_PAYLOAD_OK");
@@ -307,19 +314,12 @@ test("accepted oversized WS failures completed on HTTP do not exhaust operation 
     entry.socket.send(JSON.stringify({ type: "response.created", response: { id: `payload_${entry.index}`, status: "in_progress" } }));
     entry.socket.close(1009, "fixture oversized request");
   } });
-  for (let sequence = 0; sequence < 12; sequence += 1) {
-    const result = await setup.request({ threadId: `payload-thread-${sequence}`, turnId: `payload-turn-${sequence}` }).done;
-    assert.match(result.text, /HTTP_INTERACTION_OK/u);
-    assert.equal(setup.fallbackCompletions.length, sequence + 1);
-    assert.equal(setup.fallbackCompletions.at(-1).returned, true);
-    assert.equal(setup.fallbackCompletions.at(-1).operation.state, "completed");
-    assert.ok(setup.transport.status().operations <= 8);
-  }
+  const result = await setup.request({ threadId: "payload-thread-0", turnId: "payload-turn-0" }).done;
+  assert.match(result.text, /上游是否完成了本次请求仍待核对.*停止自动重发/u);
+  assert.equal(setup.httpRequests.length, 0);
   const healthy = await setup.request({ threadId: "payload-followup", input: [message("HEALTHY_AFTER_PAYLOAD_FALLBACKS")] }).done;
   assert.match(healthy.text, /HEALTHY_AFTER_PAYLOAD_OK/u);
-  assert.equal(setup.packets.length, 13);
-  assert.equal(setup.httpRequests.length, 12);
-  assert.equal(setup.proxy.status().operationLedger.protectedOperations, 0);
+  assert.equal(setup.packets.length, 2);
 });
 
 test("prewarm capacity diagnostics preserve managed WS recovery", { timeout: 7000 }, async context => {
@@ -345,7 +345,7 @@ test("failed prewarm retains safe compatibility diagnostics and completes the HT
   const setup = await fixture(context, { transportOptions: { maxMessageBytes: 1800 }, onPacket(entry) {
     entry.socket.send(JSON.stringify({ type: "response.created", response: { id: "failed_prewarm", status: "in_progress" } }));
     entry.socket.send(JSON.stringify({ type: "response.failed", response: { id: "failed_prewarm", status: "failed", output: [],
-      error: { code: "unsupported_parameter", status: 400, param: "generate", message: "PRIVATE_PREWARM_MESSAGE" } } }));
+      error: { type: "invalid_request_error", code: "unsupported_parameter", status: 400, param: "generate", message: "PRIVATE_PREWARM_MESSAGE" } } }));
   } });
   const original = setup.request({ input: [message("a".repeat(800)), message("b".repeat(800)), message("c".repeat(800))] });
   assert.match((await original.done).text, /HTTP_INTERACTION_OK/u);
@@ -389,14 +389,42 @@ test(`structured WS parameter rejection during ${failedPhase} falls back with th
 });
 }
 
-for (const scenario of ["accepted", "unauthorized", "safety", "outer-safety", "nested-status"]) {
+for (const omitted of ["type", "param"]) {
+test(`created prewarm rejection missing ${omitted} keeps the compatibility guard`, { timeout: 7000 }, async context => {
+  const setup = await fixture(context, { transportOptions: { maxMessageBytes: 1800 }, onPacket(entry) {
+    entry.socket.send(JSON.stringify({ type: "response.created", response: { id: "guarded_prewarm", status: "in_progress" } }));
+    const error = { type: "invalid_request_error", code: "unsupported_parameter", param: "generate", status: 400 };
+    delete error[omitted];
+    entry.socket.send(JSON.stringify({ type: "response.failed", response: { id: "guarded_prewarm", status: "failed", output: [], error } }));
+  } });
+  await setup.request({ input: [message("a".repeat(800)), message("b".repeat(800)), message("c".repeat(800))] }).done;
+  assert.equal(setup.packets.length, 1);
+  assert.equal(setup.httpRequests.length, 0);
+  assert.equal(setup.events.filter(event => event.type === "websocket_compatibility_fallback").length, 0);
+});
+}
+
+test("incomplete content filter remains a protected terminal without nested error", { timeout: 7000 }, async context => {
+  const setup = await fixture(context, { onPacket(entry) {
+    entry.socket.send(JSON.stringify({ type: "response.created", response: { id: "filtered", status: "in_progress" } }));
+    entry.socket.send(JSON.stringify({ type: "response.incomplete", response: { id: "filtered", status: "incomplete", output: [],
+      incomplete_details: { reason: "content_filter" } } }));
+  } });
+  await setup.request().done;
+  assert.equal(setup.packets.length, 1);
+  assert.equal(setup.httpRequests.length, 0);
+  assert.equal(setup.events.filter(event => event.type === "websocket_compatibility_fallback").length, 0);
+});
+
+for (const scenario of ["accepted", "unauthorized", "safety", "outer-safety", "outer-auth", "outer-quota", "outer-safety-message", "nested-status"]) {
 test(`structured parameter error preserves ${scenario} protection`, { timeout: 7000 }, async context => {
   const setup = await fixture(context, { onPacket(entry) {
     if (scenario === "accepted") {
       entry.socket.send(JSON.stringify({ type: "response.created", response: { id: "accepted_before_error", status: "in_progress" } }));
     }
     entry.socket.send(JSON.stringify({ type: "error", status: scenario === "unauthorized" ? 401 : 400,
-      ...(scenario === "outer-safety" ? { code: "content_policy_violation" } : {}), error: {
+      ...({ "outer-safety": { code: "content_policy_violation" }, "outer-auth": { code: "invalid_api_key" },
+        "outer-quota": { code: "insufficient_quota" }, "outer-safety-message": { message: "Request blocked by safety policy" } }[scenario] ?? {}), error: {
       type: "invalid_request_error", code: "unsupported_parameter", param: "input",
       ...(scenario === "nested-status" ? { status: 401 } : {}),
       message: scenario === "safety" ? "Request blocked by safety policy" : "PRIVATE_REJECTION_DETAIL" } }));
@@ -407,13 +435,23 @@ test(`structured parameter error preserves ${scenario} protection`, { timeout: 7
 });
 }
 
-for (const scenario of ["unknown", "text", "tool", "invalid_api_key", "insufficient_quota", "content_policy_violation"]) {
+test("recognized parameter rejection and unknown transport acceptance remain distinct", { timeout: 7000 }, async context => {
+  const unknown = classifyModelFailure({ source: "transport", code: "WS_UPSTREAM_ERROR",
+    message: { code: "unsupported_parameter", message: "PRIVATE_UNKNOWN_MESSAGE" },
+    requestTransmissionState: "generation_sent", progressObserved: false });
+  assert.equal(unknown.acceptance, "unknown");
+  assert.equal(unknown.httpCompatibilityFallback, undefined);
+  const setup = await fixture(context, { onPacket(entry) {
+    entry.socket.send(JSON.stringify({ type: "error", error: { code: "unsupported_parameter", message: "PRIVATE_REJECTION_MESSAGE" } }));
+  } });
+  assert.match((await setup.request().done).text, /HTTP_INTERACTION_OK/u);
+  assert.equal(setup.httpRequests.length, 1);
+  assert.equal(setup.events.filter(event => event.type === "websocket_compatibility_fallback").length, 1);
+});
+
+for (const scenario of ["text", "tool", "invalid_api_key", "insufficient_quota", "content_policy_violation"]) {
 test(`compatibility fallback excludes ${scenario}`, { timeout: 7000 }, async context => {
   const setup = await fixture(context, { onPacket(entry) {
-    if (scenario === "unknown") {
-      entry.socket.send(JSON.stringify({ type: "error", error: { code: "unsupported_parameter", message: "PRIVATE_UNKNOWN_MESSAGE" } }));
-      return;
-    }
     const id = `excluded_${scenario}`;
     entry.socket.send(JSON.stringify({ type: "response.created", response: { id, status: "in_progress" } }));
     if (scenario === "text") entry.socket.send(JSON.stringify({ type: "response.output_text.delta", delta: "OUTPUT_ALREADY_DELIVERED" }));
@@ -436,15 +474,9 @@ test(`compatibility fallback excludes ${scenario}`, { timeout: 7000 }, async con
 
 test("WS empty 503/504 then HTTP 503/504 recovers and same-turn appended text receives its own answer", { timeout: 7000 }, async context => {
   const setup = await fixture(context, { onPacket(entry) {
-    const id = `empty_${entry.index}`;
-    entry.socket.send(JSON.stringify({ type: "response.created", response: { id, status: "in_progress", output: [] } }));
-    entry.socket.send(JSON.stringify(entry.index === 1
-      ? { type: "response.output_item.done", item: { type: "reasoning", id: "empty-reasoning", summary: [], encrypted_content: "" } }
-      : { type: "response.output_text.delta", delta: "" }));
-    entry.socket.send(JSON.stringify({ type: entry.index === 1 ? "response.failed" : "response.incomplete",
-      response: { id, status: entry.index === 1 ? "failed" : "incomplete", output: [], error: { code: "server_error", status: entry.index === 1 ? 503 : 504 } } }));
+    entry.socket.send(JSON.stringify({ type: "error", error: { code: "server_error", status: 503 } }));
   }, onHttp(entry, response) {
-    if (entry.index < 3) transient(response, entry.index === 1 ? 503 : 504);
+    if (entry.index < 3) transient(response, 503);
     else httpComplete(response, `http_${entry.index}`, entry.index === 3 ? "RECOVERED_AFTER_503_504" : "APPENDED_TEXT_已收到");
   } });
   const first = setup.request();
@@ -467,7 +499,6 @@ test("WS empty 503/504 then HTTP 503/504 recovers and same-turn appended text re
   assert.equal(setup.proxy.status().operationLedger.protectedOperations, 0);
   assert.equal(setup.transport.status().unknownOperations, 0);
   assert.ok(setup.recovery.some(event => event.httpStatusCode === 503));
-  assert.ok(setup.recovery.some(event => event.httpStatusCode === 504));
   context.diagnostic("WS empty reasoning+503 -> WS empty delta+504 -> HTTP503 -> HTTP504 -> real answer -> same-turn appended full body+answer; no duplicate, false IDLE or synthetic success");
   context.diagnostic(JSON.stringify({ websocketResponseIds: setup.packets.map(entry => `empty_${entry.index}`),
     completedResponseIds: [result, next].map(response => response.events.at(-1).response.id),
@@ -483,7 +514,7 @@ test(`capacity fallback ${capacityLimit} survives 503/504 while another request 
     if (entry.index === 1) entry.socket.send(JSON.stringify({ type: "response.created", response: { id: "busy-original", status: "in_progress" } }));
     else complete(entry.socket, "after_cancel", "APPEND_AFTER_CANCEL_收到新正文");
   }, onHttp(entry, response) {
-    if (entry.index < 3) transient(response, entry.index === 1 ? 503 : 504);
+    if (entry.index < 3) transient(response, 503);
     else {
       const body = JSON.parse(zstdDecompressSync(entry.body));
       const appended = body.input.at(-1).content?.[0]?.text === "取消后同回合追加正文_新问题";
@@ -505,19 +536,19 @@ test(`capacity fallback ${capacityLimit} survives 503/504 while another request 
   await assert.rejects(busy.done);
   await until(() => setup.proxy.status().activeRequests === 0 && setup.transport.status().active === 0, "cancelled request release");
   const input = [message("original"), message("取消后同回合追加正文_新问题")];
-  const appendedRequest = setup.request({ input });
+  const blockedSameTurn = await setup.request({ input }).done;
+  assert.match(blockedSameTurn.text, /上游结果尚未核实.*未重复提交/u);
+  const appendedRequest = setup.request({ turnId: "next-turn-after-cancel", input });
   const appended = await appendedRequest.done;
   assert.match(appended.text, /APPEND_AFTER_CANCEL_收到新正文/u);
-  assert.equal(setup.packets.length, capacityLimit === "session_limit" ? 2 : 1);
-  assert.equal(setup.httpRequests.length, capacityLimit === "session_limit" ? 3 : 4);
-  if (capacityLimit === "session_limit") assert.deepEqual(setup.packets.at(-1).packet.input, input);
-  else assert.deepEqual(setup.httpRequests.at(-1).body, appendedRequest.encoded);
+  assert.equal(setup.packets.length, 2);
+  assert.equal(setup.httpRequests.length, 3);
+  assert.equal(setup.connections.length, 1);
   assert.equal(appended.events.filter(event => event.type === "response.completed").length, 1);
   assert.equal(appended.events.some(event => event.type === "response.failed"), false);
-  assert.equal(setup.proxy.status().counters.syntheticCompletions, 0);
-  assert.equal(setup.proxy.status().operationLedger.protectedOperations, 0);
+  assert.equal(setup.proxy.status().counters.syntheticCompletions, 1);
   const capacityRequestIds = new Set(setup.recovery.filter(event => event.reason === "websocket_capacity_requires_http").map(event => event.requestId));
-  assert.equal(capacityRequestIds.size, capacityLimit === "session_limit" ? 1 : 2);
+  assert.equal(capacityRequestIds.size, 1);
   context.diagnostic(`A held -> B ${capacityLimit} -> HTTP503/504 -> B answer while A remains active -> cancel A -> same-turn appended content -> correct new answer; transport=${JSON.stringify(setup.transport.status())}`);
   context.diagnostic(JSON.stringify({ busyResponseId: "busy-original", overflowResponseId: second.events.at(-1).response.id,
     appendedResponseId: appended.events.at(-1).response.id, fullAppendedBodyBytes: appendedRequest.body.length,
@@ -541,8 +572,7 @@ test("tool-result recovery then compaction invalidates old WS state and persiste
       entry.socket.send(JSON.stringify({ type: "response.output_item.done", item: call }));
       complete(entry.socket, "tool_delivered", null, [call]);
     } else if (entry.index <= 3) {
-      entry.socket.send(JSON.stringify({ type: "response.failed", response: { id: `tool_result_${entry.index}`, status: "failed", output: [],
-        error: { code: "server_error", status: entry.index === 2 ? 503 : 504 } } }));
+      entry.socket.send(JSON.stringify({ type: "error", error: { code: "server_error", status: 503 } }));
     } else if (entry.index === 4) complete(entry.socket, "after_compaction", "COMPACTED_TOOL_VALUE_1");
     else entry.socket.send(JSON.stringify({ type: "response.created", response: { id: "interrupted_checkpoint", status: "in_progress" } }));
   }, onHttp(entry, response) {
@@ -591,7 +621,9 @@ test("tool-result recovery then compaction invalidates old WS state and persiste
   await setup.close();
   const restored = await fixture(context, { proxyOptions: { operationState: JSON.parse(readFileSync(checkpointPath, "utf8")) } });
   const protectedResult = await restored.request({ input: [...compactInput, message("interrupted before output")], turnId: "old-interrupted" }).done;
-  assert.equal(protectedResult.events.at(-1).response.error.code, "proxy_operation_recovery_protected");
+  assert.equal(protectedResult.events.at(-1).type, "response.completed");
+  assert.match(protectedResult.text, /上游结果尚未核实/u);
+  assert.equal(protectedResult.events.some(event => event.type === "response.failed"), false);
   assert.equal(restored.packets.length, 0);
   assert.equal(restored.httpRequests.length, 0);
   const fresh = await restored.request({ input: compactInput, turnId: "fresh-after-reload" }).done;
@@ -604,7 +636,7 @@ test("tool-result recovery then compaction invalidates old WS state and persiste
   context.diagnostic("tool executed once -> same-turn result WS503/504+HTTP -> real compact HTTP output preserved -> fresh WS full compacted input -> disk checkpoint from live unfinished request -> reload protects old turn without network -> fresh turn succeeds; fixture tool execution=1");
   context.diagnostic(JSON.stringify({ toolCallId: call.call_id, executions, toolResultResponseId: recovered.events.at(-1).response.id,
     compactionId: JSON.parse(compact.text).id, afterCompactionResponseId: afterCompact.events.at(-1).response.id,
-    checkpointEntries: checkpoint.entries.length, restoredOldError: protectedResult.events.at(-1).response.error.code,
+    checkpointEntries: checkpoint.entries.length, restoredOldTerminal: protectedResult.events.at(-1).type,
     freshResponseId: fresh.events.at(-1).response.id, restoredWebsocketAttempts: restored.packets.length,
     restoredHttpAttempts: restored.httpRequests.length, protectedOldOperations: restored.proxy.status().operationLedger.protectedOperations }));
 });

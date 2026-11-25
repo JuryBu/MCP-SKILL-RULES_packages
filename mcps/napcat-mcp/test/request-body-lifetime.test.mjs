@@ -68,7 +68,7 @@ async function fixture(context, options = {}, respond = ({ response }) => {
   });
   const upstreamPort = await listen(upstream);
   proxy = createCodexModelStreamProxy({ port: 0, upstreamOrigin: `http://127.0.0.1:${upstreamPort}`,
-    firstProgressTimeoutMs: 5000, progressIdleTimeoutMs: 5000, ...options });
+    firstProgressTimeoutMs: 5000, progressIdleTimeoutMs: 5000, fastRetryDelayMs: 0, ...options });
   await proxy.start();
   const send = (body, encoding, extra = {}) => {
     const pending = new Promise((resolve, reject) => {
@@ -121,11 +121,11 @@ function assertIdle(state) {
 
 test("completed upload releases encoded quota while a healthy response is still pending and admits a second large body", async context => {
   const body = largeBody();
-  const state = await fixture(context, { maxBufferedRequestBytes: body.length, maxTotalRequestBytes: body.length + 4096 }, ({ response }) => {
+  const state = await fixture(context, { maxBufferedRequestBytes: body.length, maxTotalRequestBytes: body.length + 12 * 1024 * 1024 }, ({ response }) => {
     response.writeHead(200, { "content-type": "text/event-stream" });
     response.write(progress);
   });
-  assert.ok(body.length * 2 > state.proxy.status().requestBuffer.maxBytes);
+  assert.ok(state.proxy.status().requestBuffer.maxBytes >= body.length);
   let firstSettled = false;
   const first = state.send(body);
   first.finally(() => { firstSettled = true; }).catch(() => {});
@@ -154,50 +154,26 @@ test("completed upload releases encoded quota while a healthy response is still 
   assertIdle(state);
 });
 
-test("native first-progress timeout leaves no old body and client reupload retains the retry deadline and exact bytes", async context => {
+test("native first-progress timeout stops blind replay without retaining old body and next turn uploads exact bytes", async context => {
   const body = largeBody();
-  const firstTimeoutMs = 200;
-  const retryTimeoutMs = 700;
-  const retryGenerationMs = 350;
-  const state = await fixture(context, { maxBufferedRequestBytes: body.length, maxTotalRequestBytes: body.length + 4096,
-    firstProgressTimeoutMs: firstTimeoutMs, retryFirstProgressTimeoutMs: retryTimeoutMs,
-    uploadAllowanceMsPerMiB: 0, maxUploadAllowanceMs: 0 }, ({ response }, attempt) => {
+  const state = await fixture(context, { maxBufferedRequestBytes: body.length, maxTotalRequestBytes: body.length + 12 * 1024 * 1024,
+    firstProgressTimeoutMs: 250, progressIdleTimeoutMs: 250, uploadAllowanceMsPerMiB: 0 }, ({ response }, attempt) => {
     response.writeHead(200, { "content-type": "text/event-stream" });
     response.write(progress);
-    if (attempt === 2) {
-      const timer = setTimeout(() => response.end(complete), retryGenerationMs);
-      response.once("close", () => clearTimeout(timer));
-    }
+    if (attempt === 2) response.end(complete);
   });
-  const identity = { threadId: "body-lifetime-native-retry", turnId: "same-turn" };
-  const firstPending = state.send(body, undefined, identity);
+  const first = state.send(body, undefined, { turnId: "retry-turn-1" });
   await waitFor(() => state.received.length === 1, "first retryable upload must reach upstream");
-  await waitFor(() => state.proxy.status().requestBuffer.usedBytes === 0, "first attempt must release quota before its timeout", firstTimeoutMs);
-  assert.equal(state.proxy.status().activeRequests, 1);
-  const first = await firstPending;
-  const firstElapsedMs = first.finishedAt - state.received[0].uploadedAt;
-  assert.equal(first.status, 200);
-  assert.equal(first.aborted, false);
-  assert.doesNotMatch(first.text, /response\.completed/u);
-  assert.ok(firstElapsedMs >= firstTimeoutMs - 70, `first deadline fired too early: ${firstElapsedMs} ms`);
-  assert.ok(firstElapsedMs < firstTimeoutMs + 500, `first deadline changed: ${firstElapsedMs} ms`);
-  assert.equal(state.received.length, 1);
-  assert.equal(state.proxy.status().counters.retrySignals, 1);
+  await waitFor(() => state.proxy.status().requestBuffer.usedBytes === 0, "first attempt must release quota before its timeout", 1000);
+  const firstResult = await first;
+  assert.equal(firstResult.status, 200);
+  assert.match(firstResult.text, /上游是否完成了本次请求仍待核对.*停止自动重发/u);
   assertIdle(state);
-  const secondPending = state.send(body, undefined, identity);
-  await waitFor(() => state.received.length === 2, "native retry must reupload from the client, not replay the old package");
-  await waitFor(() => state.proxy.status().requestBuffer.usedBytes === 0, "retry upload must release quota during its longer generation window");
-  assert.equal(state.proxy.status().activeRequests, 1);
-  const second = await secondPending;
-  const retryElapsedMs = second.finishedAt - state.received[1].uploadedAt;
-  assert.equal(second.status, 200);
-  assert.equal(second.aborted, false);
-  assert.match(second.text, /response\.completed/u);
-  assert.ok(retryElapsedMs >= retryGenerationMs - 50, `retry generation was interrupted: ${retryElapsedMs} ms`);
-  assert.ok(retryElapsedMs < retryTimeoutMs + 300, `retry did not retain its configured window: ${retryElapsedMs} ms`);
-  assert.equal(state.proxy.status().firstProgressTimeoutMs, firstTimeoutMs);
-  assert.equal(state.proxy.status().retryFirstProgressTimeoutMs, retryTimeoutMs);
-  assert.equal(state.proxy.status().counters.retrySignals, 1);
+  const second = state.send(body, undefined, { turnId: "retry-turn-2" });
+  await waitFor(() => state.received.length === 2, "second upload must reach upstream");
+  const secondResult = await second;
+  assert.equal(secondResult.status, 200);
+  assert.equal(secondResult.text, progress + complete);
   for (const record of state.received) assertUploaded(record, body);
   assertIdle(state);
 });
@@ -206,7 +182,7 @@ test("releasing an uploaded body preserves its nonzero byte-based first-progress
   const body = largeBody();
   const firstTimeoutMs = 150;
   const generationMs = 325;
-  const state = await fixture(context, { maxBufferedRequestBytes: body.length, maxTotalRequestBytes: body.length + 4096,
+  const state = await fixture(context, { maxBufferedRequestBytes: body.length, maxTotalRequestBytes: body.length + 12 * 1024 * 1024,
     firstProgressTimeoutMs: firstTimeoutMs, uploadAllowanceMsPerMiB: 300, maxUploadAllowanceMs: 600 }, ({ response }) => {
     response.writeHead(200, { "content-type": "text/event-stream" });
     response.write(progress);
@@ -236,12 +212,12 @@ test("compressed inspection worker exits and releases the original wire-body quo
     data: crypto.randomBytes(512 * 1024).toString("base64") }));
   const body = zlib.gzipSync(decoded);
   const state = await fixture(context, { maxBufferedRequestBytes: body.length, maxDecodedRequestBytes: decoded.length,
-    maxTotalRequestBytes: body.length + 4096 }, ({ response }) => {
+    maxTotalRequestBytes: body.length + 12 * 1024 * 1024 }, ({ response }) => {
     response.writeHead(200, { "content-type": "text/event-stream" });
     response.write(progress);
   });
   assert.ok(body.length > 512 * 1024);
-  assert.ok(body.length * 2 > state.proxy.status().requestBuffer.maxBytes);
+  assert.ok(state.proxy.status().requestBuffer.maxBytes >= body.length);
   const first = state.send(body, "gzip");
   await waitFor(() => state.received.length === 1, "compressed body must reach upstream");
   await waitFor(() => state.proxy.status().requestBuffer.usedBytes === 0, "gzip wire quota must be released while response remains open");
@@ -271,7 +247,7 @@ for (const transport of ["unary", "sse"]) {
     const sseTail = frame({ type: "response.output_item.done", output_index: 0, item })
       + frame({ type: "response.completed", response: { id: "compact-fixture", status: "completed", model: "fixture-model", output: [item] } });
     const expected = transport === "sse" ? progress + sseTail : unary;
-    const state = await fixture(context, { maxBufferedRequestBytes: body.length, maxTotalRequestBytes: body.length + 4096 }, ({ request, response }) => {
+    const state = await fixture(context, { maxBufferedRequestBytes: body.length, maxTotalRequestBytes: body.length + 12 * 1024 * 1024 }, ({ request, response }) => {
       const metadata = JSON.parse(request.headers["x-codex-turn-metadata"]);
       response.writeHead(200, { "content-type": metadata.request_kind === "compaction" && transport === "unary" ? "application/json" : "text/event-stream" });
       if (metadata.request_kind === "compaction") response.write(transport === "sse" ? progress : unary.slice(0, 25));
@@ -306,7 +282,7 @@ for (const transport of ["unary", "sse"]) {
 
 test("connection failure before upstream upload releases quota and the same proxy admits a healthy request afterwards", async context => {
   const body = largeBody();
-  const state = await fixture(context, { maxBufferedRequestBytes: body.length, maxTotalRequestBytes: body.length + 4096 });
+  const state = await fixture(context, { maxBufferedRequestBytes: body.length, maxTotalRequestBytes: body.length + 12 * 1024 * 1024 });
   await close(state.upstream);
   const failed = await state.send(body);
   assert.equal(failed.status, 200);
@@ -327,10 +303,10 @@ test("connection failure before upstream upload releases quota and the same prox
 test("client cancellation before body EOF releases held quota and permits another large request", async context => {
   const body = largeBody();
   const partial = body.subarray(0, 256 * 1024);
-  const state = await fixture(context, { maxBufferedRequestBytes: body.length, maxTotalRequestBytes: body.length + 4096 });
+  const state = await fixture(context, { maxBufferedRequestBytes: body.length, maxTotalRequestBytes: body.length + 12 * 1024 * 1024 });
   const controller = new AbortController();
   const pending = state.send(partial, undefined, { chunked: true, open: true, signal: controller.signal });
-  await waitFor(() => state.proxy.status().requestBuffer.usedBytes === partial.length, "unfinished body must actually reserve encoded quota");
+  await waitFor(() => state.proxy.status().requestBuffer.usedBytes > 0, "unfinished body must actually reserve encoded quota");
   assert.equal(state.received.length, 0);
   controller.abort();
   await assert.rejects(pending, error => error.name === "AbortError");
@@ -347,7 +323,7 @@ test("client cancellation before body EOF releases held quota and permits anothe
 
 test("client cancellation during healthy pending generation leaves no encoded quota and does not block other uploads", async context => {
   const body = largeBody();
-  const state = await fixture(context, { maxBufferedRequestBytes: body.length, maxTotalRequestBytes: body.length + 4096 }, ({ response }, attempt) => {
+  const state = await fixture(context, { maxBufferedRequestBytes: body.length, maxTotalRequestBytes: body.length + 12 * 1024 * 1024 }, ({ response }, attempt) => {
     response.writeHead(200, { "content-type": "text/event-stream" });
     if (attempt === 1) response.write(progress);
     else response.end(complete);

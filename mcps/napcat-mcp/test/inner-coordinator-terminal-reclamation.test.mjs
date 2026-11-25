@@ -1,7 +1,14 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { createInnerProxyCoordinatorImplementation } from "../src/inner-proxy-coordinator.mjs";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { EventEmitter, once } from "node:events";
+import { spawn } from "node:child_process";
+import { createRequire } from "node:module";
+import { createInnerProxyCoordinator, createInnerProxyCoordinatorImplementation } from "../src/inner-proxy-coordinator.mjs";
 import { createInnerNativeTurnSource } from "../src/inner-native-turn-source.mjs";
+import { attachInnerRunnerHandoffControl, HANDOFF_CHANNEL } from "../src/inner-runner-handoff-control.mjs";
 
 function fixture() {
   const events = [];
@@ -46,6 +53,345 @@ function fixture() {
   };
   return { state, source, worker, controls, events, implementation, notify, finish, fill };
 }
+
+async function expiredRestorationFixture() {
+  const current = fixture();
+  current.state.maxThreads = 1;
+  current.state.implementation = current.implementation();
+  await current.fill(3);
+  for (const workerId of ["second", "third", "fourth"]) {
+    const candidate = current.worker(workerId);
+    current.state.workers.set(workerId, candidate);
+    await current.state.dispatch("activate", { candidateId: workerId });
+  }
+  const restored = [];
+  const relay = current.state.implementation.relayNative;
+  current.state.implementation.relayNative = (owner, event) => {
+    restored.push({ owner, event: { ...event } });
+    return relay(owner, event);
+  };
+  return { ...current, restored };
+}
+
+function attachNativeFixture(context, current, owner) {
+  const ipc = new EventEmitter();
+  ipc.connected = true;
+  let reply;
+  let requestSequence = 0;
+  ipc.send = (message, callback) => { reply = message; callback?.(); };
+  ipc.disconnect = () => { ipc.connected = false; };
+  const config = { ownerId: "fixture-owner", capability: "a".repeat(64) };
+  const controller = attachInnerRunnerHandoffControl({ config, ipc, instanceToken: owner.ready.instanceToken,
+    runnerPath: new URL("../src/codex-model-stream-proxy-runner.mjs", import.meta.url),
+    proxy: { status: () => ({ running: true, draining: false, activeRequests: 0 }) },
+    onEvent: () => {}, shutdown: () => {}, isStopping: () => false });
+  context.after(() => controller.close());
+  const request = (method, params = {}) => {
+    reply = null;
+    ipc.emit("message", { channel: HANDOFF_CHANNEL, requestId: `fixture-${++requestSequence}`,
+      instanceToken: owner.ready.instanceToken, ...config, method, ...params });
+    assert.ok(reply);
+    if (!reply.ok) throw Object.assign(new Error(reply.error.code), reply.error);
+    return reply.result;
+  };
+  const control = current.state.implementation.control;
+  const controlled = async (worker, method, params) => {
+    if (worker !== owner || !["nativeTurn", "check"].includes(method)) return control(worker, method, params);
+    const result = request(method, params);
+    await control(worker, method, params);
+    return result;
+  };
+  if (current.participant) {
+    const implementation = current.state.implementation;
+    current.participant.activate(current.participant.prepare({
+      createInnerProxyCoordinatorImplementation: () => ({ ...implementation, control: controlled }),
+    }));
+  } else current.state.implementation.control = controlled;
+  return request;
+}
+
+test("expired restoration allocates fresh ordered events instead of reusing a worker-local sequence", async context => {
+  const current = await expiredRestorationFixture();
+  const target = current.state.defaultWorker;
+  const native = attachNativeFixture(context, current, target);
+  const previousSequence = current.state.nativeSequence;
+  const original = { ...current.source.native.get("thread-0"), sequence: 9000 };
+  current.source.native.set("thread-0", original);
+  await current.state.dispatch("reclaimRetiredWorkers");
+  const events = current.restored.filter(entry => entry.owner === target && entry.event.threadId === "thread-0").map(entry => entry.event);
+  assert.equal(events.length, 2);
+  assert.deepEqual(events.map(event => event.phase), ["active", "terminal"]);
+  assert.equal(events[0].sequence, previousSequence + 1);
+  assert.equal(events[1].sequence, previousSequence + 2);
+  assert.equal(current.state.nativeSequence, previousSequence + 2);
+  assert.equal(native("check", { threadId: "thread-0" }).native.phase, "terminal");
+  assert.equal(native("check", { threadId: "thread-0" }).native.status, original.status);
+  assert.equal(current.source.child.exitCode, 0);
+});
+
+test("root coordinator participant preserves state and rejects incompatible modules and foreign tokens", async context => {
+  const checkpointRoot = fs.mkdtempSync(path.join(os.tmpdir(), "coordinator-participant-"));
+  const coordinator = createInnerProxyCoordinator({ ownerId: "fixture-owner", nativeSourceId: "unit-native",
+    checkpointRoot, upstreamOrigin: "http://127.0.0.1:9" });
+  const participant = coordinator.liveCodeParticipant();
+  const initial = participant.snapshot();
+  const state = initial.state;
+  context.after(async () => {
+    state.requests.clear();
+    state.threads.clear();
+    state.workers.clear();
+    await coordinator.close();
+    assert.equal(path.dirname(fs.realpathSync(checkpointRoot)), fs.realpathSync(os.tmpdir()));
+    fs.rmSync(checkpointRoot, { recursive: true, force: true });
+  });
+  const previousModule = process.env.COORDINATOR_PREVIOUS_COMPILED_BUNDLE
+    ? createRequire(import.meta.url)(process.env.COORDINATOR_PREVIOUS_COMPILED_BUNDLE)
+    : { createInnerProxyCoordinatorImplementation };
+  const marker = { turnId: "preserved-turn" };
+  state.nativeSequence = 42;
+  state.requests.set("held-request", marker);
+  state.threads.set("held-thread", marker);
+  const references = { workers: state.workers, threads: state.threads, requests: state.requests,
+    terminalThreads: state.terminalThreads, relay: state.relay };
+  const original = participant.activate(participant.prepare(previousModule));
+  const previous = participant.snapshot();
+  const prepared = participant.prepare({ createInnerProxyCoordinatorImplementation });
+  const rollback = participant.activate(prepared);
+  assert.equal(participant.id, "inner-coordinator");
+  assert.equal(participant.stateSchema, "inner-coordinator-state-v1");
+  assert.equal(participant.snapshot().generation, 2);
+  assert.strictEqual(participant.snapshot().state, state);
+  for (const [key, value] of Object.entries(references)) assert.strictEqual(state[key], value);
+  assert.equal(state.nativeSequence, 42);
+  assert.strictEqual(state.requests.get("held-request"), marker);
+  assert.strictEqual(state.threads.get("held-thread"), marker);
+  assert.throws(() => participant.prepare({}), { code: "COORDINATOR_LIVE_CODE_EXPORT_MISSING" });
+  assert.throws(() => participant.prepare({ createInnerProxyCoordinatorImplementation: () => ({}) }),
+    { code: "COORDINATOR_LIVE_CODE_METHOD_MISSING" });
+  assert.throws(() => participant.activate({ ...prepared }), { code: "COORDINATOR_LIVE_CODE_CANDIDATE_INVALID" });
+  assert.throws(() => participant.restore({ ...rollback }), { code: "COORDINATOR_LIVE_CODE_SNAPSHOT_INVALID" });
+  assert.equal(participant.snapshot().generation, 2);
+  participant.restore(rollback);
+  assert.strictEqual(participant.snapshot().implementation, previous.implementation);
+  assert.equal(participant.snapshot().generation, 3);
+  participant.restore(original);
+  assert.strictEqual(participant.snapshot().implementation, initial.implementation);
+  assert.equal(participant.snapshot().generation, 4);
+  for (const [key, value] of Object.entries(references)) assert.strictEqual(state[key], value);
+  assert.equal(state.nativeSequence, 42);
+  context.diagnostic(JSON.stringify({ previousFactory: process.env.COORDINATOR_PREVIOUS_COMPILED_BUNDLE ? "compiled-bundle" : "source",
+    statePreserved: true, restoredGeneration: participant.snapshot().generation }));
+});
+
+for (const { boundary, ahead } of [{ boundary: "retained", ahead: false }, { boundary: "missing", ahead: false },
+  { boundary: "retained", ahead: true }]) {
+  test(`parent activation preserves a legacy lost completion with ${boundary} source and ${ahead ? "newer" : "equal"} original sequence`,
+    { skip: !process.env.COORDINATOR_PREVIOUS_COMPILED_BUNDLE }, async context => {
+      const current = fixture();
+      const checkpointRoot = fs.mkdtempSync(path.join(os.tmpdir(), "coordinator-legacy-completion-"));
+      const coordinator = createInnerProxyCoordinator({ ownerId: "fixture-owner", nativeSourceId: "unit-native",
+        checkpointRoot, upstreamOrigin: "http://127.0.0.1:9", onEvent: event => current.events.push(event) });
+      const participant = coordinator.liveCodeParticipant();
+      current.participant = participant;
+      const state = participant.snapshot().state;
+      context.after(async () => {
+        await coordinator.close();
+        assert.equal(path.dirname(fs.realpathSync(checkpointRoot)), fs.realpathSync(os.tmpdir()));
+        fs.rmSync(checkpointRoot, { recursive: true, force: true });
+      });
+      const legacy = createRequire(import.meta.url)(process.env.COORDINATOR_PREVIOUS_COMPILED_BUNDLE);
+      const fixtureControl = current.state.implementation.control;
+      current.state = state;
+      state.maxThreads = 1;
+      state.workers.set(current.source.workerId, current.source);
+      state.defaultWorker = current.source;
+      const activate = (factory, control) => participant.activate(participant.prepare({
+        createInnerProxyCoordinatorImplementation: shared => ({ ...factory(shared), control }),
+      }));
+      activate(legacy.createInnerProxyCoordinatorImplementation, fixtureControl);
+      const notify = message => state.dispatch("observeNativeMessage", "unit-native", message);
+      if (ahead) {
+        const earlier = current.worker("earlier-owner");
+        state.workers.set(earlier.workerId, earlier);
+        state.defaultWorker = earlier;
+        await notify({ method: "turn/started", params: { threadId: "earlier-thread", turn: { id: "earlier-turn" } } });
+        await notify({ method: "turn/completed", params: { threadId: "earlier-thread", turn: { id: "earlier-turn", status: "completed" } } });
+        await state.dispatch("activate", { candidateId: current.source.workerId });
+      }
+      const completion = Object.freeze({ method: "turn/completed", params: Object.freeze({ threadId: "legacy-thread",
+        turn: Object.freeze({ id: "legacy-turn", status: "completed" }) }) });
+      await notify({ method: "turn/started", params: { threadId: "legacy-thread", turn: { id: "legacy-turn" } } });
+      await notify(completion);
+      const originalEvent = state.threads.get("legacy-thread").completion;
+      const originalBoundary = structuredClone(current.source.native.get("legacy-thread"));
+      for (const threadId of ["later-one", "later-two"]) {
+        await notify({ method: "turn/started", params: { threadId, turn: { id: threadId } } });
+        await notify({ method: "turn/completed", params: { threadId, turn: { id: threadId, status: "completed" } } });
+      }
+      for (const workerId of ahead ? ["third", "fourth"] : ["second", "third", "fourth"]) {
+        state.workers.set(workerId, current.worker(workerId));
+        await state.dispatch("activate", { candidateId: workerId });
+      }
+      const brokenTarget = state.defaultWorker;
+      const brokenNative = attachNativeFixture(context, current, brokenTarget);
+      await state.dispatch("reclaimRetiredWorkers");
+      assert.equal(brokenNative("check", { threadId: "legacy-thread" }).native.phase, "active");
+      const legacyWatermark = brokenTarget.nativeDelivered.get("legacy-thread");
+      assert.equal(legacyWatermark, originalBoundary.sequence);
+      assert.equal(originalEvent.sequence > legacyWatermark, ahead);
+      assert.equal(current.source.releasedThreadHistory.has("legacy-thread"), false);
+      assert.equal(state.threads.has("legacy-thread"), false);
+      assert.equal(state.terminalThreads.has("legacy-thread"), false);
+      assert.equal(state.workers.size, ahead ? 4 : 3);
+      const references = { workers: state.workers, threads: state.threads, terminalThreads: state.terminalThreads };
+      const previousSequence = state.nativeSequence;
+      activate(createInnerProxyCoordinatorImplementation, state.implementation.control);
+      for (const [key, value] of Object.entries(references)) assert.strictEqual(state[key], value);
+      const controlCount = current.controls.length;
+      await state.dispatch("relayNative", brokenTarget, originalEvent);
+      assert.equal(current.controls.length, controlCount + (ahead ? 1 : 0));
+      assert.throws(() => notify(completion), { code: "COORDINATOR_NATIVE_SEQUENCE_INVALID" });
+      if (ahead) {
+        const checked = brokenNative("check", { threadId: "legacy-thread" }).native;
+        assert.equal(checked.phase, "terminal");
+        assert.equal(checked.turnId, originalEvent.turnId);
+        assert.equal(checked.status, originalEvent.status);
+        assert.equal(state.nativeSequence, previousSequence);
+        assert.equal(current.source.releasedThreadHistory.has("legacy-thread"), false);
+        assert.equal(brokenTarget.releasedThreadHistory.has("legacy-thread"), true);
+        assert.equal(current.source.child.exitCode, null);
+        context.diagnostic(JSON.stringify({ originalSequence: originalEvent.sequence, legacyWatermark,
+          sameCompletionBoundaryRepaired: true, migrationCommitted: false, automaticReplay: false }));
+        return;
+      }
+      await state.dispatch("reclaimRetiredWorkers");
+      assert.equal(state.nativeSequence, previousSequence);
+      assert.equal(brokenNative("check", { threadId: "legacy-thread" }).native.phase, "active");
+      assert.deepEqual(current.source.native.get("legacy-thread"), originalBoundary);
+      assert.equal(current.source.child.exitCode, null);
+      assert.equal(current.source.releasedThreadHistory.has("legacy-thread"), false);
+      assert.equal(current.controls.some(entry => entry.owner === current.source && entry.method === "shutdown"), false);
+      state.workers.set("available-fourth-slot", current.worker("available-fourth-slot"));
+      const freshTarget = state.activation.source;
+      const freshNative = attachNativeFixture(context, current, freshTarget);
+      if (boundary === "missing") current.source.native.delete("legacy-thread");
+      await state.dispatch("reclaimRetiredWorkers");
+      if (boundary === "retained") {
+        const checked = freshNative("check", { threadId: "legacy-thread" }).native;
+        assert.equal(checked.turnId, originalEvent.turnId);
+        assert.equal(checked.phase, "terminal");
+        assert.equal(checked.status, originalEvent.status);
+        assert.equal(current.source.releasedThreadHistory.has("legacy-thread"), true);
+        assert.equal(current.source.child.exitCode, 0);
+      } else {
+        assert.equal(freshNative("check", { threadId: "legacy-thread" }).native, null);
+        assert.equal(current.source.releasedThreadHistory.has("legacy-thread"), false);
+        assert.equal(current.source.child.exitCode, null);
+        assert.ok(current.events.some(event => event.type === "retired_history_preserved"
+          && event.threadId === "legacy-thread" && event.code === "COORDINATOR_TERMINAL_HISTORY_UNAVAILABLE"));
+      }
+      assert.equal(brokenNative("check", { threadId: "legacy-thread" }).native.phase, "active");
+      context.diagnostic(JSON.stringify({ sourceBoundary: boundary, sameCompletionRepair: false,
+        threeLiveWorkersPreserved: true, verifiedFreshTargetRecovered: boundary === "retained", legacyTargetStillActive: true }));
+    });
+}
+
+test("consecutive expired restorations keep increasing coordinator and worker event sequences", async context => {
+  const current = await expiredRestorationFixture();
+  const first = current.state.defaultWorker;
+  attachNativeFixture(context, current, first);
+  await current.state.dispatch("reclaimRetiredWorkers");
+  assert.equal(current.source.child.exitCode, 0);
+  for (const workerId of ["spare-one", "spare-two", "fifth", "sixth"]) {
+    current.state.workers.set(workerId, current.worker(workerId));
+  }
+  const final = current.state.workers.get("sixth");
+  const native = attachNativeFixture(context, current, final);
+  await current.state.dispatch("activate", { candidateId: "fifth" });
+  await current.state.dispatch("activate", { candidateId: "sixth" });
+  const previousSequence = current.state.nativeSequence;
+  await current.state.dispatch("reclaimRetiredWorkers");
+  const events = current.restored.filter(entry => entry.owner === final && entry.event.threadId === "thread-0").map(entry => entry.event);
+  assert.deepEqual(events.map(event => event.phase), ["active", "terminal"]);
+  assert.equal(events[0].sequence, previousSequence + 1);
+  assert.equal(events[1].sequence, previousSequence + 2);
+  assert.equal(native("check", { threadId: "thread-0" }).native.phase, "terminal");
+  assert.equal(first.releasedThreadHistory.has("thread-0"), true);
+  assert.equal(final.releasedThreadHistory.has("thread-0"), false);
+});
+
+test("a restored terminal accepts a subsequent start and completion without losing its owner", async context => {
+  const current = await expiredRestorationFixture();
+  const target = current.state.defaultWorker;
+  const native = attachNativeFixture(context, current, target);
+  await current.state.dispatch("reclaimRetiredWorkers");
+  const previousSequence = current.state.nativeSequence;
+  const previousNativeSequence = target.nativeSequence;
+  await current.notify("thread-0", "resumed-turn");
+  await current.notify("thread-0", "resumed-turn", "completed", "failed");
+  const resumed = current.state.threads.get("thread-0");
+  assert.strictEqual(resumed.worker, target);
+  assert.equal(resumed.phase, "terminal");
+  assert.equal(resumed.start.sequence, previousSequence + 1);
+  assert.equal(resumed.completion.sequence, previousSequence + 2);
+  const checked = native("check", { threadId: "thread-0" }).native;
+  assert.equal(checked.turnId, "resumed-turn");
+  assert.equal(checked.status, "failed");
+  assert.equal(checked.sequence, previousNativeSequence + 2);
+});
+
+for (const replay of ["duplicate", "old-sequence"]) {
+  test(`restored terminal ${replay} events stay idempotent at the coordinator and rejected at the worker`, async context => {
+    const current = await expiredRestorationFixture();
+    const target = current.state.defaultWorker;
+    const native = attachNativeFixture(context, current, target);
+    await current.state.dispatch("reclaimRetiredWorkers");
+    const events = current.restored.filter(entry => entry.owner === target && entry.event.threadId === "thread-0").map(entry => entry.event);
+    const checked = native("check", { threadId: "thread-0" }).native;
+    const controlCount = current.controls.length;
+    const event = replay === "duplicate" ? events[1] : events[0];
+    await current.state.dispatch("relayNative", target, event);
+    assert.equal(current.controls.length, controlCount);
+    assert.deepEqual(native("check", { threadId: "thread-0" }).native, checked);
+    assert.throws(() => native("nativeTurn", { event: { ...event, sequence: replay === "duplicate" ? checked.sequence : checked.sequence - 1 } }),
+      { code: "HANDOFF_INVALID_NATIVE_EVENT" });
+    assert.deepEqual(native("check", { threadId: "thread-0" }).native, checked);
+  });
+}
+
+test("failed expired restoration retains its source boundary and retries with a fresh ordered pair", async context => {
+  const current = await expiredRestorationFixture();
+  for (const workerId of ["retry-spare-one", "retry-spare-two"]) current.state.workers.set(workerId, current.worker(workerId));
+  const target = current.state.defaultWorker;
+  attachNativeFixture(context, current, target);
+  attachNativeFixture(context, current, current.state.activation.source);
+  const originalBoundary = structuredClone(current.source.native.get("thread-0"));
+  const originalHistory = [...current.source.threadHistory];
+  const control = current.state.implementation.control;
+  current.state.implementation.control = (owner, method, params) => {
+    if (method === "accept") throw Object.assign(new Error("synthetic acceptance failure"), { code: "FIXTURE_ACCEPT_FAILED" });
+    return control(owner, method, params);
+  };
+  await current.state.dispatch("reclaimRetiredWorkers");
+  assert.deepEqual(current.source.native.get("thread-0"), originalBoundary);
+  assert.deepEqual([...current.source.threadHistory], originalHistory);
+  assert.equal(current.source.releasedThreadHistory.size, 0);
+  assert.equal(current.source.child.exitCode, null);
+  assert.equal(target.releasedThreadHistory.has("thread-0"), true);
+  assert.ok(current.controls.some(entry => entry.owner === current.source && entry.method === "cancel"));
+  assert.equal(current.state.migrations.size, 0);
+  assert.equal(current.state.transactionActive, false);
+  assert.equal(current.state.workerMaintenance, false);
+  const previousSequence = current.state.nativeSequence;
+  current.state.implementation.control = control;
+  await current.state.dispatch("reclaimRetiredWorkers");
+  const retries = current.restored.filter(entry => entry.event.threadId === "thread-0" && entry.event.sequence > previousSequence);
+  assert.deepEqual(retries.map(entry => entry.event.phase), ["active", "terminal"]);
+  assert.equal(retries[0].event.sequence, previousSequence + 1);
+  assert.equal(retries[1].event.sequence, previousSequence + 2);
+  assert.equal(current.source.releasedThreadHistory.has("thread-0"), true);
+  assert.equal(current.source.child.exitCode, 0);
+});
 
 test("terminal slots remain reusable while unrelated work is active on the same worker", async () => {
   const current = fixture();
@@ -495,8 +841,34 @@ for (const [name, protect] of Object.entries({
   });
 }
 
-test("reclamation transfers retained and expired terminal boundaries and preserves the rollback source", async () => {
+test("reclamation transfers retained and expired terminal boundaries and preserves the rollback source", async context => {
   const current = fixture();
+  const child = spawn(process.execPath, ["-e", 'process.on("message", message => { if (message?.type === "shutdown") process.disconnect(); }); process.on("disconnect", () => process.exit(0)); process.send({ ready: true });'],
+    { stdio: ["ignore", "ignore", "ignore", "ipc"], windowsHide: true });
+  current.source.child = child;
+  const control = current.state.implementation.control;
+  current.state.implementation.control = async (owner, method, params) => {
+    if (owner !== current.source || method !== "shutdown") return control(owner, method, params);
+    current.controls.push({ owner, method, params });
+    const exited = once(child, "exit");
+    child.send({ type: "shutdown" });
+    const [exitCode, signalCode] = await exited;
+    assert.equal(exitCode, 0);
+    assert.equal(signalCode, null);
+    return { recorded: true };
+  };
+  context.after(async () => {
+    const shutdownRequested = current.controls.some(entry => entry.owner === current.source && entry.method === "shutdown");
+    if (child.exitCode === null && child.signalCode === null) {
+      const exited = once(child, "exit");
+      child.send({ type: "shutdown" });
+      await exited;
+    }
+    assert.equal(child.exitCode, 0);
+    assert.equal(child.signalCode, null);
+    context.diagnostic(JSON.stringify({ ownedChildPid: child.pid, shutdownRequested, cleanupExitCode: child.exitCode }));
+  });
+  await once(child, "message", { signal: AbortSignal.timeout(2000) });
   await current.fill(260);
   for (const workerId of ["second", "third", "fourth"]) {
     const candidate = current.worker(workerId);
@@ -505,7 +877,11 @@ test("reclamation transfers retained and expired terminal boundaries and preserv
   }
   const history = current.state.terminalThreads;
   await current.state.dispatch("reclaimRetiredWorkers");
-  assert.equal(current.source.child.exitCode, 0);
+  assert.equal(current.source.child.exitCode, 0, JSON.stringify({ ownedChildPid: child.pid,
+    preserved: current.events.filter(event => event.type.startsWith("retired_")).slice(-5),
+    originalBoundary: current.source.native.get("thread-0"),
+    restoredBoundary: current.state.defaultWorker.native.get("thread-0"),
+    deliveredSequence: current.state.defaultWorker.nativeDelivered?.get("thread-0") }));
   assert.equal(current.source.releasedThreadHistory.size, 260);
   assert.strictEqual(current.state.terminalThreads, history);
   assert.equal(history.size, 128);
@@ -635,14 +1011,19 @@ test("an ambiguous expired owner is rejected without retiring unrelated history"
   assert.deepEqual([...current.state.terminalThreads], history);
 });
 
-test("production freshness still rejects a candidate whose released thread has expired from the coordinator cache", async () => {
+test("production freshness still rejects a candidate whose released thread has expired from the coordinator cache", async context => {
   const current = fixture();
   await current.finish("moved-thread");
   const target = current.worker("target");
   current.state.workers.set(target.workerId, target);
   await current.state.dispatch("migrate", { threadId: "moved-thread", candidateId: target.workerId });
   await current.fill(640);
-  current.state.runtimeProfile = {};
+  const stateRoot = fs.mkdtempSync(path.join(os.tmpdir(), "coordinator-freshness-"));
+  context.after(() => {
+    assert.equal(path.dirname(fs.realpathSync(stateRoot)), fs.realpathSync(os.tmpdir()));
+    fs.rmSync(stateRoot, { recursive: true, force: true });
+  });
+  current.state.runtimeProfile = { stateRoot };
   current.state.implementation = current.implementation();
   await assert.rejects(current.state.dispatch("activate", { candidateId: current.source.workerId }),
     { code: "COORDINATOR_FRESH_WORKER_REQUIRED" });

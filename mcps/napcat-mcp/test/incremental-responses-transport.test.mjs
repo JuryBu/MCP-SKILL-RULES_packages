@@ -76,6 +76,7 @@ async function fixture(context, handler, options = {}) {
   const server = new WebSocketServer({ host: "127.0.0.1", port: 0 });
   await once(server, "listening");
   const messages = [];
+  const controls = [];
   const connections = [];
   const sockets = new Set();
   server.on("connection", (socket, request) => {
@@ -86,6 +87,11 @@ async function fixture(context, handler, options = {}) {
     socket.on("close", () => sockets.delete(socket));
     socket.on("message", raw => {
       const entry = { connection, packet: JSON.parse(raw), bytes: raw.length, socket, index: messages.length + 1 };
+      if (entry.packet.type === "response.interrupt") {
+        controls.push(entry);
+        options.onInterrupt?.(entry);
+        return;
+      }
       messages.push(entry);
       if (handler) handler(entry);
       else complete(socket, `resp_${entry.index}`);
@@ -101,13 +107,13 @@ async function fixture(context, handler, options = {}) {
     assert.equal(transport.status().active, 0);
     assert.equal(transport.status().connections, 0);
   });
-  return { transport, messages, connections, sockets, url };
+  return { transport, messages, controls, connections, sockets, url };
 }
 
 function start(fixtureState, operationId, payload, settings = {}) {
   const { transport, url } = fixtureState;
   const client = transport.createRequestClient({
-    sessionKey: settings.sessionKey ?? "session-a", operationId, payload, url: settings.url ?? url,
+    sessionKey: settings.sessionKey ?? "session-a", turnId: settings.turnId, operationId, payload, url: settings.url ?? url,
     headers: settings.headers ?? fixtureHeaders,
     onPreparationProgress: settings.onPreparationProgress,
     onPacketSending: settings.onPacketSending,
@@ -160,12 +166,103 @@ test("cancelled downstream can drain a matching completed response without repla
   assert.equal(cancelled.sse.includes('"type":"response.completed"'), false);
 });
 
+test("legacy HTTP generation interruption retains the acknowledged WS anchor across a turn stop", async context => {
+  const initial = [message("large original history")];
+  const state = await fixture(context, entry => {
+    if (entry.index !== 1) return complete(entry.socket, `resp_${entry.index}`);
+    entry.socket.send(JSON.stringify({ type: "response.created", response: { id: "resp_first", status: "in_progress" } }));
+  }, { onInterrupt(entry) {
+    setTimeout(() => entry.socket.send(JSON.stringify({ type: "response.incomplete", response: {
+      id: "resp_first", status: "incomplete", output: [], incomplete_details: { reason: "interrupted" },
+    } })), 400);
+  } });
+  const first = start(state, "legacy-interrupt-first", body(initial), { turnId: "old-turn" });
+  await waitFor(() => state.transport.getOperation("legacy-interrupt-first")?.acceptance === true);
+  assert.equal(first.request.interrupt({ responseId: "resp_first", mode: "discard_partial_items" }).code, "native_websocket_required");
+  assert.equal(first.request.cancelAndDrain(), true);
+  first.request.destroy();
+  assert.equal((await first.done).error?.code, "ABORT_ERR");
+  assert.equal(state.transport.cancelTurn({ threadId: "session-a", turnId: "old-turn" }), true);
+  const next = await start(state, "legacy-interrupt-next", body([...initial, message("inserted instruction")]), { turnId: "new-turn" }).done;
+  assert.equal(next.error, undefined);
+  assert.equal(state.connections.length, 1);
+  assert.deepEqual(state.controls.map(entry => entry.packet), [{ type: "response.interrupt", response_id: "resp_first", mode: "discard_partial_items" }]);
+  assert.equal(state.messages[1].packet.previous_response_id, "resp_first");
+  assert.deepEqual(state.messages[1].packet.input, [message("inserted instruction")]);
+  assert.equal(state.transport.getOperation("legacy-interrupt-first").terminalOutcome, "interrupted");
+  assert.equal(state.transport.status().active, 0);
+  assert.equal(state.transport.status().queued, 0);
+});
+
+test("legacy HTTP interruption rejects a mismatched ACK and rebuilds only that session", async context => {
+  const initial = [message("original history")];
+  const state = await fixture(context, entry => {
+    if (entry.index !== 1) return complete(entry.socket, `resp_${entry.index}`);
+    entry.socket.send(JSON.stringify({ type: "response.created", response: { id: "resp_first", status: "in_progress" } }));
+    entry.socket.send(JSON.stringify({ type: "response.output_text.delta", delta: "partial" }));
+  }, { onInterrupt(entry) {
+    entry.socket.send(JSON.stringify({ type: "response.incomplete", response: {
+      id: "wrong_response", status: "incomplete", output: [], incomplete_details: { reason: "interrupted" },
+    } }));
+  } });
+  const first = start(state, "legacy-wrong-first", body(initial));
+  await waitFor(() => state.transport.getOperation("legacy-wrong-first")?.acceptance === true);
+  assert.equal(first.request.cancelAndDrain(), true);
+  first.request.destroy();
+  await first.done;
+  const nextInput = [...initial, message("new instruction")];
+  const next = await start(state, "legacy-wrong-next", body(nextInput)).done;
+  assert.equal(next.error, undefined);
+  assert.equal(state.connections.length, 2);
+  assert.equal(state.messages[1].packet.previous_response_id, undefined);
+  assert.deepEqual(state.messages[1].packet.input, nextInput);
+  assert.equal(state.transport.status().active, 0);
+  assert.equal(state.transport.status().queued, 0);
+});
+
+test("legacy HTTP repeated interruptions retain text and image increments and the following new turn", async context => {
+  const state = await fixture(context, entry => {
+    if (entry.index >= 4) return complete(entry.socket, `resp_${entry.index}`);
+    entry.socket.send(JSON.stringify({ type: "response.created", response: { id: `resp_${entry.index}`, status: "in_progress" } }));
+    entry.socket.send(JSON.stringify({ type: "response.output_text.delta", delta: "partial" }));
+  }, { onInterrupt(entry) {
+    setTimeout(() => entry.socket.send(JSON.stringify({ type: "response.incomplete", response: {
+      id: entry.packet.response_id, status: "incomplete", output: [], incomplete_details: { reason: "interrupted" },
+    } })), 30);
+  } });
+  const initial = message("large history ".repeat(5000));
+  let input = [initial];
+  for (let index = 1; index <= 3; index += 1) {
+    const operationId = `legacy-burst-${index}`;
+    const running = start(state, operationId, body(input));
+    await waitFor(() => state.transport.getOperation(operationId)?.acceptance === true);
+    assert.equal(running.request.cancelAndDrain(), true);
+    running.request.destroy();
+    assert.equal((await running.done).error?.code, "ABORT_ERR");
+    input = [...input, index === 3 ? { type: "message", role: "user", content: [
+      { type: "input_text", text: "image insertion" },
+      { type: "input_image", image_url: `data:image/png;base64,${redBluePng().toString("base64")}` },
+    ] } : message(`inserted ${index}`)];
+  }
+  assert.equal((await start(state, "legacy-burst-final", body(input)).done).error, undefined);
+  assert.equal((await start(state, "legacy-after-completed", body([...input, message("new turn")])).done).error, undefined);
+  assert.equal(state.connections.length, 1);
+  assert.equal(state.controls.length, 3);
+  for (const entry of state.messages.slice(1)) {
+    assert.equal(entry.packet.input.length, 1);
+    assert.notDeepEqual(entry.packet.input[0], initial);
+    assert.ok(entry.packet.previous_response_id);
+  }
+  assert.equal(state.transport.status().active, 0);
+  assert.equal(state.transport.status().queued, 0);
+});
+
 test("drain expiry remains bounded and rebuilds the next real input", async context => {
   const state = await fixture(context, entry => {
     if (entry.index !== 1) return complete(entry.socket, `resp_${entry.index}`);
     entry.socket.send(JSON.stringify({ type: "response.created", response: { id: "resp_first", status: "in_progress" } }));
     entry.socket.send(JSON.stringify({ type: "response.output_text.delta", delta: "partial" }));
-  });
+  }, { interruptTimeoutMs: 300, interruptHandoffTimeoutMs: 400 });
   const first = start(state, "cancel-expire-first", body([message("initial")]));
   await waitFor(() => state.transport.getOperation("cancel-expire-first")?.acceptance === true);
   const started = performance.now();
@@ -177,6 +274,7 @@ test("drain expiry remains bounded and rebuilds the next real input", async cont
   const input = [message("initial"), message("changed")];
   const next = await start(state, "cancel-expire-next", body(input)).done;
   assert.equal(next.error, undefined);
+  assert.ok(performance.now() - started >= 300);
   assert.ok(performance.now() - started < 800);
   assert.equal(state.connections.length, 2);
   assert.equal(state.messages[1].packet.previous_response_id, undefined);
@@ -313,7 +411,7 @@ test("dynamic turn tracing metadata preserves the exact prefix while semantic me
   const output = [assistant("first output")];
   const state = await fixture(context, entry => complete(entry.socket, `resp_meta_${entry.index}`, entry.index === 1 ? output : []));
   const input = [message("initial")];
-  const metadata = (turn, sandbox = "read-only") => ({ thread_id: "trace-thread", turn_id: turn, root_turn_id: turn,
+  const metadata = (turn, sandbox = "read-only") => ({ thread_id: "trace-thread", turn_id: turn, root_turn_id: turn, sandbox_mode: sandbox,
     "x-codex-turn-metadata": JSON.stringify({ thread_id: "trace-thread", turn_id: turn,
       root_turn_id: turn, turn_started_at_unix_ms: turn === "one" ? 1 : 2, sandbox_mode: sandbox }) });
   await start(state, "trace-one", { ...body(input), client_metadata: metadata("one") }).done;
@@ -327,6 +425,211 @@ test("dynamic turn tracing metadata preserves the exact prefix while semantic me
     client_metadata: metadata("three", "workspace-write") }).done;
   assert.equal(state.connections.length, 2);
   assert.equal(state.messages[2].packet.previous_response_id, undefined);
+});
+
+test("client source diagnostic metadata may disappear across message sources without replacing unchanged tools", async context => {
+  const state = await fixture(context);
+  const diagnostic = { client_type: "fixture_desktop", source: "fixture_user" };
+  const metadata = details => ({ thread_id: "source-thread", "x-codex-turn-metadata": JSON.stringify({
+    thread_id: "source-thread", sandbox_mode: "read-only", ...details }) });
+  const tools = [{ type: "function", name: "fixture_tool", parameters: { type: "object", properties: {} } }];
+  const decisions = [];
+  const settings = { onPacketSending: progress => decisions.push(progress.cacheDecision) };
+  const input = [message("first")];
+  await start(state, "source-initial", { ...body(input), tools, client_metadata: metadata(diagnostic) }, settings).done;
+  for (const [index, details] of [{}, { ...diagnostic, source: "fixture_thread_tool" }].entries()) {
+    const added = message(`source-${index}`);
+    input.push(added);
+    await start(state, `source-${index}`, { ...body(input), tools, client_metadata: metadata(details) }, settings).done;
+    assert.equal(state.connections.length, 1);
+    assert.equal(state.messages.at(-1).packet.previous_response_id, `resp_${index + 1}`);
+    assert.deepEqual(state.messages.at(-1).packet.input, [added]);
+    assert.deepEqual(state.messages.at(-1).packet.client_metadata, metadata(details));
+    assert.deepEqual(decisions.at(-1).clientMetadataChanges, []);
+    assert.deepEqual(decisions.at(-1).rawClientMetadataChanges.map(change => [change.path, change.before, change.after]),
+      ["client_type", "source"].map(key => [`client_metadata.x-codex-turn-metadata.${key}`,
+        index === 0 ? "string" : "absent", index === 0 ? "absent" : "string"]));
+    assert.ok(decisions.at(-1).rawClientMetadataChanges.every(change => /^[a-f0-9]{16}$/u.test(change.keyTag)));
+  }
+  input.push(message("different tool schema"));
+  await start(state, "source-tools-changed", { ...body(input), tools: [{ ...tools[0], name: "different_tool" }],
+    client_metadata: metadata(diagnostic) }).done;
+  assert.equal(state.connections.length, 2);
+  assert.equal(state.messages.at(-1).packet.previous_response_id, undefined);
+  assert.deepEqual(state.messages.at(-1).packet.input, input);
+  input.push(message("different sandbox"));
+  await start(state, "source-sandbox-changed", { ...body(input), tools: [{ ...tools[0], name: "different_tool" }],
+    client_metadata: metadata({ ...diagnostic, sandbox_mode: "workspace-write" }) }).done;
+  assert.equal(state.connections.length, 2);
+  assert.ok(state.messages.at(-1).packet.previous_response_id);
+  input.push(message("structured request annotation"));
+  await start(state, "source-structured-metadata", { ...body(input), tools: [{ ...tools[0], name: "different_tool" }],
+    client_metadata: metadata({ ...diagnostic, sandbox_mode: "workspace-write", client_type: ["fixture_desktop"] }) }).done;
+  assert.equal(state.connections.length, 2);
+  assert.ok(state.messages.at(-1).packet.previous_response_id);
+  assert.deepEqual(state.messages.at(-1).packet.input, [input.at(-1)]);
+});
+
+test("client metadata diagnostics report normalized paths and types without changing cache decisions", async context => {
+  const secret = "fixture-private-value-never-log";
+  const nested = value => ({ "x-codex-turn-metadata": JSON.stringify(value) });
+  const change = (path, before, after, truncated = false) => ({ path, before, after,
+    beforePresent: before !== "absent", afterPresent: after !== "absent", truncated });
+  const cases = [
+    { name: "metadata added", before: undefined, after: {}, changes: [change("client_metadata", "absent", "object")] },
+    { name: "metadata removed", before: {}, after: undefined, changes: [change("client_metadata", "object", "absent")] },
+    { name: "unknown field added", before: {}, after: { "fixture-private-key": secret },
+      changes: [change("client_metadata.<key:1>", "absent", "string")] },
+    { name: "unknown field removed", before: { "fixture-private-key": secret }, after: {},
+      changes: [change("client_metadata.<key:1>", "string", "absent")] },
+    { name: "parsed nested annotation type changed", before: nested({ sandbox_mode: { "fixture-private-key": secret } }),
+      after: nested({ sandbox_mode: { "fixture-private-key": 42 } }),
+      changes: [], rawChanges: [change("client_metadata.x-codex-turn-metadata.sandbox_mode.<key:1>", "string", "number")] },
+    { name: "unknown nested annotation changed", before: nested({ "fixture-private-key": secret }),
+      after: nested({ "fixture-private-key": "fixture-private-next-value" }),
+      changes: [], rawChanges: [change("client_metadata.x-codex-turn-metadata.<key:1>", "string", "string")] },
+    { name: "unparseable metadata remains opaque", before: { "x-codex-turn-metadata": `${secret}{` },
+      after: { "x-codex-turn-metadata": "fixture-private-next-value{" },
+      changes: [change("client_metadata.x-codex-turn-metadata", "string", "string")] },
+    { name: "null becomes array", before: { approval_policy: null }, after: { approval_policy: [secret] },
+      changes: [change("client_metadata.approval_policy", "null", "array")] },
+    { name: "empty object becomes empty array", before: { approval_policy: {} }, after: { approval_policy: [] },
+      changes: [change("client_metadata.approval_policy", "object", "array")] },
+    { name: "top-level trigger remains semantic", before: { turn_trigger: "user" }, after: { turn_trigger: "subagent_notification" },
+      changes: [change("client_metadata.turn_trigger", "string", "string")] },
+    ...["window_id", "window_number", "context_window_id", "history_initialization", "request_kind", "agent_id", "agent_name",
+      "root", "sandbox", "auto_review_enabled", "node_repl"].map(field => ({ name: `safe diagnostic field ${field}`,
+      before: { [field]: secret }, after: { [field]: 42 }, changes: [change(`client_metadata.${field}`, "string", "number")] })),
+    { name: "array index uses the actual index", before: { approval_policy: Array(12).fill(secret) },
+      after: { approval_policy: Array.from({ length: 12 }, (_value, index) => index === 10 ? 42 : secret) },
+      changes: [change("client_metadata.approval_policy[10]", "string", "number")] },
+    { name: "ignored provenance is silent", before: { turn_id: "first", root_turn_id: "first", parent_turn_id: "first",
+      turn_started_at_unix_ms: 1, ...nested({ turn_id: "first", root_turn_id: "first", parent_turn_id: "first",
+        turn_started_at_unix_ms: 1, turn_trigger: "user", sandbox_mode: "read-only" }) },
+      after: { turn_id: "next", root_turn_id: "next", parent_turn_id: "next", turn_started_at_unix_ms: 2,
+        ...nested({ turn_trigger: "subagent_notification", turn_id: "next", root_turn_id: "next", parent_turn_id: "next",
+          turn_started_at_unix_ms: 2, sandbox_mode: "read-only" }) }, changes: [] },
+    { name: "canonical property order is silent", before: nested({ sandbox_mode: "read-only", approval_policy: secret }),
+      after: nested({ approval_policy: secret, sandbox_mode: "read-only" }), changes: [] },
+  ];
+  for (const scenario of cases) await context.test(scenario.name, async subcontext => {
+    const state = await fixture(subcontext);
+    const decisions = [];
+    const settings = { onPacketSending: progress => decisions.push(progress.cacheDecision) };
+    const initial = [message("initial")];
+    const addition = message("next");
+    const payload = (input, metadata) => ({ ...body(input), ...(metadata === undefined ? {} : { client_metadata: metadata }) });
+    assert.equal((await start(state, "metadata-first", payload(initial, scenario.before), settings).done).error, undefined);
+    assert.equal((await start(state, "metadata-next", payload([...initial, addition], scenario.after), settings).done).error, undefined);
+    assert.deepEqual(decisions[0].clientMetadataChanges, []);
+    assert.deepEqual(decisions[1].clientMetadataChanges, scenario.changes);
+    if (scenario.rawChanges) assert.deepEqual(decisions[1].rawClientMetadataChanges.map(({ keyTag, ...change }) => change), scenario.rawChanges);
+    const changed = scenario.changes.length > 0;
+    assert.equal(decisions[1].reason, changed ? "configuration_or_identity_changed" : "reused");
+    assert.equal(state.connections.length, changed ? 2 : 1);
+    assert.equal(state.messages[1].packet.previous_response_id, changed ? undefined : "resp_1");
+    assert.deepEqual(state.messages[1].packet.input, changed ? [...initial, addition] : [addition]);
+    assert.deepEqual(state.messages[1].packet.client_metadata, scenario.after);
+    const diagnostic = JSON.stringify(decisions);
+    for (const privateText of [secret, "fixture-private-key", "fixture-private-next-value"]) assert.equal(diagnostic.includes(privateText), false);
+    assert.doesNotMatch(diagnostic, /[a-f0-9]{64}/i);
+  });
+});
+
+test("client metadata diagnostics bound changed paths, sensitive key lengths and nested snapshots", async context => {
+  for (const size of [24, 80]) await context.test(`width ${size}`, async subcontext => {
+    const state = await fixture(subcontext);
+    const decisions = [];
+    const settings = { onPacketSending: progress => decisions.push(progress.cacheDecision) };
+    const metadata = value => Object.fromEntries(Array.from({ length: size }, (_entry, index) =>
+      [`private-sensitive-key-${index}-${"x".repeat(1000)}`, value]));
+    const initial = [message("initial")];
+    await start(state, "bounded-first", { ...body(initial), client_metadata: metadata("private-before") }, settings).done;
+    const result = await start(state, "bounded-next", { ...body([...initial, message("next")]), client_metadata: metadata("private-after") }, settings).done;
+    assert.equal(result.error, undefined);
+    const changes = decisions[1].clientMetadataChanges;
+    assert.equal(changes.length, size === 24 ? 12 : 1);
+    assert.ok(changes.every(change => change.path.length <= 192));
+    assert.equal(changes[0].truncated, size > 64);
+    assert.ok(JSON.stringify(changes).length < 2500);
+    assert.doesNotMatch(JSON.stringify(decisions), /private-|x{20}|[a-f0-9]{64}/i);
+    assert.equal(state.connections.length, 2);
+  });
+  await context.test("depth limit", async subcontext => {
+    const state = await fixture(subcontext);
+    const decisions = [];
+    const settings = { onPacketSending: progress => decisions.push(progress.cacheDecision) };
+    const metadata = value => ({ approval_policy: { approval_policy: { approval_policy: { approval_policy: { approval_policy: value } } } } });
+    const initial = [message("initial")];
+    await start(state, "depth-first", { ...body(initial), client_metadata: metadata("private-before") }, settings).done;
+    await start(state, "depth-next", { ...body([...initial, message("next")]), client_metadata: metadata("private-after") }, settings).done;
+    assert.equal(decisions[1].clientMetadataChanges.length, 1);
+    assert.equal(decisions[1].clientMetadataChanges[0].truncated, true);
+    assert.equal(decisions[1].clientMetadataChanges[0].before, "object");
+    assert.equal(decisions[1].clientMetadataChanges[0].after, "object");
+    assert.doesNotMatch(JSON.stringify(decisions), /private-|[a-f0-9]{64}/i);
+  });
+});
+
+test("cache diagnostics retain concurrent miss causes and the preceding reset without changing reuse", async context => {
+  const state = await fixture(context);
+  const decisions = [];
+  const settings = { onPacketSending: progress => decisions.push(progress.cacheDecision) };
+  await start(state, "causes-first", body([message("initial")]), settings).done;
+  const edited = [message("edited")];
+  const payload = input => ({ ...body(input), client_metadata: { agent_name: "fixture-private-agent-value" } });
+  await start(state, "causes-edited", payload(edited), settings).done;
+  await start(state, "causes-reused", payload([...edited, message("next")]), settings).done;
+  assert.deepEqual(decisions[0].cacheMissReasons, ["initial", "connection_unavailable", "previous_response_unavailable"]);
+  assert.equal(decisions[0].connectionWasOpen, false);
+  assert.equal(decisions[0].previousResponsePresent, false);
+  assert.equal(decisions[0].lastResetReason, null);
+  assert.equal(decisions[0].lastResetAt, null);
+  assert.equal(decisions[1].connectionWasOpen, true);
+  assert.equal(decisions[1].previousResponsePresent, true);
+  assert.deepEqual(decisions[1].cacheMissReasons, ["configuration_or_identity_changed", "input_prefix_changed"]);
+  assert.equal(decisions[1].reason, "configuration_or_identity_changed");
+  assert.equal(decisions[1].lastResetReason, "initial_binding");
+  assert.match(decisions[1].lastResetAt, /^\d{4}-\d\d-\d\dT.*Z$/);
+  assert.equal(decisions[2].lastResetReason, "configuration_and_input_prefix_changed");
+  assert.equal(decisions[2].lastResetWasIdle, false);
+  assert.equal(decisions[2].lastResetCloseCode, null);
+  assert.equal(decisions[2].lastResetCloseCategory, null);
+  assert.deepEqual(decisions[2].cacheMissReasons, []);
+  assert.equal(decisions[2].reason, "reused");
+  assert.equal(state.connections.length, 2);
+  assert.equal(state.messages[1].packet.previous_response_id, undefined);
+  assert.equal(state.messages[2].packet.previous_response_id, "resp_2");
+  assert.deepEqual(state.messages[2].packet.input, [message("next")]);
+  assert.doesNotMatch(JSON.stringify(decisions), /fixture-private-agent-value|resp_|[a-f0-9]{64}/i);
+});
+
+test("idle close diagnostics expose only bounded codes and fixed classifications", async context => {
+  for (const [code, category] of [[1000, "normal"], [1009, "message_too_large"], [4001, "application"]]) {
+    await context.test(`close ${code}`, async subcontext => {
+      const state = await fixture(subcontext);
+      const decisions = [];
+      const settings = { onPacketSending: progress => decisions.push(progress.cacheDecision) };
+      const initial = [message("history")];
+      await start(state, "close-first", body(initial), settings).done;
+      state.connections[0].socket.close(code, "fixture-private-close-text");
+      await waitFor(() => state.transport.status().connections === 0);
+      assert.equal((await start(state, "close-next", body([...initial, message("next")]), settings).done).error, undefined);
+      const decision = decisions[1];
+      assert.equal(decision.connectionWasOpen, false);
+      assert.equal(decision.previousResponsePresent, false);
+      assert.equal(decision.lastResetWasIdle, true);
+      assert.equal(decision.lastResetReason, code === 1009 ? "WS_MESSAGE_TOO_LARGE" : "WS_CONNECTION_CLOSED");
+      assert.equal(decision.lastResetCloseCode, code);
+      assert.equal(decision.lastResetCloseCategory, category);
+      assert.match(decision.lastResetAt, /^\d{4}-\d\d-\d\dT.*Z$/);
+      assert.deepEqual(decision.cacheMissReasons, ["connection_unavailable", "previous_response_unavailable"]);
+      assert.equal(state.connections.length, 2);
+      assert.equal(state.messages[1].packet.previous_response_id, undefined);
+      assert.deepEqual(state.messages[1].packet.input, [...initial, message("next")]);
+      assert.doesNotMatch(JSON.stringify(decisions), /fixture-private-close-text|resp_|[a-f0-9]{64}/i);
+    });
+  }
 });
 
 test("two generate:false prewarms are followed by one generation; only generation SSE escapes", async context => {
@@ -456,16 +759,22 @@ test("edited, compressed, semantic-config, authentication and URL changes rebuil
 
 test("an idle disconnect drops connection-local IDs and rebuilds from full input", async context => {
   const state = await fixture(context);
+  const decisions = [];
+  const settings = { onPacketSending: progress => decisions.push(progress.cacheDecision) };
   const input = [message("history")];
-  await start(state, "disconnect-1", body(input)).done;
+  await start(state, "disconnect-1", body(input), settings).done;
   state.connections[0].socket.terminate();
   await waitFor(() => state.transport.status().connections === 0);
-  const result = await start(state, "disconnect-2", body([...input, message("next")])).done;
+  const result = await start(state, "disconnect-2", body([...input, message("next")]), settings).done;
   assert.equal(result.error, undefined);
   assert.equal(state.connections.length, 2);
   assert.deepEqual(state.messages[1].packet.input, [...input, message("next")]);
   assert.equal(state.messages[1].packet.previous_response_id, undefined);
   assert.equal(state.transport.getOperation("disconnect-1").state, "completed");
+  assert.equal(decisions[1].lastResetCloseCode, 1006);
+  assert.equal(decisions[1].lastResetCloseCategory, "abnormal");
+  assert.equal(decisions[1].lastResetWasIdle, true);
+  assert.equal(decisions[1].lastResetReason, "WS_CONNECTION_CLOSED");
 });
 
 test("a sent generation with no acceptance event remains unknown and duplicate operation is blocked", async context => {
@@ -503,7 +812,8 @@ test("unknown prewarm acceptance prevents replay of the same packet", async cont
   const first = await start(state, "unknown-prewarm", payload).done;
   assert.equal(first.error.requestAccepted, "unknown");
   assert.equal(first.error.requestTransmissionState, "prewarm_sent");
-  assert.equal(first.response, undefined);
+  assert.equal(first.response.statusCode, 200);
+  assert.equal(first.sse, "");
   const duplicate = await start(state, "unknown-prewarm", payload).done;
   assert.equal(duplicate.error.code, "duplicate_operation");
   assert.equal(state.messages.length, 1);
@@ -536,15 +846,17 @@ test("503 invalidates only the affected session and preserves earlier unknown re
   const failed = await start(state, "service-unavailable", body([message("503")])).done;
   assert.equal(failed.error.code, "WS_HTTP_503");
   assert.equal(failed.error.httpStatus, 503);
-  assert.equal(failed.error.requestAccepted, "unknown");
+  assert.equal(failed.error.requestAccepted, false);
   assert.equal(state.transport.getOperation("older-unknown").acceptance, "unknown");
+  assert.equal(state.transport.getOperation("older-unknown").canRetry, false);
+  assert.equal(state.transport.getOperation("service-unavailable").canRetry, true);
   assert.equal(healthySocket.readyState, WebSocket.OPEN);
   const healthy = await start(state, "healthy-increment", body([message("healthy"), message("next")]), { sessionKey: "session-b" }).done;
   assert.equal(healthy.error, undefined);
   assert.equal(state.messages.at(-1).packet.previous_response_id, "resp_2");
 });
 
-test("matching empty failed terminal permits a fresh connection without losing accepted history", async context => {
+test("matching empty failed terminal permits a fresh connection after explicit rejection", async context => {
   const state = await fixture(context, entry => {
     const id = `resp_terminal_${entry.index}`;
     if (entry.index > 1) return complete(entry.socket, id);
@@ -554,7 +866,7 @@ test("matching empty failed terminal permits a fresh connection without losing a
   });
   const payload = body([message("safe-empty-terminal")]);
   const failed = await start(state, "empty-failed", payload).done;
-  assert.equal(failed.error.requestAccepted, true);
+  assert.equal(failed.error.requestAccepted, false);
   assert.equal(failed.request.terminalOutcome, "failed_no_output");
   assert.equal(state.transport.getOperation("empty-failed").canRetry, true);
   assert.equal(state.transport.getOperation("empty-failed").requiresReconciliation, false);
@@ -563,13 +875,22 @@ test("matching empty failed terminal permits a fresh connection without losing a
   assert.equal(state.messages[1].packet.previous_response_id, undefined);
 });
 
-test("a failed terminal with missing output or prior business events stays replay protected", async context => {
-  const cases = [null, { type: "response.output_text.delta", delta: "visible" },
-    { type: "response.output_item.added", item: { type: "function_call", call_id: "fixture-tool", arguments: "{}" } },
-    { type: "response.web_search_call.in_progress" }, { type: "response.reasoning_summary_text.delta", delta: "reasoning" }];
-  for (const [index, progress] of cases.entries()) {
+test("failed response replay permission follows each delivered output shape", async context => {
+  const cases = [
+    { name: "missing output without progress", progress: null, canRetry: true },
+    { name: "visible text", progress: { type: "response.output_text.delta", delta: "visible" }, canRetry: false },
+    { name: "partial function item", progress: { type: "response.output_item.added",
+      item: { type: "function_call", call_id: "fixture-tool", arguments: "{}" } }, canRetry: false },
+    { name: "completed executable tool", progress: { type: "response.output_item.done",
+      item: { type: "function_call", name: "counter", call_id: "fixture-tool", arguments: "{}" } }, canRetry: false },
+    { name: "search already running", progress: { type: "response.web_search_call.in_progress" }, canRetry: false },
+    { name: "delivered reasoning summary", progress: { type: "response.reasoning_summary_text.delta", delta: "reasoning" }, canRetry: false },
+    { name: "protocol-only progress", progress: { type: "response.in_progress" }, canRetry: true },
+  ];
+  for (const [index, { name, progress, canRetry }] of cases.entries()) await context.test(name, async context => {
     const state = await fixture(context, entry => {
       const id = `resp_unsafe_${index}`;
+      if (entry.index > 1) return complete(entry.socket, id);
       entry.socket.send(JSON.stringify({ type: "response.created", response: { id, status: "in_progress", output: [] } }));
       if (progress) entry.socket.send(JSON.stringify(progress));
       entry.socket.send(JSON.stringify({ type: "response.failed", response: { id, status: "failed",
@@ -577,11 +898,12 @@ test("a failed terminal with missing output or prior business events stays repla
     });
     const operation = `unsafe-${index}`;
     const failed = await start(state, operation, body([message("protected")])).done;
-    assert.equal(failed.request.terminalOutcome, undefined);
-    assert.equal(state.transport.getOperation(operation).canRetry, false);
+    assert.equal(failed.request.terminalOutcome, progress && canRetry ? "failed_no_output" : undefined);
+    assert.equal(failed.error.requestAccepted, !canRetry);
+    assert.equal(state.transport.getOperation(operation).canRetry, canRetry);
     await start(state, operation, body([message("protected")])).done;
-    assert.equal(state.messages.length, 1);
-  }
+    assert.equal(state.messages.length, canRetry ? 2 : 1);
+  });
 });
 
 test("conflicting response identities cannot hide business output before an empty failed terminal", async context => {
@@ -632,7 +954,7 @@ test("verified prewarm failures deliver an immutable internal proof without cons
   assert.equal(state.messages[0].packet.generate, false);
   const policy = classifyModelFailure({ source: "transport", requestAccepted: failed.error.requestAccepted,
     statusCode: failed.error.httpStatus, code: failed.error.code, terminalEvidence: evidence });
-  assert.equal(policy.acceptance, "accepted");
+  assert.equal(policy.acceptance, "rejected");
   assert.equal(policy.retryable, true);
   assert.equal(classifyModelFailure({ source: "transport", requestAccepted: true, statusCode: 503,
     terminalEvidence: { ...evidence } }).retryable, false);
@@ -717,8 +1039,13 @@ test("cancelling while awaiting a terminal preserves acceptance and rebuilds onl
   assert.equal((await pending.done).error.requestAccepted, true);
   assert.equal(state.connections[0].socket.readyState, WebSocket.OPEN);
   assert.equal(state.transport.getOperation("await-cancel").state, "cancelled");
-  await start(state, "after-cancel", body([message("fresh")])).done;
+  const decisions = [];
+  await start(state, "after-cancel", body([message("fresh")]), { onPacketSending: progress => decisions.push(progress.cacheDecision) }).done;
   assert.equal(state.messages.at(-1).packet.previous_response_id, undefined);
+  assert.equal(decisions[0].lastResetReason, "active_request_cancelled");
+  assert.equal(decisions[0].lastResetWasIdle, false);
+  assert.equal(decisions[0].lastResetCloseCode, null);
+  assert.deepEqual(decisions[0].cacheMissReasons, ["connection_unavailable", "previous_response_unavailable"]);
 });
 
 test("connecting cancellation is unsent; Writable finish only reports local body completion", async context => {
@@ -1015,10 +1342,10 @@ test("upstream failure event stays byte-for-byte SSE and never creates a success
   const state = await fixture(context, entry => entry.socket.send(raw));
   const result = await start(state, "raw-failure", body([message("failure")])).done;
   assert.equal(result.error.httpStatus, 503);
-  assert.equal(result.error.requestAccepted, true);
+  assert.equal(result.error.requestAccepted, false);
   assert.ok(result.sse.includes(`data: ${raw}\n\n`));
   assert.equal(result.sse.includes("response.completed"), false);
-  assert.equal(state.transport.getOperation("raw-failure").acceptance, true);
+  assert.equal(state.transport.getOperation("raw-failure").acceptance, false);
 });
 
 test("backpressure across separate network reads preserves the terminal and the next queued operation", async context => {
@@ -1066,6 +1393,29 @@ test("large UTF8 histories remain atomic, every frame respects its limit, and th
   assert.equal(state.messages.at(-1).packet.previous_response_id, terminalId);
   assert.deepEqual(state.messages.at(-1).packet.input, [message("next")]);
   context.diagnostic(`large history items=2000; prewarm frames=${prewarmFrames}; frame cap=4096B; next-turn bytes=${state.messages.at(-1).bytes}`);
+});
+
+test("idle session eviction preserves the most recently used conversation prefix", async context => {
+  const state = await fixture(context, null, { maxSessions: 2 });
+  const firstInput = [message("recent-first")];
+  const secondInput = [message("older-second")];
+  assert.equal((await start(state, "recent-first", body(firstInput)).done).error, undefined);
+  assert.equal((await start(state, "older-second", body(secondInput), { sessionKey: "session-b" }).done).error, undefined);
+  const recentInput = [...firstInput, message("recent-next")];
+  assert.equal((await start(state, "recent-next", body(recentInput)).done).error, undefined);
+  assert.equal((await start(state, "third-session", body([message("third")]), { sessionKey: "session-c" }).done).error, undefined);
+  const latestInput = [...recentInput, message("latest")];
+  assert.equal((await start(state, "recent-latest", body(latestInput)).done).error, undefined);
+  assert.equal(state.messages[4].connection, state.messages[0].connection);
+  assert.equal(state.messages[4].packet.previous_response_id, "resp_3");
+  assert.deepEqual(state.messages[4].packet.input, [message("latest")]);
+  assert.equal(state.connections.length, 3);
+  assert.equal((await start(state, "older-resumed", body(secondInput), { sessionKey: "session-b" }).done).error, undefined);
+  assert.equal(state.connections.length, 4);
+  assert.equal(state.messages[5].packet.previous_response_id, undefined);
+  assert.deepEqual(state.messages[5].packet.input, secondInput);
+  assert.equal(state.transport.status().sessions, 2);
+  assert.equal(state.transport.status().active, 0);
 });
 
 test("idle session eviction never evicts its unknown operation ledger", async context => {
@@ -1176,10 +1526,63 @@ test("explicit no-output failures retain their original classification and allow
     const first = await start(state, "raw-failure", input).done;
     assert.deepEqual(first.error.upstreamError, error);
     const retry = await start(state, "raw-failure", input, { retryWithoutOutput: true }).done;
-    assert.equal(retry.error, undefined);
-    assert.equal(state.packets.length, 2);
-    assert.equal(state.transport.getOperation("raw-failure").attempt, 2);
+    const explicitRejection = error.code === "rate_limit_exceeded" || error.status === 503;
+    if (explicitRejection) {
+      assert.equal(retry.error, undefined);
+      assert.equal(state.packets.length, 2);
+      assert.equal(state.transport.getOperation("raw-failure").attempt, 2);
+    } else {
+      assert.equal(retry.error?.code, "duplicate_operation");
+      assert.equal(state.packets.length, 1);
+      assert.equal(state.transport.getOperation("raw-failure").requiresReconciliation, true);
+    }
   }
+});
+
+test("confirmed warm-only cancellations do not fill the default operation capacity", async context => {
+  let activeRequest;
+  let generationCount = 0;
+  const state = synchronousFixture(context, (socket, packet, index) => {
+    if (packet.generate !== false) generationCount += 1;
+    queueMicrotask(() => {
+      assert.equal(activeRequest.cancelAndDrain(), true);
+      activeRequest.destroy();
+      socket.complete(`warm_${index}`);
+    });
+  }, { interruptiblePrewarmBytes: 128, maxMessageBytes: 1024, maxSessionBytes: 65536 });
+  for (let index = 0; index < 4100; index += 1) {
+    const operationId = `warm-capacity-${index}`;
+    const current = start(state, operationId, body([message(`${index}:` + "w".repeat(256))]));
+    activeRequest = current.request;
+    assert.equal((await current.done).error.code, "ABORT_ERR");
+    assert.equal(state.transport.getOperation(operationId).state, "cancelled");
+    assert.equal(state.transport.getOperation(operationId).acceptance, true);
+    assert.equal(state.transport.getOperation(operationId).requiresReconciliation, false);
+  }
+  assert.equal(generationCount, 0);
+  assert.equal(state.transport.status().active, 0);
+  assert.equal(state.transport.status().operations, 4096);
+});
+
+test("known native history initialization provenance preserves the unchanged history and wire values", async context => {
+  const state = await fixture(context);
+  const input = [message("preserved history")];
+  const metadata = value => ({ "x-codex-turn-metadata": JSON.stringify({ history_initialization: value, sandbox_mode: "read-only" }) });
+  const decisions = [];
+  const settings = { onPacketSending: value => decisions.push(value.cacheDecision) };
+  assert.equal((await start(state, "native-new", { ...body(input), client_metadata: metadata("new") }, settings).done).error, undefined);
+  const next = message("ordinary resumed turn");
+  assert.equal((await start(state, "native-resumed", { ...body([...input, next]), client_metadata: metadata("cold_resume") }, settings).done).error, undefined);
+  assert.equal(decisions[1].reason, "reused");
+  assert.equal(state.connections.length, 1);
+  assert.deepEqual(state.messages[1].packet.input, [next]);
+  assert.deepEqual(state.messages[1].packet.client_metadata, metadata("cold_resume"));
+  assert.equal((await start(state, "unknown-initialization", { ...body([...input, next, message("third")]),
+    client_metadata: metadata("unknown-semantic-mode") }, settings).done).error, undefined);
+  assert.equal(decisions[2].reason, "reused");
+  assert.equal(state.connections.length, 1);
+  assert.deepEqual(state.messages[2].packet.input, [message("third")]);
+  assert.deepEqual(state.messages[2].packet.client_metadata, metadata("unknown-semantic-mode"));
 });
 
 test("a local duplicate preserves the original operation and its raw failure", async context => {
@@ -1370,9 +1773,10 @@ test("managed websocket recovery retries a verified empty failed response before
       error: { status: 503, code: "server_error" } } }));
   }, prewarm ? { maxMessageBytes: 1500 } : {});
   const recovery = [];
+  const events = [];
   const proxy = createCodexModelStreamProxy({ port: 0, upstreamOrigin: "http://127.0.0.1:9", managedRecovery: true,
-    managedRetryBaseMs: 10, incrementalTransport: state.transport, incrementalUpstreamUrl: state.url,
-    onRecoveryState: entry => recovery.push(entry) });
+    managedRetryBaseMs: 10, fastRetryDelayMs: 0, incrementalTransport: state.transport, incrementalUpstreamUrl: state.url,
+    onEvent: e => events.push(e), onRecoveryState: entry => recovery.push(entry) });
   await proxy.start();
   context.after(() => proxy.stop());
   const text = await new Promise((resolve, reject) => {
@@ -1392,15 +1796,20 @@ test("managed websocket recovery retries a verified empty failed response before
     request.once("close", () => clearTimeout(watchdog));
     request.end(encoded);
   });
-  assert.ok(state.messages.length >= 2);
-  if (!prewarm) assert.equal(state.messages.length, 2);
-  else assert.equal(state.messages.filter(entry => entry.packet.generate !== false).length, 1);
-  assert.equal(state.connections.length, 2);
-  assert.equal((text.match(/event: response.completed/g) ?? []).length, 1);
-  assert.equal((text.match(/event: response.failed/g) ?? []).length, 0);
-  assert.equal(recovery.filter(entry => entry.phase === "waiting" && entry.willRetry).length, 1);
-  assert.ok(recovery.filter(entry => entry.phase === "waiting").every(entry => entry.acceptance === "accepted"));
-  assert.equal(proxy.status().operationLedger.protectedOperations, 0);
+  if (!prewarm) {
+    assert.equal(state.messages.length, 1);
+    assert.ok(events.some(e => e.type === "managed_retry_deferred_to_native"));
+    assert.equal(proxy.status().operationLedger.protectedOperations, 0);
+  } else {
+    assert.ok(state.messages.length >= 2);
+    assert.equal(state.messages.filter(entry => entry.packet.generate !== false).length, 1);
+    assert.equal(state.connections.length, 2);
+    assert.equal((text.match(/event: response.completed/g) ?? []).length, 1);
+    assert.equal((text.match(/event: response.failed/g) ?? []).length, 0);
+    assert.equal(recovery.filter(entry => entry.phase === "waiting" && entry.willRetry).length, 1);
+    assert.ok(recovery.filter(entry => entry.phase === "waiting").every(entry => entry.acceptance === "rejected"));
+    assert.equal(proxy.status().operationLedger.protectedOperations, 0);
+  }
   });
 });
 
@@ -1540,7 +1949,7 @@ test("accepted progress followed by silence times out accurately and cancellatio
   }
 });
 
-test("prewarm acknowledgements expose preparation progress without a response or business event", async context => {
+test("prewarm acknowledgements expose early headers and preparation progress without business events", async context => {
   const progress = [];
   let sawResponse = false;
   const state = synchronousFixture(context, (socket, _packet, index) => {
@@ -1549,7 +1958,7 @@ test("prewarm acknowledgements expose preparation progress without a response or
   }, { responseTimeoutMs: 40, prewarmTimeoutMs: 70, maxMessageBytes: 650, maxPreviousResponseIdBytes: 16 });
   const active = start(state, "preparation", body(Array.from({ length: 5 }, () => message("x".repeat(300)))), {
     onPreparationProgress(event) {
-      assert.equal(sawResponse, false);
+      assert.equal(sawResponse, true);
       assert.equal(event.phase, "prewarm_completed");
       assert.equal(event.businessProgress, false);
       assert.equal(event.operationId, "preparation");
@@ -1565,17 +1974,18 @@ test("prewarm acknowledgements expose preparation progress without a response or
   assert.equal(progress.at(-1).preparedInputItems, 4);
 });
 
-test("prewarm confirmation has a finite independent deadline despite incoming deltas", async context => {
+test("prewarm confirmation has a finite independent deadline despite non-output progress", async context => {
   const progress = [];
   const state = synchronousFixture(context, socket => {
-    const timer = setInterval(() => socket.event({ type: "response.output_text.delta", delta: "invalid warm activity" }), 5);
+    const timer = setInterval(() => socket.event({ type: "response.in_progress" }), 5);
     context.after(() => clearInterval(timer));
   }, { responseTimeoutMs: 200, prewarmTimeoutMs: 40, maxMessageBytes: 650, maxPreviousResponseIdBytes: 16,
     onPreparationProgress: event => progress.push(event) });
   const result = await start(state, "warm-idle", body([message("a".repeat(300)), message("b".repeat(300))])).done;
   assert.equal(result.error.code, "WS_PREWARM_TIMEOUT");
   assert.equal(result.error.requestAccepted, true);
-  assert.equal(result.response, undefined);
+  assert.equal(result.response.statusCode, 200);
+  assert.equal(result.sse, "");
   assert.deepEqual(progress, []);
   assert.equal(state.packets.length, 1);
 });

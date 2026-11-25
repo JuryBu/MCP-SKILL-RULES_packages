@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import http from "node:http";
 import { createInnerNativeTurnSource } from "../src/inner-native-turn-source.mjs";
 import { createInnerProxyCoordinatorImplementation } from "../src/inner-proxy-coordinator.mjs";
 
@@ -59,7 +60,7 @@ function admissionFixture(maximumRemembered = 2) {
   const state = { options: {}, nativeSourceId: "native-a", workers: new Map([[worker.workerId, worker]]), reclaimedWorkers: [],
     threads: new Map(), terminalThreads: new Map(), migrations: new Map(), pending: new Map(), adoptions: new Map(), requests: new Map(),
     maxThreads: 2, defaultWorker: worker, nativeSequence: 0, httpSequence: 0, generation: 0, relay: Promise.resolve(),
-    nativeHealthy: true, transactionActive: false, workerMaintenance: false, server: { listening: false }, onEvent: () => {} };
+    nativeHealthy: true, transactionActive: false, workerMaintenance: false, server: http.createServer(), onEvent: () => {} };
   state.dispatch = (method, ...args) => state.implementation[method](...args);
   state.bindDispatch = (method, ...bound) => (...args) => state.dispatch(method, ...bound, ...args);
   state.implementation = { ...createInnerProxyCoordinatorImplementation(state),

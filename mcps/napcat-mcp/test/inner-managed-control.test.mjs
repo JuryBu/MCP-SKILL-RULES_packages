@@ -84,6 +84,7 @@ function buildOwnedCandidate(value, delayFirstReply = false, originalBytes = fal
   const root = path.join(value.root, originalBytes ? "approved-original" : "approved-candidate");
   const target = path.join(root, "src");
   fs.mkdirSync(target, { recursive: true });
+  fs.symlinkSync(path.join(installationRoot, "node_modules"), path.join(root, "node_modules"), "junction");
   const copied = new Set();
   function copy(name) {
     if (copied.has(name)) return;
@@ -128,7 +129,7 @@ async function startNormalEntry(value) {
   }
   const deadline = Date.now() + 10000;
   while (Date.now() < deadline) {
-    try { if ((await get()).httpStatus === 200) return { options, identity, get, post, task }; } catch {}
+    try { const res = await get(); if (res.httpStatus === 200 && res.body?.healthy === true) return { options, identity, get, post, task }; } catch {}
     await sleep(25);
   }
   fs.writeFileSync(options.stopFilePath, "owned-test-stop");

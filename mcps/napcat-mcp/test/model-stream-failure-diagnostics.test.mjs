@@ -16,6 +16,22 @@ function assertPrivateValuesAbsent(value) {
   for (const privateValue of PRIVATE_VALUES) assert.equal(serialized.includes(privateValue), false, privateValue);
 }
 
+function assertEventValuesPrivate(events) {
+  const diagnosticEvents = events.map(event => {
+    if (event.type !== "model_recovery_state") return event;
+    assert.equal(event.threadId, PRIVATE_VALUES[6]);
+    assert.equal(event.turnId, PRIVATE_VALUES[7]);
+    const { threadId, turnId, ...diagnosticEvent } = event;
+    return diagnosticEvent;
+  });
+  assertPrivateValuesAbsent(diagnosticEvents);
+}
+
+function responseEvents(body) {
+  return body.split("\n").filter(line => line.startsWith("data: "))
+    .map(line => JSON.parse(line.slice(6)));
+}
+
 function assertClosedValues(value) {
   const enumerations = new Set([
     "unknown", "connection", "request_sending", "awaiting_response", "response_headers",
@@ -98,6 +114,14 @@ test("challenge scanning and counters are bounded and successful HTTP has no ref
   assert.equal(successful.snapshot().httpRefusalSignal, "unknown");
 });
 
+test("only recovery routing identity fields may contain exact thread and turn values", () => {
+  const recovery = { type: "model_recovery_state", threadId: PRIVATE_VALUES[6], turnId: PRIVATE_VALUES[7] };
+  assertEventValuesPrivate([recovery]);
+  assert.throws(() => assertEventValuesPrivate([{ ...recovery, cookie: PRIVATE_VALUES[0] }]));
+  assert.throws(() => assertEventValuesPrivate([{ ...recovery, threadId: PRIVATE_VALUES[2] }]));
+  assert.throws(() => assertEventValuesPrivate([{ type: "turn_attempt_finished", threadId: PRIVATE_VALUES[6] }]));
+});
+
 async function startFixture(context, handler) {
   const events = [];
   const upstream = http.createServer(handler);
@@ -105,6 +129,7 @@ async function startFixture(context, handler) {
   await once(upstream, "listening");
   const proxy = createCodexModelStreamProxy({ port: 0,
     upstreamOrigin: `http://127.0.0.1:${upstream.address().port}`,
+    fastRetryDelayMs: 20, rapidRetryMinimumMs: 10,
     onEvent: event => events.push(event),
   });
   context.after(async () => {
@@ -147,24 +172,24 @@ function attemptEvidence(events) {
   assert.match(event.threadHash, /^[a-f0-9]{16}$/u);
   assert.match(event.turnHash, /^[a-f0-9]{16}$/u);
   assert.equal(event.correlation, "exact");
-  assertPrivateValuesAbsent(events);
+  assertEventValuesPrivate(events);
   assertClosedValues(event.failureDiagnostics);
   return event;
 }
 
 const refusals = [
   { name: "unknown HTML and CF header", body: `<html>${PRIVATE_VALUES.join(" ")}</html>`, format: "text/html",
-    expected: "unknown", kind: "retryable_failure", retry: true },
+    expected: "unknown", kind: "retryable_failure", category: "authentication" },
   { name: "explicit HTML challenge marker", body: `<html>/cdn-cgi/challenge-platform/ ${PRIVATE_VALUES[5]}</html>`,
-    format: "text/html", expected: "challenge", kind: "retryable_failure", retry: true },
+    format: "text/html", expected: "challenge", kind: "retryable_failure", category: "authentication" },
   { name: "explicit challenge header", body: "<html>opaque</html>", format: "text/html",
-    headers: { "cf-mitigated": "challenge" }, expected: "challenge", kind: "retryable_failure", retry: true },
+    headers: { "cf-mitigated": "challenge" }, expected: "challenge", kind: "retryable_failure", category: "authentication" },
   { name: "authentication code", error: { code: "invalid_api_key", message: PRIVATE_VALUES[5] },
-    expected: "authentication", kind: "permanent_failure", retry: false },
+    expected: "authentication", kind: "permanent_failure", category: "authentication" },
   { name: "security code wins over quota wording", error: { code: "cyber_policy", message: `quota exceeded ${PRIVATE_VALUES[5]}` },
-    expected: "security", kind: "permanent_failure", retry: false },
+    expected: "security", kind: "permanent_failure", category: "safety" },
   { name: "quota code", error: { code: "insufficient_quota", message: PRIVATE_VALUES[5] },
-    expected: "usage_limit", kind: "usage_limit", retry: false },
+    expected: "usage_limit", kind: "usage_limit", category: "quota" },
 ];
 
 for (const refusal of refusals) test(`synthetic HTTP403: ${refusal.name}`, { timeout: 5000 }, async context => {
@@ -176,7 +201,7 @@ for (const refusal of refusals) test(`synthetic HTTP403: ${refusal.name}`, { tim
       "set-cookie": PRIVATE_VALUES[0], "cf-ray": PRIVATE_VALUES[8], ...refusal.headers });
     response.end(refusal.body ?? JSON.stringify({ error: refusal.error }));
   });
-  await sendRequest(proxy);
+  const body = await sendRequest(proxy);
   const event = attemptEvidence(events);
   assert.equal(requests, 1);
   assert.equal(event.kind, refusal.kind);
@@ -184,20 +209,28 @@ for (const refusal of refusals) test(`synthetic HTTP403: ${refusal.name}`, { tim
   assert.equal(event.failureDiagnostics.httpRefusalSignal, refusal.expected);
   assert.equal(event.failureDiagnostics.statusCode, 403);
   assert.equal(event.failureDiagnostics.stage, "response_body");
-  const retry = events.find(candidate => candidate.type === "native_retry_signal");
-  assert.equal(Boolean(retry), refusal.retry);
-  if (retry) {
-    assert.deepEqual(retry.failureDiagnostics, event.failureDiagnostics);
-    assert.equal(retry.requestId, event.requestId);
-    assert.equal(retry.threadHash, event.threadHash);
-    assert.equal(retry.turnHash, event.turnHash);
-    assert.equal(retry.category, "transient");
-  }
+  assert.equal(events.filter(candidate => candidate.type === "native_retry_signal").length, 0);
+  const terminal = events.find(candidate => candidate.type === "model_terminal_failure");
+  assert.ok(terminal);
+  assert.equal(terminal.category, refusal.category);
+  assert.equal(terminal.acceptance, "rejected");
+  const completed = responseEvents(body).filter(candidate => candidate.type === "response.completed");
+  assert.equal(completed.length, 1);
+  assert.ok(completed[0].response.output.some(item => item.type === "message"
+    && item.content.some(part => part.type === "output_text" && part.text.trim().length > 0)));
+  assert.equal(body.includes("function_call"), false);
+  assert.ok((await sendRequest(proxy)).includes("response.completed"));
+  assert.equal(requests, 1);
+  assert.equal(events.filter(candidate => candidate.type === "native_retry_signal").length, 0);
+  assertEventValuesPrivate(events);
 });
 
 test("reset before HTTP response is a request error after local request handoff", { timeout: 5000 }, async context => {
-  const { proxy, events } = await startFixture(context, request => request.socket.destroy());
-  await sendRequest(proxy);
+  let requests = 0;
+  const { proxy, events } = await startFixture(context, request => { requests += 1; request.socket.destroy(); });
+  const body = await sendRequest(proxy);
+  assert.match(body, /上游是否完成了本次请求仍待核对.*停止自动重发/u);
+  assert.equal(requests, 1);
   const event = attemptEvidence(events);
   assert.equal(event.reason, "ECONNRESET");
   assert.equal(event.endCause, "upstream_transport");
@@ -206,6 +239,7 @@ test("reset before HTTP response is a request error after local request handoff"
   assert.equal(event.failureDiagnostics.responseStarted, false);
   assert.equal(event.failureDiagnostics.stage, "awaiting_response");
   assert.equal(event.failureDiagnostics.httpRefusalSignal, "unknown");
+  assert.equal(events.filter(candidate => candidate.type === "native_retry_signal").length, 0);
 });
 
 test("truncated HTTP403 body records response reset and preserves the original terminal branch", { timeout: 5000 }, async context => {
@@ -226,16 +260,15 @@ test("truncated HTTP403 body records response reset and preserves the original t
   assert.equal(events.some(candidate => candidate.type === "native_retry_signal"), false);
 });
 
-test("HTTP403 and request reset retain 1/2 retry correlation then a real completion resets attempts", { timeout: 5000 }, async context => {
+test("explicit 503 retries retain 1/2 retry correlation then a real completion resets attempts", { timeout: 5000 }, async context => {
   let requests = 0;
   const { proxy, events } = await startFixture(context, (request, response) => {
     requests += 1;
     request.resume();
-    if (requests === 1) {
-      response.writeHead(403, { "content-type": "text/html", "cf-ray": PRIVATE_VALUES[8] });
-      response.end("<html>opaque</html>");
-    } else if (requests === 2) request.socket.destroy();
-    else {
+    if (requests <= 2) {
+      response.writeHead(503, { "content-type": "application/json" });
+      response.end(JSON.stringify({ error: { code: "server_error", message: "temporary" } }));
+    } else {
       response.writeHead(200, { "content-type": "text/event-stream" });
       response.end('data: {"type":"response.completed"}\n\n');
     }
@@ -246,19 +279,18 @@ test("HTTP403 and request reset retain 1/2 retry correlation then a real complet
   await sendRequest(proxy);
   const retries = events.filter(event => event.type === "native_retry_signal");
   assert.deepEqual(retries.map(event => event.attemptNumber), [1, 2]);
-  assert.deepEqual(retries.map(event => event.category), ["transient", "network"]);
   assert.notEqual(retries[0].requestId, retries[1].requestId);
   assert.equal(retries[0].threadHash, retries[1].threadHash);
   assert.equal(retries[0].turnHash, retries[1].turnHash);
-  assert.equal(retries[0].failureDiagnostics.httpRefusalSignal, "unknown");
-  assert.equal(retries[1].failureDiagnostics.errorSource, "request");
   assert.equal(events.filter(event => event.type === "turn_attempt_started").at(-1).attemptNumber, 1);
   assert.equal(requests, 4);
-  assertPrivateValuesAbsent(events);
+  assertEventValuesPrivate(events);
 });
 
 test("reset after SSE progress is a response error with unchanged native retry", { timeout: 5000 }, async context => {
+  let requests = 0;
   const { proxy, events } = await startFixture(context, (request, response) => {
+    requests += 1;
     request.resume();
     response.writeHead(200, { "content-type": "text/event-stream" });
     response.write(`data: ${JSON.stringify({ type: "response.output_text.delta", delta: PRIVATE_VALUES[5] })}\n\n`);
@@ -272,7 +304,10 @@ test("reset after SSE progress is a response error with unchanged native retry",
   assert.equal(event.failureDiagnostics.stage, "stream_progress");
   assert.equal(event.failureDiagnostics.responseFrames, 1);
   assert.equal(event.failureDiagnostics.progressObserved, true);
-  assert.equal(events.filter(candidate => candidate.type === "native_retry_signal").length, 1);
+  assert.equal(events.filter(candidate => candidate.type === "native_retry_signal").length, 0);
+  assert.equal(requests, 1);
+  assert.equal(responseEvents(body).filter(candidate => candidate.type === "response.output_text.delta").length, 2);
+  assert.match(body, /上游是否完成了本次请求仍待核对.*停止自动重发/u);
 });
 
 test("reset before completion cannot expose a buffered executable tool or dispatch a side effect", { timeout: 5000 }, async context => {
@@ -287,12 +322,14 @@ test("reset before completion cannot expose a buffered executable tool or dispat
     setTimeout(() => response.destroy(), 20);
   });
   const body = await sendRequest(proxy);
-  const executableFrames = body.split("\n").filter(line => line.startsWith("data: "))
-    .map(line => JSON.parse(line.slice(6))).filter(event => event.type === "response.output_item.done" && event.item?.type === "function_call");
+  const executableFrames = responseEvents(body)
+    .filter(event => event.type === "response.output_item.done" && event.item?.type === "function_call");
   assert.equal(executableFrames.length, 0);
   assert.equal(requests, 1);
   const event = attemptEvidence(events);
   assert.equal(event.sawExecutableToolDone, true);
   assert.equal(event.failureDiagnostics.errorSource, "response");
   assert.equal(event.phase, "tool_completion_barrier");
+  assert.match(body, /上游是否完成了本次请求仍待核对.*停止自动重发/u);
+  assert.equal(events.filter(candidate => candidate.type === "native_retry_signal").length, 0);
 });

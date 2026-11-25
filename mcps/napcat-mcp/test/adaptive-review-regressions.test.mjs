@@ -138,12 +138,11 @@ for (const headersOnly of [false, true]) {
     await setup.request("silent-same-turn");
     const outcomes = setup.events.filter(event => event.type === "turn_attempt_finished");
     context.diagnostic(JSON.stringify({ scenario: "buffered-silence", headersOnly, upstreamRequests: setup.count(), outcomes: outcomes.map(event => ({ kind: event.kind, reason: event.reason, elapsedMs: event.elapsedMs })) }));
-    assert.equal(setup.count(), 2, "one native retry is permitted, then the shared attempt budget stops replay");
+    assert.equal(setup.count(), 1, "direct HTTP post-connect silence requires reconciliation without blind replay");
     assert.equal(outcomes[0]?.kind, "adaptive_wait_timeout");
     assert.equal(outcomes[0]?.reason, "ADAPTIVE_UPSTREAM_IDLE_TIMEOUT");
     assert.ok(outcomes[0].elapsedMs >= 170, "known buffered mode must use the 180ms idle budget, not the 80ms first-progress budget");
-    assert.equal(setup.events.filter(event => event.type === "native_retry_signal").length, 1);
-    assert.ok(setup.events.some(event => event.type === "adaptive_wait_terminal_replayed"));
+    assert.equal(setup.events.filter(event => event.type === "native_retry_signal").length, 0);
     assert.equal(setup.proxy.status().activeRequests, 0);
   });
 }
@@ -171,7 +170,7 @@ test("review: late paced short output does not teach buffered mode or extend the
   assert.equal(afterFirst.buffered, 0, "ten paced deltas are not a concentrated burst just because the answer is short");
   const second = await setup.request();
   const outcome = setup.events.filter(event => event.type === "turn_attempt_finished").at(-1);
-  assert.equal(second.events.some(event => event.type === "response.completed"), false);
+  assert.equal(second.events.some(event => event.type === "response.completed"), true);
   assert.equal(outcome?.reason, "FIRST_PROGRESS_TIMEOUT");
   assert.equal(setup.events.filter(event => event.type === "adaptive_delivery_probe_started").length, 1);
 });

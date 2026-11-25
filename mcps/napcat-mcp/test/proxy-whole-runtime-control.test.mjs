@@ -62,7 +62,8 @@ function fixture(context, actualParent = false, createRuntime = createProxyWhole
       state.workerCalls.push("prepare");
       if (state.failPreparation) throw new Error("owned-worker-preparation-failure");
       if (state.delayPreparation) await new Promise(resolve => { state.releasePreparation = resolve; });
-      const worker = { workerId: `candidate-${workers.length}`, sourceHashes: specification.expectedHashes, ready: true, alive: true };
+      const worker = { workerId: `candidate-${workers.length}`, sourceHashes: specification.expectedHashes,
+        candidateApprovalId: specification.candidateApprovalId ?? null, ready: true, alive: true };
       workers.push(worker);
       return { workerId: worker.workerId };
     },
@@ -195,7 +196,8 @@ test("successive registrations retain four approvals and protect a live source",
   const value = fixture(context);
   const source = value.profile.approvedCandidates[0];
   value.profile.approvedCandidates.splice(0, 1, ...Array.from({ length: 4 }, (_, index) => ({ ...source, id: `registered-${index}` })));
-  value.workers.push({ workerId: "live-registered", alive: true, ready: true, sourceHashes: source.expectedHashes });
+  value.workers.push({ workerId: "live-registered", alive: true, ready: true,
+    candidateApprovalId: "registered-0", sourceHashes: source.expectedHashes });
   let registrySha256 = null;
   for (const index of [4, 5]) {
     const result = value.runtime.register({ instanceId: "instance", expectedRevision: 0, expectedRegistrySha256: registrySha256,

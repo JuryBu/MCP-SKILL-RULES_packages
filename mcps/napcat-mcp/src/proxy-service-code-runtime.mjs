@@ -2,6 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { CodexAppServerProxyError } from "./outer-runtime-contract.mjs";
 import { proxyServiceDependencies } from "./codex-app-server-proxy-runner.mjs";
+import { createRuntimeLifecycleDiagnostics } from "./runtime-lifecycle-diagnostics.mjs";
 
 const methods = Object.freeze(["runDiagnosticObserver", "recordDiagnosticStorageFailure", "persist", "log", "requestStop", "installSignals", "markFatal", "pauseForUpstream", "resumeAfterUpstream", "handleProxyEvent", "watchLifecycleStep",
   "initializeService", "runBackendCycle", "handleBackendExit", "handleBackendFailure", "cleanupBackendCycle", "restartBackoff", "finishService"]);
@@ -27,7 +28,7 @@ export function createProxyServiceCodeRuntime(state) {
     exportName: "createProxyServiceImplementation", snapshot,
     prepare(module) {
       if (typeof module?.createProxyServiceImplementation !== "function") fail("PROXY_SERVICE_CODE_EXPORT_MISSING");
-      const protectedNames = ["options", "fsImpl", "now", "pid", "lock", "diagnosticStorageFailures", "dependencies"];
+      const protectedNames = ["options", "fsImpl", "now", "pid", "lock", "diagnosticStorageFailures", "dependencies", "lifecycleDiagnostics"];
       const retained = protectedNames.map(name => state[name]);
       const candidate = Object.freeze({ state, implementation: checked(module.createProxyServiceImplementation(state)) });
       if (protectedNames.some((name, index) => state[name] !== retained[index])) fail("PROXY_SERVICE_CODE_RESOURCE_DRIFT");
@@ -62,8 +63,60 @@ export function createProxyServiceImplementation(state) {
   const { startTimeoutMs: DEFAULT_START_TIMEOUT_MS, bundleDeepCheckIntervalMs: DEFAULT_BUNDLE_DEEP_CHECK_INTERVAL_MS,
     executableRefreshIntervalMs: DEFAULT_EXECUTABLE_REFRESH_INTERVAL_MS, livenessIntervalMs: DEFAULT_LIVENESS_INTERVAL_MS,
     restartBackoffMs: DEFAULT_RESTART_BACKOFF_MS } = dependencies.defaults;
-  const shouldStop = () => state.stopRequested || fsImpl.existsSync(options.stopFilePath);
+  const shouldStop = () => {
+    if (state.stopRequested) return true;
+    if (["stopping", "stopped"].includes(state.status.state)) {
+      requestStop(state.stopReason ?? state.status.stopReason ?? "requested");
+      return true;
+    }
+    if (!fsImpl.existsSync(options.stopFilePath)) return false;
+    requestStop("stop_file");
+    return true;
+  };
   const ownsLock = () => lock.isOwner();
+  function lifecycle() {
+    let attached = false;
+    if (!state.lifecycleDiagnostics && !state.lifecycleInitializationFailed && path.isAbsolute(options.runtimeStatePath ?? "")) {
+      try {
+        state.lifecycleDiagnostics = createRuntimeLifecycleDiagnostics({
+          filePath: path.join(path.dirname(options.runtimeStatePath), "outer-lifecycle.jsonl"), component: "outer", fsImpl, now,
+          startedAt: state.status.startedAt, captureIdentity: options.captureLifecycleIdentity !== false,
+          readIdentity: options.readLifecycleIdentity,
+        });
+        state.lifecycleDiagnostics.watchProcess();
+        state.lifecycleDiagnostics.record("attached", { step: state.status.state === "running" ? "ready" : "created" });
+        attached = true;
+      } catch {
+        state.lifecycleDiagnostics?.close();
+        state.lifecycleDiagnostics = null;
+        state.lifecycleInitializationFailed = true;
+      }
+    }
+    state.lifecycleDiagnostics?.watchChild(state.appServer, { parentPid: pid, executablePath: state.currentExecutable }, "native");
+    if (attached && state.status.state === "running") state.lifecycleDiagnostics.record("step", { step: "ready" });
+    return state.lifecycleDiagnostics;
+  }
+  function recordStop(reason, diagnostic = {}) {
+    if (state.lifecycleStop) return;
+    const signal = typeof reason === "string" && reason.startsWith("signal:") ? reason.slice(7) : null;
+    state.lifecycleStop = {
+      ...diagnostic, scope: "runtime_tree", step: "stop_requested", signal,
+      reasonCode: signal ? "signal" : reason === "stop_file" ? "stop_file"
+        : diagnostic.actorKind === "control" ? "control_request" : reason === "fallback_required" ? "recovery" : "requested",
+      actorKind: signal ? "signal" : reason === "stop_file" ? "stop_file" : diagnostic.actorKind,
+    };
+    lifecycle()?.record("stop_requested", state.lifecycleStop);
+  }
+  function recordNativeStop() {
+    const child = state.appServer;
+    if (!child || child.exitCode !== null || child.signalCode !== null) return;
+    shouldStop();
+    state.lifecycleDiagnostics?.record("stop_requested", {
+      targetComponent: "native", target: state.lifecycleDiagnostics.childIdentity(child),
+      actorKind: "runner", actor: state.lifecycleDiagnostics.selfIdentity(), scope: "native", step: "child_stop_requested",
+      operationId: state.lifecycleStop?.operationId, reasonCode: state.lifecycleStop?.reasonCode ?? "recovery",
+    });
+  }
   function runDiagnosticObserver(observer, value) {
     try { const pending = observer?.(value); pending?.catch?.(() => {}); } catch {}
   }
@@ -101,9 +154,10 @@ export function createProxyServiceImplementation(state) {
       state.dispatch("recordDiagnosticStorageFailure", error, "diagnostic_log");
     }
   }
-  function requestStop(reason) {
+  function requestStop(reason, diagnostic = {}) {
     state.stopRequested = true;
     if (!state.stopReason) state.stopReason = reason;
+    recordStop(reason, diagnostic);
   }
   function installSignals() {
     const handlers = new Map();
@@ -115,6 +169,7 @@ export function createProxyServiceImplementation(state) {
     return () => { for (const [signal, handler] of handlers) process.removeListener(signal, handler); };
   }
   function markFatal(error) {
+    state.lifecycleDiagnostics?.record("error_observed", { step: "failed", reasonCode: state.status.state === "starting" ? "startup_failure" : "recovery" });
     if (!ownsLock()) return false;
     const errorValue = dependencies.publicError(error, "CODEX_PROXY_INCOMPATIBLE");
     const at = now().toISOString();
@@ -151,9 +206,10 @@ export function createProxyServiceImplementation(state) {
         .every(name => Number(snapshot?.outerRuntime?.[name] ?? 0) === 0);
   }
   async function watchLifecycleStep(cycle) {
+    if (shouldStop()) return { code: null, signal: "stop_requested" };
+    lifecycle();
     await dependencies.wait(options.lifecyclePollIntervalMs ?? 250);
     if (!cycle.active) return { code: null, signal: "watch_stopped" };
-    const shouldStop = () => state.stopRequested || fsImpl.existsSync(options.stopFilePath);
     if (shouldStop()) return { code: null, signal: "stop_requested" };
     const proxySnapshot = state.proxy.status();
     if (Number(proxySnapshot?.clientCount) > 0) state.sawDesktopClient = true;
@@ -208,6 +264,7 @@ export function createProxyServiceImplementation(state) {
       onEvent: state.bindDispatch("handleProxyEvent"),
     });
     await state.proxy.start();
+    state.lifecycleDiagnostics?.record("step", { step: "listening" });
     persist({ proxy: state.proxy.status() });
     state.startupGuard = createOperationGuard(Math.max(1, startupDeadlineAt - Date.now()), shouldStop);
     const candidates = codexCandidates({
@@ -223,6 +280,7 @@ export function createProxyServiceImplementation(state) {
     const bundleRoot = options.bundleRoot ?? path.join(path.dirname(options.runtimeStatePath), "codex-runtime-bundles");
     for (const candidate of orderedCandidates) {
       try {
+        state.lifecycleDiagnostics?.record("step", { step: "probing" });
         state.startupGuard.check();
         const preparationOptions = {
           bundleRoot,
@@ -248,6 +306,7 @@ export function createProxyServiceImplementation(state) {
         });
         state.preparedLaunch = probed?.launched ?? null;
         state.appServer = state.preparedLaunch?.child ?? null;
+        state.lifecycleDiagnostics?.watchChild(state.appServer, { parentPid: pid, executablePath: revision.executablePath }, "native");
         if (state.appServer?.pid) createdChildPids.add(state.appServer.pid);
         state.startupGuard.check();
         state.currentExecutable = revision.executablePath;
@@ -274,6 +333,7 @@ export function createProxyServiceImplementation(state) {
 
   }
   async function runBackendCycle() {
+      if (shouldStop()) return { stop: true };
       if (state.waitingForDesktop) {
         let nextLivenessAt = 0;
         while (!shouldStop()) {
@@ -297,6 +357,7 @@ export function createProxyServiceImplementation(state) {
       const launched = state.preparedLaunch ?? (options.spawnAppServer ?? spawnAppServer)(state.currentExecutable, state.upstreamPort, options);
       state.preparedLaunch = null;
       state.appServer = launched.child;
+      state.lifecycleDiagnostics?.watchChild(state.appServer, { parentPid: pid, executablePath: state.currentExecutable }, "native");
       if (state.appServer?.pid) createdChildPids.add(state.appServer.pid);
       persist({
         appServerPid: state.appServer.pid ?? null,
@@ -340,6 +401,7 @@ export function createProxyServiceImplementation(state) {
           resolveProxyFailureArtifacts(options, state.status, fsImpl, now);
         }
         log("app_server_started", { executablePath: state.currentExecutable, appServerPid: state.appServer.pid ?? null });
+        state.lifecycleDiagnostics?.record("step", { step: "ready" });
         const appServerExit = waitForExit(state.appServer);
         let exit;
         let emptyDesktopRestartState = {
@@ -435,6 +497,8 @@ export function createProxyServiceImplementation(state) {
     return { skipBackoff: false };
   }
   function handleBackendFailure(error) {
+        if (shouldStop()) return { stop: true };
+        state.lifecycleDiagnostics?.record("error_observed", { step: "failed", reasonCode: "startup_failure" });
         if (error?.code === "APP_SERVER_START_CANCELLED") throw error;
         state.restartFailureCount += 1;
         pauseForUpstream("APP_SERVER_START_FAILED", "Codex App Server 启动失败，自动唤醒已暂停并等待重试");
@@ -453,6 +517,7 @@ export function createProxyServiceImplementation(state) {
         if (launchGuard !== state.startupGuard) launchGuard.close();
         state.proxy.pauseUpstream?.();
         try {
+          recordNativeStop();
           await terminateManagedAppServer(state.appServer, state.upstreamPort, options);
           state.appServer = null;
           persist({ appServerPid: null }, { allowStorageDegradation: shouldStop() });
@@ -480,6 +545,7 @@ export function createProxyServiceImplementation(state) {
 
   }
   async function restartBackoff() {
+      if (shouldStop()) return true;
       if (state.restartFailureCount >= DEFAULT_RESTART_BACKOFF_MS.length) {
         markFatal(new CodexAppServerProxyError(
           "APP_SERVER_RESTART_EXHAUSTED",
@@ -496,10 +562,15 @@ export function createProxyServiceImplementation(state) {
   }
   async function finishService() {
     try {
+      requestStop(state.stopReason ?? "completed");
+      lifecycle();
+      if (state.stopReason) recordStop(state.stopReason);
+      state.lifecycleDiagnostics?.record("step", { step: "draining" });
       state.startupGuard?.close();
       state.signalCleanup();
       await state.proxy?.close().catch(() => {});
       try {
+        recordNativeStop();
         await terminateManagedAppServer(state.appServer, state.upstreamPort, options);
         state.appServer = null;
       } catch (error) {
@@ -530,6 +601,9 @@ export function createProxyServiceImplementation(state) {
       });
     } finally {
       lock.release();
+      state.lifecycleDiagnostics?.record("step", { step: state.shutdownError ? "failed" : "resources_closed" });
+      state.lifecycleDiagnostics?.stopInspections();
+      if (state.lifecycleOwned) state.lifecycleDiagnostics?.close();
     }
 
   }

@@ -74,20 +74,20 @@ for (const [reason, mutate] of beforeCases) {
     const recent = value.coordinator.status().recentRejections;
     assert.equal(recent.length, 1);
     assert.equal(recent[0].code, "COORDINATOR_TURN_UNAVAILABLE");
-    assert.equal(recent[0].reason, reason);
-    assert.equal(recent[0].decisionPoint, "before_adopt");
+    assert.equal(recent[0].reason, reason === "native_unhealthy" ? "request_failed" : reason);
+    assert.equal(recent[0].decisionPoint, reason === "native_unhealthy" ? "native_publication" : "before_adopt");
     assert.equal(recent[0].threadHash, hash16(threadId));
     assert.equal(recent[0].turnHash, hash16(turnId));
     assert.equal(recent[0].nativeHealthy, value.shared.nativeHealthy);
-    assert.equal(recent[0].workerAlive, reason !== "thread_not_found" && reason !== "worker_dead");
+    assert.equal(recent[0].workerAlive, reason !== "thread_not_found" && reason !== "worker_dead" && reason !== "native_unhealthy");
     assert.equal(recent[0].coordinatorActiveHttp, 0);
-    if (reason !== "thread_not_found") {
+    if (reason !== "thread_not_found" && reason !== "native_unhealthy") {
       assert.equal(recent[0].currentTurnHash, hash16(value.state.turnId));
       assert.equal(recent[0].activeHttp, 0);
       assert.equal(recent[0].workerActiveHttp, 0);
     }
     assert.equal(value.calls.length, 0);
-    assert.equal(value.observed[0].reason, reason);
+    assert.equal(value.observed[0].reason, reason === "native_unhealthy" ? "request_failed" : reason);
     const evidence = JSON.stringify([recent, value.events, value.observed]);
     for (const secret of [threadId, turnId, otherTurnId, "private-token", "private-body", "private-query"]) {
       assert.equal(evidence.includes(secret), false, secret);
@@ -277,7 +277,8 @@ test("rejection categories and parent hashes identify request purpose without ch
       assert.equal(recent.subagentKind, subagentKind);
       assert.equal(recent.parentThreadHash, hash16(parentId));
       assert.equal(recent.threadRegistry, "absent");
-      assert.equal(recent.reason, "thread_not_found");
+      const expectedReason = requestKind === "memory" ? "request_failed" : "thread_not_found";
+      assert.equal(recent.reason, expectedReason);
       assert.equal(Object.hasOwn(recent, "terminalTurnMatches"), false);
     }
   }

@@ -129,9 +129,9 @@ test("live tool-wait handoff retains active native turn and recovery counts with
   assert.equal(envelope.payload.native.phase, "active");
   assert.equal(Object.hasOwn(envelope.payload, "terminal"), false);
   assert.equal(envelope.payload.snapshot.state.emptyIdleTurns[0][1].count, 2);
-  assert.match((await state.request("working")).body, /proxy_repeated_empty_idle/);
+  assert.match((await state.request("working")).body, /连续三个回合没有模型文本或已完成的工具工作，本回合已停止自动继续/u);
   const calls = state.calls.length;
-  assert.match((await state.request("working")).body, /proxy_repeated_empty_idle/);
+  assert.match((await state.request("working")).body, /连续三个回合没有模型文本或已完成的工具工作，本回合已停止自动继续/u);
   assert.equal(state.calls.length, calls);
   await state.notify("working", "completed");
 });
@@ -310,7 +310,7 @@ test("activate at active HTTP zero transfers recovery counts on next request wit
   await state.notify("working", "started");
   const candidate = await state.coordinator.prepareCandidate(state.workerSpecification());
   await state.coordinator.activate({ candidateId: candidate.workerId });
-  assert.match((await state.request("working")).body, /proxy_repeated_empty_idle/);
+  assert.match((await state.request("working")).body, /连续三个回合没有模型文本或已完成的工具工作，本回合已停止自动继续/u);
   assert.equal(state.coordinator.status().threads[0].workerId, candidate.workerId);
   assert.equal(state.coordinator.status().threads[0].phase, "active");
   assert.equal(state.calls.length, 3);

@@ -79,12 +79,14 @@ function complete(socket, id) {
   socket.send(JSON.stringify({ type: "response.completed", response: { id, status: "completed", output: [] } }));
 }
 
-async function fixture(context, { holdConnections = [], autoPong = true } = {}) {
+async function fixture(context, { holdConnections = [], autoPong = true, interruptiblePrewarmBytes = packetBytes,
+  uploadAcknowledgementTimeoutMs = 30000 } = {}) {
   const server = new WebSocketServer({ host: "127.0.0.1", port: 0, maxPayload: packetBytes, perMessageDeflate: false, autoPong });
   await once(server, "listening");
   const clients = [];
   const connections = [];
   const messages = [];
+  const uploadProgress = [];
   const holds = new Set(holdConnections);
   server.on("connection", (socket, request) => {
     const connection = { socket, network: request.socket, frames: [], pings: [], pongs: [], index: connections.length + 1 };
@@ -101,6 +103,7 @@ async function fixture(context, { holdConnections = [], autoPong = true } = {}) 
   });
   const transport = createIncrementalResponsesTransport({
     maxMessageBytes: packetBytes, maxSessionBytes: 64 * 1024 * 1024, responseTimeoutMs: 4000,
+    interruptiblePrewarmBytes, uploadAcknowledgementTimeoutMs,
     createWebSocket(url, options) {
       const socket = new WebSocket(url, options);
       const client = { socket, sends: [], pongs: [], index: clients.length + 1 };
@@ -141,11 +144,12 @@ async function fixture(context, { holdConnections = [], autoPong = true } = {}) 
     assert.ok(connections.every(connection => connection.network.destroyed));
     context.diagnostic(`cleanup: closed=${status.closed}, sockets=${connections.length}, active=${status.active}, retainedBytes=${status.retainedBytes}`);
   });
-  return { transport, clients, connections, messages, url: `ws://127.0.0.1:${server.address().port}/responses` };
+  return { transport, clients, connections, messages, uploadProgress, url: `ws://127.0.0.1:${server.address().port}/responses` };
 }
 
 function start(state, operationId, payload, { sessionKey = "session-a", signal } = {}) {
-  const client = state.transport.createRequestClient({ sessionKey, operationId, payload, url: state.url, headers: { Authorization: "Bearer loopback-fixture" } });
+  const client = state.transport.createRequestClient({ sessionKey, operationId, payload, url: state.url, headers: { Authorization: "Bearer loopback-fixture" },
+    onUploadProgress: progress => state.uploadProgress.push(progress) });
   const request = client.request(state.url, { signal });
   let sse = "";
   let finish;
@@ -173,17 +177,24 @@ async function firstFragment(state, connectionIndex) {
 }
 
 async function remoteReadBarrier(state, connectionIndex, checkpoint = 1) {
-  await waitFor(() => state.connections[connectionIndex - 1]?.pings.length === checkpoint, "remote-read barrier Ping");
+  await waitFor(() => state.connections[connectionIndex - 1]?.pings.length >= checkpoint, "remote-read barrier Ping");
   const connection = state.connections[connectionIndex - 1];
   const client = state.clients[connectionIndex - 1];
-  await waitFor(() => connection.frames.filter(frame => frame.opcode === 9).length === checkpoint, "barrier Ping on the real wire");
-  assert.equal(client.sends.length, checkpoint * 4, "only 256KiB may pass before its matching remote Pong");
-  assert.equal(client.sends.reduce((bytes, entry) => bytes + entry.data.length, 0), checkpoint * 256 * 1024);
+  const progress = checkpoint === 1 ? null : state.uploadProgress.at(-1);
+  const acknowledgedBytes = progress?.acknowledgedBytes ?? 0;
+  const window = progress?.uploadWindow ?? 1;
+  assert.ok(window >= 1 && window <= 4);
+  const expectedBytes = acknowledgedBytes + window * 256 * 1024;
+  await waitFor(() => client.sends.reduce((bytes, entry) => bytes + entry.data.length, 0) >= expectedBytes, "bounded adaptive window fills");
+  await waitFor(() => connection.frames.filter(frame => frame.opcode === 9).length >= expectedBytes / (256 * 1024), "barrier Ping on the real wire");
+  assert.equal(client.sends.length * fragmentBytes, expectedBytes);
+  assert.equal(client.sends.reduce((bytes, entry) => bytes + entry.data.length, 0), expectedBytes);
+  assert.ok(expectedBytes - acknowledgedBytes <= 1024 * 1024, "unconfirmed upload stays within 1MiB");
   assert.ok(client.sends.every(entry => !entry.fin));
   assert.equal(connection.pings.at(-1).length, 16);
   assert.equal(client.socket.listenerCount("pong"), 2, "one fixture observer and one live acknowledgement listener");
   assert.equal(state.messages.filter(entry => entry.connection === connectionIndex).length, 0);
-  return { connection, client, token: connection.pings.at(-1) };
+  return { connection, client, token: connection.pings.at(-1), sendCount: client.sends.length, expectedBytes };
 }
 
 function continueBarriers(connection, token) {
@@ -356,7 +367,8 @@ test("cancelling at a remote-read barrier removes its waiter and a late Pong can
 
 test("a remote-read barrier ignores a wrong token and a late Pong from the previous checkpoint", { timeout: 7000 }, async context => {
   const state = await fixture(context, { autoPong: false });
-  const pending = start(state, "barrier-token-match", largeBody("barrier-tokens"));
+  const payload = largeBody("barrier-tokens");
+  const pending = start(state, "barrier-token-match", payload);
   const first = await remoteReadBarrier(state, 1);
   const wrong = Buffer.from(first.token);
   wrong[0] ^= 0xff;
@@ -364,22 +376,56 @@ test("a remote-read barrier ignores a wrong token and a late Pong from the previ
   await waitFor(() => first.client.pongs.some(token => token.equals(wrong)), "wrong token delivered over the real socket");
   await nextIo();
   assert.equal(first.client.sends.length, 4);
+  assert.equal(state.uploadProgress.length, 0, "wrong Pong must not refresh upload progress or its budget");
   assert.equal(first.client.socket.listenerCount("pong"), 2);
   first.connection.socket.pong(first.token);
   const second = await remoteReadBarrier(state, 1, 2);
+  const progressCount = state.uploadProgress.length;
   assert.notDeepEqual(second.token, first.token);
   second.connection.socket.pong(first.token);
   await waitFor(() => second.client.pongs.filter(token => token.equals(first.token)).length === 2, "late Pong from the previous checkpoint");
   await nextIo();
-  assert.equal(second.client.sends.length, 8);
+  assert.equal(second.client.sends.length, second.sendCount);
+  assert.equal(state.uploadProgress.length, progressCount, "late Pong must not refresh upload progress or its budget");
   assert.equal(second.client.socket.listenerCount("pong"), 2);
   continueBarriers(second.connection, second.token);
   assert.equal((await pending.done).error, undefined);
   assert.equal(state.messages.length, 1);
+  assert.deepEqual(state.messages[0].packet.input, payload.input);
+  assert.deepEqual(Buffer.concat(second.client.sends.map(entry => entry.data)), state.messages[0].raw);
   assert.equal(state.transport.getOperation("barrier-token-match").state, "completed");
   assert.equal(second.client.socket.listenerCount("pong"), 1);
   assert.equal(new Set(second.connection.pings.map(token => token.toString("hex"))).size, second.connection.pings.length);
-  context.diagnostic("barrier token matching: wrong token held at 262144B; previous-checkpoint Pong held at 524288B; matching Pongs completed the original JSON");
+  context.diagnostic(`barrier token matching: wrong token held at 262144B; previous-checkpoint Pong held at ${second.expectedBytes}B; matching Pongs completed the original JSON`);
+});
+
+test("wrong and late Pongs cannot refresh the outstanding adaptive upload deadline", { timeout: 7000 }, async context => {
+  const state = await fixture(context, { autoPong: false, uploadAcknowledgementTimeoutMs: 300 });
+  const pending = start(state, "barrier-invalid-pong-deadline", largeBody("deadline-tokens"));
+  const first = await remoteReadBarrier(state, 1);
+  first.connection.socket.pong(first.token);
+  const second = await remoteReadBarrier(state, 1, 2);
+  const wrong = Buffer.from(second.token);
+  wrong[0] ^= 0xff;
+  const progressCount = state.uploadProgress.length;
+  const timer = setInterval(() => {
+    if (second.connection.socket.readyState !== WebSocket.OPEN) return;
+    second.connection.socket.pong(wrong);
+    second.connection.socket.pong(first.token);
+  }, 30);
+  context.after(() => clearInterval(timer));
+  let deadline;
+  const expired = new Promise(resolve => { deadline = setTimeout(() => resolve({ error: null }), 900); });
+  const result = await Promise.race([pending.done, expired]);
+  clearInterval(timer);
+  clearTimeout(deadline);
+  assert.equal(result.error?.code, "WS_SEND_ERROR", "invalid Pongs must leave the 300ms acknowledgement deadline active");
+  assert.equal(result.error.requestAccepted, "unknown");
+  assert.equal(state.uploadProgress.length, progressCount);
+  assert.equal(second.client.sends.length, second.sendCount);
+  assert.equal(second.client.socket.listenerCount("pong"), 0);
+  assert.equal(state.messages.length, 0);
+  assert.equal(state.transport.getOperation("barrier-invalid-pong-deadline").requiresReconciliation, true);
 });
 
 test("a remote-read barrier resumes after a short peer pause while B and heartbeat Pong remain live", { timeout: 7000 }, async context => {

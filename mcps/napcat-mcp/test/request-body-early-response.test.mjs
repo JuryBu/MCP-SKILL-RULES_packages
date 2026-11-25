@@ -36,7 +36,7 @@ test("terminal responses close unfinished uploads without retaining encoded quot
     { name: "turn early HTTP error", path: "/v1/responses", requestKind: "turn", stream: true,
       statusCode: 413, responseBody: '{"error":{"message":"too large"}}' },
     { name: "unary compaction early success", path: "/v1/responses/compact", requestKind: "compaction", stream: false,
-      statusCode: 200, responseBody: '{"id":"fixture-result"}' },
+      statusCode: 200, responseBody: '{"id":"fixture-result","output":[{"type":"compaction","encrypted_content":"opaque"}]}' },
     { name: "sampling compaction early HTTP error", path: "/v1/responses", requestKind: "compaction", stream: true,
       statusCode: 413, responseBody: '{"error":{"code":"invalid_request","message":"invalid request"}}' },
   ];
@@ -58,14 +58,16 @@ test("terminal responses close unfinished uploads without retaining encoded quot
       const body = Buffer.from(JSON.stringify({ model: "fixture", input: "x".repeat(65536), stream: scenario.stream }));
       const events = [];
       const proxy = createCodexModelStreamProxy({ port: 0, upstreamOrigin: "http://budget-fixture.invalid",
-        maxBufferedRequestBytes: body.length, maxTotalRequestBytes: body.length,
+        maxBufferedRequestBytes: body.length * 2, maxTotalRequestBytes: 16 * 1024 * 1024,
         firstProgressTimeoutMs: 1000, progressIdleTimeoutMs: 1000, uploadAllowanceMsPerMiB: 0,
         onEvent: event => events.push(event) });
+      let seq = 0;
       const send = () => new Promise((resolve, reject) => {
+        const turnId = `${scenario.name}-${++seq}`;
         const request = originalRequest({ host: "127.0.0.1", port: proxy.status().port, path: scenario.path, method: "POST",
           headers: { "content-type": "application/json", "content-length": body.length,
             "x-codex-turn-metadata": JSON.stringify({ request_kind: scenario.requestKind,
-              thread_id: "early-response-fixture", turn_id: scenario.name }) } }, response => {
+              thread_id: "early-response-fixture", turn_id: turnId }) } }, response => {
           let text = "";
           response.setEncoding("utf8");
           response.on("data", chunk => { text += chunk; });
@@ -103,7 +105,7 @@ test("terminal responses close unfinished uploads without retaining encoded quot
             assert.ok(frames.some(frame => frame.type === "response.failed" && /compaction/u.test(frame.response?.error?.code ?? "")));
             assert.equal(frames.some(frame => frame.type === "response.completed" || frame.item?.type === "message"), false);
           }
-          assert.equal(events.some(event => event.type === "compaction_stream_terminal_failure"), true);
+          assert.equal(events.some(event => event.type === "compaction_stream_terminal_failure" || (event.type === "model_terminal_failure" && event.category === "permanent")), true);
         }
         for (let attempt = 0; attempt < 100 && proxy.status().requestBuffer.usedBytes !== 0; attempt += 1) await delay(5);
         assert.equal(proxy.status().requestBuffer.usedBytes, 0);

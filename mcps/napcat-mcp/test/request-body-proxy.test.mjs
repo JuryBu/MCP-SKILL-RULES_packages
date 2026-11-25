@@ -63,7 +63,7 @@ test("decoded and wire limits are independent and original compressed bytes surv
 test("typed decoding failures are received by the HTTP client and never forwarded", async context => {
   const state = await fixture(context, { maxBufferedRequestBytes: 1024, maxDecodedRequestBytes: 2048 });
   const cases = [
-    [zlib.gzipSync(Buffer.from(JSON.stringify({ text: "a".repeat(3000) }))), "gzip", 200, "decoded_body_too_large"],
+    // source-json-inspection streams decoded JSON via disk source instead of rejecting at maxDecodedRequestBytes
     [Buffer.from("not-gzip"), "gzip", 400, "invalid_compression"],
     [Buffer.from("{}"), "future-encoding", 415, "unsupported_content_encoding"],
     [Buffer.from("{broken"), undefined, 400, "invalid_json"],
@@ -82,12 +82,11 @@ test("typed decoding failures are received by the HTTP client and never forwarde
   assert.equal(success.status, 200);
 });
 
-test("wire overflow returns a terminal completion before EOF rather than retrying", async context => {
+test("wire overflow beyond maxBufferedRequestBytes streams through disk source and rejects invalid JSON on EOF", async context => {
   const state = await fixture(context, { maxBufferedRequestBytes: 1024 });
-  const response = await state.send(Buffer.alloc(2048, 65), undefined, { chunked: true, open: true });
-  assert.equal(response.status, 200);
-  assert.match(response.text, /已停止重复重试/u);
-  assert.ok(state.events.some(event => event.type === "request_body_rejected" && event.code === "ENCODED_BODY_TOO_LARGE" && event.retryable === false));
+  const response = await state.send(Buffer.alloc(2048, 65), undefined, { chunked: true });
+  assert.equal(response.status, 400);
+  assert.equal(JSON.parse(response.text).error.code, "invalid_json");
   assert.equal(state.received.length, 0);
   assert.equal(state.proxy.status().requestBuffer.usedBytes, 0);
 });
@@ -99,28 +98,24 @@ test("compaction overflow preserves a JSON failure instead of fabricating a succ
     { path: "/v1/responses/compact", requestKind: "turn" },
     { path: "/v1/responses", requestKind: "compaction" },
   ]) {
-    const wire = await state.send(Buffer.alloc(2048, 65), undefined, { ...route, chunked: true, open: true });
-    assert.equal(wire.status, 413);
+    const wire = await state.send(Buffer.alloc(2048, 65), undefined, { ...route, chunked: true });
+    assert.equal(wire.status, 400);
     assert.match(wire.headers["content-type"], /application\/json/u);
-    assert.equal(JSON.parse(wire.text).error.code, "ENCODED_BODY_TOO_LARGE");
-    const decoded = await state.send(zlib.gzipSync(Buffer.from(JSON.stringify({ stream: false, input: "x".repeat(3000) }))), "gzip", route);
-    assert.equal(decoded.status, 413);
-    assert.equal(JSON.parse(decoded.text).error.code, "decoded_body_too_large");
+    assert.equal(JSON.parse(wire.text).error.code, "invalid_json");
   }
   assert.equal(state.received.length, 0);
   assert.equal(state.proxy.status().requestBuffer.usedBytes, 0);
 });
 
-test("exact wire boundary remains valid, plus one is rejected", async context => {
+test("exact wire boundary and plus one both stream validly via disk source", async context => {
   const state = await fixture(context, { maxBufferedRequestBytes: 1024 });
   const exact = Buffer.from(JSON.stringify({ data: "a".repeat(1013) }));
   assert.equal(exact.length, 1024);
   assert.equal((await state.send(exact)).status, 200);
   const over = Buffer.from(JSON.stringify({ data: "a".repeat(1014) }));
-  const rejected = await state.send(over);
-  assert.equal(rejected.status, 200);
-  assert.match(rejected.text, /已停止重复重试/u);
-  assert.equal(state.received.length, 1);
+  const spilled = await state.send(over);
+  assert.equal(spilled.status, 200);
+  assert.equal(state.received.length, 2);
 });
 
 test("aggregate encoded budget rejects with 503 and recovers after cancellation", async context => {
@@ -128,9 +123,9 @@ test("aggregate encoded budget rejects with 503 and recovers after cancellation"
   const controller = new AbortController();
   const pending = state.send(Buffer.alloc(900, 32), undefined, { chunked: true, open: true, signal: controller.signal });
   pending.catch(() => {});
-  for (let attempts = 0; attempts < 100 && state.proxy.status().requestBuffer.usedBytes !== 900; attempts++) await delay(5);
-  assert.equal(state.proxy.status().requestBuffer.usedBytes, 900);
-  const response = await state.send(Buffer.from(JSON.stringify({ data: "b".repeat(200) })));
+  for (let attempts = 0; attempts < 100 && state.proxy.status().requestBuffer.usedBytes === 0; attempts++) await delay(5);
+  assert.ok(state.proxy.status().requestBuffer.usedBytes > 0);
+  const response = await state.send(Buffer.from(JSON.stringify({ data: "b".repeat(900) })));
   assert.equal(response.status, 503);
   assert.equal(response.headers["retry-after"], "1");
   assert.equal(JSON.parse(response.text).error.code, "REQUEST_BUFFER_BUSY");

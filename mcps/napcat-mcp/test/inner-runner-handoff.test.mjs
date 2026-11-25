@@ -236,9 +236,9 @@ test("signed file handoff preserves real core state; tampering, half files and d
   assert.deepEqual(JSON.parse(fs.readFileSync(transferred.filePath, "utf8")).payload.snapshot.state, expectedState);
   await candidate.rpc("cancel", { threadId: "thread-a", token: transferred.token });
   await state.turn(candidate, 5, "three", "active");
-  assert.match((await state.request(candidate, "three")).body, /proxy_repeated_empty_idle/u);
+  assert.match((await state.request(candidate, "three")).body, /连续三个回合没有模型文本或已完成的工具工作，本回合已停止自动继续/u);
   const before = state.calls();
-  assert.match((await state.request(candidate, "three")).body, /proxy_repeated_empty_idle/u);
+  assert.match((await state.request(candidate, "three")).body, /连续三个回合没有模型文本或已完成的工具工作，本回合已停止自动继续/u);
   assert.equal(state.calls(), before);
   await state.turn(candidate, 6, "three", "terminal");
   const retained = await candidate.rpc("prepare", { threadId: "thread-a", fileName: "inner-runner-retained.json" });
@@ -267,6 +267,6 @@ test("normal runner cancels its own freeze after an injected checkpoint write fa
   assert.equal(JSON.parse(fs.readFileSync(retained.filePath, "utf8")).payload.snapshot.state.emptyIdleTurns[0][1].count, 2);
   await old.rpc("cancel", { threadId: "thread-a", token: retained.token });
   await state.turn(old, 5, "three", "active");
-  assert.match((await state.request(old, "three")).body, /proxy_repeated_empty_idle/u);
+  assert.match((await state.request(old, "three")).body, /连续三个回合没有模型文本或已完成的工具工作，本回合已停止自动继续/u);
   await state.turn(old, 6, "three", "terminal");
 });

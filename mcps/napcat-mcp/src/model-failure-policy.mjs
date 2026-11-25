@@ -1,5 +1,19 @@
 const terminalEvidenceRegistry = new WeakMap();
 
+export const isKnownIncompleteResponse = (event, responseId) => event?.type === "response.incomplete"
+  && typeof responseId === "string" && responseId.length > 0 && event.response?.id === responseId
+  && event.response.status === "incomplete" && Array.isArray(event.response.output)
+  && ["max_output_tokens", "content_filter"].includes(event.response.incomplete_details?.reason)
+  && !event.error && !event.response.error;
+
+export function modelRecoveryAction(policy, { ordinary = false, cancelled = false, localRejection = false,
+  outputDelivered = false, clientCanContinue = false } = {}) {
+  if (cancelled || localRejection || !ordinary || !["temporary", "acceptance_unknown"].includes(policy?.category)) return "finish";
+  if (outputDelivered && clientCanContinue) return "continue_in_client";
+  if (!outputDelivered && policy.retryable === true) return "retry_request";
+  return "finish";
+}
+
 export function createModelFailureTerminalEvidence({ operationId, attempt, generation, packetSequence, responseId, statusCode, error } = {}) {
   if (typeof operationId !== "string" || !operationId || typeof responseId !== "string" || !responseId
     || ![attempt, generation, packetSequence].every(value => Number.isSafeInteger(value) && value > 0)) {
@@ -11,6 +25,12 @@ export function createModelFailureTerminalEvidence({ operationId, attempt, gener
   return evidence;
 }
 
+const GENERIC_TEMPORARY_SERVER_CODES = ["server_error", "internal_server_error", "service_unavailable", "temporarily_unavailable"];
+
+export function isGenericTemporaryServerCode(code) {
+  return typeof code === "string" && GENERIC_TEMPORARY_SERVER_CODES.includes(code.toLowerCase());
+}
+
 const CODE_GROUPS = [
   ["cancelled", false, false, ["abort_err", "err_aborted", "err_canceled", "cancelled", "canceled", "request_cancelled", "request_canceled"]],
   ["safety", true, false, ["content_policy_violation", "content_policy_error", "content_filter", "safety_violation", "safety_error", "safety_policy_violation", "moderation_blocked", "bio_policy", "cyber_policy", "misalignment_policy_violation", "invalid_prompt"]],
@@ -19,11 +39,12 @@ const CODE_GROUPS = [
   ["payload_too_large", true, false, ["payload_too_large", "request_too_large", "message_too_big", "request_entity_too_large", "ws_message_too_large", "unsupported_image_prewarm", "session_bytes_exceeded"]],
   ["transport_capacity", false, false, ["session_limit", "operation_limit"]],
   ["permanent", true, false, ["invalid_request_error", "invalid_request", "invalid_argument", "context_length_exceeded", "model_not_found", "unsupported_parameter", "unsupported_value"]],
-  ["temporary", true, false, ["rate_limit_exceeded", "rate_limit_error", "too_many_requests", "overloaded_error", "engine_overloaded"]],
-  ["temporary", false, false, ["server_error", "internal_server_error", "service_unavailable", "temporarily_unavailable"]],
+  ["temporary", true, false, ["rate_limit_exceeded", "rate_limit_error", "too_many_requests", "overloaded_error", "engine_overloaded", "server_is_overloaded", "server_overloaded", "model_at_capacity"]],
+  ["temporary", false, false, GENERIC_TEMPORARY_SERVER_CODES],
+  ["temporary", true, true, ["websocket_connection_limit_reached"]],
   ["temporary", false, true, ["econnreset", "econnrefused", "econnaborted", "etimedout", "enotfound", "eai_again", "enetunreach", "ehostunreach", "epipe", "err_network", "err_socket_closed", "err_stream_premature_close", "err_tls_handshake_timeout", "und_err_connect_timeout", "und_err_headers_timeout", "und_err_body_timeout", "und_err_socket", "fetch_failed", "connection_failed", "ws_connection_error", "ws_connect_timeout", "ws_connection_closed", "ws_send_error", "ws_terminal_timeout",
     "first_progress_timeout", "progress_idle_timeout", "upstream_idle_timeout", "ws_prewarm_timeout",
-    "previous_response_not_found", "websocket_connection_limit_reached", "stream_ended_without_completion",
+    "previous_response_not_found", "stream_ended_without_completion",
     "stream_error", "upstream_error", "compaction_incomplete", "compaction_timeout", "compaction_stream_error"]],
 ];
 
@@ -38,6 +59,7 @@ const MESSAGE_RULES = [
   ["quota", "quota_exhausted", /^(?:you(?: have|'ve)? (?:exceeded|reached|hit) your (?:current )?(?:quota|usage limit)\b|(?:your )?(?:quota|usage limit) (?:has been )?(?:reached|exceeded|exhausted)\b|insufficient (?:quota|credits)\b|(?:your )?credit balance (?:is )?too low\b)/i],
   ["payload_too_large", "payload_too_large", /^(?:request (?:entity|body|payload) too large\b|payload too large\b|message too (?:big|large)\b)/i],
   ["temporary", "rate_limit_exceeded", /^(?:rate limit (?:reached|exceeded)\b|too many requests\b)/i],
+  ["temporary", "server_overloaded", /^(?:selected model is at capacity\b|server overloaded\b)/i],
   ["temporary", "network_failure", /^(?:fetch failed\b|network (?:error|failure)\b|socket hang up\b|connection (?:reset|refused|timed out|closed)\b|client network socket disconnected before secure tls connection was established\b)/i],
 ];
 
@@ -106,7 +128,9 @@ function collectSignals(code, message) {
     }
   }
   codes.sort((left, right) => left.priority - right.priority);
-  return { code: codes[0], messages, complete: complete && pending.length === 0 };
+  return { code: codes.find(candidate => candidate.code.toLowerCase() !== "invalid_request_error") ?? codes[0],
+    hasNetworkCode: codes.some(candidate => candidate.networkFailure),
+    messages, complete: complete && pending.length === 0 };
 }
 
 function messageDiagnosis(messages) {
@@ -129,21 +153,27 @@ function statusDiagnosis(statusCode) {
   return { category, reasonCode: `http_${statusCode}`, remoteRejection: REJECTION_STATUSES.has(statusCode), networkFailure: false, evidence: "status" };
 }
 
-function diagnose(failure, signals, statusCode, wsCloseCode) {
+function diagnose(failure, signals, statusCode, wsCloseCode, hasHttpStatus) {
   if (wsCloseCode === 1009) {
     return { category: "payload_too_large", reasonCode: "ws_close_1009", remoteRejection: false, networkFailure: false };
   }
   if (failure.cancelled === true || signals.code?.category === "cancelled") {
     return { category: "cancelled", reasonCode: "request_cancelled", remoteRejection: false, networkFailure: false };
   }
-  if (signals.code && signals.code.category !== "temporary") {
+  const genericRequestError = signals.code?.code.toLowerCase() === "invalid_request_error";
+  if (signals.code && signals.code.category !== "temporary" && !genericRequestError) {
     return { ...signals.code, reasonCode: signals.code.code, evidence: "code" };
   }
   const status = statusDiagnosis(statusCode);
-  if ([401, 402, 413].includes(statusCode)) return status;
+  if ([401, 402, 403, 413, 451].includes(statusCode)) return status;
   const message = messageDiagnosis(signals.messages);
   if (message && message.category !== "temporary") return message;
-  if (statusCode === 503) return status;
+  if (genericRequestError && message) return message;
+  if (hasHttpStatus && [400, 404, 415, 422].includes(statusCode) && !message
+    && !signals.hasNetworkCode && isGenericTemporaryServerCode(signals.code?.code)) {
+    return { ...status, ignoresGenericHttpCode: true };
+  }
+  if (statusCode === 503 && !genericRequestError) return status;
   if (signals.code) return { ...signals.code, reasonCode: signals.code.code, evidence: "code" };
   return message ?? status;
 }
@@ -163,7 +193,8 @@ function requestAcceptance(failure, transmission, source, diagnosis, statusCode)
 export function classifyModelFailure(failure = {}) {
   if (!failure || typeof failure !== "object" || Array.isArray(failure)) failure = {};
   const terminalEvidence = terminalEvidenceRegistry.get(failure.terminalEvidence);
-  const statusCode = numericCode(failure.statusCode, 100, 599)
+  const explicitStatusCode = numericCode(failure.statusCode, 100, 599);
+  const statusCode = explicitStatusCode
     ?? (terminalEvidence ? numericCode(failure.terminalEvidence.statusCode, 100, 599) : undefined);
   const wsCloseCode = numericCode(failure.wsCloseCode, 1000, 4999);
   const source = normalizedEnum(failure.source, ["http", "sse", "transport", "local"]);
@@ -171,7 +202,7 @@ export function classifyModelFailure(failure = {}) {
     "prewarm_sent", "generation_sent", "response_received", "completed", "started", "finished", "unknown"]);
   const signals = collectSignals(failure.code, terminalEvidence
     ? { error: terminalEvidence.error, message: failure.message } : failure.message);
-  const diagnosis = diagnose(failure, signals, statusCode, wsCloseCode);
+  const diagnosis = diagnose(failure, signals, statusCode, wsCloseCode, source === "http" && explicitStatusCode !== undefined);
   const acceptance = requestAcceptance(failure, transmission, source, diagnosis, statusCode);
   let category = diagnosis?.category ?? (acceptance === "unknown" ? "acceptance_unknown" : "permanent");
   if (diagnosis?.networkFailure && acceptance === "unknown" && statusCode !== 503) category = "acceptance_unknown";
@@ -183,7 +214,9 @@ export function classifyModelFailure(failure = {}) {
     && (acceptance === "not_sent" || acceptance === "rejected" || terminalNoOutput);
   const invalidateSession = statusCode === 503 || wsCloseCode === 1009 || category === "payload_too_large"
     || source === "transport" || diagnosis?.networkFailure === true || acceptance === "accepted" || acceptance === "unknown";
-  const reasonCode = signals.code?.code ?? diagnosis?.reasonCode ?? "unknown_failure";
+  const reasonCode = diagnosis?.ignoresGenericHttpCode || signals.code?.code.toLowerCase() === "invalid_request_error"
+    ? diagnosis?.reasonCode ?? signals.code?.code
+    : signals.code?.code ?? diagnosis?.reasonCode ?? "unknown_failure";
   const httpCompatibilityFallback = category === "permanent" && signals.complete
     && ["unsupported_parameter", "unsupported_value"].includes(reasonCode)
     && ![401, 402, 403, 451].includes(statusCode)
@@ -196,6 +229,7 @@ export function classifyModelFailure(failure = {}) {
     acceptance,
     invalidateSession,
     reasonCode,
+    ...(diagnosis?.ignoresGenericHttpCode ? { httpStatusOverridesGenericCode: true } : {}),
     ...(httpCompatibilityFallback ? { httpCompatibilityFallback: true } : {}),
     ...(terminalNoOutput ? { terminalOutcome: "failed_no_output" } : {}),
   });

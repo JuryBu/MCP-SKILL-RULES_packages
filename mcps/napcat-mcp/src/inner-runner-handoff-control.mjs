@@ -7,6 +7,7 @@ import { validateInnerMigrationPlan } from "./inner-migration-plan.mjs";
 import { validateInnerRuntimeProfile } from "./inner-runtime-profile.mjs";
 import { signRecoveryEnvelope, canContinueRecovery } from "./model-recovery-notifications.mjs";
 import { createModelOperationLedger } from "./model-operation-ledger.mjs";
+import { internalMemoryRejectionDiagnostics } from "./internal-memory-request-authority.mjs";
 
 export const HANDOFF_CHANNEL = "inner-runner-handoff-v1";
 const MAX_MESSAGE_BYTES = 16 * 1024;
@@ -224,6 +225,22 @@ export function attachInnerRunnerHandoffControl({ config, proxy, instanceToken, 
   }
 
   function execute(message) {
+    if (message.method === "prepareInternalMemoryConnection") {
+      if (typeof proxy.prepareInternalMemoryConnection !== "function") fail("HANDOFF_INTERNAL_MEMORY_UNAVAILABLE");
+      return proxy.prepareInternalMemoryConnection(message.connection);
+    }
+    if (message.method === "authorizeInternalMemory") {
+      if (typeof proxy.authorizeInternalMemoryRequest !== "function") fail("HANDOFF_INTERNAL_MEMORY_UNAVAILABLE");
+      return proxy.authorizeInternalMemoryRequest(message.grant);
+    }
+    if (message.method === "revokeInternalMemoryConnection") {
+      if (typeof proxy.revokeInternalMemoryConnection !== "function") fail("HANDOFF_INTERNAL_MEMORY_UNAVAILABLE");
+      return proxy.revokeInternalMemoryConnection({ connectionToken: message.connectionToken, reason: message.reason });
+    }
+    if (message.method === "internalMemoryStatus") {
+      if (typeof proxy.internalMemoryStatus !== "function") fail("HANDOFF_INTERNAL_MEMORY_UNAVAILABLE");
+      return proxy.internalMemoryStatus();
+    }
     if (message.method === "bindRecovery") {
       const native = nativeTurns.get(message.threadId);
       if (native?.phase !== "active" || native.turnId !== message.turnId || native.connectionGeneration
@@ -305,6 +322,9 @@ export function attachInnerRunnerHandoffControl({ config, proxy, instanceToken, 
         ...(event.connectionGeneration ? { connectionGeneration: event.connectionGeneration } : {}),
         ...(event.phase === "terminal" ? { status: event.status } : {}) });
       lastSequence = event.sequence;
+      if (!restoring && event.phase === "terminal" && event.status === "interrupted") {
+        proxy.cancelNativeTurn?.({ threadId: event.threadId, turnId: event.turnId });
+      }
       return { recorded: true, sequence: lastSequence };
     }
     if (message.method === "prepare") return prepare(message);
@@ -344,9 +364,11 @@ export function attachInnerRunnerHandoffControl({ config, proxy, instanceToken, 
       onEvent({ type: "handoff_control_result", requestId, method: message.method, ok: true });
       if (message.method === "shutdown") void shutdown("handoff_ipc_shutdown");
     } catch (error) {
-      send({ requestId, ok: false, error: { code: error.code ?? "HANDOFF_FAILED" } });
+      const diagnostics = message.method === "authorizeInternalMemory" && typeof error.code === "string" && error.code.startsWith("INTERNAL_MEMORY_")
+        ? internalMemoryRejectionDiagnostics(error.diagnostics) : undefined;
+      send({ requestId, ok: false, error: { code: error.code ?? "HANDOFF_FAILED", ...(diagnostics ? { diagnostics } : {}) } });
       onEvent({ type: "handoff_control_result", requestId, method: typeof message.method === "string" ? message.method.slice(0, 64) : null,
-        ok: false, code: error.code ?? "HANDOFF_FAILED" });
+        ok: false, code: error.code ?? "HANDOFF_FAILED", ...(diagnostics ? { diagnostics } : {}) });
     }
   }
   const disconnected = () => { void shutdown("handoff_ipc_disconnect"); };

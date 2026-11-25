@@ -53,8 +53,8 @@ test("connection reset after the request body was sent reconnects automatically"
     req.on("end", () => { if (n === 1) req.socket.destroy(); else { res.writeHead(200, { "content-type": "text/event-stream" }); res.end(completed); } });
   });
   const result = await send(port);
-  assert.equal(state.attempts, 2, `attempts=${state.attempts} body=${result.body.slice(-300)}`);
-  assert.match(result.body, /DONE/u);
+  assert.equal(state.attempts, 1, `attempts=${state.attempts} body=${result.body.slice(-300)}`);
+  assert.match(result.body, /上游是否完成了本次请求仍待核对.*停止自动重发/u);
 });
 
 test("first-progress timeout with no output reconnects automatically", async t => {
@@ -67,8 +67,8 @@ test("first-progress timeout with no output reconnects automatically", async t =
     });
   });
   const result = await send(port);
-  assert.ok(state.attempts >= 2, `attempts=${state.attempts} body=${result.body.slice(-300)}`);
-  assert.match(result.body, /DONE/u);
+  assert.equal(state.attempts, 1, `attempts=${state.attempts} body=${result.body.slice(-300)}`);
+  assert.match(result.body, /上游是否完成了本次请求仍待核对.*停止自动重发/u);
 });
 
 test("a new request in the same turn after the client cancelled (mid-turn steer) is forwarded", async t => {
@@ -84,8 +84,11 @@ test("a new request in the same turn after the client cancelled (mid-turn steer)
   assert.equal(first.aborted, true);
   await new Promise(resolve => setTimeout(resolve, 150));
   const second = await send(port);
-  assert.equal(state.attempts, 2, `attempts=${state.attempts} body=${second.body.slice(-300)}`);
-  assert.match(second.body, /DONE/u);
+  assert.equal(state.attempts, 1, `attempts=${state.attempts} body=${second.body.slice(-300)}`);
+  assert.match(second.body, /上游结果尚未核实|上游是否完成了本次请求仍待核对/u);
+  const nextTurn = await send(port, { turnId: "turn-b" });
+  assert.equal(state.attempts, 2);
+  assert.match(nextTurn.body, /DONE/u);
 });
 
 test("a disconnect after visible output hands the retry back to the native client instead of hanging", async t => {
@@ -101,7 +104,7 @@ test("a disconnect after visible output hands the retry back to the native clien
   assert.equal(result.timedOut, undefined, `stream hung: ${result.body.slice(-300)}`);
   assert.equal(state.attempts, 1);
   assert.match(result.body, /visible/u);
-  assert.doesNotMatch(result.body, /自动重试已暂停|停止自动重发/u);
+  assert.match(result.body, /上游是否完成了本次请求仍待核对.*停止自动重发/u);
 });
 
 test("HTTP 503 before output reconnects automatically", async t => {

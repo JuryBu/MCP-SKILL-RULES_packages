@@ -5,12 +5,14 @@ import crypto from "node:crypto";
 import net from "node:net";
 import { createCodexAppServerProxy } from "./codex-app-server-proxy.mjs";
 import { parseArguments, runCodexAppServerProxyService, waitForLaunchPublication } from "./codex-app-server-proxy-runner.mjs";
-import { createInnerProxyCoordinator } from "./inner-proxy-coordinator.mjs";
+import { createInnerProxyCoordinator, recordNativeWsRelayFailure, recordNativeRootPeerFailure } from "./inner-proxy-coordinator.mjs";
 import { createInnerNativeTurnSource } from "./inner-native-turn-source.mjs";
-import { validateInnerRuntimeProfile, approvedInnerCandidate, readInnerCandidateRegistry } from "./inner-runtime-profile.mjs";
+import { validateInnerRuntimeProfile, approvedInnerCandidate, readInnerCandidateRegistry, checkedRuntimePath } from "./inner-runtime-profile.mjs";
+import { createModelOperationLedger } from "./model-operation-ledger.mjs";
 import { createProxyParentCodeRuntime } from "./proxy-live-parent-runtime.mjs";
 import { createProxyClassCodeParticipant } from "./proxy-live-code-runtime.mjs";
 import { createProxyWholeRuntimeControl } from "./proxy-whole-runtime-control.mjs";
+import { createManagedNativeIdentitySupplier } from "./managed-native-process-identity.mjs";
 
 const sleep = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds));
 const nativeSourceGeneration = crypto.randomUUID();
@@ -128,7 +130,7 @@ export function createManagedInnerProxySession(configuration, onEvent = () => {}
     coordinator: null, nativeSource: null, managedInnerControl: null, serviceCodeParticipant: null, parentCodeRuntime: null,
     stopIdentity: JSON.stringify({ ownerId: configuration.ownerId, nonce: crypto.randomUUID(), createdAt: new Date().toISOString() }),
     started: false, closed: false, innerEndpoint: null, outerTask: null, outerResult: null, outerFinished: false,
-    stopWritten: false, publicationStarted: false, cleanupError: null, coordinatorCloseTask: null,
+    stopWritten: false, shutdownRequested: false, publicationStarted: false, cleanupError: null, coordinatorCloseTask: null,
     controlRevision: 0, controlBusy: false, controlOperations: new Map(),
     resources: { publicationTimer: null, controlTimers: new Set() },
     completion: null, resolveCompletion: null, rejectCompletion: null,
@@ -141,6 +143,8 @@ export function createManagedInnerProxySession(configuration, onEvent = () => {}
     checkpointRoot: root, upstreamOrigin: configuration.upstreamOrigin, port: configuration.innerPort,
     mode: configuration.mode, runtimeProfile,
     nodeExecutable: configuration.nodeExecutable, environment: { ...configuration.environment, CODEX_HOME: home },
+    isShutdownRequested: () => shared.shutdownRequested || shared.outerFinished
+      || shared.serviceCodeParticipant?.snapshot().state.stopRequested === true || fs.existsSync(options.stopFilePath),
     onEvent: shared.bindDispatch("handleCoordinatorEvent") });
   shared.nativeSource = createInnerNativeTurnSource({ sourceId: configuration.nativeSourceId, coordinator: shared.coordinator });
   shared.nativeSourceGeneration = nativeSourceGeneration;
@@ -191,7 +195,21 @@ export function createManagedInnerProxySession(configuration, onEvent = () => {}
 export function createManagedInnerProxySessionImplementation(shared) {
   const { configuration, onEvent, serviceDependencies, home, options, runtimeProfile, coordinator } = shared;
   const closeCoordinator = () => shared.coordinatorCloseTask ??= coordinator.close();
+  const nativeIdentitySupplier = createManagedNativeIdentitySupplier({
+    getServiceState: () => shared.serviceCodeParticipant?.snapshot().state,
+  });
+  const configureNativeIdentity = () => {
+    const coordinatorOptions = coordinator.liveCodeParticipant().snapshot().state.options;
+    coordinatorOptions.getExpectedNativeIdentity ??= nativeIdentitySupplier;
+    coordinatorOptions.reconcileNativeStart = (metadata, context) => shared.dispatch("dispatchControl", "reconcile-root-start", metadata, context);
+    coordinatorOptions.nativeStartLookupPending = metadata => {
+      const lookup = shared.rootStartLookups?.get(JSON.stringify([metadata.thread_id, metadata.turn_id]));
+      return lookup?.trusted === true && lookup.current();
+    };
+    return coordinatorOptions.getExpectedNativeIdentity;
+  };
   const publish = state => {
+    configureNativeIdentity();
     if (!runtimeProfile) return;
     const statePath = runtimeProfile.managedStatePath;
     const temporary = `${statePath}.${crypto.randomUUID()}.pending`;
@@ -240,6 +258,7 @@ export function createManagedInnerProxySessionImplementation(shared) {
     await shared.outerTask;
   }
   function requestOwnedStop() {
+    shared.shutdownRequested = true;
     if (shared.stopWritten || shared.outerFinished) return;
     if (fs.existsSync(options.stopFilePath)) return;
     fs.writeFileSync(options.stopFilePath, shared.stopIdentity, { flag: "wx" });
@@ -248,6 +267,7 @@ export function createManagedInnerProxySessionImplementation(shared) {
   function controlStatus() {
     requireReady();
     const current = coordinator.status();
+    if (!current.nativeHealthy) throw new Error("MANAGED_SESSION_NOT_READY");
     const selected = current.workers.find(worker => worker.workerId === current.defaultWorkerId && worker.alive);
     if (!shared.innerEndpoint || readRuntime()?.state !== "running" || !selected) throw new Error("INNER_CONTROL_NOT_READY");
     return { ok: true, ownerId: configuration.ownerId, nativeSourceId: configuration.nativeSourceId,
@@ -259,7 +279,214 @@ export function createManagedInnerProxySessionImplementation(shared) {
     if (input.ownerId !== configuration.ownerId || input.nativeSourceId !== configuration.nativeSourceId
       || input.instanceToken !== options.instanceToken) throw new Error("INNER_CONTROL_IDENTITY_MISMATCH");
   }
+  function diagnosticControlStatus() {
+    const current = coordinator.status();
+    const source = shared.nativeSource.status();
+    const outer = readRuntime();
+    const selected = current.workers.find(worker => worker.workerId === current.defaultWorkerId && worker.alive);
+    const healthy = Boolean(shared.started && !shared.closed && !shared.outerFinished && shared.innerEndpoint
+      && outer?.state === "running" && source.healthy && current.running && current.nativeHealthy
+      && !shared.selectionRecoveryError && selected);
+    const operations = [...shared.controlOperations.values()];
+    return { ok: healthy, healthy, state: healthy ? "running" : shared.closed ? "closed" : shared.started ? "degraded" : "starting",
+      failureCode: source.failureCode ?? (!source.healthy || !current.nativeHealthy ? "NATIVE_SOURCE_UNAVAILABLE"
+        : shared.selectionRecoveryError ?? (healthy ? null : "MANAGED_SESSION_NOT_READY")),
+      ownerId: configuration.ownerId, nativeSourceId: configuration.nativeSourceId,
+      pid: process.pid, instanceToken: options.instanceToken, revision: shared.controlRevision, busy: shared.controlBusy,
+      selectedWorkerId: selected?.workerId ?? current.defaultWorkerId ?? null, selectedSourceHashes: selected?.sourceHashes ?? null,
+      nativeSource: source, coordinator: current, operations,
+      inFlight: { activeHttp: current.activeHttp ?? null, pendingControl: current.pendingControl ?? null,
+        activeTurns: current.threads.filter(thread => thread.phase === "active").length,
+        pendingControlOperations: operations.filter(operation => operation.state === "pending").length,
+        unknownControlOperations: operations.filter(operation => operation.state === "unknown").length,
+        transactionActive: current.transactionActive, workerMaintenance: current.workerMaintenance,
+        clientCount: outer?.proxy?.clientCount ?? null,
+        activeOperationCount: outer?.proxy?.outerRuntime?.activeOperationCount ?? null,
+        trackedRequestCount: outer?.proxy?.outerRuntime?.trackedRequestCount ?? null,
+        pendingToolCount: outer?.proxy?.outerRuntime?.pendingToolCount ?? null } };
+  }
   async function dispatchControl(method, input, context = {}) {
+    if (method === "reconcile-root-start") {
+      if (typeof context.isClosed !== "function" || !(context.signal instanceof AbortSignal)) return { recovered: false };
+      const threadId = input?.thread_id;
+      const turnId = input?.turn_id;
+      if (![threadId, turnId].every(value => typeof value === "string" && value.length > 0
+        && value.length <= 512 && !value.includes("\u0000"))) return { recovered: false };
+      const registry = shared.rootStartLookups ??= new Map();
+      const key = JSON.stringify([threadId, turnId]);
+      const waiter = { isClosed: context.isClosed, signal: context.signal };
+      const waiting = value => !value.signal?.aborted && value.isClosed?.() !== true;
+      let lookup = registry.get(key);
+      if (lookup && !lookup.current()) { registry.delete(key); lookup = null; }
+      if (!lookup) {
+        const proxy = shared.recoveryProxy;
+        const client = [...(proxy?.clients ?? [])].find(value => !value.closed && value.initialized === true
+          && value.upstream?.readyState === proxy.WebSocketImpl.OPEN
+          && (value.initializedUpstream === undefined || value.initializedUpstream === value.upstream));
+        if (!client || registry.size >= 128) return { recovered: false };
+        const upstream = client.upstream;
+        const connectionGeneration = client.metadataUpstreamGeneration;
+        if (typeof connectionGeneration !== "string" || !connectionGeneration) return { recovered: false };
+        const source = shared.nativeSource;
+        const generation = shared.nativeSourceGeneration;
+        const implementationGeneration = shared.implementationGeneration;
+        const revision = shared.controlRevision;
+        const coordinatorState = coordinator.liveCodeParticipant().snapshot().state;
+        const defaultWorker = coordinatorState.defaultWorker;
+        const coordinatorGeneration = coordinatorState.generation;
+        const coordinatorImplementation = coordinatorState.implementation;
+        const coordinatorImplementationGeneration = coordinatorState.implementationGeneration;
+        const previous = coordinatorState.threads.get(threadId) ?? coordinatorState.terminalThreads?.get(threadId);
+        const previousTurnId = previous?.turnId;
+        const previousEpoch = previous?.epoch;
+        const previousWorker = previous?.worker;
+        const previousPhase = previous?.phase;
+        const previousStart = previous?.start;
+        const previousConnectionGeneration = previousStart?.connectionGeneration;
+        let expectedPhase = previousPhase;
+        let expectedEpoch = previousEpoch;
+        let recovery = previous?.pendingNativeStartRecovery;
+        const reuse = (previousPhase === "active" || previousPhase === "terminal" && recovery)
+          && previousTurnId !== turnId && input.subagent_kind === "thread_spawn"
+          && (input.request_kind === undefined || input.request_kind === "turn");
+        const workerChild = previousWorker?.child;
+        const workerReady = previousWorker?.ready;
+        const workerToken = workerReady?.instanceToken;
+        const workerSource = JSON.stringify(workerReady?.sourceHashes);
+        const workerStateRoot = previousWorker?.stateRoot;
+        const targetIdle = () => previous.activeHttp === 0 && previous.nativeRelays === 0
+          && ![...coordinatorState.requests.values()].some(request => request.thread === previous);
+        const unchangedTarget = () => {
+          const current = coordinatorState.threads.get(threadId) ?? coordinatorState.terminalThreads?.get(threadId);
+          return previous ? current === previous && current.phase === (reuse ? expectedPhase : "terminal") && current.turnId === previousTurnId
+            && current.turnId !== turnId && current.epoch === expectedEpoch && current.worker === previousWorker
+            && (reuse || !current.pendingNativeStartRecovery && targetIdle())
+            && current.pendingNativeStartRecovery === recovery
+            && (!recovery || recovery.turnId === previousTurnId && recovery.worker === previousWorker
+              && recovery.stateRoot === workerStateRoot && recovery.child === workerChild && recovery.ready === workerReady)
+            && !current.pendingActivation && !current.activationError && !current.migrationCleanupError
+            && (!reuse || current.start === previousStart && current.start?.connectionGeneration === previousConnectionGeneration
+              && previousWorker.child === workerChild && previousWorker.ready === workerReady
+              && workerReady?.instanceToken === workerToken && JSON.stringify(workerReady?.sourceHashes) === workerSource
+              && previousWorker.stateRoot === workerStateRoot && workerChild?.connected === true
+              && workerChild.exitCode === null && workerChild.signalCode === null && !previousWorker.startup
+              && !previousWorker.cleanupPending && !previousWorker.recoveryTask && !previousWorker.recoveryError
+              && !previousWorker.replacementWorker && previousWorker.reclamation !== "stopping") : !current;
+        };
+        const operationsClear = () => {
+          const stateRoot = checkedRuntimePath(workerStateRoot, { directory: true });
+          const file = checkedRuntimePath(path.join(stateRoot, "codex-model-operation-state.json"), { existing: true });
+          if (fs.statSync(file).size > 2 * 1024 * 1024) return false;
+          const bytes = fs.readFileSync(file);
+          if (bytes.length > 2 * 1024 * 1024) return false;
+          const operations = createModelOperationLedger({ state: JSON.parse(bytes.toString("utf8")) });
+          return operations.exportThread(threadId).entries.length === 0;
+        };
+        const supplier = configureNativeIdentity();
+        lookup = { threadId, turnId, trusted: false, invalid: false, waiters: new Set(), deadline: Date.now() + 5000 };
+        lookup.current = () => !lookup.invalid && Date.now() < lookup.deadline
+          && [...lookup.waiters].some(waiting) && !shared.closed && !shared.outerFinished && !shared.shutdownRequested
+          && shared.nativeSource === source && shared.nativeSourceGeneration === generation
+          && shared.implementationGeneration === implementationGeneration && shared.controlRevision === revision
+          && source.status().healthy && coordinatorState.nativeHealthy && !coordinatorState.closing
+          && !coordinatorState.transactionActive && !coordinatorState.workerMaintenance && !shared.controlBusy
+          && coordinatorState.defaultWorker === defaultWorker && coordinatorState.generation === coordinatorGeneration
+          && coordinatorState.implementation === coordinatorImplementation
+          && coordinatorState.implementationGeneration === coordinatorImplementationGeneration
+          && !coordinatorState.migrations.has(threadId) && !coordinatorState.adoptions.has(threadId) && unchangedTarget()
+          && !client.closed && client.upstream === upstream && upstream.readyState === proxy.WebSocketImpl.OPEN
+          && client.metadataUpstreamGeneration === connectionGeneration && client.initialized === true
+          && (client.initializedUpstream === undefined || client.initializedUpstream === upstream)
+          && (!lookup.identity || supplier.isCurrent?.(lookup.identity) === true);
+        lookup.waiters.add(waiter);
+        registry.set(key, lookup);
+        lookup.done = (async () => {
+          try {
+            if (!lookup.current()) return { recovered: false };
+            lookup.identity = await supplier({});
+            if (!lookup.current()) return { recovered: false };
+            const lookupTurns = params => proxy._liveInjectRequest(client, "thread/turns/list", params,
+              { timeoutMs: Math.max(1, Math.min(1250, lookup.deadline - Date.now())) });
+            lookup.trusted = true;
+            let cursor;
+            const cursors = new Set();
+            let turn;
+            let terminal;
+            for (let page = 0; page < 4 && lookup.current(); page += 1) {
+              const result = await lookupTurns({ threadId, limit: 8, sortDirection: "desc", itemsView: "notLoaded",
+                ...(cursor ? { cursor } : {}) });
+              if (!lookup.current() || !Array.isArray(result?.data)) return { recovered: false };
+              turn ??= result.data.find(value => value.id === turnId);
+              if (reuse) terminal ??= result.data.find(value => value.id === previousTurnId);
+              if (turn && (!reuse || terminal)) break;
+              const next = result.nextCursor;
+              if (typeof next !== "string" || !next || next.length > 4096 || cursors.has(next)) break;
+              cursors.add(next);
+              cursor = next;
+            }
+            if (!lookup.current() || turn?.status !== "inProgress") return { recovered: false };
+            if (reuse && !["completed", "failed", "interrupted"].includes(terminal?.status)) return { recovered: false };
+            const commits = shared.rootStartCommits ??= new Map();
+            const commit = Promise.resolve(commits.get(threadId)).catch(() => {}).then(async () => {
+              if (!lookup.current()) return false;
+              if (reuse) {
+                while (lookup.current() && !targetIdle()) await sleep(20);
+                if (!lookup.current() || !operationsClear() || !lookup.current() || !targetIdle()) return false;
+                recovery ??= { turnId: previousTurnId, worker: previousWorker, stateRoot: workerStateRoot,
+                  child: workerChild, ready: workerReady };
+                previous.pendingNativeStartRecovery = recovery;
+                if (previous.phase === "active") {
+                  const completed = source.observe({ method: "turn/completed",
+                    params: { threadId, turn: { id: previousTurnId, status: terminal.status } } });
+                  completed.catch(() => {});
+                  if (coordinatorState.threads.get(threadId) !== previous || previous.phase !== "terminal"
+                    || previous.turnId !== previousTurnId || previous.worker !== previousWorker
+                    || previous.completion?.status !== terminal.status) return false;
+                  expectedPhase = "terminal";
+                  expectedEpoch = previous.completion.sequence;
+                }
+                if (!lookup.current() || previous.activeHttp !== 0
+                  || previous.nativeRelays !== (previousPhase === "active" ? 1 : 0) || !operationsClear()) return false;
+                delete previous.pendingNativeStartRecovery;
+              }
+              try {
+                await source.observe({ method: "turn/started", params: { threadId, turn: { id: turnId, status: "inProgress" } },
+                  rootAdmissionOrigin: "authoritative_lookup", rootAdmissionNativeIdentity: lookup.identity,
+                  recoveryConnectionGeneration: connectionGeneration });
+              } catch (error) {
+                if (recovery && previous.turnId === previousTurnId) previous.pendingNativeStartRecovery = recovery;
+                throw error;
+              }
+              return true;
+            });
+            commits.set(threadId, commit);
+            try { if (!await commit) return { recovered: false }; }
+            finally { if (commits.get(threadId) === commit) commits.delete(threadId); }
+            if (reuse) onEvent({ type: "authoritative_terminal_recovery", threadId, turnId: previousTurnId,
+              status: terminal.status, source: "thread/turns/list" });
+            onEvent({ type: "authoritative_start_recovery", threadId, turnId, source: "thread/turns/list", connectionGeneration });
+            return { recovered: true };
+          } catch (error) {
+            onEvent({ type: "authoritative_start_recovery_skipped", threadId, turnId, code: error.code ?? error.message });
+            return { recovered: false };
+          } finally {
+            lookup.trusted = false;
+            if (registry.get(key) === lookup) registry.delete(key);
+          }
+        })();
+      } else lookup.waiters.add(waiter);
+      const removeWaiter = () => {
+        lookup.waiters.delete(waiter);
+        if (![...lookup.waiters].some(waiting)) {
+          lookup.invalid = true;
+          if (registry.get(key) === lookup) registry.delete(key);
+        }
+      };
+      context.signal.addEventListener("abort", removeWaiter, { once: true });
+      if (context.signal.aborted) removeWaiter();
+      try { return await lookup.done; }
+      finally { context.signal.removeEventListener("abort", removeWaiter); removeWaiter(); }
+    }
     if (method === "recover-before-turn" && typeof context.lookupTurns === "function"
       && typeof context.connectionActive === "function") {
       const originalSource = shared.nativeSource;
@@ -321,8 +548,8 @@ export function createManagedInnerProxySessionImplementation(shared) {
       return { recovered: true };
     }
     bindControl(input);
+    if (method === "status") return diagnosticControlStatus();
     const current = controlStatus();
-    if (method === "status") return current;
     if (method === "continue-http") {
       const result = await coordinator.recoveryControl(method, input);
       return { ok: result.accepted === true, ...result };
@@ -481,6 +708,12 @@ export function createManagedInnerProxySessionImplementation(shared) {
   return {
     dispatchControl, createOuterProxy, handleOuterFinished, refreshPublishedStatus,
     handleCoordinatorEvent(event) {
+      if (event.type === "native_start_lookup_requested") configureNativeIdentity();
+      if (event.type === "native_ws_relay_failed") {
+        const state = coordinator.liveCodeParticipant().snapshot().state;
+        recordNativeRootPeerFailure(state, event);
+        recordNativeWsRelayFailure(state, event);
+      }
       if (event.type === "model_recovery_state") shared.recoveryProxy?.publishRecoveryState(event.envelope);
       if (event.type === "activation_automatically_rolled_back" && shared.parentCodeRuntime?.recover) {
         shared.selectionRecoveryTask = Promise.resolve(shared.parentCodeRuntime.recover({ automaticRollback: event }))
@@ -500,13 +733,22 @@ export function createManagedInnerProxySessionImplementation(shared) {
       if (runtimeProfile && shared.publicationStarted && !shared.closed) refreshPublishedStatus();
     },
     handleNativeTurn(message, context = {}) {
+      for (const lookup of shared.rootStartLookups?.values() ?? []) {
+        if (lookup.threadId === message.params?.threadId && (message.method === "turn/started"
+          || message.method === "turn/completed" && lookup.turnId === message.params?.turn?.id)) lookup.invalid = true;
+      }
       if (shared.nativeSourceGeneration !== nativeSourceGeneration && shared.nativeSource.status().healthy) {
         shared.nativeSource = createInnerNativeTurnSource({ sourceId: configuration.nativeSourceId, coordinator,
           previousSource: shared.nativeSource });
         shared.nativeSourceGeneration = nativeSourceGeneration;
       }
-      const observed = shared.nativeSource.observe(context.connectionGeneration
-        ? { ...message, recoveryConnectionGeneration: context.connectionGeneration } : message);
+      const rootContext = message.method === "turn/started" ? {
+        rootAdmissionOrigin: context.admissionOrigin ?? "legacy_unknown",
+        rootAdmissionNativeIdentity: configureNativeIdentity()(),
+      } : {};
+      rootContext.rootAdmissionNativeIdentity?.catch?.(() => {});
+      const observed = shared.nativeSource.observe({ ...message, ...rootContext,
+        ...(context.connectionGeneration ? { recoveryConnectionGeneration: context.connectionGeneration } : {}) });
       return context.connectionGeneration ? coordinator.recoveryControl("bind-native", {
         threadId: message.params.threadId, turnId: message.params.turn.id, connectionGeneration: context.connectionGeneration }) : observed;
     },
@@ -522,6 +764,7 @@ export function createManagedInnerProxySessionImplementation(shared) {
     handleControlDeadline(deadline) { deadline.resolve(); },
     handleServiceCodeParticipant(participant) {
       shared.serviceCodeParticipant = participant;
+      configureNativeIdentity();
       serviceDependencies.onServiceCodeParticipant?.(participant);
     },
     async start() {

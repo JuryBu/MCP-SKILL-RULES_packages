@@ -5,6 +5,7 @@ import { checkedRuntimePath } from "./inner-runtime-profile.mjs";
 import { createModelOperationLedger } from "./model-operation-ledger.mjs";
 import { validateDurableRecoveryState } from "./thread-recovery-handoff.mjs";
 import { renameReplaceSync } from "./atomic-file.mjs";
+import { sourceInputProof } from "./source-input-proof.mjs";
 
 const fail = code => { throw Object.assign(new Error(code), { code }); };
 const hash = value => crypto.createHash("sha256").update(value).digest("hex");
@@ -45,7 +46,7 @@ export function readFailedWorkerRecovery({ root, worker, ownerId, nativeSourceId
   return { operationState, recoveryState };
 }
 
-export function readRecoveredWorkerOperation(worker, metadata, request) {
+function recoveredWorkerOperation(worker, metadata, request) {
   if (!worker.recoveredFrom) return null;
   const pathname = String(request.url ?? "").split("?")[0].replace(/\/+$/u, "");
   const fallbackKind = request.method === "POST" && /\/responses(?:\/compact)?$/u.test(pathname)
@@ -53,7 +54,28 @@ export function readRecoveredWorkerOperation(worker, metadata, request) {
   const requestKind = typeof metadata?.request_kind === "string" ? metadata.request_kind : fallbackKind;
   if (!["turn", "compaction"].includes(requestKind) || !metadata?.thread_id || !metadata?.turn_id) return null;
   const operations = createModelOperationLedger({ state: read(path.join(worker.stateRoot, "codex-model-operation-state.json")) });
-  const entry = operations.get(`${metadata.thread_id}\u0000${metadata.turn_id}\u0000${requestKind}`);
+  const key = `${metadata.thread_id}\u0000${metadata.turn_id}\u0000${requestKind}`;
+  const entry = operations.get(key);
+  return { operations, key, entry, requestKind };
+}
+
+export function readRecoveredWorkerOperation(worker, metadata, request, payload) {
+  const recovered = recoveredWorkerOperation(worker, metadata, request);
+  if (!recovered) return null;
+  const { operations, key, entry, requestKind } = recovered;
+  if (entry && requestKind === "turn" && operations.canContinue(key, payload)) return null;
+  return entry ? { requestKind, entry } : null;
+}
+
+export async function readRecoveredWorkerOperationSource(worker, metadata, request, payload) {
+  if (!sourceInputProof(payload)) return readRecoveredWorkerOperation(worker, metadata, request, payload);
+  const recovered = recoveredWorkerOperation(worker, metadata, request);
+  if (!recovered) return null;
+  const { operations, key, entry, requestKind } = recovered;
+  if (entry && requestKind === "turn") {
+    await operations.prepareSource(key, payload);
+    if (operations.canContinue(key, payload)) return null;
+  }
   return entry ? { requestKind, entry } : null;
 }
 

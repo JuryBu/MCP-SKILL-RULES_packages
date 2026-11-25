@@ -20,6 +20,7 @@ async function fixture(context, reply) {
     port: 0,
     upstreamOrigin: `http://127.0.0.1:${upstream.address().port}`,
     firstProgressTimeoutMs: 1000,
+    fastRetryDelayMs: 0,
     maxConsecutiveAttempts: 6,
     onEvent: event => events.push(event),
   });
@@ -64,7 +65,7 @@ for (const [name, event] of [
     assert.equal(server.calls(), 1);
     assert.equal(server.proxy.status().counters.retrySignals, 0);
     assert.equal(server.proxy.status().counters.actualCompletions, 0);
-    assert.ok(server.events.some(event => event.type === "safety_policy_completed_idle"));
+    assert.ok(server.events.some(event => event.type === "safety_policy_terminal_failure" || (event.type === "model_terminal_failure" && event.category === "safety")));
   });
 }
 
@@ -83,7 +84,7 @@ for (const status of [200, 400, 429, 500]) {
 
 test("unrelated server error mentioning policy is still retryable", async context => {
   const server = await fixture(context, response => {
-    response.writeHead(500, { "content-type": "application/json" });
+    response.writeHead(503, { "content-type": "application/json" });
     response.end(JSON.stringify({ error: { code: "server_error", message: "bio_policy service unavailable" } }));
   });
   const result = await server.request();
@@ -150,7 +151,7 @@ for (const code of ["cyber_policy", "misalignment_policy_violation", "invalid_pr
       assert.equal(server.calls(), 1);
       assert.equal(server.proxy.status().counters.retrySignals, 0);
       assert.equal(server.proxy.status().counters.actualCompletions, 0);
-      assert.ok(server.events.some(event => event.type === "safety_policy_completed_idle" && event.code === code));
+      assert.ok(server.events.some(event => (event.type === "safety_policy_terminal_failure" || (event.type === "model_terminal_failure" && event.category === "safety")) && (event.code === code || event.reason === code)));
     });
   }
   for (const status of [200, 400, 429, 500]) {
@@ -202,7 +203,7 @@ test("policy code takes precedence over quota wording and never reflects arbitra
   const result = await server.request();
   assert.ok(result.body.includes("cyber_policy"));
   for (const secret of ["fixture-secret", "fixture-token", "fixture-key", "sk-fixturekey", "quoted-secret", "cookie-secret", "words-secret"]) assert.ok(!result.body.includes(secret));
-  assert.ok(server.events.some(event => event.type === "safety_policy_completed_idle"));
+  assert.ok(server.events.some(event => event.type === "safety_policy_terminal_failure" || (event.type === "model_terminal_failure" && event.category === "safety")));
   assert.equal(server.proxy.status().counters.retrySignals, 0);
 });
 
@@ -218,7 +219,7 @@ test("explicit context limit wins over capacity wording", async context => {
 
 for (const code of ["server_error", "service_unavailable", "timeout"]) test(`${code} with authentication wording remains retryable`, async context => {
   const server = await fixture(context, response => {
-    response.writeHead(500, { "content-type": "application/json" });
+    response.writeHead(503, { "content-type": "application/json" });
     response.end(JSON.stringify({ error: { code, message: "authentication service temporarily unavailable" } }));
   });
   const result = await server.request();
@@ -287,7 +288,7 @@ for (const code of ["credit_balance_exhausted", "organization_spend_limit_exceed
 
 test("a server error mentioning cyber policy still remains retryable", async context => {
   const server = await fixture(context, response => {
-    response.writeHead(500, { "content-type": "application/json" });
+    response.writeHead(503, { "content-type": "application/json" });
     response.end(JSON.stringify({ error: { code: "server_error", message: "cyber_policy service unavailable" } }));
   });
   const result = await server.request();

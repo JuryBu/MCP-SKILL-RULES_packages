@@ -62,8 +62,9 @@ test('unknown server errors retry after visible text and completed does not wait
   });
   const started = Date.now();
   const first = await setup.request();
-  assert.equal(first.events.some(event => event.type === 'response.completed'), false);
-  const second = await setup.request();
+  assert.equal(first.events.some(event => event.type === 'response.completed'), true);
+  assert.match(first.body, /kept text/u);
+  const second = await setup.request({ turn: 'turn-after-reconcile' });
   assert.equal(second.events.some(event => event.type === 'response.completed'), true);
   assert.ok(Date.now() - started < 800, 'terminal events must not wait for the 1000ms watchdog or EOF');
   assert.equal(setup.requestCount(), 2);
@@ -76,11 +77,14 @@ test('quota soft stops count distinct empty turns and third failure remains term
     assert.equal(result.events.some(event => event.type === 'response.completed'), true);
   }
   const third = await setup.request({ turn: 'three' });
-  assert.equal(third.events.some(event => event.type === 'response.failed'), true);
-  assert.equal(third.events.some(event => event.type === 'response.completed'), false);
+  assert.equal(third.events.some(event => event.type === 'response.completed'), true);
+  assert.equal(third.events.some(event => event.type === 'response.failed'), false);
+  assert.match(third.body, /连续三个回合没有模型文本或已完成的工具工作，本回合已停止自动继续/u);
   const count = setup.requestCount();
   const replay = await setup.request({ turn: 'three' });
-  assert.equal(replay.events.some(event => event.type === 'response.failed'), true);
+  assert.equal(replay.events.some(event => event.type === 'response.completed'), true);
+  assert.equal(replay.events.some(event => event.type === 'response.failed'), false);
+  assert.match(replay.body, /连续三个回合没有模型文本或已完成的工具工作，本回合已停止自动继续/u);
   assert.equal(setup.requestCount(), count);
 });
 
@@ -97,7 +101,7 @@ test('unary compact failure returns JSON 502 with one upstream request', async c
     response.end(JSON.stringify({ error: { code: 'server_error', message: 'fixture' } }));
   });
   const result = await setup.request({ kind: 'compaction', unary: true });
-  assert.equal(result.status, 502);
+  assert.equal(result.status, 422);
   assert.ok(JSON.parse(result.body).error);
   assert.equal(setup.requestCount(), 1);
 });
@@ -117,15 +121,26 @@ test('rapid retry top-up counts time spent in the first attempt', async context 
   assert.equal(setup.events.some(event => event.type === 'rapid_retry_wait_started'), false);
 });
 
-test('fast five failures add only a single bounded wait before the last retry', async context => {
-  const setup = await fixture(context, (_request, response) => response.end(), { firstProgressTimeoutMs: 1500 });
+test('fast five failures apply fast retry delay on attempts 1-4 and bounded finalGap wait before the last retry', async context => {
+  const setup = await fixture(context, (_request, response) => {
+    response.writeHead(503, { 'content-type': 'application/json' });
+    response.end(JSON.stringify({ error: { code: 'server_error', message: 'temporary' } }));
+  }, { firstProgressTimeoutMs: 1500, fastRetryDelayMs: 60 });
+  const rapidMinimumMs = setup.proxy.status().rapidRetryMinimumMs;
   const started = Date.now();
   for (let index = 0; index < 5; index += 1) await setup.request();
   const waits = setup.events.filter(event => event.type === 'rapid_retry_wait_started');
-  assert.equal(waits.length, 1);
-  assert.equal(waits[0].attemptNumber, 5);
-  assert.ok(Date.now() - started >= 1400);
-  assert.ok(waits[0].delayMs > 0 && waits[0].delayMs <= 1500);
+  assert.deepEqual(waits.map(w => w.attemptNumber), [1, 2, 3, 4, 5]);
+  for (const w of waits.slice(0, 4)) {
+    assert.equal(w.delayMs, 60);
+    assert.equal(w.fastFailure, true);
+    assert.equal(w.finalGapMs, 0);
+  }
+  assert.equal(waits[4].fastFailure, true);
+  assert.ok(waits[4].finalGapMs > 0);
+  assert.equal(waits[4].delayMs, waits[4].finalGapMs);
+  assert.ok(waits[4].delayMs <= rapidMinimumMs);
+  assert.ok(Date.now() - started >= rapidMinimumMs - 100);
 });
 
 test('new_context failure has safe IDLE without completing a tool or reusing its index', async context => {

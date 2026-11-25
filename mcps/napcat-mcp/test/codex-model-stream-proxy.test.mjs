@@ -68,39 +68,28 @@ test("request classification uses x-codex-turn-metadata and guards resumable tur
   assert.equal(classifyCodexModelRequest({ headers: {} }).guarded, false);
 });
 
-test("late output from a timed out attempt is discarded before the client retry exposes output", async (t) => {
+test("late output from a timed out attempt is discarded and stops blind replay via reconciliation", async (t) => {
   let attempts = 0;
+  let delayed;
   const upstream = http.createServer((req, res) => {
     attempts += 1;
     res.writeHead(200, { "content-type": "text/event-stream" });
-    if (attempts === 1) {
-      res.write(sse({ type: "response.in_progress" }));
-      setTimeout(() => {
+    res.write(sse({ type: "response.in_progress" }));
+    delayed = setTimeout(() => {
+      if (!res.destroyed) {
         res.write(sse({ type: "response.output_text.delta", delta: "OLD" }));
         res.end(sse({ type: "response.completed" }));
-      }, 120);
-      return;
-    }
-    res.end(sse({ type: "response.output_text.delta", delta: "NEW" }) + sse({ type: "response.completed" }));
+      }
+    }, 300);
   });
   const upstreamPort = await listen(upstream);
-  const proxy = createCodexModelStreamProxy({
-    port: 0,
-    upstreamOrigin: `http://127.0.0.1:${upstreamPort}`,
-    firstProgressTimeoutMs: 40,
-    maxConsecutiveAttempts: 2,
-  });
+  const proxy = createCodexModelStreamProxy({ port: 0, upstreamOrigin: `http://127.0.0.1:${upstreamPort}`, firstProgressTimeoutMs: 80, progressIdleTimeoutMs: 80, fastRetryDelayMs: 0 });
   await proxy.start();
-  t.after(async () => { await proxy.stop(); upstream.closeAllConnections?.(); upstream.close(); });
-
-  const first = await request(proxy.status().port, { stream: true, tools: [{ type: "function", name: "safe" }] }, { threadId: "late-output-thread" });
-  await new Promise((resolve) => setTimeout(resolve, 140));
+  t.after(async () => { clearTimeout(delayed); await proxy.stop(); upstream.closeAllConnections?.(); upstream.close(); });
+  const first = await request(proxy.status().port, { stream: true, tools: [] }, { turnId: "late-out" });
   assert.equal(attempts, 1);
-  assert.doesNotMatch(first.body, /OLD|NEW/u);
-  const result = await request(proxy.status().port, { stream: true, tools: [{ type: "function", name: "safe" }] }, { threadId: "late-output-thread" });
-  assert.equal(attempts, 2);
-  assert.match(result.body, /NEW/u);
-  assert.doesNotMatch(result.body, /OLD/u);
+  assert.doesNotMatch(first.body, /OLD/u);
+  assert.match(first.body, /上游是否完成了本次请求仍待核对.*停止自动重发/u);
 });
 
 test("a stream that already exposed text ends for a native retry without losing the streamed text", async (t) => {
@@ -122,7 +111,8 @@ test("a stream that already exposed text ends for a native retry without losing 
   assert.equal(result.aborted, false);
   assert.equal(attempts, 1);
   assert.match(result.body, /visible/u);
-  assert.equal(events.filter((event) => event.type === "native_retry_signal").length, 1);
+  assert.equal(events.filter((event) => event.type === "native_retry_signal").length, 0);
+  assert.match(result.body, /上游是否完成了本次请求仍待核对.*停止自动重发/u);
 });
 
 test("SSE progress ignores status-only frames and accepts text, reasoning, tool arguments, and completion", () => {
@@ -140,18 +130,20 @@ test("ordinary turn records a retry signal and exposes only the client retry out
     attempts += 1;
     assert.equal(req.headers.authorization, "Bearer secret-test-token");
     assert.equal(req.headers["accept-encoding"], "identity");
-    res.writeHead(200, { "content-type": "text/event-stream" });
-    res.write(sse({ type: "response.in_progress", attempt: attempts }));
-    if (attempts === 2) {
-      res.end(sse({ type: "response.output_text.delta", delta: "recovered" }) + sse({ type: "response.completed" }));
+    if (attempts === 1) {
+      res.writeHead(503, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: { code: "server_error", message: "temporary" } }));
+      return;
     }
+    res.writeHead(200, { "content-type": "text/event-stream" });
+    res.end(sse({ type: "response.output_text.delta", delta: "recovered" }) + sse({ type: "response.completed" }));
   });
   const upstreamPort = await listen(upstream);
   const events = [];
   const proxy = createCodexModelStreamProxy({
     port: 0,
     upstreamOrigin: `http://127.0.0.1:${upstreamPort}`,
-    firstProgressTimeoutMs: 80,
+    firstProgressTimeoutMs: 80, fastRetryDelayMs: 0,
     maxConsecutiveAttempts: 2,
     onEvent: (event) => events.push(event),
   });
@@ -161,7 +153,6 @@ test("ordinary turn records a retry signal and exposes only the client retry out
   const first = await request(proxy.status().port, { stream: true, tools: [{ type: "function", name: "safe" }] }, { threadId: "ordinary-retry-thread" });
   assert.equal(first.statusCode, 200);
   assert.equal(attempts, 1);
-  assert.match(first.body, /"attempt":1/u);
   assert.equal(events.filter((event) => event.type === "native_retry_signal").length, 1);
   const result = await request(proxy.status().port, { stream: true, tools: [{ type: "function", name: "safe" }] }, { threadId: "ordinary-retry-thread" });
   assert.equal(result.statusCode, 200);
@@ -202,7 +193,7 @@ test("concurrent healthy request is not delayed or cancelled by another stalled 
   const slowFirst = await slow;
   assert.doesNotMatch(slowFirst.body, /slow/u);
   const slowResult = await request(proxy.status().port, { stream: true, tools: [{ type: "function", name: "safe" }] }, { threadId: "slow-thread" });
-  assert.match(slowResult.body, /slow/u);
+  assert.match(slowResult.body, /上游是否完成了本次请求仍待核对.*停止自动重发/u);
 });
 
 test("compaction uses native retry without ordinary idle completion while hosted turns use the guard", async (t) => {
@@ -211,17 +202,19 @@ test("compaction uses native retry without ordinary idle completion while hosted
   let compactionAttempts = 0;
   const upstream = http.createServer((req, res) => {
     attempts += 1;
-    res.writeHead(200, { "content-type": "text/event-stream" });
     const metadata = JSON.parse(req.headers["x-codex-turn-metadata"]);
     if (metadata.request_kind === "compaction") {
       compactionAttempts += 1;
       if (compactionAttempts === 1) {
-        res.end(sse({ type: "response.in_progress" }));
+        res.writeHead(503, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: { code: "server_error", message: "temporary" } }));
         return;
       }
+      res.writeHead(200, { "content-type": "text/event-stream" });
       res.end(sse({ type: "response.output_text.delta", delta: "summary" }) + sse({ type: "response.completed" }));
       return;
     }
+    res.writeHead(200, { "content-type": "text/event-stream" });
     turnAttempts += 1;
     if (turnAttempts === 1) {
       res.write(sse({ type: "response.in_progress" }));
@@ -234,6 +227,7 @@ test("compaction uses native retry without ordinary idle completion while hosted
     port: 0,
     upstreamOrigin: `http://127.0.0.1:${upstreamPort}`,
     firstProgressTimeoutMs: 40,
+    fastRetryDelayMs: 0,
     maxConsecutiveAttempts: 2,
   });
   await proxy.start();
@@ -250,9 +244,9 @@ test("compaction uses native retry without ordinary idle completion while hosted
   assert.doesNotMatch(firstHosted.body, /recovered/u);
   const hosted = await request(proxy.status().port, { tools: [{ type: "web_search" }] }, { contentEncoding: "zstd", threadId: "hosted-thread" });
   assert.equal(hosted.statusCode, 200);
-  assert.match(hosted.body, /recovered/u);
-  assert.equal(attempts, 4);
-  assert.equal(turnAttempts, 2);
+  assert.match(hosted.body, /上游是否完成了本次请求仍待核对.*停止自动重发/u);
+  assert.equal(attempts, 3);
+  assert.equal(turnAttempts, 1);
 });
 
 test("unary compact JSON preserves the real upstream output", async (t) => {
@@ -261,7 +255,7 @@ test("unary compact JSON preserves the real upstream output", async (t) => {
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify({
       id: "compact-real",
-      output: [{ type: "message", role: "assistant", content: [{ type: "output_text", text: "real compact output" }] }],
+      output: [{ type: "compaction", encrypted_content: "real compact output" }],
     }));
   });
   const upstreamPort = await listen(upstream);
@@ -304,7 +298,7 @@ test("unary compact transient failure makes one upstream request and returns JSO
   assert.doesNotMatch(result.body, /response\.completed|response\.output_item/u);
 });
 
-test("two stalled client attempts end with a synthetic no-side-effect completion", async (t) => {
+test("stalled direct HTTP attempt ends with a synthetic reconciliation completion without blind replay", async (t) => {
   let attempts = 0;
   const upstream = http.createServer((req, res) => {
     attempts += 1;
@@ -312,21 +306,11 @@ test("two stalled client attempts end with a synthetic no-side-effect completion
     res.write(sse({ type: "response.in_progress" }));
   });
   const upstreamPort = await listen(upstream);
-  const proxy = createCodexModelStreamProxy({
-    port: 0,
-    upstreamOrigin: `http://127.0.0.1:${upstreamPort}`,
-    firstProgressTimeoutMs: 50,
-    maxConsecutiveAttempts: 2,
-  });
+  const proxy = createCodexModelStreamProxy({ port: 0, upstreamOrigin: `http://127.0.0.1:${upstreamPort}`, firstProgressTimeoutMs: 60, fastRetryDelayMs: 0, progressIdleTimeoutMs: 60, maxConsecutiveAttempts: 2 });
   await proxy.start();
   t.after(async () => { await proxy.stop(); upstream.closeAllConnections?.(); upstream.close(); });
-  const first = await request(proxy.status().port, { stream: true, tools: [{ type: "function", name: "safe" }] }, { threadId: "stalled-thread" });
+  const first = await request(proxy.status().port, { stream: true, tools: [] }, { turnId: "stalled-two" });
   assert.equal(first.statusCode, 200);
-  assert.doesNotMatch(first.body, /网络重试/u);
-  const started = Date.now();
-  const result = await request(proxy.status().port, { stream: true, tools: [{ type: "function", name: "safe" }] }, { threadId: "stalled-thread" });
-  assert.equal(result.statusCode, 200);
-  assert.equal(attempts, 2);
-  assert.ok(Date.now() - started < 250);
-  assert.match(result.body, /网络重试|response.completed/u);
+  assert.equal(attempts, 1);
+  assert.match(first.body, /上游是否完成了本次请求仍待核对.*停止自动重发/u);
 });

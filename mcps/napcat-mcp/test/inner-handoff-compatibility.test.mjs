@@ -55,7 +55,7 @@ test("default requires identical core and helper even with a request-supplied mi
     ...args.payload, source: { sourceHashes: { ...target, helper: source.core } } } }), { code: "CHECKPOINT_IDENTITY_MISMATCH" });
 });
 
-test("normal configuration pins the manifest before use and keeps production mode closed", () => {
+test("normal configuration pins the manifest and requires a production profile before production use", () => {
   const parent = process.env.INNER_RUNNER_TEST_ROOT ?? path.join(os.tmpdir(), "napcat-hot-switch-20261010", "inner-version-0100-unit");
   fs.mkdirSync(parent, { recursive: true });
   const root = fs.mkdtempSync(path.join(parent, "inner-version-0100-config-"));
@@ -67,7 +67,7 @@ test("normal configuration pins the manifest before use and keeps production mod
   const fixed = isolatedHandoffConfiguration(args(supplied));
   assert.ok(Object.isFrozen(fixed));
   assert.equal(fixed.compatibility.sha256, supplied.compatibility.sha256);
-  assert.throws(() => isolatedHandoffConfiguration(args({ ...supplied, mode: "production" })), { code: "HANDOFF_INVALID_CONFIGURATION" });
+  assert.throws(() => isolatedHandoffConfiguration(args({ ...supplied, mode: "production" })), { code: "INNER_PROFILE_PRODUCTION_REQUIRED" });
   assert.throws(() => isolatedHandoffConfiguration(args({ ...supplied, compatibility: { ...supplied.compatibility, sha256: "0".repeat(64) } })),
     { code: "HANDOFF_COMPATIBILITY_MANIFEST_HASH_MISMATCH" });
   fs.writeFileSync(path.join(root, "configuration-evidence.json"), JSON.stringify({ manifestSha256: fixed.compatibility.sha256,

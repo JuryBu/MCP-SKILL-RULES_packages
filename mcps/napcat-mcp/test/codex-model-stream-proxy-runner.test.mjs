@@ -100,7 +100,7 @@ async function modelRequest(port) {
   });
 }
 
-for (const scenario of [{ rate: 1000 }, { rate: 2000, file: true }, { rate: 3000, file: true, environment: true }]) {
+for (const scenario of [{ rate: 33555 }, { rate: 2000, file: true }, { rate: 3000, file: true, environment: true }]) {
   test(`runner applies ${scenario.rate} ms per MiB to actual encoded request bytes`, async t => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-upload-runner-"));
     const upstream = http.createServer((request, response) => {

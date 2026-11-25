@@ -12,6 +12,16 @@ function validThread(threadId) {
   return typeof threadId === "string" && threadId.length > 0 && threadId.length <= 512 && !threadId.includes("\u0000");
 }
 
+export function recoveryPersistenceDiagnostics(error) {
+  const code = error?.cause?.code;
+  const stage = error?.recoveryPersistenceStage;
+  const saveStage = error?.cause?.stateSaveStage;
+  return { stage: ["validation", "callback"].includes(stage) ? stage : "unknown",
+    causeCode: typeof code === "string" && /^[A-Z][A-Z0-9_]{0,79}$/u.test(code) ? code : "UNKNOWN",
+    ...( ["open", "write", "fsync", "close", "rename", "directory_open", "directory_fsync", "directory_close"].includes(saveStage)
+      ? { saveStage } : {}) };
+}
+
 export function validateDurableRecoveryState(input, { policyKey, now = Date.now } = {}) {
   if (!input || input.schemaVersion !== 1 || typeof input.policyKey !== "string"
     || (policyKey !== undefined && input.policyKey !== policyKey)
@@ -40,7 +50,7 @@ export function validateDurableRecoveryState(input, { policyKey, now = Date.now 
   return JSON.parse(JSON.stringify(input));
 }
 
-export function createThreadRecoveryHandoff({ maps, active, policy, operationLedger, state, onStateChange, now = Date.now }) {
+export function createThreadRecoveryHandoff({ maps, active, policy, operationLedger, state, onStateChange, onPersistenceError, now = Date.now }) {
   const frozen = new Map();
   const used = new Map();
   const policyKey = JSON.stringify(policy);
@@ -48,6 +58,11 @@ export function createThreadRecoveryHandoff({ maps, active, policy, operationLed
     ? key === threadId : key.startsWith(`${threadId}\u0000`);
   const busy = threadId => [...active.values()].some(state => state.threadId === threadId);
   const clone = value => JSON.parse(JSON.stringify(value));
+  let pendingSave = false;
+  let deferred = false;
+  let saving = false;
+  let revision = 0;
+  let save = () => { pendingSave = false; };
   if (state !== undefined) {
     const restored = validateDurableRecoveryState(state, { policyKey, now });
     for (const channel of CHANNELS) for (const [key, value] of restored.state[channel]) {
@@ -57,15 +72,24 @@ export function createThreadRecoveryHandoff({ maps, active, policy, operationLed
   }
   if (onStateChange !== undefined) {
     if (typeof onStateChange !== "function") fail("MODEL_OPERATION_RECOVERY_STATE_INVALID");
-    const save = () => {
+    save = () => {
+      if (saving) { pendingSave = true; return; }
+      const savingRevision = revision;
+      let stage = "validation";
+      saving = true;
       try {
         const snapshot = validateDurableRecoveryState({ schemaVersion: 1, policyKey, capturedAt: now(),
           state: Object.fromEntries(CHANNELS.map(channel => [channel, [...maps[channel]]])) }, { policyKey, now });
+        stage = "callback";
         if (onStateChange(snapshot)?.then) fail("MODEL_OPERATION_RECOVERY_STATE_ASYNC");
+        pendingSave = revision !== savingRevision;
       } catch (cause) {
-        throw Object.assign(new Error("MODEL_OPERATION_RECOVERY_STATE_PERSISTENCE_FAILED"), {
-          code: "MODEL_OPERATION_RECOVERY_STATE_PERSISTENCE_FAILED", cause });
-      }
+        pendingSave = true;
+        const error = Object.assign(new Error("MODEL_OPERATION_RECOVERY_STATE_PERSISTENCE_FAILED"), {
+          code: "MODEL_OPERATION_RECOVERY_STATE_PERSISTENCE_FAILED", cause, recoveryPersistenceStage: stage });
+        try { onPersistenceError?.(recoveryPersistenceDiagnostics(error)); } catch {}
+        throw error;
+      } finally { saving = false; }
     };
     save();
     for (const channel of CHANNELS) {
@@ -74,10 +98,17 @@ export function createThreadRecoveryHandoff({ maps, active, policy, operationLed
         value(...args) {
           const previous = new Map(target);
           const result = Map.prototype[method].apply(target, args);
+          revision += 1;
+          const mutationRevision = revision;
+          pendingSave = true;
+          if (deferred || saving) return result;
           try { save(); }
           catch (error) {
-            Map.prototype.clear.call(target);
-            for (const [key, value] of previous) Map.prototype.set.call(target, key, value);
+            if (revision === mutationRevision) {
+              Map.prototype.clear.call(target);
+              for (const [key, value] of previous) Map.prototype.set.call(target, key, value);
+              revision += 1;
+            }
             throw error;
           }
           return result;
@@ -92,6 +123,22 @@ export function createThreadRecoveryHandoff({ maps, active, policy, operationLed
   };
 
   return {
+    pending() { return pendingSave; },
+    flushPending() {
+      if (pendingSave) save();
+      if (pendingSave) throw Object.assign(new Error("MODEL_OPERATION_RECOVERY_STATE_PERSISTENCE_FAILED"), {
+        code: "MODEL_OPERATION_RECOVERY_STATE_PERSISTENCE_FAILED", recoveryPersistenceStage: "callback",
+        cause: { code: "MODEL_OPERATION_RECOVERY_STATE_CHANGED_DURING_SAVE" } });
+    },
+    completeStateUpdate(update) {
+      deferred = true;
+      try { update(); } finally { deferred = false; }
+      try { save(); }
+      catch (error) {
+        if (error.code !== "MODEL_OPERATION_RECOVERY_STATE_PERSISTENCE_FAILED") throw error;
+      }
+      return { pending: pendingSave };
+    },
     noteRequest(threadId) {
       pruneUsed();
       if (validThread(threadId)) used.set(threadId, now());

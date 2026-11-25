@@ -97,10 +97,26 @@ export function createProxyWholeRuntimeControlImplementation(state) {
     if (!worker) fail("LIVE_WHOLE_WORKER_NOT_READY");
     return worker;
   };
+  const sourceApproval = worker => {
+    const approvals = profile.approvedCandidates ?? [];
+    if (worker.candidateApprovalId !== undefined && worker.candidateApprovalId !== null) {
+      const approval = approvals.find(entry => entry.id === worker.candidateApprovalId);
+      if (!approval) fail("LIVE_WHOLE_SOURCE_APPROVAL_MISSING");
+      if (!sameHashes(worker.sourceHashes, approval.expectedHashes)) fail("LIVE_WHOLE_SOURCE_APPROVAL_HASH_MISMATCH");
+      return approval;
+    }
+    const matches = approvals.filter(entry => sameHashes(worker.sourceHashes, entry.expectedHashes));
+    const initialMatches = sameHashes(worker.sourceHashes, profile.initial.expectedHashes);
+    if (initialMatches && typeof worker.sourceRunnerPath === "string" && path.isAbsolute(worker.sourceRunnerPath)
+      && path.resolve(worker.sourceRunnerPath) === path.resolve(profile.initial.runnerPath)) return null;
+    if (matches.length + Number(initialMatches) > 1) fail("LIVE_WHOLE_SOURCE_APPROVAL_AMBIGUOUS");
+    if (matches.length) return matches[0];
+    if (initialMatches) return null;
+    fail("LIVE_WHOLE_SOURCE_NOT_APPROVED");
+  };
   const sourceSpecification = worker => {
-    if (sameHashes(worker.sourceHashes, profile.initial.expectedHashes)) return profile.initial;
-    const approval = profile.approvedCandidates?.find(entry => sameHashes(worker.sourceHashes, entry.expectedHashes));
-    if (!approval) fail("LIVE_WHOLE_SOURCE_NOT_APPROVED");
+    const approval = sourceApproval(worker);
+    if (!approval) return profile.initial;
     const candidate = approvedInnerCandidate(profile, approval.id);
     return { runnerPath: candidate.runnerPath, expectedHashes: candidate.expectedHashes, candidateApprovalId: candidate.id };
   };
@@ -152,7 +168,7 @@ export function createProxyWholeRuntimeControlImplementation(state) {
         const next = duplicate ? [...existing] : [...existing, { id: candidate.id, installationRoot: candidate.installationRoot,
           runnerPath: candidate.runnerPath, expectedHashes: candidate.expectedHashes }];
         const protectedIds = new Set(coordinator.status().workers.filter(worker => worker.alive)
-          .map(worker => existing.find(entry => sameHashes(entry.expectedHashes, worker.sourceHashes))?.id).filter(Boolean));
+          .map(worker => sourceApproval(worker)?.id).filter(Boolean));
         if (state.selected?.sourceSpec.candidateApprovalId) protectedIds.add(state.selected.sourceSpec.candidateApprovalId);
         if (state.selected?.previousSelection) protectedIds.add(state.selected.previousSelection.candidateId);
         const durableSelection = readInnerCandidateRegistry(profile)?.selection;

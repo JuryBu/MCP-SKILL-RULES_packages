@@ -66,13 +66,13 @@ test("fixed entry migrates only a terminal thread while another tool-wait simula
   }
   const result = await coordinator.migrate({ threadId: "thread-b", candidateId: candidate.workerId });
   assert.equal(result.committed, true);
-  assert.equal(result.accepted.importedEntries, 1);
+  assert.equal(result.accepted.importedEntries, 3);
   const status = coordinator.status();
   assert.equal(status.threads.find(thread => thread.threadId === "thread-a").workerId, fixture.endpoint.workerId);
   assert.equal(status.threads.find(thread => thread.threadId === "thread-b").workerId, candidate.workerId);
   await notify("thread-b", "b3", "started");
   const continued = await request("thread-b", "b3");
-  assert.match(continued.body, /Three distinct turns/);
+  assert.match(continued.body, /连续三个回合没有模型文本或已完成的工具工作，本回合已停止自动继续/u);
   await notify("thread-b", "b3", "completed");
   assert.equal((await request("thread-a", "a1")).status, 200);
   await notify("thread-a", "a1", "completed");

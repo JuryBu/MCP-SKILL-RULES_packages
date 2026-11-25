@@ -12,6 +12,7 @@ import { isolatedHandoffConfiguration, attachInnerRunnerHandoffControl } from ".
 import { readUploadAllowancePolicy } from "./upload-allowance-policy.mjs";
 import { createIncrementalResponsesTransport } from "./incremental-responses-transport.mjs";
 import { readModelRuntimeEnvironment } from "./model-runtime-policy.mjs";
+import { createRuntimeLifecycleDiagnostics } from "./runtime-lifecycle-diagnostics.mjs";
 
 function integerEnvironment(name, fallback, minimum, maximum) {
   const value = Number(effectiveEnvironment[name] ?? fallback);
@@ -28,22 +29,34 @@ function booleanEnvironment(name, fallback = false) {
   return value === "1";
 }
 
-function writeJsonAtomic(filePath, value) {
+function writeJsonAtomic(filePath, value, { compact = false } = {}) {
   const temporaryPath = `${filePath}.${process.pid}.${crypto.randomUUID()}.tmp`;
   let descriptor;
+  let stateSaveStage = "open";
   try {
     descriptor = fs.openSync(temporaryPath, "wx");
-    fs.writeFileSync(descriptor, `${JSON.stringify(value, null, 2)}\n`, "utf8");
+    stateSaveStage = "write";
+    fs.writeFileSync(descriptor, compact ? JSON.stringify(value) : `${JSON.stringify(value, null, 2)}\n`, "utf8");
+    stateSaveStage = "fsync";
     fs.fsyncSync(descriptor);
+    stateSaveStage = "close";
     fs.closeSync(descriptor);
     descriptor = undefined;
+    stateSaveStage = "rename";
     renameReplaceSync(temporaryPath, filePath);
     if (process.platform !== "win32") {
+      stateSaveStage = "directory_open";
       const directory = fs.openSync(path.dirname(filePath), "r");
-      try { fs.fsyncSync(directory); } finally { fs.closeSync(directory); }
+      let directoryError;
+      stateSaveStage = "directory_fsync";
+      try { fs.fsyncSync(directory); } catch (error) { directoryError = error; }
+      try { fs.closeSync(directory); }
+      catch (error) { if (!directoryError) { stateSaveStage = "directory_close"; throw error; } }
+      if (directoryError) throw directoryError;
     }
   } catch (error) {
-    if (descriptor !== undefined) fs.closeSync(descriptor);
+    if (error && typeof error === "object") error.stateSaveStage = stateSaveStage;
+    if (descriptor !== undefined) { try { fs.closeSync(descriptor); } catch {} }
     try { fs.unlinkSync(temporaryPath); } catch {}
     throw error;
   }
@@ -51,6 +64,8 @@ function writeJsonAtomic(filePath, value) {
 
 const stateRoot = path.resolve(process.env.CODEX_MODEL_STREAM_PROXY_STATE_ROOT
   ?? path.join(process.env.USERPROFILE ?? process.cwd(), ".codex-toolkit", "napcat-mcp", "state"));
+let lifecycleDiagnostics = null;
+let shutdownDiagnostic = null;
 const runtimePath = path.join(stateRoot, "codex-model-stream-proxy-runtime.json");
 const logPath = path.join(stateRoot, "codex-model-stream-proxy.jsonl");
 const stopPath = path.join(stateRoot, "codex-model-stream-proxy.stop");
@@ -112,9 +127,15 @@ const ANOMALY_EVENT_TYPES = new Set([
   "adaptive_late_streaming_success",
   "adaptive_wait_stopped",
   "adaptive_delivery_state_write_failed",
+  "recovery_state_persistence_failed",
+  "completed_recovery_state_pending",
 ]);
 
 function appendRunnerEvent(event) {
+  if (event.type === "handoff_control_result" && event.method === "shutdown" && event.ok === true) {
+    shutdownDiagnostic = { actorKind: "control", actor: { pid: process.ppid }, operationId: event.requestId,
+      controlSequence: Number(/^coordinator-([1-9][0-9]*)$/u.exec(event.requestId)?.[1]) };
+  }
   try {
     operationalLog.append({ at: new Date().toISOString(), ...event });
     if (ANOMALY_EVENT_TYPES.has(event.type)) {
@@ -179,11 +200,12 @@ const proxy = createCodexModelStreamProxy({
   managedRetryBaseMs: integerEnvironment("CODEX_MODEL_STREAM_PROXY_MANAGED_RETRY_BASE_MS", 5000, 10, 60000),
   largeHttpBodyBytes: integerEnvironment("CODEX_MODEL_STREAM_PROXY_LARGE_HTTP_BODY_BYTES", 4 * 1024 * 1024, 1024, 256 * 1024 * 1024),
   operationState: readOperationState(),
-  onOperationStateChange(state) { writeJsonAtomic(operationStatePath, state); },
+  onOperationStateChange(state) { writeJsonAtomic(operationStatePath, state, { compact: true }); },
   durableRecoveryState: readDurableRecoveryState(),
-  onDurableRecoveryStateChange(state) { writeJsonAtomic(durableRecoveryStatePath, state); },
+  onDurableRecoveryStateChange(state) { writeJsonAtomic(durableRecoveryStatePath, state, { compact: true }); },
   onRecoveryState(event) { handoffControl?.publishRecovery(event); },
   incrementalTransport,
+  nativeWebSocketEnabled: process.env.CODEX_MODEL_STREAM_PROXY_NATIVE_WS_ENABLED === "1",
   incrementalUpstreamUrl,
   incrementalImagesEnabled,
   firstProgressTimeoutMs: integerEnvironment("CODEX_MODEL_STREAM_PROXY_FIRST_PROGRESS_TIMEOUT_MS", 40_000, 1_000, 300_000),
@@ -210,6 +232,11 @@ try {
 } finally {
   fs.closeSync(lockHandle);
 }
+lifecycleDiagnostics = createRuntimeLifecycleDiagnostics({
+  filePath: path.join(stateRoot, "worker-lifecycle.jsonl"), component: "worker", captureIdentity: true,
+});
+lifecycleDiagnostics.watchProcess();
+lifecycleDiagnostics.record("started", { step: "created" });
 const modelObserver = createModelObserver({
   filePath: path.join(stateRoot, "codex-model-observations.jsonl"),
   statusPath: path.join(stateRoot, "codex-model-observer-runtime.json"),
@@ -305,9 +332,18 @@ async function closeModelObserver() {
 async function shutdown(reason, exitCode = 0) {
   if (stopping) return;
   stopping = true;
+  const reasonCode = ["SIGINT", "SIGTERM"].includes(reason) ? "signal"
+    : reason === "stop_file" ? "stop_file" : reason === "handoff_ipc_shutdown" ? "ipc_shutdown"
+      : reason === "handoff_ipc_disconnect" ? "ipc_disconnect" : reason.startsWith("handoff_ipc_") ? "ipc_failure"
+        : reason === "uncaughtException" ? "uncaught_exception" : reason === "unhandledRejection" ? "unhandled_rejection" : "requested";
+  lifecycleDiagnostics.record("stop_requested", {
+    ...(reasonCode === "ipc_shutdown" ? shutdownDiagnostic : {}), reasonCode, scope: "worker", step: "stop_requested",
+    ...(reasonCode === "signal" ? { actorKind: "signal", signal: reason } : reasonCode === "stop_file" ? { actorKind: "stop_file" } : {}),
+  });
   clearInterval(heartbeat);
   clearInterval(stopWatcher);
   try {
+    lifecycleDiagnostics.record("step", { step: "draining" });
     proxy.beginDrain();
     writeRuntimeState("draining", null, "drain");
     const deadline = Date.now() + drainTimeoutMs;
@@ -331,8 +367,11 @@ async function shutdown(reason, exitCode = 0) {
     exitCode = 1;
   }
   appendRunnerEvent({ type: "runner_stopped", reason, exitCode });
+  lifecycleDiagnostics.record("step", { step: exitCode === 0 ? "resources_closed" : "failed" });
   process.exitCode = exitCode;
   handoffControl?.close();
+  lifecycleDiagnostics.stopInspections();
+  lifecycleDiagnostics.record("step", { step: "exiting", exitCode });
 }
 
 process.once("SIGINT", () => void shutdown("SIGINT"));
@@ -351,6 +390,7 @@ try {
   await proxy.start();
   writeRuntimeState("running", null, "startup", true);
   appendRunnerEvent({ type: "runner_started", pid: process.pid, endpoint: runtimeState().endpoint });
+  lifecycleDiagnostics.record("step", { step: "ready" });
   handoffControl = attachInnerRunnerHandoffControl({
     config: handoffConfig, proxy, instanceToken, runnerPath: new URL(import.meta.url),
     onEvent: appendRunnerEvent, shutdown, isStopping: () => stopping,
@@ -361,11 +401,13 @@ try {
     if (fs.existsSync(stopPath)) void shutdown("stop_file");
   }, 500);
 } catch (error) {
+  lifecycleDiagnostics.record("error_observed", { step: "failed", reasonCode: "startup_failure" });
   writeRuntimeState("failed", { code: error.code ?? "START_FAILED", message: error.message }, "startup_failed");
   appendRunnerEvent({ type: "runner_start_failed", code: error.code ?? "START_FAILED", message: error.message });
   await proxy.stop();
   await closeModelObserver();
   if (!proxy.status().running && proxy.status().activeRequests === 0) releaseOwnLock();
+  lifecycleDiagnostics.stopInspections();
   process.exitCode = 1;
   handoffControl?.close();
 }

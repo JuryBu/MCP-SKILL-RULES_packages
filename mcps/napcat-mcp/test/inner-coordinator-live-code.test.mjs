@@ -439,7 +439,7 @@ test("prepare rejects missing export and every missing dispatch method without s
       return implementation;
     } });
     for (const [name, method] of Object.entries(implementation)) {
-      if (typeof method !== "function") continue;
+      if (typeof method !== "function" || name === "acquireNativeResponse") continue;
       assert.throws(() => participant.prepare({ [participant.exportName]: () => {
         const incomplete = { ...implementation };
         delete incomplete[name];

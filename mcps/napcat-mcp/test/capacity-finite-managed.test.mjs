@@ -117,19 +117,29 @@ for (const definition of capacityCases) {
   });
 }
 
-for (const definition of [{ code: "server_error", protocol: "http" }, { code: "ECONNRESET", protocol: "reset" }]) {
-  test(`managed network ${definition.code} continues to eight and cancellation stops replay`, { timeout: 8000 }, async context => {
-    const setup = await fixture(context, definition);
-    const body = await setup.request();
-    assert.equal(setup.cancelled(), true);
-    assert.equal(setup.requests.length, 8);
-    assert.equal(setup.events.filter(event => event.type === "turn_attempt_started").length, 1);
-    assert.equal(setup.events.filter(event => event.type === "retry_exhausted_terminal_failure").length, 0);
-    assert.doesNotMatch(body, /response\.completed|当前模型暂时满载/u);
-    await delay(200);
-    assert.equal(setup.requests.length, 8);
-    assert.equal(setup.proxy.status().activeRequests, 0);
-    assert.ok(setup.requests.every(requestBody => requestBody.equals(setup.requests[0])));
-    context.diagnostic("upstream=8 client=1 exhausted=0; cancelled at cap; no ninth send after 200ms");
-  });
-}
+test("managed network server_error continues to eight and cancellation stops replay", { timeout: 8000 }, async context => {
+  const setup = await fixture(context, { code: "server_error", protocol: "http" });
+  const body = await setup.request();
+  assert.equal(setup.cancelled(), true);
+  assert.equal(setup.requests.length, 8);
+  assert.equal(setup.events.filter(event => event.type === "turn_attempt_started").length, 1);
+  assert.equal(setup.events.filter(event => event.type === "retry_exhausted_terminal_failure").length, 0);
+  assert.doesNotMatch(body, /response\.completed|当前模型暂时满载/u);
+  await delay(200);
+  assert.equal(setup.requests.length, 8);
+  assert.equal(setup.proxy.status().activeRequests, 0);
+  assert.ok(setup.requests.every(requestBody => requestBody.equals(setup.requests[0])));
+  context.diagnostic("upstream=8 client=1 exhausted=0; cancelled at cap; no ninth send after 200ms");
+});
+
+test("managed network ECONNRESET after direct HTTP connect requires reconciliation and stops blind replay", { timeout: 8000 }, async context => {
+  const setup = await fixture(context, { code: "ECONNRESET", protocol: "reset" });
+  const body = await setup.request();
+  assert.equal(setup.cancelled(), false);
+  assert.equal(setup.requests.length, 1);
+  assert.equal(setup.events.filter(event => event.type === "turn_attempt_started").length, 1);
+  assert.match(body, /上游是否完成了本次请求仍待核对.*停止自动重发/u);
+  await delay(200);
+  assert.equal(setup.requests.length, 1);
+  assert.equal(setup.proxy.status().activeRequests, 0);
+});

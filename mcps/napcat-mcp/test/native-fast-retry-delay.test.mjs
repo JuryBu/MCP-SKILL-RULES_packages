@@ -56,11 +56,17 @@ test("real HTTP delays each quick failure and sends each native attempt upstream
     assert.ok(Date.now() - began >= 50);
     assert.equal(value.calls.length, index);
   }
-  await value.request("owned-one-turn");
+  const terminalBody = await value.request("owned-one-turn");
   assert.equal(value.calls.length, 3);
   assert.equal(value.events.filter(event => event.type === "rapid_retry_wait_started").length, 2);
   assert.equal(value.events.filter(event => event.type === "native_retry_signal").length, 2);
-  assert.equal(value.events.at(-1)?.type === "retry_exhausted_completed_idle" || value.events.some(event => event.type === "retry_exhausted_completed_idle"), true);
+  assert.deepEqual(value.events.filter(event => event.type === "turn_attempt_started").map(event => event.attemptNumber), [1, 2, 3]);
+  const terminalEvents = value.events.filter(event => event.type === "retry_exhausted_terminal_failure");
+  assert.equal(terminalEvents.length, 1);
+  assert.equal(terminalEvents[0].attemptNumber, 3);
+  assert.equal(terminalEvents[0].reason, "HTTP_503");
+  assert.match(terminalBody, /event: response\.completed\n/);
+  assert.doesNotMatch(terminalBody, /event: response\.failed\n/);
 });
 
 test("cancelling a cooldown releases the request and makes no additional upstream call", async context => {
@@ -73,12 +79,17 @@ test("cancelling a cooldown releases the request and makes no additional upstrea
   }
   assert.equal(value.events.some(event => event.type === "rapid_retry_wait_started"), true);
   const refused = assert.rejects(pending, error => error.name === "AbortError");
+  const cancelBegan = Date.now();
   abort.abort();
   await refused;
   while (value.proxy.status().activeRequests && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 5));
   assert.equal(value.proxy.status().activeRequests, 0);
+  const cancelElapsedMs = Date.now() - cancelBegan;
+  assert.ok(cancelElapsedMs < 500, `cancellation elapsed ${cancelElapsedMs}ms`);
   assert.equal(value.calls.length, 1);
   assert.equal(value.events.filter(event => event.type === "native_retry_signal").length, 0);
+  console.log(JSON.stringify({ evidence: "owned-loopback-cooldown-cancel", cancelElapsedMs,
+    upstreamCalls: value.calls.length, activeRequests: value.proxy.status().activeRequests }));
 });
 
 test("default runtime cooldown really waits thirty seconds", { timeout: 45000 }, async context => {

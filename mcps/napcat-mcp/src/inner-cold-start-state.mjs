@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
+import crypto from "node:crypto";
 import { spawnSync } from "node:child_process";
 import { checkedRuntimePath } from "./inner-runtime-profile.mjs";
 import { createModelOperationLedger } from "./model-operation-ledger.mjs";
@@ -44,6 +45,7 @@ function live(pid, details) {
   try { process.kill(pid, 0); return true; }
   catch (error) {
     if (error.code === "ESRCH") return false;
+    if (error.code === "EPERM" || error.code === "EACCES") return undefined;
     fail("COLD_START_PROCESS_STATE_UNKNOWN", details);
   }
 }
@@ -52,7 +54,8 @@ function inspectWindowsProcesses(pid) {
   try {
     const child = windowsPowerShellEnvironment();
     const filter = pid === undefined ? "" : ` -Filter 'ProcessId = ${pid}'`;
-    const command = `$ErrorActionPreference='Stop';[Console]::OutputEncoding=New-Object Text.UTF8Encoding($false);$p=@(Get-CimInstance Win32_Process${filter} | Select-Object ProcessId,ParentProcessId,Name,CommandLine,@{n='CreationDate';e={if($_.CreationDate){$_.CreationDate.ToUniversalTime().ToString('o')}}});[pscustomobject]@{complete=$true;processes=$p}|ConvertTo-Json -Depth 4 -Compress`;
+    const boot = pid === undefined ? "$b=(Get-CimInstance Win32_OperatingSystem).LastBootUpTime.ToUniversalTime().ToString('o');" : "$b=$null;";
+    const command = `$ErrorActionPreference='Stop';[Console]::OutputEncoding=New-Object Text.UTF8Encoding($false);$s=[DateTime]::UtcNow.ToString('o');${boot}$p=@(Get-CimInstance Win32_Process${filter} | Select-Object ProcessId,ParentProcessId,Name,CommandLine,@{n='CreationDate';e={if($_.CreationDate){$_.CreationDate.ToUniversalTime().ToString('o')}}});[pscustomobject]@{complete=$true;bootStartedAt=$b;samplingStartedAt=$s;sampledAt=[DateTime]::UtcNow.ToString('o');processes=$p}|ConvertTo-Json -Depth 4 -Compress`;
     const result = spawnSync(child.executable, ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", command], {
       env: child.environment, encoding: "utf8", timeout: 12000, maxBuffer: 4194304, windowsHide: true });
     if (result.error || result.status !== 0) return null;
@@ -63,7 +66,8 @@ function inspectWindowsProcesses(pid) {
       if (!Number.isSafeInteger(record?.ProcessId) || record.ProcessId < 0 || processes.has(record.ProcessId)) return null;
       processes.set(record.ProcessId, record);
     }
-    return processes;
+    return { processes, bootStartedAt: observed.bootStartedAt, samplingStartedAt: observed.samplingStartedAt,
+      sampledAt: observed.sampledAt, sha256: crypto.createHash("sha256").update(result.stdout).digest("hex") };
   } catch { return null; }
 }
 
@@ -74,6 +78,40 @@ function validBirth(value) {
 
 function windowsIdentity(record) {
   return validBirth(record?.CreationDate) ? { platform: "win32", createdAt: record.CreationDate } : null;
+}
+
+function fileEvidence(target, maximum = 65536, expected) {
+  checkedRuntimePath(target, { existing: true });
+  const identity = stat => ({ dev: stat.dev, ino: stat.ino, size: stat.size, nlink: stat.nlink,
+    birthtimeMs: stat.birthtimeMs, mtimeMs: stat.mtimeMs, ctimeMs: stat.ctimeMs });
+  const before = fs.statSync(target);
+  if (!before.isFile() || before.nlink !== 1 || before.size > maximum) fail("COLD_START_ORIGINAL_IDENTITY_UNKNOWN");
+  const bytes = fs.readFileSync(target);
+  if (bytes.length !== before.size || JSON.stringify(identity(before)) !== JSON.stringify(identity(fs.statSync(target)))) {
+    fail("COLD_START_RECOVERY_ORIGINAL_CHANGED");
+  }
+  if (expected !== undefined) {
+    let current;
+    try { current = JSON.parse(bytes.toString("utf8")); }
+    catch { fail("COLD_START_RECOVERY_ORIGINAL_CHANGED"); }
+    if (JSON.stringify(current) !== JSON.stringify(expected)) fail("COLD_START_RECOVERY_ORIGINAL_CHANGED");
+  }
+  return { target, maximum, ...identity(before), sha256: crypto.createHash("sha256").update(bytes).digest("hex") };
+}
+
+function previousBoot(snapshot, original, processIdentity) {
+  if (!snapshot || ![snapshot.bootStartedAt, snapshot.samplingStartedAt, snapshot.sampledAt].every(validBirth)) return false;
+  const bootAt = Date.parse(snapshot.bootStartedAt);
+  const startedAt = Date.parse(snapshot.samplingStartedAt);
+  const sampledAt = Date.parse(snapshot.sampledAt);
+  const now = Date.now();
+  const current = windowsIdentity(snapshot.processes.get(process.pid));
+  if (bootAt > startedAt || startedAt > sampledAt || now < sampledAt || now - startedAt > 15000
+    || !current || Date.parse(current.createdAt) < bootAt || Date.parse(current.createdAt) > startedAt
+    || Math.abs(Date.parse(current.createdAt) - (now - process.uptime() * 1000)) > 2000) return false;
+  if (![original.birthtimeMs, original.mtimeMs].every(value => Number.isFinite(value) && value > 0 && value + 2000 < bootAt)) return false;
+  return processIdentity == null || (processIdentity.platform === "win32" && validBirth(processIdentity.createdAt)
+    && Date.parse(processIdentity.createdAt) < bootAt && Date.parse(processIdentity.createdAt) <= original.mtimeMs + 2000);
 }
 
 function workerCommand(command) {
@@ -93,13 +131,16 @@ function workerCommand(command) {
   return entry ? (path.win32.basename(entry).toLowerCase() === "codex-model-stream-proxy-runner.mjs" ? "worker" : "other") : "unknown";
 }
 
-function checkOldWorker(marker, markerPath, inspect) {
+function checkOldWorker(marker, markerPath, inspect, recoverPreviousBoot = () => false) {
   const details = { pid: marker.pid, workerId: marker.workerId, sessionId: marker.sessionId };
-  if (!live(marker.pid, details)) return null;
+  const state = live(marker.pid, details);
+  if (state === false) return null;
   if (process.platform !== "win32") fail("COLD_START_OLD_WORKER_ALIVE", details);
   const observed = inspect()?.get(marker.pid);
   if (!observed) {
-    if (!live(marker.pid, details)) return null;
+    const confirmed = live(marker.pid, details);
+    if (confirmed === false) return null;
+    if (state === undefined && confirmed === undefined && recoverPreviousBoot()) return { ...details, reason: "previous_system_boot" };
     fail("COLD_START_PROCESS_STATE_UNKNOWN", { ...details, reason: "process_snapshot_unavailable" });
   }
   const identity = windowsIdentity(observed);
@@ -146,10 +187,19 @@ export function acquireInnerColdStart({ stateRoot, ownerId, nativeSourceId, sess
   const claimPath = path.join(root, `.inner-cold-session-${sessionId}.json`);
   const claim = { ...binding, kind: "session", sessionId, pid: process.pid };
   durableJson(claimPath, claim);
+  const closeSession = (target, closedSessionId, recovery = {}) => {
+    const closedPath = `${target}.closed`;
+    const validate = () => {
+      const closed = readJson(closedPath);
+      if (!matches(closed) || closed.kind !== "closed" || closed.sessionId !== closedSessionId) fail("COLD_START_SESSION_CLOSE_INVALID");
+    };
+    try { durableJson(closedPath, { ...binding, kind: "closed", sessionId: closedSessionId, ...recovery }); }
+    catch (error) { if (error.code !== "EEXIST") throw error; validate(); }
+  };
   let released = false;
   const release = () => {
     if (released) return;
-    durableJson(`${claimPath}.closed`, { ...binding, kind: "closed", sessionId });
+    closeSession(claimPath, sessionId);
     released = true;
   };
   try {
@@ -157,6 +207,31 @@ export function acquireInnerColdStart({ stateRoot, ownerId, nativeSourceId, sess
     if (children.length > 2048) fail("COLD_START_DISCOVERY_CAPACITY");
     if (fs.existsSync(path.join(root, operationFile))) fail("COLD_START_UNBOUND_ROOT_STATE");
     const sessions = new Map();
+    const sessionPaths = new Map();
+    const recoveredSessions = [];
+    const recoveryFiles = new Map();
+    const bootFiles = new Map();
+    const workerChecks = [];
+    let observed;
+    const snapshot = () => (observed === undefined ? (observed = inspectWindowsProcesses()) : observed);
+    const inspect = () => snapshot()?.processes;
+    const track = (target, maximum, expected) => {
+      const evidence = fileEvidence(target, maximum, expected);
+      if (recoveryFiles.has(target) && JSON.stringify(recoveryFiles.get(target)) !== JSON.stringify(evidence)) {
+        fail("COLD_START_RECOVERY_ORIGINAL_CHANGED");
+      }
+      recoveryFiles.set(target, evidence);
+      return evidence;
+    };
+    const provePreviousBoot = (target, processIdentity) => {
+      const evidence = track(target);
+      if (!previousBoot(snapshot(), evidence, processIdentity)) return false;
+      bootFiles.set(target, { evidence, processIdentity });
+      return true;
+    };
+    const discovered = entries => entries.filter(child => sessionPattern.test(child.name) || workerPattern.test(child.name)
+      || (child.isDirectory() && fs.existsSync(path.join(root, child.name, operationFile)))).map(child => child.name).sort().join("\n");
+    const discovery = discovered(children);
     for (const child of children) {
       const match = sessionPattern.exec(child.name);
       if (!match) continue;
@@ -165,16 +240,32 @@ export function acquireInnerColdStart({ stateRoot, ownerId, nativeSourceId, sess
       if (!matches(record) || record.kind !== "session" || record.sessionId !== match[1]
         || !Number.isSafeInteger(record.pid) || record.pid < 1) fail("COLD_START_SESSION_OWNER_MISMATCH");
       sessions.set(record.sessionId, record);
+      sessionPaths.set(record.sessionId, target);
       if (record.sessionId === sessionId) continue;
       if (fs.existsSync(`${target}.closed`)) {
         const closed = readJson(`${target}.closed`);
         if (!matches(closed) || closed.kind !== "closed" || closed.sessionId !== record.sessionId) fail("COLD_START_SESSION_CLOSE_INVALID");
-      } else if (live(record.pid)) fail("COLD_START_OTHER_SESSION_ALIVE");
+      } else {
+        const state = live(record.pid);
+        if (state === false) {
+          track(target, undefined, record);
+          recoveredSessions.push({ target, record });
+        }
+        else {
+          const identity = windowsIdentity(inspect()?.get(record.pid));
+          if (!identity) {
+            if (state === undefined && !inspect()?.has(record.pid) && provePreviousBoot(target, record.processIdentity)) {
+              recoveredSessions.push({ target, record, previousBoot: true });
+              continue;
+            }
+            fail("COLD_START_PROCESS_STATE_UNKNOWN", { pid: record.pid, sessionId: record.sessionId, reason: "process_snapshot_unavailable" });
+          }
+          if (Date.parse(identity.createdAt) <= fs.statSync(target).mtimeMs + 2000) fail("COLD_START_OTHER_SESSION_ALIVE");
+        }
+      }
     }
     const merged = new Map();
     const ignoredWorkerPids = [];
-    let observed;
-    const inspect = () => (observed === undefined ? (observed = inspectWindowsProcesses()) : observed);
     let recoveredWorkers = 0;
     for (const child of children) {
       const target = path.join(root, child.name);
@@ -187,11 +278,22 @@ export function acquireInnerColdStart({ stateRoot, ownerId, nativeSourceId, sess
         || !sessions.has(marker.sessionId) || !child.name.startsWith(`${marker.sessionId}-worker-`)) fail("COLD_START_WORKER_OWNER_MISMATCH");
       if (marker.sessionId === sessionId) continue;
       if (marker.phase !== "started") fail("COLD_START_WORKER_START_UNRESOLVED");
-      const ignored = checkOldWorker(marker, markerPath, inspect);
+      const recoverPreviousBoot = () => provePreviousBoot(sessionPaths.get(marker.sessionId), sessions.get(marker.sessionId).processIdentity)
+        && provePreviousBoot(markerPath, marker.processIdentity);
+      const closingSession = recoveredSessions.find(session => session.record.sessionId === marker.sessionId);
+      if (closingSession?.previousBoot && !recoverPreviousBoot()) fail("COLD_START_PROCESS_STATE_UNKNOWN", {
+        pid: marker.pid, workerId: marker.workerId, sessionId: marker.sessionId, reason: "worker_boot_identity_unavailable" });
+      const ignored = checkOldWorker(marker, markerPath, inspect, recoverPreviousBoot);
       if (ignored) ignoredWorkerPids.push(ignored);
       const statePath = path.join(target, operationFile);
       if (!fs.existsSync(statePath)) fail("COLD_START_LEDGER_MISSING");
-      const restored = createModelOperationLedger({ state: readJson(statePath, 2 * 1024 * 1024) }).snapshot();
+      const originalState = readJson(statePath, 2 * 1024 * 1024);
+      if (closingSession || ignored?.reason === "previous_system_boot") {
+        track(markerPath, undefined, marker);
+        track(statePath, 2 * 1024 * 1024, originalState);
+        workerChecks.push({ marker, markerPath, previousBoot: bootFiles.has(markerPath) });
+      }
+      const restored = createModelOperationLedger({ state: originalState }).snapshot();
       for (const [key, entry] of restored.entries) {
         if (!entry.threadHash) fail("COLD_START_OPERATION_UNBOUND");
         const previous = merged.get(key);
@@ -202,6 +304,41 @@ export function acquireInnerColdStart({ stateRoot, ownerId, nativeSourceId, sess
       recoveredWorkers += 1;
     }
     const recovered = createModelOperationLedger({ state: { schemaVersion: 1, entries: [...merged] } }).snapshot();
+    let finalSnapshot;
+    if (bootFiles.size) {
+      finalSnapshot = inspectWindowsProcesses();
+      for (const { evidence, processIdentity } of bootFiles.values()) {
+        if (!previousBoot(finalSnapshot, evidence, processIdentity) || finalSnapshot.bootStartedAt !== snapshot().bootStartedAt) {
+          fail("COLD_START_PROCESS_STATE_UNKNOWN", { reason: "system_boot_evidence_changed" });
+        }
+      }
+    }
+    for (const { marker, markerPath, previousBoot: endedBeforeBoot } of workerChecks) {
+      checkOldWorker(marker, markerPath, () => (finalSnapshot ??= inspectWindowsProcesses())?.processes,
+        () => endedBeforeBoot && !finalSnapshot?.processes.has(marker.pid));
+    }
+    if (recoveryFiles.size && discovery !== discovered(fs.readdirSync(root, { withFileTypes: true }))) fail("COLD_START_DISCOVERY_CHANGED");
+    for (const evidence of recoveryFiles.values()) {
+      if (JSON.stringify(fileEvidence(evidence.target, evidence.maximum)) !== JSON.stringify(evidence)) fail("COLD_START_RECOVERY_ORIGINAL_CHANGED");
+    }
+    for (const { target, record } of recoveredSessions) {
+      if (JSON.stringify(readJson(target)) !== JSON.stringify(record)) fail("COLD_START_SESSION_CHANGED");
+      const state = live(record.pid);
+      const endedBeforeBoot = bootFiles.has(target) && state === undefined && !finalSnapshot?.processes.has(record.pid);
+      if (state !== false && !endedBeforeBoot) fail("COLD_START_PROCESS_STATE_UNKNOWN", {
+        pid: record.pid, sessionId: record.sessionId, reason: "session_recovery_evidence_changed" });
+      const originals = [...recoveryFiles.values()].filter(evidence => evidence.target === target
+        || path.basename(path.dirname(evidence.target)).startsWith(`${record.sessionId}-worker-`))
+        .map(evidence => ({ name: path.relative(root, evidence.target), sha256: evidence.sha256,
+          birthtimeMs: evidence.birthtimeMs, mtimeMs: evidence.mtimeMs })).sort((left, right) => left.name < right.name ? -1 : left.name > right.name ? 1 : 0);
+      closeSession(target, record.sessionId, { reason: endedBeforeBoot ? "verified_previous_boot_session_recovered" : "verified_dead_session_recovered",
+        recoveredBySessionId: sessionId, ...(endedBeforeBoot ? { recoveryEvidence: {
+          source: "Win32_OperatingSystem.LastBootUpTime", bootStartedAt: finalSnapshot.bootStartedAt,
+          firstSampledAt: snapshot().sampledAt, finalSampledAt: finalSnapshot.sampledAt,
+          firstSnapshotSha256: snapshot().sha256, finalSnapshotSha256: finalSnapshot.sha256,
+          originalCount: originals.length, originalsSha256: crypto.createHash("sha256").update(JSON.stringify(originals)).digest("hex"),
+        } } : {}) });
+    }
     return {
       status: { recoveredWorkers, protectedOperations: recovered.entries.length, sessionId, ignoredWorkerPids },
       seed(workerRoot, workerId) {
@@ -214,7 +351,7 @@ export function acquireInnerColdStart({ stateRoot, ownerId, nativeSourceId, sess
       started(workerRoot, workerId, pid) {
         if (released || path.dirname(workerRoot) !== root || !workerId.startsWith(`${sessionId}-worker-`)
           || !Number.isSafeInteger(pid) || pid < 1) fail("COLD_START_WORKER_IDENTITY_INVALID");
-        const observed = process.platform === "win32" && live(pid) ? inspectWindowsProcesses(pid)?.get(pid) : null;
+        const observed = process.platform === "win32" && live(pid) !== false ? inspectWindowsProcesses(pid)?.processes.get(pid) : null;
         const processIdentity = observed?.ParentProcessId === process.pid ? windowsIdentity(observed) : null;
         durableJson(path.join(workerRoot, workerMarker), { ...binding, kind: "worker", sessionId, workerId,
           phase: "started", pid, ...(process.platform === "win32" ? { processIdentity } : {}) }, true);

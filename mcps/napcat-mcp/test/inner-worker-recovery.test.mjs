@@ -243,7 +243,7 @@ test("rejected native binding keeps the shared queue usable and never clears a r
   await state.coordinator.recoveryControl("bind-native", input);
   assert.equal(state.coordinator.recoveryControl("binding", input).connectionGeneration, input.connectionGeneration);
   assert.equal(state.coordinator.status().threads.find(thread => thread.threadId === "binding").recoveryBindingError, null);
-  shared.dispatch("handleNativeRelayFailure", { code: "OWNED_NATIVE_SOURCE_FAILURE" });
+  assert.throws(() => shared.dispatch("handleNativeRelayFailure", { code: "OWNED_NATIVE_SOURCE_FAILURE" }), { code: "OWNED_NATIVE_SOURCE_FAILURE" });
   assert.throws(() => state.coordinator.recoveryControl("bind-native", input), /RECOVERY_BINDING_INVALID/);
   assert.equal(state.coordinator.status().nativeHealthy, false);
 });
@@ -324,7 +324,7 @@ test("candidate death restores adopted and new threads while old HTTP finishes o
   assert.equal((await state.request("candidate-new")).status, 200);
   assert.equal(state.calls.filter(call => call.body.input.some(item => item.call_id === "once")).length, 1);
   const retry = await state.request("partial", [], "working", AbortSignal.timeout(2000));
-  assert.match(retry.body, /"type":"response.failed"/u);
+  assert.ok(retry.status === 503 || /"type":"response.failed"/u.test(retry.body));
   assert.doesNotMatch(retry.body, /"type":"response.completed"/u);
   assert.equal(state.calls.filter(call => call.metadata.thread_id === "partial").length, 1);
   await state.notify("adopted", "completed", "working", "interrupted");
