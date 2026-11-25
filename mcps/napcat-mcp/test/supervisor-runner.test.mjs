@@ -20,7 +20,9 @@ import {
   stopWindowsProcessTrees,
   invokePowerShellScript,
   invokePowerShellCommand,
+  invokeOfflineRecoveryGuard,
 } from "../src/supervisor-runner.mjs";
+import { loadOfflineRecoveryState, writeOfflineRecoveryBarrier } from "../src/napcat-offline-recovery.mjs";
 
 function createFixture() {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "napcat-supervisor-test-"));
@@ -90,6 +92,533 @@ function baseOptions(fixture, overrides = {}) {
 function readRuntime(fixture) {
   return JSON.parse(fs.readFileSync(fixture.runtimeStatePath, "utf8"));
 }
+
+for (const proofAvailable of [true, false]) {
+  test("reachable offline: durable debit precedes the only stop, or no credentials proof preserves the original", async () => {
+    const fixture = createFixture();
+    const originalTime = Date.parse("2026-07-24T08:00:00Z");
+    const barrier = path.join(path.dirname(fixture.runtimeStatePath), "napcat-offline-recovery.json");
+    let currentTime = originalTime;
+    let calls = 0;
+    let waits = 0;
+    const originalProcess = { pid: 7003, name: "QQ.exe", creationDate: new Date(originalTime - 1000).toISOString(),
+      commandLine: '"C:\\Fixture\\QQ.exe" --fixture-only' };
+    try {
+      const overrides = {
+        once: false,
+        now: () => new Date(currentTime),
+        staleNapCatReachableOfflineMs: 100,
+        checkNapCatStatus: async () => ({ reachable: true, runtimeStatus: { online: false, good: true },
+          error: { code: "QQ_LOGIN_IDENTITY_UNAVAILABLE" } }),
+        checkNapCatProcesses: async () => ({ known: true, present: true, processes: [originalProcess] }),
+        checkNativeQuickLogin: async () => proofAvailable ? { fileSha256: "fixture" } : false,
+        wait() {
+          waits += 1;
+          currentTime += 101;
+          if (waits >= 2) fs.writeFileSync(fixture.stopFilePath, "fixture completed");
+        },
+        async offlineRecoveryGuard(request) {
+          calls += 1;
+          assert.equal(request.action, "recover-reachable-offline");
+          assert.equal(request.root.pid, originalProcess.pid);
+          const previous = JSON.parse(fs.readFileSync(barrier, "utf8"));
+          assert.equal(previous.attemptAt, currentTime);
+          assert.equal(previous.needsManual, true);
+          assert.equal(readRuntime(fixture).login.blocked, true);
+          throw new Error("fixture simulated a lost result after stop");
+        },
+      };
+      await runSupervisorService(baseOptions(fixture, overrides));
+      assert.equal(calls, proofAvailable ? 1 : 0);
+      assert.equal(readRuntime(fixture).autoOfflineRecovery.needsManual, true);
+      const preserved = fs.readFileSync(barrier);
+      fs.unlinkSync(fixture.stopFilePath);
+      fs.writeFileSync(fixture.runtimeStatePath, JSON.stringify({ login: { blocked: false } }) + "\n");
+      currentTime += 24 * 60 * 60_000;
+      await runSupervisorService(baseOptions(fixture, { ...overrides, once: true,
+        checkNapCatProcesses: async () => ({ known: true, present: false, processes: [] }) }));
+      assert.equal(calls, proofAvailable ? 1 : 0);
+      assert.deepEqual(fs.readFileSync(barrier), preserved);
+      assert.equal(readRuntime(fixture).actions.quickLogin.reason, "manual_login_required");
+    } finally { fixture.cleanup(); }
+  });
+}
+
+test("an unconfirmed guarded no-process login is not repeated after a supervisor restart", async (context) => {
+  const fixture = createFixture();
+  context.after(fixture.cleanup);
+  const touches = [];
+  const barrier = path.join(path.dirname(fixture.runtimeStatePath), "napcat-offline-recovery.json");
+  const overrides = {
+    checkNapCatStatus: async () => ({ known: true, reachable: false }),
+    checkNapCatProcesses: async () => ({ known: true, present: false, processes: [] }),
+    offlineRecoveryGuard: async request => {
+      touches.push(request.action);
+      assert.equal(JSON.parse(fs.readFileSync(barrier, "utf8")).needsManual, true);
+      assert.equal(readRuntime(fixture).login.blocked, true);
+      return { status: "unknown", changed: null, reason: "login_unverified" };
+    },
+  };
+  await runSupervisorService(baseOptions(fixture, overrides));
+  fs.writeFileSync(fixture.runtimeStatePath, "{}\n");
+  await runSupervisorService(baseOptions(fixture, { ...overrides, now: () => new Date("2026-07-25T08:00:00.000Z") }));
+  assert.deepEqual(touches, ["quick-login"]);
+  assert.equal(readRuntime(fixture).actions.quickLogin.reason, "manual_login_required");
+});
+
+test("a confirmed no-op guard restores both durable recovery and the runtime login mark", async context => {
+  const fixture = createFixture();
+  context.after(fixture.cleanup);
+  const barrier = path.join(path.dirname(fixture.runtimeStatePath), "napcat-offline-recovery.json");
+  const samples = [];
+  await runSupervisorService(baseOptions(fixture, {
+    checkNapCatStatus: async () => ({ known: true, reachable: false }),
+    checkNapCatProcesses: async () => ({ known: true, present: false, processes: [] }),
+    offlineRecoveryGuard: async () => {
+      assert.equal(JSON.parse(fs.readFileSync(barrier, "utf8")).needsManual, true);
+      assert.equal(readRuntime(fixture).login.blocked, true);
+      return { status: "deferred", changed: false, reason: "maintenance_active" };
+    },
+    fsImpl: { ...fs, renameSync(source, target) {
+      if (target === fixture.runtimeStatePath) {
+        const pending = JSON.parse(fs.readFileSync(source, "utf8"));
+        samples.push({ blocked: pending.login?.blocked, actions: pending.actions });
+      }
+      fs.renameSync(source, target);
+    } },
+  }));
+  const reserved = samples.findIndex(sample => sample.blocked === true);
+  assert.ok(reserved >= 0);
+  assert.equal(samples[reserved + 1].blocked, false);
+  assert.equal(samples[reserved + 1].actions.quickLogin, undefined);
+  assert.equal(JSON.parse(fs.readFileSync(barrier, "utf8")).needsManual, false);
+  assert.equal(readRuntime(fixture).actions.quickLogin.attempted, false);
+});
+
+for (const failedReservation of ["barrier", "runtime"]) {
+  test(`a denied ${failedReservation} flush leaves recovery unsubmitted`, async context => {
+    const fixture = createFixture();
+    context.after(fixture.cleanup);
+    const barrier = path.join(path.dirname(fixture.runtimeStatePath), "napcat-offline-recovery.json");
+    const barrierTemporaryPrefix = path.join(path.dirname(barrier), "." + path.basename(barrier) + ".");
+    const runtimeTemporaryPrefix = fixture.runtimeStatePath + ".tmp-";
+    fs.mkdirSync(path.dirname(barrier), { recursive: true });
+    writeOfflineRecoveryBarrier(barrier, loadOfflineRecoveryState());
+    const prior = fs.readFileSync(barrier);
+    const handles = new Map();
+    let touches = 0;
+    let refused = 0;
+    await runSupervisorService(baseOptions(fixture, {
+      checkNapCatStatus: async () => ({ known: true, reachable: false }),
+      checkNapCatProcesses: async () => ({ known: true, present: false, processes: [] }),
+      offlineRecoveryGuard: async () => { touches += 1; throw new Error("fixture guard must not start"); },
+      fsImpl: {
+        ...fs,
+        openSync(file, ...options) {
+          const handle = fs.openSync(file, ...options);
+          if (typeof file === "string") handles.set(handle, file);
+          return handle;
+        },
+        fsyncSync(handle) {
+          const file = handles.get(handle);
+          if (file?.startsWith(barrierTemporaryPrefix) || file?.startsWith(runtimeTemporaryPrefix)) {
+            const pending = JSON.parse(fs.readFileSync(file, "utf8"));
+            if ((failedReservation === "barrier" && file.startsWith(barrierTemporaryPrefix) && pending.needsManual === true)
+              || (failedReservation === "runtime" && file.startsWith(runtimeTemporaryPrefix) && pending.login?.blocked === true)) {
+              refused += 1;
+              throw Object.assign(new Error("fixture flush denied"), { code: "ERR_ACCESS_DENIED" });
+            }
+          }
+          return fs.fsyncSync(handle);
+        },
+        closeSync(handle) {
+          handles.delete(handle);
+          return fs.closeSync(handle);
+        },
+      },
+    }));
+    assert.equal(refused, 1);
+    assert.equal(touches, 0);
+    assert.equal(readRuntime(fixture).login.blocked, false);
+    assert.equal(readRuntime(fixture).actions.quickLogin.attempted, false);
+    assert.deepEqual(fs.readFileSync(barrier), prior);
+  });
+}
+
+test("a rejected runtime readback restores both pre-dispatch records before a later cycle or restart", async context => {
+  const fixture = createFixture();
+  context.after(fixture.cleanup);
+  const barrier = path.join(path.dirname(fixture.runtimeStatePath), "napcat-offline-recovery.json");
+  fs.mkdirSync(path.dirname(barrier), { recursive: true });
+  writeOfflineRecoveryBarrier(barrier, loadOfflineRecoveryState());
+  const prior = fs.readFileSync(barrier);
+  let calls = 0;
+  let failNextRuntimeRead = false;
+  let rejected = false;
+  let recordsWhenRestored;
+  const options = {
+    checkNapCatStatus: async () => ({ known: true, reachable: false }),
+    checkNapCatProcesses: async () => ({ known: true, present: false, processes: [] }),
+    offlineRecoveryGuard: async () => {
+      calls += 1;
+      return { status: "deferred", changed: false, reason: "maintenance_active" };
+    },
+  };
+  await runSupervisorService(baseOptions(fixture, { ...options, fsImpl: {
+    ...fs,
+    renameSync(source, target) {
+      const publication = [fixture.runtimeStatePath, barrier].includes(target) ? JSON.parse(fs.readFileSync(source, "utf8")) : null;
+      fs.renameSync(source, target);
+      if (target === fixture.runtimeStatePath && publication.login.blocked && !rejected) failNextRuntimeRead = true;
+      if (target === barrier && rejected && !publication.needsManual && !recordsWhenRestored) {
+        recordsWhenRestored = [fs.readFileSync(fixture.runtimeStatePath), fs.readFileSync(barrier)];
+      }
+    },
+    readFileSync(file, ...options) {
+      if (file === fixture.runtimeStatePath && failNextRuntimeRead) {
+        failNextRuntimeRead = false;
+        rejected = true;
+        throw Object.assign(new Error("fixture readback denied"), { code: "ERR_ACCESS_DENIED" });
+      }
+      return fs.readFileSync(file, ...options);
+    },
+  } }));
+  assert.equal(rejected, true);
+  assert.equal(calls, 0);
+  assert.ok(recordsWhenRestored);
+  assert.equal(JSON.parse(recordsWhenRestored[0]).login.blocked, false);
+  assert.deepEqual(recordsWhenRestored[1], prior);
+  fs.writeFileSync(fixture.runtimeStatePath, recordsWhenRestored[0]);
+  fs.writeFileSync(barrier, recordsWhenRestored[1]);
+  await runSupervisorService(baseOptions(fixture, { ...options, now: () => new Date("2026-07-25T08:00:00.000Z") }));
+  assert.equal(calls, 1);
+  assert.equal(readRuntime(fixture).actions.quickLogin.reason, "maintenance_active");
+});
+
+test("a damaged recovery record survives confirmed online and still blocks a future guarded action", async (context) => {
+  const fixture = createFixture();
+  context.after(fixture.cleanup);
+  const touches = [];
+  const barrier = path.join(path.dirname(fixture.runtimeStatePath), "napcat-offline-recovery.json");
+  fs.mkdirSync(path.dirname(barrier));
+  fs.writeFileSync(barrier, "incomplete\n");
+  let online = true;
+  let cycle = 0;
+  await runSupervisorService(baseOptions(fixture, {
+    once: false,
+    checkNapCatStatus: async () => ({ known: true, reachable: online, online, accountMatches: online }),
+    checkNapCatProcesses: async () => ({ known: true, present: online, processes: [] }),
+    offlineRecoveryGuard: async request => touches.push(request.action),
+    wait() {
+      online = false;
+      if (++cycle >= 2) fs.writeFileSync(fixture.stopFilePath, "fixture completed");
+    },
+  }));
+  assert.deepEqual(touches, []);
+  assert.equal(fs.readFileSync(barrier, "utf8"), "incomplete\n");
+});
+
+test("the opted-in development notice reserves an uncertain outcome once; training and ambiguous states never dispatch", async (context) => {
+  for (const [machine, online, reachable, manualAfterVerifiedStop, count] of [
+    ["development", false, true, false, 1], ["development", false, false, true, 1],
+    ["development", false, false, false, 0], ["training", false, true, false, 0],
+    ["development", undefined, true, false, 0],
+  ]) {
+    const fixture = createFixture();
+    context.after(fixture.cleanup);
+    const seen = [];
+    const barrier = path.join(path.dirname(fixture.runtimeStatePath), "napcat-offline-recovery.json");
+    fs.mkdirSync(path.dirname(barrier));
+    const binding = JSON.parse(fs.readFileSync(fixture.bindingPath, "utf8"));
+    fs.writeFileSync(fixture.bindingPath, JSON.stringify({ ...binding, controlPlane: { localMachine: machine } }));
+    fs.writeFileSync(barrier, JSON.stringify({ ...loadOfflineRecoveryState(), needsManual: true,
+      manualAfterVerifiedStopAt: manualAfterVerifiedStop ? Date.parse("2026-07-24T07:59:59.000Z") : null }));
+    const options = baseOptions(fixture, {
+      checkNapCatStatus: async () => ({ reachable, runtimeStatus: { online, good: true } }),
+      offlineRecoveryGuard: async () => { throw new Error("unexpected guard"); },
+      showOfflineDesktopNotice: async (key) => {
+        seen.push(key);
+        const stored = JSON.parse(fs.readFileSync(barrier, "utf8"));
+        assert.equal(stored.noticeAt, null);
+        assert.equal(typeof stored.noticeAttemptAt, "number");
+        assert.equal(readRuntime(fixture).login.blocked, true);
+        assert.equal(readRuntime(fixture).actions.offlineNotice.incidentKey, key);
+        throw new Error("unknown notice result");
+      },
+    });
+    await runSupervisorService(options);
+    fs.writeFileSync(fixture.runtimeStatePath, "{}\n");
+    await runSupervisorService(options);
+    assert.equal(seen.length, count);
+    assert.equal(JSON.parse(fs.readFileSync(barrier, "utf8")).noticeAt, null);
+    assert.ok(seen.every(key => /^napcat-offline-\d+$/u.test(key)));
+  }
+});
+
+test("a definitively unshown notice can retry later; only display confirmation marks it shown", async context => {
+  const fixture = createFixture();
+  context.after(fixture.cleanup);
+  const barrier = path.join(path.dirname(fixture.runtimeStatePath), "napcat-offline-recovery.json");
+  fs.mkdirSync(path.dirname(barrier));
+  const binding = JSON.parse(fs.readFileSync(fixture.bindingPath, "utf8"));
+  fs.writeFileSync(fixture.bindingPath, JSON.stringify({ ...binding, controlPlane: { localMachine: "development" } }));
+  let observedAt = Date.parse("2026-07-24T08:00:00Z");
+  fs.writeFileSync(barrier, JSON.stringify({ ...loadOfflineRecoveryState(), needsManual: true, manualAfterVerifiedStopAt: observedAt - 1000 }));
+  let attempts = 0;
+  const options = baseOptions(fixture, {
+    now: () => new Date(observedAt),
+    checkNapCatStatus: async () => ({ known: true, reachable: false, online: false }),
+    offlineRecoveryGuard: async () => { throw new Error("unexpected guard"); },
+    showOfflineDesktopNotice: async () => ++attempts === 1 ? "notice_offline_unverified" : "notice_returned",
+  });
+  const readBarrier = () => JSON.parse(fs.readFileSync(barrier, "utf8"));
+  await runSupervisorService(options);
+  assert.equal(attempts, 1);
+  assert.equal(readRuntime(fixture).actions.offlineNotice.result, "not_shown");
+  assert.equal(readBarrier().noticeAt, null);
+  assert.equal(readBarrier().noticeAttemptAt, null);
+  observedAt += 4 * 60_000;
+  await runSupervisorService(options);
+  assert.equal(attempts, 1);
+  observedAt += 60_000;
+  await runSupervisorService(options);
+  assert.equal(readRuntime(fixture).actions.offlineNotice.result, "shown");
+  assert.equal(readBarrier().noticeAt, observedAt);
+  assert.equal(readBarrier().noticeAttemptAt, null);
+  observedAt += 5 * 60_000;
+  await runSupervisorService(options);
+  assert.equal(attempts, 2);
+});
+
+test("an explicitly disabled notice never starts its helper or debits its incident", async context => {
+  const fixture = createFixture();
+  context.after(fixture.cleanup);
+  const barrier = path.join(path.dirname(fixture.runtimeStatePath), "napcat-offline-recovery.json");
+  const config = path.join(fixture.root, "interactive.json");
+  fs.mkdirSync(path.dirname(barrier));
+  const binding = JSON.parse(fs.readFileSync(fixture.bindingPath, "utf8"));
+  fs.writeFileSync(fixture.bindingPath, JSON.stringify({ ...binding, controlPlane: { localMachine: "development" } }));
+  const environment = JSON.parse(fs.readFileSync(fixture.privateEnvPath, "utf8"));
+  fs.writeFileSync(fixture.privateEnvPath, JSON.stringify({ ...environment, NAPCAT_OFFLINE_INTERACTIVE_CONFIG: config }));
+  fs.writeFileSync(config, JSON.stringify({ offlineNoticeEnabled: false }));
+  const before = Buffer.from(JSON.stringify({ ...loadOfflineRecoveryState(), needsManual: true }));
+  fs.writeFileSync(barrier, before);
+  let attempts = 0;
+  const options = baseOptions(fixture, {
+    checkNapCatStatus: async () => ({ reachable: true, runtimeStatus: { online: false, good: true } }),
+    offlineRecoveryGuard: async () => { throw new Error("unexpected guard"); },
+    showOfflineDesktopNotice: async () => { attempts += 1; return "notice_returned"; },
+  });
+  await runSupervisorService(options);
+  await runSupervisorService({ ...options, now: () => new Date("2026-07-24T08:10:00.000Z") });
+  assert.equal(attempts, 0);
+  assert.deepEqual(fs.readFileSync(barrier), before);
+  assert.equal(readRuntime(fixture).actions.offlineNotice, undefined);
+});
+
+for (const rearmed of [false, true]) {
+  test(`a return to offline during ${rearmed ? "the twelve-hour embargo" : "the unrearmed interval"} requires manual login without stopping again`, async context => {
+    const fixture = createFixture();
+    context.after(fixture.cleanup);
+    const barrier = path.join(path.dirname(fixture.runtimeStatePath), "napcat-offline-recovery.json");
+    fs.mkdirSync(path.dirname(barrier));
+    const binding = JSON.parse(fs.readFileSync(fixture.bindingPath, "utf8"));
+    fs.writeFileSync(fixture.bindingPath, JSON.stringify({ ...binding, controlPlane: { localMachine: "development" } }));
+    let observedAt = Date.parse("2026-07-24T08:00:00Z");
+    const attemptAt = observedAt - (rearmed ? 3_600_000 : 1000);
+    fs.writeFileSync(barrier, JSON.stringify({ ...loadOfflineRecoveryState(), attemptAt, rearmed }));
+    const process = { pid: 7003, name: "QQ.exe", creationDate: new Date(observedAt - 1000).toISOString(),
+      commandLine: '"C:\\Fixture\\QQ.exe" --fixture-only' };
+    let guardCalls = 0;
+    let notices = 0;
+    let cycles = 0;
+    await runSupervisorService(baseOptions(fixture, {
+      once: false,
+      now: () => new Date(observedAt),
+      staleNapCatReachableOfflineMs: 100,
+      checkNapCatStatus: async () => ({ reachable: true, runtimeStatus: { online: false, good: true } }),
+      checkNapCatProcesses: async () => ({ known: true, present: true, processes: [process] }),
+      offlineRecoveryGuard: async () => { guardCalls += 1; },
+      showOfflineDesktopNotice: async () => { notices += 1; return "notice_returned"; },
+      wait() {
+        observedAt += 101;
+        if (++cycles === 3) fs.writeFileSync(fixture.stopFilePath, "test ended");
+      },
+    }));
+    const report = readRuntime(fixture);
+    assert.equal(guardCalls, 0);
+    assert.equal(notices, 1);
+    assert.equal(report.login.blocked, true);
+    assert.equal(report.autoOfflineRecovery.needsManual, true);
+    assert.equal(report.autoOfflineRecovery.attemptAt, attemptAt);
+    assert.equal(report.actions.staleNapCatRecovery.reachableOfflinePreserved, true);
+  });
+}
+
+test("a confirmed reachable recovery clears the manual hold in the same scan", async context => {
+  const fixture = createFixture();
+  context.after(fixture.cleanup);
+  let observedAt = Date.parse("2026-07-24T08:00:00Z");
+  const process = { pid: 7003, name: "QQ.exe", creationDate: new Date(observedAt - 1000).toISOString(),
+    commandLine: '"C:\\Fixture\\QQ.exe" --fixture-only' };
+  let cycles = 0;
+  let notices = 0;
+  await runSupervisorService(baseOptions(fixture, {
+    once: false,
+    now: () => new Date(observedAt),
+    staleNapCatReachableOfflineMs: 100,
+    checkNapCatStatus: async () => ({ reachable: true, runtimeStatus: { online: false, good: true } }),
+    checkNapCatProcesses: async () => ({ known: true, present: true, processes: [process] }),
+    checkNativeQuickLogin: async () => ({ fileSha256: "fixture" }),
+    offlineRecoveryGuard: async () => ({ status: "recovered", changed: true, reason: "verified_online" }),
+    showOfflineDesktopNotice: async () => { notices += 1; return "notice_returned"; },
+    wait() {
+      observedAt += 101;
+      if (++cycles === 2) fs.writeFileSync(fixture.stopFilePath, "test ended");
+    },
+  }));
+  const report = readRuntime(fixture);
+  assert.equal(report.actions.staleNapCatRecovery.succeeded, true);
+  assert.equal(report.login.blocked, false);
+  assert.equal(report.autoOfflineRecovery.needsManual, false);
+  assert.equal(report.autoOfflineRecovery.rearmed, false);
+  assert.equal(notices, 0);
+});
+
+test("only an acknowledged stop with a manual result permits a disconnected notice", async context => {
+  for (const stopped of [false, true]) {
+    const fixture = createFixture();
+    context.after(fixture.cleanup);
+    const binding = JSON.parse(fs.readFileSync(fixture.bindingPath, "utf8"));
+    fs.writeFileSync(fixture.bindingPath, JSON.stringify({ ...binding, controlPlane: { localMachine: "development" } }));
+    let observedAt = Date.parse("2026-07-24T08:00:00Z");
+    const process = { pid: 7011, name: "QQ.exe", creationDate: new Date(observedAt - 1000).toISOString(),
+      commandLine: '"C:\\Fixture\\QQ.exe" --fixture-only' };
+    let cycles = 0;
+    let notices = 0;
+    const options = baseOptions(fixture, {
+      once: false,
+      now: () => new Date(observedAt),
+      staleNapCatReachableOfflineMs: 100,
+      checkNapCatStatus: async () => cycles < 2
+        ? { reachable: true, runtimeStatus: { online: false, good: true } }
+        : { known: true, reachable: false, online: false },
+      checkNapCatProcesses: async () => ({ known: true, present: cycles < 2, processes: cycles < 2 ? [process] : [] }),
+      checkNativeQuickLogin: async () => ({ fileSha256: "fixture" }),
+      offlineRecoveryGuard: async () => stopped
+        ? { status: "needs-manual", changed: true, reason: "manual_login_required" }
+        : { status: "unknown", changed: null, reason: "stop_unverified" },
+      showOfflineDesktopNotice: async () => {
+        if (cycles < 2) return "notice_offline_unverified";
+        const runtime = readRuntime(fixture);
+        assert.ok(Number.isSafeInteger(runtime.autoOfflineRecovery.manualAfterVerifiedStopAt));
+        assert.equal(runtime.login.blocked, true);
+        notices += 1;
+        return "notice_returned";
+      },
+      wait() {
+        observedAt += cycles === 1 ? 5 * 60_000 : 101;
+        if (++cycles === 3) fs.writeFileSync(fixture.stopFilePath, "test ended");
+      },
+    });
+    await runSupervisorService(options);
+    assert.equal(notices, stopped ? 1 : 0);
+    assert.equal(Number.isSafeInteger(readRuntime(fixture).autoOfflineRecovery.manualAfterVerifiedStopAt), stopped);
+  }
+});
+
+test("an unconfigured Windows recovery preserves legacy no-process login without dropping an unresolved guard hold", async context => {
+  const fixture = createFixture();
+  context.after(fixture.cleanup);
+  const barrier = path.join(path.dirname(fixture.runtimeStatePath), "napcat-offline-recovery.json");
+  const calls = [];
+  const options = baseOptions(fixture, {
+    useWindowsOfflineGuard: true,
+    checkNapCatStatus: async () => ({ known: true, reachable: false }),
+    checkNapCatProcesses: async () => ({ known: true, present: false, processes: [] }),
+    quickLogin: async request => calls.push(request.noQr),
+  });
+  await runSupervisorService(options);
+  assert.deepEqual(calls, [true]);
+  fs.writeFileSync(barrier, JSON.stringify({ ...loadOfflineRecoveryState(), needsManual: true }));
+  fs.writeFileSync(fixture.runtimeStatePath, "{}\n");
+  await runSupervisorService({ ...options, now: () => new Date("2026-07-25T08:00:00.000Z") });
+  assert.deepEqual(calls, [true]);
+  assert.equal(readRuntime(fixture).actions.quickLogin.reason, "manual_login_required");
+});
+
+test("the real Windows helper rejects incomplete stdin without using account files", { skip: process.platform !== "win32" }, async () => {
+  const scriptPath = path.resolve("ops", "invoke-napcat-offline-recovery.ps1");
+  const result = await invokeOfflineRecoveryGuard({}, { scriptPath, timeoutMs: 15_000, env: { ...process.env, PSModulePath: "X:\\fixture" } });
+  assert.deepEqual(result, { status: "deferred", changed: false, reason: "invalid_request", nativeQuickLoginVerified: false });
+});
+
+test("repeated offline guard startup timeouts back off 60s then 15m and reset once napcat is online", async context => {
+  const fixture = createFixture();
+  context.after(fixture.cleanup);
+  let observedAt = Date.parse("2026-07-24T08:00:00.000Z");
+  let onlineNow = false;
+  let guardCalls = 0;
+  const recorded = [];
+  const advances = [
+    30_000,
+    29_000,
+    1_000,
+    60_000,
+    13 * 60_000 + 59_000,
+    1_000,
+    10_000,
+    10_000,
+    59_000,
+    1_000,
+  ];
+  let step = 0;
+  await runSupervisorService(baseOptions(fixture, {
+    once: false,
+    loginCooldownMs: 1_000,
+    now: () => new Date(observedAt),
+    checkNapCatStatus: async () => onlineNow
+      ? { known: true, reachable: true, online: true, accountMatches: true }
+      : { known: true, reachable: false, online: false, accountMatches: false },
+    checkNapCatProcesses: async () => ({ known: true, present: onlineNow, processes: onlineNow ? [{ pid: 7003, name: "NapCat.exe" }] : [] }),
+    offlineRecoveryGuard: async () => {
+      guardCalls += 1;
+      if (guardCalls === 5) return { status: "started", changed: true, reason: "verified_online", nativeQuickLoginVerified: true };
+      return { status: "deferred", changed: false, reason: "offline_guard_startup_timeout", nativeQuickLoginVerified: false };
+    },
+    wait: async () => {
+      const runtime = readRuntime(fixture);
+      recorded.push({
+        step,
+        online: onlineNow,
+        guardCalls,
+        reason: runtime.actions.quickLogin?.reason ?? null,
+        succeeded: runtime.actions.quickLogin?.succeeded ?? null,
+        blocked: runtime.login.blocked,
+      });
+      if (step >= advances.length) {
+        fs.writeFileSync(fixture.stopFilePath, "test ended");
+        return;
+      }
+      observedAt += advances[step];
+      step += 1;
+      onlineNow = step === 7;
+    },
+  }));
+  assert.deepEqual(recorded, [
+    { step: 0, online: false, guardCalls: 1, reason: "offline_guard_startup_timeout", succeeded: null, blocked: false },
+    { step: 1, online: false, guardCalls: 1, reason: "offline_guard_startup_timeout", succeeded: null, blocked: false },
+    { step: 2, online: false, guardCalls: 1, reason: "offline_guard_startup_timeout", succeeded: null, blocked: false },
+    { step: 3, online: false, guardCalls: 2, reason: "offline_guard_startup_timeout_exhausted", succeeded: null, blocked: false },
+    { step: 4, online: false, guardCalls: 2, reason: "offline_guard_startup_timeout_exhausted", succeeded: null, blocked: false },
+    { step: 5, online: false, guardCalls: 2, reason: "offline_guard_startup_timeout_exhausted", succeeded: null, blocked: false },
+    { step: 6, online: false, guardCalls: 3, reason: "offline_guard_startup_timeout_exhausted", succeeded: null, blocked: false },
+    { step: 7, online: true, guardCalls: 3, reason: null, succeeded: null, blocked: false },
+    { step: 8, online: false, guardCalls: 4, reason: "offline_guard_startup_timeout", succeeded: null, blocked: false },
+    { step: 9, online: false, guardCalls: 4, reason: "offline_guard_startup_timeout", succeeded: null, blocked: false },
+    { step: 10, online: false, guardCalls: 5, reason: null, succeeded: true, blocked: false },
+  ]);
+});
 
 test("生产 CLI 解析约定参数，并保留可选脚本路径", () => {
   const fixture = createFixture();
@@ -760,6 +1289,7 @@ test("NapCat HTTP 不可达且连续离线超过宽限期时只停止匹配进�
   try {
     await runSupervisorService(baseOptions(fixture, {
       once: false,
+      useWindowsOfflineGuard: true,
       now: () => currentTime,
       scanIntervalMs: 60_000,
       staleNapCatOfflineMs: 120_000,
@@ -814,6 +1344,7 @@ test("NapCat HTTP 可达但 online=false 时保留现有进程，不把状态抖
   try {
     await runSupervisorService(baseOptions(fixture, {
       once: false,
+      useWindowsOfflineGuard: true,
       now: () => currentTime,
       scanIntervalMs: 60_000,
       staleNapCatOfflineMs: 60_000,
@@ -839,7 +1370,7 @@ test("NapCat HTTP 可达但 online=false 时保留现有进程，不把状态抖
     assert.equal(loginCalls.length, 0);
     assert.equal(runtime.actions.staleNapCatRecovery.attempted, false);
     assert.equal(runtime.actions.staleNapCatRecovery.trigger, "reachable_offline");
-    assert.equal(runtime.actions.staleNapCatRecovery.reason, "reachable_offline_preserved");
+    assert.equal(runtime.actions.staleNapCatRecovery.reason, "reachable_offline_guard_not_configured");
     assert.equal(runtime.actions.staleNapCatRecovery.reachableOfflinePreserved, true);
     assert.equal(runtime.actions.quickLogin.reason, "napcat_process_present");
     assert.equal(runtime.login.offlineProcessSince, "2026-07-24T08:00:00.000Z");
@@ -1299,6 +1830,8 @@ test("PowerShell 调用默认隐藏，登录脚本通过 execFile 时仍保留 -
 
 test("监督器的 Windows PowerShell 子进程隔离 PS7 模块路径并保留中文", { skip: process.platform !== "win32" }, async () => {
   const inherited = { ...process.env, PSModulePath: "C:\\Fixture\\PowerShell7\\Modules" };
+  delete inherited.NAPCAT_POWERSHELL_PATH;
+  delete inherited.NAPCAT_OFFLINE_GUARD_POWERSHELL_PATH;
   const before = { ...inherited };
   const command = "$row = Get-CimInstance Win32_Process -Filter ('ProcessId = ' + $PID) -ErrorAction Stop; [pscustomobject]@{name=$row.Name;text='中文 含空格';version=$PSVersionTable.PSVersion.ToString()} | ConvertTo-Json -Compress";
   const result = await invokePowerShellCommand(command, { env: inherited, timeoutMs: 10_000 });
@@ -1306,4 +1839,254 @@ test("监督器的 Windows PowerShell 子进程隔离 PS7 模块路径并保留�
   assert.match(result.value[0].version, /^5\.1\./);
   assert.equal(result.value[0].name.toLowerCase(), "powershell.exe");
   assert.deepEqual(inherited, before);
+});
+
+test("监督器配置官方 PowerShell 7 路径时子进程真实运行于 PS7 RemoteSigned 且零 Bypass", {
+  skip: process.platform !== "win32" || !(process.env.NAPCAT_POWERSHELL_PATH && /pwsh\.exe$/i.test(process.env.NAPCAT_POWERSHELL_PATH)),
+}, async () => {
+  const pwshPath = process.env.NAPCAT_POWERSHELL_PATH;
+  const inherited = { ...process.env, PSModulePath: "C:\\Fixture\\Dirty\\Modules", PSExecutionPolicyPreference: "Bypass" };
+  const command = "$row = Get-CimInstance Win32_Process -Filter ('ProcessId = ' + $PID) -ErrorAction Stop; [pscustomobject]@{name=$row.Name;version=$PSVersionTable.PSVersion.ToString();edition=$PSVersionTable.PSEdition;effective=(Get-ExecutionPolicy).ToString();process=(Get-ExecutionPolicy -Scope Process).ToString()} | ConvertTo-Json -Compress";
+  const result = await invokePowerShellCommand(command, { env: inherited, powershellPath: pwshPath, timeoutMs: 15_000 });
+  assert.equal(result.value[0].name.toLowerCase(), "pwsh.exe");
+  assert.equal(result.value[0].edition, "Core");
+  assert.match(result.value[0].version, /^7\./);
+  assert.equal(result.value[0].effective, "RemoteSigned");
+  assert.equal(result.value[0].process, "Undefined");
+});
+
+test("invokeOfflineRecoveryGuard 配置 pwsh.exe 时零 Bypass 且清理 PSModulePath 与 PSExecutionPolicyPreference", async () => {
+  const pwshPath = "C:\\Program Files\\WindowsApps\\Microsoft.PowerShell_7.6.7.0_x64__8wekyb3d8bbwe\\pwsh.exe";
+  const scriptPath = "C:\\ops\\invoke-napcat-offline-recovery.ps1";
+  const inherited = {
+    SystemRoot: "C:\\Windows",
+    PSModulePath: "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\Modules",
+    psmodulepath: "C:\\Legacy\\Modules",
+    PSExecutionPolicyPreference: "Bypass",
+    psexecutionpolicypreference: "Unrestricted",
+    NAPCAT_TEST_KEEP: "preserved",
+  };
+  const before = { ...inherited };
+  const calls = [];
+  const result = await invokeOfflineRecoveryGuard({ action: "quick-login" }, {
+    scriptPath,
+    timeoutMs: 15_000,
+    powershellPath: pwshPath,
+    env: inherited,
+    exec(executable, args, options, callback) {
+      let received = "";
+      calls.push({ executable, args, options });
+      return {
+        stdin: {
+          on() {},
+          end(payload) {
+            received = payload;
+            callback(null, JSON.stringify({
+              status: "deferred",
+              changed: false,
+              reason: "invalid_request",
+              nativeQuickLoginVerified: false,
+            }));
+          },
+        },
+        get received() { return received; },
+      };
+    },
+  });
+  assert.deepEqual(result, {
+    status: "deferred",
+    changed: false,
+    reason: "invalid_request",
+    nativeQuickLoginVerified: false,
+  });
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].executable, pwshPath);
+  assert.deepEqual(calls[0].args, ["-NoLogo", "-NoProfile", "-NonInteractive", "-File", scriptPath]);
+  assert.equal(calls[0].args.some((arg) => /executionpolicy|bypass/i.test(arg)), false);
+  const envKeysLower = Object.keys(calls[0].options.env).map((key) => key.toLowerCase());
+  assert.equal(envKeysLower.includes("psmodulepath"), false);
+  assert.equal(envKeysLower.includes("psexecutionpolicypreference"), false);
+  assert.equal(calls[0].options.env.NAPCAT_TEST_KEEP, "preserved");
+  assert.deepEqual(inherited, before);
+
+  await assert.rejects(
+    invokeOfflineRecoveryGuard({}, { scriptPath, timeoutMs: 15_000, powershellPath: "pwsh.exe" }),
+    { code: "NAPCAT_OFFLINE_GUARD_CONFIGURATION_INVALID" },
+  );
+  await assert.rejects(
+    invokeOfflineRecoveryGuard({}, { scriptPath, timeoutMs: 15_000, powershellPath: "C:\\Windows\\System32\\cmd.exe" }),
+    { code: "NAPCAT_OFFLINE_GUARD_CONFIGURATION_INVALID" },
+  );
+});
+
+test("invokeOfflineRecoveryGuard 在 Windows PowerShell 5.1 路径保留 Bypass 且剥离 PSExecutionPolicyPreference", async () => {
+  const winPsPath = "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe";
+  const scriptPath = "C:\\ops\\invoke-napcat-offline-recovery.ps1";
+  const inherited = {
+    SystemRoot: "C:\\Windows",
+    PSModulePath: "C:\\Program Files\\PowerShell\\7\\Modules",
+    PSExecutionPolicyPreference: "Bypass",
+    psexecutionpolicypreference: "RemoteSigned",
+    NAPCAT_TEST_KEEP: "preserved",
+  };
+  const before = { ...inherited };
+
+  for (const powershellPath of [null, winPsPath]) {
+    const calls = [];
+    const result = await invokeOfflineRecoveryGuard({ action: "quick-login" }, {
+      scriptPath,
+      timeoutMs: 15_000,
+      powershellPath,
+      env: inherited,
+      exec(executable, args, options, callback) {
+        calls.push({ executable, args, options });
+        return {
+          stdin: {
+            on() {},
+            end() {
+              callback(null, JSON.stringify({
+                status: "deferred",
+                changed: false,
+                reason: "invalid_request",
+                nativeQuickLoginVerified: false,
+              }));
+            },
+          },
+        };
+      },
+    });
+    assert.deepEqual(result, {
+      status: "deferred",
+      changed: false,
+      reason: "invalid_request",
+      nativeQuickLoginVerified: false,
+    });
+    assert.equal(calls.length, 1);
+    assert.equal(path.win32.basename(calls[0].executable).toLowerCase(), "powershell.exe");
+    assert.deepEqual(calls[0].args, [
+      "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", scriptPath,
+    ]);
+    const envKeysLower = Object.keys(calls[0].options.env).map((key) => key.toLowerCase());
+    assert.equal(envKeysLower.includes("psexecutionpolicypreference"), false);
+    assert.match(calls[0].options.env.PSModulePath, /WindowsPowerShell\\v1\.0\\Modules$/i);
+    assert.equal(calls[0].options.env.NAPCAT_TEST_KEEP, "preserved");
+  }
+  assert.deepEqual(inherited, before);
+});
+
+test("invokePowerShellScript 与 invokePowerShellCommand 按 pwsh.exe 零 Bypass 与 powershell.exe 保留 Bypass 显式分流", async () => {
+  const pwshPath = "C:\\Program Files\\PowerShell\\7\\pwsh.exe";
+  const winPsPath = "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe";
+  const scriptPath = "C:\\ops\\login.ps1";
+  const cleanEnv = {
+    SystemRoot: "C:\\Windows",
+    PSModulePath: "C:\\Dirty\\Modules",
+    PSExecutionPolicyPreference: "Bypass",
+  };
+
+  const scriptCalls = [];
+  const captureScript = (executable, argumentsList, options, callback) => {
+    scriptCalls.push({ executable, argumentsList, options });
+    callback(null, "ok\n", "");
+  };
+  await invokePowerShellScript(scriptPath, ["-NoQr"], { env: cleanEnv, powershellPath: pwshPath, execFileImpl: captureScript });
+  await invokePowerShellScript(scriptPath, ["-NoQr"], { env: cleanEnv, powershellPath: winPsPath, execFileImpl: captureScript });
+  await invokePowerShellScript(scriptPath, ["-NoQr"], { env: cleanEnv, execFileImpl: captureScript });
+
+  assert.equal(scriptCalls[0].executable, pwshPath);
+  assert.equal(scriptCalls[0].argumentsList.some((arg) => /executionpolicy|bypass/i.test(arg)), false);
+  assert.equal(Object.keys(scriptCalls[0].options.env).some((key) => key.toLowerCase() === "psmodulepath"), false);
+  assert.equal(Object.keys(scriptCalls[0].options.env).some((key) => key.toLowerCase() === "psexecutionpolicypreference"), false);
+
+  for (const call of [scriptCalls[1], scriptCalls[2]]) {
+    assert.equal(path.win32.basename(call.executable).toLowerCase(), "powershell.exe");
+    const policyIndex = call.argumentsList.indexOf("-ExecutionPolicy");
+    assert.ok(policyIndex >= 0 && call.argumentsList[policyIndex + 1] === "Bypass");
+    assert.equal(Object.keys(call.options.env).some((key) => key.toLowerCase() === "psexecutionpolicypreference"), false);
+    assert.match(call.options.env.PSModulePath, /WindowsPowerShell\\v1\.0\\Modules$/i);
+  }
+
+  const commandCalls = [];
+  const captureCommand = (executable, argumentsList, options, callback) => {
+    commandCalls.push({ executable, argumentsList, options });
+    callback(null, JSON.stringify({ ok: true }), "");
+  };
+  await invokePowerShellCommand("Write-Output '{}'", { env: cleanEnv, powershellPath: pwshPath, execFileImpl: captureCommand });
+  await invokePowerShellCommand("Write-Output '{}'", { env: cleanEnv, powershellPath: winPsPath, execFileImpl: captureCommand });
+
+  assert.equal(commandCalls[0].executable, pwshPath);
+  assert.equal(commandCalls[0].argumentsList.some((arg) => /executionpolicy|bypass/i.test(arg)), false);
+  assert.equal(Object.keys(commandCalls[0].options.env).some((key) => key.toLowerCase() === "psmodulepath"), false);
+  assert.equal(Object.keys(commandCalls[0].options.env).some((key) => key.toLowerCase() === "psexecutionpolicypreference"), false);
+
+  assert.equal(commandCalls[1].executable, winPsPath);
+  const cmdPolicyIndex = commandCalls[1].argumentsList.indexOf("-ExecutionPolicy");
+  assert.ok(cmdPolicyIndex >= 0 && commandCalls[1].argumentsList[cmdPolicyIndex + 1] === "Bypass");
+  assert.equal(Object.keys(commandCalls[1].options.env).some((key) => key.toLowerCase() === "psexecutionpolicypreference"), false);
+});
+
+test("runSupervisorService 的 showOfflineNotice 按 pwsh.exe 零 Bypass 与 powershell.exe 保留 Bypass 双分流", async (context) => {
+  const pwshPath = "C:\\Program Files\\PowerShell\\7\\pwsh.exe";
+  const winPsPath = "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe";
+  const prevHostPs = process.env.NAPCAT_POWERSHELL_PATH;
+  const prevHostGuardPs = process.env.NAPCAT_OFFLINE_GUARD_POWERSHELL_PATH;
+  process.env.NAPCAT_POWERSHELL_PATH = pwshPath;
+  process.env.NAPCAT_OFFLINE_GUARD_POWERSHELL_PATH = pwshPath;
+  context.after(() => {
+    if (prevHostPs === undefined) delete process.env.NAPCAT_POWERSHELL_PATH;
+    else process.env.NAPCAT_POWERSHELL_PATH = prevHostPs;
+    if (prevHostGuardPs === undefined) delete process.env.NAPCAT_OFFLINE_GUARD_POWERSHELL_PATH;
+    else process.env.NAPCAT_OFFLINE_GUARD_POWERSHELL_PATH = prevHostGuardPs;
+  });
+  for (const [label, configuredPath, expectBypass] of [
+    ["pwsh", pwshPath, false],
+    ["winps-explicit", winPsPath, true],
+    ["winps-default", null, true],
+  ]) {
+    const fixture = createFixture();
+    context.after(fixture.cleanup);
+    const barrier = path.join(path.dirname(fixture.runtimeStatePath), "napcat-offline-recovery.json");
+    fs.mkdirSync(path.dirname(barrier), { recursive: true });
+    const binding = JSON.parse(fs.readFileSync(fixture.bindingPath, "utf8"));
+    fs.writeFileSync(fixture.bindingPath, JSON.stringify({ ...binding, controlPlane: { localMachine: "development" } }));
+    const noticeConfig = path.join(fixture.root, "interactive-config.json");
+    fs.writeFileSync(noticeConfig, JSON.stringify({ offlineNoticeEnabled: true }));
+    const privateEnv = JSON.parse(fs.readFileSync(fixture.privateEnvPath, "utf8"));
+    fs.writeFileSync(fixture.privateEnvPath, JSON.stringify({
+      ...privateEnv,
+      NAPCAT_OFFLINE_INTERACTIVE_CONFIG: noticeConfig,
+      ...(configuredPath ? { NAPCAT_OFFLINE_GUARD_POWERSHELL_PATH: configuredPath } : {}),
+    }));
+    fs.writeFileSync(barrier, JSON.stringify({ ...loadOfflineRecoveryState(), needsManual: true }));
+    const calls = [];
+    await runSupervisorService(baseOptions(fixture, {
+      useWindowsOfflineGuard: true,
+      env: {
+        SystemRoot: "C:\\Windows",
+        PSModulePath: "C:\\Dirty\\Modules",
+        PSExecutionPolicyPreference: "Bypass",
+      },
+      checkNapCatStatus: async () => ({ reachable: true, runtimeStatus: { online: false, good: true } }),
+      offlineRecoveryGuard: async () => { throw new Error("unexpected guard"); },
+      execFileImpl(executable, args, options, callback) {
+        calls.push({ executable, args, options });
+        callback(null, JSON.stringify({ status: "notice_returned" }), "");
+      },
+    }));
+    assert.equal(calls.length, 1, `expected single notice launch for ${label}`);
+    assert.equal(calls[0].args.includes("-File"), true);
+    assert.equal(calls[0].args.some((arg) => /show-napcat-offline-notice\.ps1$/i.test(arg)), true);
+    const envKeysLower = Object.keys(calls[0].options.env).map((key) => key.toLowerCase());
+    assert.equal(envKeysLower.includes("psexecutionpolicypreference"), false);
+    if (expectBypass) {
+      assert.equal(path.win32.basename(calls[0].executable).toLowerCase(), "powershell.exe");
+      const policyIndex = calls[0].args.indexOf("-ExecutionPolicy");
+      assert.ok(policyIndex >= 0 && calls[0].args[policyIndex + 1] === "Bypass");
+      assert.match(calls[0].options.env.PSModulePath, /WindowsPowerShell\\v1\.0\\Modules$/i);
+    } else {
+      assert.equal(calls[0].executable, pwshPath);
+      assert.equal(calls[0].args.some((arg) => /executionpolicy|bypass/i.test(arg)), false);
+      assert.equal(envKeysLower.includes("psmodulepath"), false);
+    }
+  }
 });

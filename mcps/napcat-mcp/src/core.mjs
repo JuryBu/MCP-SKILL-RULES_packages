@@ -5,6 +5,7 @@ import { Readable, Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { canonicalMachineRole } from "./machine-role.mjs";
 import { renameReplaceSync } from "./atomic-file.mjs";
+import { readOfflineRecoveryBarrier } from "./napcat-offline-recovery.mjs";
 import { OWNER_REPLY_EVENT_LIMITS } from "./owner-reply-events.mjs";
 import { createConfiguredFileAccess } from "./configured-files.mjs";
 
@@ -23,6 +24,8 @@ const DEFAULT_GROUP_FILE_COUNT_LIMIT = 1500;
 const DEFAULT_GROUP_FILE_CLEANUP_BATCH = 100;
 const DEFAULT_GROUP_FILE_SCAN_COUNT = 2000;
 const RECONCILIATION_CLOCK_SKEW_MS = 60 * 60 * 1000;
+const SUPERVISOR_RUNTIME_MAX_AGE_MS = 150_000;
+const SUPERVISOR_RUNTIME_MAX_BYTES = 256 * 1024;
 const FILE_TRANSPORT_GROUP_UPLOAD = "group_file_upload";
 const FILE_TRANSPORT_CHAT_ATTACHMENT = "chat_attachment";
 
@@ -53,6 +56,71 @@ function readJsonFile(filePath, missingCode) {
     return JSON.parse(fs.readFileSync(filePath, "utf8").replace(/^\uFEFF/, ""));
   } catch (error) {
     throw new NapCatNotifierError("INVALID_JSON", `无法解析 JSON：${filePath}`, { cause: error });
+  }
+}
+
+function directLoopbackConnectionAttempts(error, target, depth = 0) {
+  if (!error || depth >= 6) return null;
+  if (error instanceof AggregateError) {
+    const parts = error.errors.map(failure => directLoopbackConnectionAttempts(failure, target, depth + 1));
+    return parts.length > 0 && parts.every(Boolean) ? parts.flat() : null;
+  }
+  if (typeof error.code === "string") {
+    if (error.syscall !== "connect" || error.port !== target.port || !target.addresses.includes(error.address)) return null;
+    return [{ code: error.code, address: error.address }];
+  }
+  return directLoopbackConnectionAttempts(error.cause, target, depth + 1);
+}
+
+function oneBotLoopbackProbe(error, baseUrl) {
+  if (error?.code !== "ONEBOT_NETWORK_ERROR") return null;
+  try {
+    const target = new URL(baseUrl);
+    if (target.protocol !== "http:" && target.protocol !== "https:") return null;
+    const hostname = target.hostname;
+    if (!["127.0.0.1", "localhost", "[::1]"].includes(hostname)) return null;
+    const attempts = directLoopbackConnectionAttempts(error.cause, {
+      port: target.port ? Number(target.port) : target.protocol === "https:" ? 443 : 80,
+      addresses: hostname === "localhost" ? ["127.0.0.1", "::1"] : [hostname.replace(/^\[|\]$/gu, "")],
+    });
+    if (!attempts) return null;
+    if (attempts.every(attempt => attempt.code === "ECONNREFUSED")) return "connection_refused";
+    if (hostname === "localhost" && new Set(attempts.map(attempt => attempt.address)).size > 1
+      && attempts.some(attempt => attempt.code === "ECONNREFUSED")
+      && attempts.every(attempt => ["ECONNREFUSED", "EACCES", "EAFNOSUPPORT", "EADDRNOTAVAIL"].includes(attempt.code))) {
+      return "loopback_family_unverified";
+    }
+  } catch {}
+  return null;
+}
+
+function readManualLoginStatus(runtimeStatus, runtimeStatePath, now, refused = false) {
+  const definitelyOffline = runtimeStatus?.online === false;
+  if (!definitelyOffline && !(runtimeStatus === undefined && refused)) return {};
+  try {
+    const metadata = fs.lstatSync(runtimeStatePath);
+    if (!metadata.isFile() || metadata.size <= 0 || metadata.size > SUPERVISOR_RUNTIME_MAX_BYTES) return {};
+    const snapshot = readJsonFile(runtimeStatePath, "SUPERVISOR_RUNTIME_MISSING");
+    if (snapshot?.autoOfflineRecovery?.needsManual !== true || typeof snapshot.updatedAt !== "string") return {};
+    const nowMs = now().getTime();
+    const updatedAtMs = Date.parse(snapshot.updatedAt);
+    const ageMs = nowMs - updatedAtMs;
+    if (!Number.isFinite(ageMs) || ageMs < 0 || ageMs > SUPERVISOR_RUNTIME_MAX_AGE_MS
+      || new Date(updatedAtMs).toISOString() !== snapshot.updatedAt) return {};
+    if (!definitelyOffline) {
+      const stoppedAt = snapshot.autoOfflineRecovery.manualAfterVerifiedStopAt;
+      if (!(snapshot.state === "running" && snapshot.login?.blocked === true
+        && Number.isSafeInteger(stoppedAt) && stoppedAt > 0 && stoppedAt <= updatedAtMs)) return {};
+      const hold = readOfflineRecoveryBarrier(path.join(path.dirname(runtimeStatePath), "napcat-offline-recovery.json"));
+      if (hold?.needsManual !== true || hold.manualAfterVerifiedStopAt !== stoppedAt) return {};
+    }
+    return {
+      manualLoginRequired: true,
+      offlineReason: "manual_quick_login_required",
+      localRecoveryEntry: "restart-napcat-qr-login.ps1",
+    };
+  } catch {
+    return {};
   }
 }
 
@@ -1072,6 +1140,12 @@ export function createNapCatNotifier(options = {}) {
     cwd,
     env,
   );
+  const configuredDataRoot = env.CODEX_TOOLKIT_NAPCAT_DATA_ROOT?.trim();
+  const supervisorStateDir = configuredDataRoot
+    ? path.join(resolveConfiguredPath(configuredDataRoot, ".", cwd, env), "state")
+    : path.dirname(statePath);
+  const supervisorRuntimeStatePath = options.supervisorRuntimeStatePath
+    ?? path.join(supervisorStateDir, "supervisor-runtime.json");
   const baseUrl = String(env.NAPCAT_HTTP_URL || "http://127.0.0.1:3010").replace(/\/+$/, "");
   const accessToken = String(env.NAPCAT_ACCESS_TOKEN || "");
   const allowEmptyToken = env.NAPCAT_ALLOW_EMPTY_TOKEN === "1";
@@ -1218,6 +1292,7 @@ export function createNapCatNotifier(options = {}) {
     try {
       response = await fetchImpl(`${baseUrl}/${action}`, {
         method: "POST",
+        ...(context?.rejectRedirect === true ? { redirect: "error" } : {}),
         headers: {
           "Content-Type": "application/json",
           ...(accessToken ? { Authorization: `Bearer ${accessToken}` } : {}),
@@ -1773,8 +1848,9 @@ export function createNapCatNotifier(options = {}) {
         error: publicError(error),
       };
     }
+    let runtimeStatus;
     try {
-      const runtimeStatus = await callOneBot("get_status");
+      runtimeStatus = await callOneBot("get_status", {}, timeoutMs, { rejectRedirect: true });
       const loginInfo = await callOneBot("get_login_info");
       let identity = null;
       let identityError = null;
@@ -1834,11 +1910,13 @@ export function createNapCatNotifier(options = {}) {
         identityError,
         group,
         groupError,
+        ...readManualLoginStatus(runtimeStatus, supervisorRuntimeStatePath, now),
       };
     } catch (error) {
+      const loopbackProbe = oneBotLoopbackProbe(error, baseUrl);
       return {
         ready: false,
-        reachable: false,
+        reachable: runtimeStatus !== undefined,
         baseUrl,
         tokenConfigured: Boolean(accessToken),
         binding: {
@@ -1856,7 +1934,10 @@ export function createNapCatNotifier(options = {}) {
           targetCount: Object.keys(binding.controlPlane.targets).length,
           defaultTargetKey: binding.controlPlane.defaultTargetKey,
         },
+        ...(runtimeStatus === undefined ? {} : { runtimeStatus }),
         error: publicError(error),
+        ...(runtimeStatus === undefined && loopbackProbe === "loopback_family_unverified" ? { offlineRecoveryProbe: loopbackProbe } : {}),
+        ...readManualLoginStatus(runtimeStatus, supervisorRuntimeStatePath, now, loopbackProbe === "connection_refused"),
       };
     }
   }

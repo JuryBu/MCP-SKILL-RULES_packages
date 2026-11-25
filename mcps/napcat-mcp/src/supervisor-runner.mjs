@@ -1,15 +1,31 @@
 import fs from "node:fs";
 import path from "node:path";
 import { execFile } from "node:child_process";
+import {
+  DEFAULT_REACHABLE_OFFLINE_GRACE_MS,
+  durableRecoveryChanged,
+  nativeQuickLoginEvidence,
+  observeOfflineRecovery,
+  ownedQqRoot,
+  ownedStaleLaunchRoot,
+  reachableOfflineDecision,
+  readOfflineRecoveryBarrier,
+  reserveOfflineRecoveryAttempt,
+  retainVerifiedNativeLogin,
+  snapshotNativeLoginInputs,
+  writeOfflineRecoveryBarrier,
+} from "./napcat-offline-recovery.mjs";
 import { createHash, randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { createNapCatNotifier } from "./core.mjs";
 import { createBoundedJsonlWriter } from "./bounded-jsonl-log.mjs";
+import { renameReplaceSync } from "./atomic-file.mjs";
 import { createTaskRegistry } from "./task-registry.mjs";
 import { createTaskRouterController } from "./task-router-controller.mjs";
 import { acquireInstanceLock, readPrivateEnvironment } from "./task-router-runner.mjs";
 import { classifyNapCatProcesses } from "./napcat-process-identity.mjs";
 import { windowsPowerShellEnvironment } from "./windows-powershell-environment.mjs";
+import { canonicalMachineRole } from "./machine-role.mjs";
 
 export const DEFAULT_SUPERVISOR_INTERVAL_MS = 15_000;
 export const DEFAULT_PROBE_TIMEOUT_MS = 4_000;
@@ -25,6 +41,9 @@ export const DEFAULT_SUPERVISOR_LOG_MAX_BYTES = 4 * 1024 * 1024;
 export const DEFAULT_SUPERVISOR_LOG_MAX_FILES = 8;
 export const DEFAULT_SUPERVISOR_DIAGNOSTIC_LOG_MAX_BYTES = 1024 * 1024;
 export const DEFAULT_SUPERVISOR_DIAGNOSTIC_LOG_MAX_FILES = 8;
+const OFFLINE_GUARD_STARTUP_TIMEOUT_MS = 15_000;
+const OFFLINE_GUARD_STARTUP_RETRY_MS = 60_000;
+const OFFLINE_GUARD_STARTUP_EXHAUSTED_RETRY_MS = 15 * 60_000;
 
 const CLI_OPTIONS = new Set([
   "private-env",
@@ -59,6 +78,7 @@ const CLI_OPTIONS = new Set([
   "alert-file",
   "maintenance",
   "alert",
+  "account-state-dir",
   "once",
 ]);
 
@@ -325,9 +345,11 @@ export function atomicWriteJson(filePath, value, options = {}) {
     if (typeof fsImpl.fsyncSync === "function") fsImpl.fsyncSync(descriptor);
     fsImpl.closeSync(descriptor);
     descriptor = undefined;
-    fsImpl.renameSync(temporaryPath, normalizedPath);
+    renameReplaceSync(temporaryPath, normalizedPath, { renameSync: fsImpl.renameSync.bind(fsImpl) });
   } catch (error) {
-    if (descriptor !== undefined) fsImpl.closeSync(descriptor);
+    if (descriptor !== undefined) {
+      try { fsImpl.closeSync(descriptor); } catch {}
+    }
     try {
       fsImpl.unlinkSync(temporaryPath);
     } catch {
@@ -539,6 +561,7 @@ export function parseArguments(argv) {
     napcatRoot: resolveOptionalPath(values["napcat-root"]),
     qqExePath: resolveOptionalPath(values["qq-exe-path"]),
     qqUserDataDir: resolveOptionalPath(values["qq-user-data-dir"]),
+    accountStateDir: resolveOptionalPath(values["account-state-dir"]),
     once: values.once === true,
   };
 }
@@ -572,41 +595,101 @@ function execFilePromise(executable, args, options = {}) {
   });
 }
 
+function stripEnvironmentKeys(environment, keys) {
+  const blocked = new Set(keys.map((key) => key.toLowerCase()));
+  const copy = { ...environment };
+  for (const key of Object.keys(copy)) {
+    if (blocked.has(key.toLowerCase())) delete copy[key];
+  }
+  return copy;
+}
+
+function firstNonEmptyString(...values) {
+  for (const value of values) {
+    if (value !== undefined && value !== null && String(value).trim() !== "") {
+      return String(value).trim();
+    }
+  }
+  return null;
+}
+
+function resolveConfiguredPowerShell(env = process.env, explicitPath = null, { includeOfflineGuardEnv = true } = {}) {
+  const sourceEnv = env && typeof env === "object" ? env : process.env;
+  const candidate = firstNonEmptyString(
+    explicitPath,
+    includeOfflineGuardEnv ? sourceEnv.NAPCAT_OFFLINE_GUARD_POWERSHELL_PATH : null,
+    sourceEnv.NAPCAT_POWERSHELL_PATH,
+  );
+  if (!candidate) {
+    const native = windowsPowerShellEnvironment(sourceEnv);
+    return {
+      ...native,
+      environment: stripEnvironmentKeys(native.environment, ["PSExecutionPolicyPreference"]),
+      isPowerShell7: false,
+    };
+  }
+  const basename = path.win32.basename(candidate).toLowerCase();
+  if (!path.win32.isAbsolute(candidate) || (basename !== "pwsh.exe" && basename !== "powershell.exe")) {
+    throw Object.assign(new Error("NAPCAT_OFFLINE_GUARD_CONFIGURATION_INVALID"), {
+      code: "NAPCAT_OFFLINE_GUARD_CONFIGURATION_INVALID",
+    });
+  }
+  if (basename === "pwsh.exe") {
+    return {
+      executable: candidate,
+      environment: stripEnvironmentKeys(sourceEnv, ["PSModulePath", "PSExecutionPolicyPreference"]),
+      isPowerShell7: true,
+    };
+  }
+  const native = windowsPowerShellEnvironment(sourceEnv);
+  return {
+    executable: candidate,
+    environment: stripEnvironmentKeys(native.environment, ["PSExecutionPolicyPreference"]),
+    isPowerShell7: false,
+  };
+}
+
+function powerShellExecutionPolicyArgs(resolved) {
+  return resolved?.isPowerShell7 ? [] : ["-ExecutionPolicy", "Bypass"];
+}
+
 export async function invokePowerShellScript(scriptPath, scriptArguments = [], options = {}) {
-  const native = windowsPowerShellEnvironment(options.env ?? process.env);
+  const resolved = resolveConfiguredPowerShell(options.env ?? process.env, options.powershellPath ?? null, {
+    includeOfflineGuardEnv: false,
+  });
   const normalizedScriptPath = resolveRequiredPath(scriptPath, "PowerShell 脚本");
   const argumentsList = [
     "-NoProfile",
     "-NonInteractive",
-    "-ExecutionPolicy",
-    "Bypass",
+    ...powerShellExecutionPolicyArgs(resolved),
     "-WindowStyle",
     "Hidden",
     "-File",
     normalizedScriptPath,
     ...scriptArguments.map((value) => String(value)),
   ];
-  return execFilePromise(options.powershellPath ?? native.executable, argumentsList, {
+  return execFilePromise(resolved.executable, argumentsList, {
     ...options,
-    env: options.powershellPath ? options.env : native.environment,
+    env: resolved.environment,
   });
 }
 
 export async function invokePowerShellCommand(command, options = {}) {
-  const native = windowsPowerShellEnvironment(options.env ?? process.env);
+  const resolved = resolveConfiguredPowerShell(options.env ?? process.env, options.powershellPath ?? null, {
+    includeOfflineGuardEnv: false,
+  });
   const argumentsList = [
     "-NoProfile",
     "-NonInteractive",
-    "-ExecutionPolicy",
-    "Bypass",
+    ...powerShellExecutionPolicyArgs(resolved),
     "-WindowStyle",
     "Hidden",
     "-Command",
     "[Console]::OutputEncoding = New-Object Text.UTF8Encoding($false); " + String(command),
   ];
-  const result = await execFilePromise(options.powershellPath ?? native.executable, argumentsList, {
+  const result = await execFilePromise(resolved.executable, argumentsList, {
     ...options,
-    env: options.powershellPath ? options.env : native.environment,
+    env: resolved.environment,
   });
   return { ...result, value: parseJsonOutput(result.stdout) };
 }
@@ -901,7 +984,11 @@ export async function checkNapCatProcesses(options = {}) {
     error.code = "NAPCAT_PROCESS_SCAN_UNKNOWN";
     throw error;
   }
-  return processCheckResult(classification.owned);
+  return {
+    ...processCheckResult(classification.owned),
+    recoveryRoot: ownedQqRoot(classification.owned),
+    staleLaunchRoot: ownedStaleLaunchRoot(classification.owned),
+  };
 }
 
 export async function checkCodexProcesses(options = {}) {
@@ -943,7 +1030,7 @@ export function normalizeNapCatStatus(value) {
   const accountMatches = normalizeBoolean(value?.accountMatches)
     ?? (value?.identityError ? false : value?.identity ? true : readySignal === true ? true : null);
   const reachable = value?.reachable !== false;
-  const known = value?.known !== false && !value?.error && onlineSignal !== null;
+  const known = value?.known !== false && onlineSignal !== null && (!value?.error || (reachable && runtimeOnline !== null));
   const readyAllowed = readySignal !== false && runtimeGood !== false;
   return {
     known,
@@ -1030,6 +1117,8 @@ export function normalizeProcessCheck(value) {
     present: present === true,
     count: Number.isSafeInteger(Number(value?.count)) ? Number(value.count) : (present ? 1 : 0),
     processes: Array.isArray(value?.processes) ? value.processes : [],
+    recoveryRoot: value?.recoveryRoot ?? (Array.isArray(value?.processes) ? ownedQqRoot(value.processes) : null),
+    staleLaunchRoot: value?.staleLaunchRoot ?? (Array.isArray(value?.processes) ? ownedStaleLaunchRoot(value.processes) : null),
     error: value?.error ?? null,
   };
 }
@@ -1157,10 +1246,123 @@ export function createSupervisorDependencies(options = {}) {
     napcatRoot: resolveOptionalPath(options.napcatRoot ?? options["napcat-root"]),
     qqExePath: resolveOptionalPath(options.qqExePath ?? options["qq-exe-path"]),
     qqUserDataDir: resolveOptionalPath(options.qqUserDataDir ?? options["qq-user-data-dir"]),
+    accountStateDir: resolveOptionalPath(options.accountStateDir ?? privateEnvironment.NAPCAT_ACCOUNT_STATE_DIR),
     notifier,
     registry,
     routerController,
   };
+}
+
+function offlineGuardDeferred(reason) {
+  return { status: "deferred", changed: false, reason, nativeQuickLoginVerified: false };
+}
+
+export async function invokeOfflineRecoveryGuard(request, {
+  scriptPath, timeoutMs, env = process.env, exec = execFile, beforeDispatch, powershellPath = null,
+} = {}) {
+  if (!path.isAbsolute(scriptPath ?? "") || !Number.isSafeInteger(timeoutMs) || timeoutMs < 1000) {
+    throw Object.assign(new Error("NAPCAT_OFFLINE_GUARD_CONFIGURATION_INVALID"), {
+      code: "NAPCAT_OFFLINE_GUARD_CONFIGURATION_INVALID",
+    });
+  }
+  const resolved = resolveConfiguredPowerShell(env, powershellPath);
+  const guardedDispatch = typeof beforeDispatch === "function";
+  const args = ["-NoLogo", "-NoProfile", "-NonInteractive", ...powerShellExecutionPolicyArgs(resolved), "-File", scriptPath];
+  const readyLine = "NAPCAT_OFFLINE_GUARD_READY_V1";
+  const encoded = JSON.stringify(request);
+  if (guardedDispatch) args.push("-AwaitDurableCommit");
+  return new Promise((resolve, reject) => {
+    let submitted = !guardedDispatch;
+    let closed = !guardedDispatch;
+    let buffered = "";
+    let failedBeforeDispatch;
+    let startupTimer;
+    let deferredReason = "offline_guard_startup_unavailable";
+    const closeReadiness = () => {
+      closed = true;
+      if (startupTimer) clearTimeout(startupTimer);
+    };
+    const unknown = () => reject(Object.assign(new Error("NAPCAT_OFFLINE_GUARD_OUTCOME_UNKNOWN"),
+      { code: "NAPCAT_OFFLINE_GUARD_OUTCOME_UNKNOWN", outcomeUnknown: true }));
+    const child = exec(resolved.executable, args,
+      { timeout: timeoutMs, windowsHide: true, encoding: "utf8", env: resolved.environment, maxBuffer: 64 * 1024 }, (error, output) => {
+        closeReadiness();
+        if (failedBeforeDispatch) return reject(failedBeforeDispatch);
+        if (!submitted) return resolve(offlineGuardDeferred(deferredReason));
+        if (error) return unknown();
+        try {
+          let body = output.replace(/^\uFEFF/u, "");
+          if (guardedDispatch) {
+            const firstLineEnd = body.indexOf("\n");
+            if (firstLineEnd < 0 || body.slice(0, firstLineEnd).replace(/\r$/u, "") !== readyLine) return unknown();
+            body = body.slice(firstLineEnd + 1);
+          }
+          const value = JSON.parse(body);
+          if (!["recovered", "stopped", "started", "deferred", "needs-manual", "unknown"].includes(value?.status)
+            || !(typeof value.changed === "boolean" || value.changed === undefined && ["unknown", "needs-manual"].includes(value.status))
+            || (["recovered", "stopped", "started"].includes(value.status) && value.changed !== true)
+            || (value.status === "deferred" && value.changed !== false)
+            || typeof value.reason !== "string" || !/^[a-z0-9_-]{1,64}$/iu.test(value.reason)) {
+            return unknown();
+          }
+          resolve({ status: value.status, changed: value.changed ?? null, reason: value.reason,
+            nativeQuickLoginVerified: value.nativeQuickLoginVerified === true,
+            ...(value.cleanupFailed === true ? { cleanupFailed: true } : {}) });
+        } catch { unknown(); }
+      });
+    if (!child?.stdin) {
+      if (guardedDispatch) return resolve(offlineGuardDeferred(deferredReason));
+      return unknown();
+    }
+    child.stdin.on("error", () => {
+      closeReadiness();
+      if (submitted) unknown();
+    });
+    const submit = () => {
+      submitted = true;
+      try { child.stdin.end(encoded); } catch { unknown(); }
+    };
+    if (!guardedDispatch) { submit(); return; }
+    const finishWithoutDispatch = () => {
+      closeReadiness();
+      try { child.stdin.end(); } catch {}
+    };
+    if (!child.stdout) { finishWithoutDispatch(); return; }
+    child.stdout.on("data", chunk => {
+      if (closed) return;
+      buffered += chunk;
+      const end = buffered.indexOf("\n");
+      if (end < 0 && buffered.length <= 128) return;
+      const header = buffered.slice(0, end).replace(/^\uFEFF|\r$/gu, "");
+      if (header !== readyLine || end !== buffered.length - 1 || child.stdin.destroyed || child.stdin.writableEnded) {
+        finishWithoutDispatch();
+        return;
+      }
+      closeReadiness();
+      try {
+        if (beforeDispatch() !== true) {
+          deferredReason = "maintenance_active";
+          finishWithoutDispatch();
+          return;
+        }
+      } catch (error) {
+        failedBeforeDispatch = error;
+        finishWithoutDispatch();
+        return;
+      }
+      if (child.stdin.destroyed || child.stdin.writableEnded) { finishWithoutDispatch(); return; }
+      submit();
+    });
+    if (!closed) {
+      startupTimer = setTimeout(() => {
+        if (closed) return;
+        deferredReason = "offline_guard_startup_timeout";
+        finishWithoutDispatch();
+        try { child.kill(); } catch {}
+      }, Math.min(OFFLINE_GUARD_STARTUP_TIMEOUT_MS, timeoutMs));
+      startupTimer.unref();
+    }
+  });
 }
 
 function installSignalHandlers(processObject, requestStop) {
@@ -1374,6 +1576,193 @@ export async function runSupervisorService(options = {}) {
     };
   }
   const previousRuntime = readJsonObject(runtimeStatePath, fsImpl);
+  const windowsOfflineRecovery = options.useWindowsOfflineGuard === true;
+  const accountStateDir = options.accountStateDir ?? dependencies.accountStateDir ?? null;
+  const powerShellExecutionEnv = options.env ?? dependencies.environment ?? process.env;
+  const configuredPowerShell = firstNonEmptyString(
+    options.powershellPath,
+    dependencies.privateEnvironment?.NAPCAT_POWERSHELL_PATH,
+    powerShellExecutionEnv?.NAPCAT_POWERSHELL_PATH,
+  );
+  const configuredGuardPowerShell = firstNonEmptyString(
+    options.offlineGuardPowerShellPath,
+    options.powershellPath,
+    dependencies.privateEnvironment?.NAPCAT_OFFLINE_GUARD_POWERSHELL_PATH,
+    dependencies.privateEnvironment?.NAPCAT_POWERSHELL_PATH,
+    powerShellExecutionEnv?.NAPCAT_OFFLINE_GUARD_POWERSHELL_PATH,
+    powerShellExecutionEnv?.NAPCAT_POWERSHELL_PATH,
+  );
+  const nativeGuard = windowsOfflineRecovery && accountStateDir !== null && accountStateDir !== ""
+    ? (request, timeoutMs, beforeDispatch) => invokeOfflineRecoveryGuard(request, {
+      scriptPath: path.join(dependencies.codeRoot, "ops", "invoke-napcat-offline-recovery.ps1"),
+      timeoutMs,
+      env: powerShellExecutionEnv,
+      powershellPath: configuredGuardPowerShell,
+      beforeDispatch,
+    }) : null;
+  const offlineGuard = options.offlineRecoveryGuard ?? nativeGuard;
+  let nativeGuardStartupUnavailable = false;
+  let nativeGuardStartupTimeouts = 0;
+  let nativeGuardStartupRetryAt = 0;
+  const offlineBarrierPath = path.join(path.dirname(runtimeStatePath), "napcat-offline-recovery.json");
+  let offlineRecovery = offlineGuard || windowsOfflineRecovery ? readOfflineRecoveryBarrier(offlineBarrierPath, fsImpl) : undefined;
+  let offlineRecoveryWriteUncertain = offlineRecovery === null;
+  const reachableOfflineGraceMs = offlineGuard ? normalizePositiveInteger(
+    options.staleNapCatReachableOfflineMs ?? dependencies.privateEnvironment?.NAPCAT_REACHABLE_OFFLINE_GRACE_MS,
+    "staleNapCatReachableOfflineMs", DEFAULT_REACHABLE_OFFLINE_GRACE_MS,
+  ) : DEFAULT_REACHABLE_OFFLINE_GRACE_MS;
+  const guardPaths = {
+    dataRoot: dependencies.rootDir,
+    accountStateDir,
+    legacyStartupSha256: options.legacyStartupSha256 ?? dependencies.privateEnvironment?.NAPCAT_REGISTERED_LEGACY_STARTUP_SHA256 ?? null,
+    qqUserDataDir: options.qqUserDataDir ?? dependencies.qqUserDataDir,
+    napcatRoot: options.napcatRoot ?? dependencies.napcatRoot,
+    qqExePath: options.qqExePath ?? dependencies.qqExePath,
+    brokerRoot: dependencies.brokerRoot,
+    bindingPath,
+    privateEnvPath,
+    loginScriptPath: options.loginScriptPath ?? dependencies.loginScriptPath,
+    maintenancePath: automationMaintenancePath,
+  };
+  const runRecoveryGuard = async (action, processes, root, timeBudget, quickLoginProof, beforeDispatch) => {
+    const request = {
+      schema: "napcat.offline-recovery-request/v1", action, paths: guardPaths,
+      root: root ? { pid: root.pid, creationDate: root.creationDate } : null,
+      processes: normalizeProcessRecords(processes).map(record => ({
+        pid: processId(record),
+        identityKey: record.identityKey ?? processIdentityKey(record),
+      })),
+      quickLoginProof, deadlineAt: Date.now() + timeBudget,
+      timeoutSeconds: Math.min(900, Math.max(30, Math.ceil(loginTimeoutMs / 1000))),
+    };
+    const prepareDispatch = () => {
+      try { return beforeDispatch(); }
+      catch (error) {
+        if (error && typeof error === "object") error.guardDispatchStarted = false;
+        throw error;
+      }
+    };
+    if (nativeGuardStartupUnavailable) return offlineGuardDeferred("offline_guard_startup_unavailable");
+    if (nowMs(clock) < nativeGuardStartupRetryAt) {
+      return offlineGuardDeferred(
+        nativeGuardStartupTimeouts >= 2 ? "offline_guard_startup_timeout_exhausted" : "offline_guard_startup_timeout",
+      );
+    }
+    let result;
+    if (offlineGuard !== nativeGuard) {
+      if (prepareDispatch() !== true) return offlineGuardDeferred("maintenance_active");
+      result = await offlineGuard(request, timeBudget + 12_000);
+    } else {
+      result = await nativeGuard(request, timeBudget + 12_000, prepareDispatch);
+    }
+    if (result?.reason === "offline_guard_startup_unavailable") {
+      nativeGuardStartupUnavailable = true;
+    } else if (result?.reason === "offline_guard_startup_timeout") {
+      nativeGuardStartupTimeouts += 1;
+      if (nativeGuardStartupTimeouts >= 2) {
+        nativeGuardStartupRetryAt = nowMs(clock) + OFFLINE_GUARD_STARTUP_EXHAUSTED_RETRY_MS;
+        return offlineGuardDeferred("offline_guard_startup_timeout_exhausted");
+      }
+      nativeGuardStartupRetryAt = nowMs(clock) + OFFLINE_GUARD_STARTUP_RETRY_MS;
+    } else {
+      nativeGuardStartupTimeouts = 0;
+      nativeGuardStartupRetryAt = 0;
+    }
+    return result;
+  };
+  const commitOfflineRecovery = next => {
+    try {
+      offlineRecovery = writeOfflineRecoveryBarrier(offlineBarrierPath, next, fsImpl);
+    } catch (error) {
+      offlineRecoveryWriteUncertain = true;
+      throw error;
+    }
+  };
+  const reserveRecoveryMutation = next => {
+    const before = offlineRecovery;
+    const previousStatus = status;
+    commitOfflineRecovery(next);
+    let runtimeReplaced = false;
+    try {
+      persist({ login: {
+        ...status.login,
+        blocked: true,
+        blockedAt: nowIso(clock),
+        blockedReason: { code: "NAPCAT_MANUAL_LOGIN_REQUIRED", message: "上一次恢复仍待核实" },
+      } });
+      runtimeReplaced = true;
+      const writtenLogin = readJsonObject(runtimeStatePath, fsImpl).login;
+      if (writtenLogin?.blocked !== true || writtenLogin.blockedAt !== status.login.blockedAt
+        || writtenLogin.blockedReason?.code !== status.login.blockedReason.code) {
+        throw Object.assign(new Error("NAPCAT_OFFLINE_RECOVERY_RESERVATION_UNVERIFIED"),
+          { code: "NAPCAT_OFFLINE_RECOVERY_RESERVATION_UNVERIFIED" });
+      }
+    } catch (error) {
+      status = previousStatus;
+      try {
+        if (runtimeReplaced) atomicWriteJson(runtimeStatePath, previousStatus, { fsImpl, pid, now: clock });
+        commitOfflineRecovery(before);
+      } catch {
+        offlineRecoveryWriteUncertain = true;
+        error.recoveryReservationRestoreUnverified = true;
+      }
+      throw error;
+    }
+  };
+  const restoreRecoveryMutation = before => {
+    try {
+      persist({ login: {
+        ...status.login, blocked: loginBlocked, blockedAt: loginBlockedAt, blockedReason: loginBlockedReason,
+      } });
+      commitOfflineRecovery(before);
+    } catch (error) {
+      offlineRecoveryWriteUncertain = true;
+      error.recoveryReservationRestoreUnverified = true;
+      throw error;
+    }
+  };
+  const runLegacyGuardedRecovery = async (action, processes, root, timeBudget) => {
+    const before = offlineRecovery;
+    if (!before || before.needsManual || offlineRecoveryWriteUncertain) throw new Error("NAPCAT_OFFLINE_GUARD_UNAVAILABLE");
+    let reserved = false;
+    const outcome = await runRecoveryGuard(action, processes, root, timeBudget, null, () => {
+      if (detectStop()) return false;
+      reserveRecoveryMutation({ ...before, needsManual: true, rearmed: false });
+      reserved = true;
+      return true;
+    });
+    if (reserved && (outcome.status === "deferred" && outcome.changed === false
+      || outcome.changed === true && outcome.status === (action === "quick-login" ? "started" : "stopped"))) {
+      restoreRecoveryMutation(before);
+    }
+    return outcome;
+  };
+  const checkNativeQuickLogin = options.checkNativeQuickLogin ?? (now => nativeQuickLoginEvidence(guardPaths, now, fsImpl));
+  const offlineNoticeConfig = dependencies.privateEnvironment?.NAPCAT_OFFLINE_INTERACTIVE_CONFIG;
+  const noticeExplicitlyDisabled = () => typeof offlineNoticeConfig === "string" && path.isAbsolute(offlineNoticeConfig)
+    && readJsonObject(offlineNoticeConfig, fsImpl).offlineNoticeEnabled === false;
+  const showOfflineNotice = options.showOfflineDesktopNotice ?? (windowsOfflineRecovery
+    && typeof offlineNoticeConfig === "string" && path.isAbsolute(offlineNoticeConfig)
+    ? async incidentKey => {
+      const resolved = resolveConfiguredPowerShell(powerShellExecutionEnv, configuredGuardPowerShell);
+      const script = path.join(dependencies.codeRoot, "ops", "show-napcat-offline-notice.ps1");
+      const { stdout } = await execFilePromise(resolved.executable, ["-NoLogo", "-NoProfile", "-NonInteractive",
+        ...powerShellExecutionPolicyArgs(resolved), "-File", script,
+        "-ConfigPath", offlineNoticeConfig, "-IncidentKey", incidentKey], {
+        env: resolved.environment,
+        timeoutMs: 18_000,
+        ...(options.execFileImpl ? { execFileImpl: options.execFileImpl } : {}),
+      });
+      return JSON.parse(stdout.trim()).status;
+    } : null);
+  const rememberGuardedLogin = (before, guarded) => {
+    if (guarded?.nativeQuickLoginVerified !== true || guarded.changed !== true || !["started", "recovered"].includes(guarded.status)) {
+      return false;
+    }
+    try {
+      return retainVerifiedNativeLogin({ paths: guardPaths, before, now: nowMs(clock), confirmed: true }, fsImpl);
+    } catch { return false; }
+  };
   const previousLogin = previousRuntime.login && typeof previousRuntime.login === "object"
     ? previousRuntime.login
     : {};
@@ -1455,7 +1844,7 @@ export async function runSupervisorService(options = {}) {
   let cycleCount = 0;
   let loginLastAttemptAt = previousLogin.lastAttemptAt ?? null;
   let loginNextAllowedAt = previousLogin.nextAllowedAt ?? null;
-  let loginBlocked = previousLogin.blocked === true;
+  let loginBlocked = previousLogin.blocked === true || offlineRecovery?.needsManual === true || offlineRecovery === null;
   let loginBlockedAt = previousLogin.blockedAt ?? null;
   let loginBlockedReason = previousLogin.blockedReason ?? null;
   let manualBlockRecheckLastAttemptAt = previousLogin.manualBlockRecheckLastAttemptAt ?? null;
@@ -1513,6 +1902,8 @@ export async function runSupervisorService(options = {}) {
       ? (input) => runQuickLogin({
         ...input,
         ...options,
+        env: powerShellExecutionEnv,
+        ...(configuredPowerShell ? { powershellPath: configuredPowerShell } : {}),
         loginScriptPath: options.loginScriptPath ?? dependencies.loginScriptPath,
         napcatRoot: options.napcatRoot ?? dependencies.napcatRoot,
         qqExePath: options.qqExePath ?? dependencies.qqExePath,
@@ -1528,6 +1919,8 @@ export async function runSupervisorService(options = {}) {
       ? (input) => runBrokerStart({
         ...input,
         ...options,
+        env: powerShellExecutionEnv,
+        ...(configuredPowerShell ? { powershellPath: configuredPowerShell } : {}),
         brokerStartScriptPath: options.brokerStartScriptPath ?? dependencies.brokerStartScriptPath,
         timeoutMs: probeTimeoutMs,
       })
@@ -1542,10 +1935,17 @@ export async function runSupervisorService(options = {}) {
   let processSnapshotPromise = null;
   const getProcessSnapshot = async () => {
     if (!processSnapshotPromise) {
-      processSnapshotPromise = (options.listProcesses ?? listWindowsProcesses)({
-        ...options,
-        timeoutMs: probeTimeoutMs,
-      });
+      processSnapshotPromise = options.listProcesses
+        ? options.listProcesses({
+          ...options,
+          timeoutMs: probeTimeoutMs,
+        })
+        : listWindowsProcesses({
+          ...options,
+          env: powerShellExecutionEnv,
+          ...(configuredPowerShell ? { powershellPath: configuredPowerShell } : {}),
+          timeoutMs: probeTimeoutMs,
+        });
     }
     return processSnapshotPromise;
   };
@@ -1561,6 +1961,8 @@ export async function runSupervisorService(options = {}) {
   const stopNapCatProcessTrees = options.stopNapCatProcesses
     ?? ((input) => stopWindowsProcessTrees(input.processes, {
       ...options,
+      env: powerShellExecutionEnv,
+      ...(configuredPowerShell ? { powershellPath: configuredPowerShell } : {}),
       napcatRoot: options.napcatRoot ?? dependencies.napcatRoot,
       qqExePath: options.qqExePath ?? dependencies.qqExePath,
       currentPid: pid,
@@ -1600,6 +2002,10 @@ export async function runSupervisorService(options = {}) {
         { known: false, reachable: false, online: false, accountMatches: false },
       ));
       if (napcat.error) errors.push({ source: "napcat", error: napcat.error });
+      if (napcat.ready && napcat.online) {
+        nativeGuardStartupTimeouts = 0;
+        nativeGuardStartupRetryAt = 0;
+      }
 
       const napcatRuntime = normalizeNapCatRuntime(await capture(
         checkRuntime,
@@ -1759,6 +2165,87 @@ export async function runSupervisorService(options = {}) {
         ? Math.max(0, nowMs(clock) - parsedUnknownProcessSince)
         : 0;
       const reachableOfflineProcessKnown = offlineProcessKnown && napcat.reachable === true;
+      const recoveryNow = nowMs(clock);
+      const recoveryRoot = reachableOfflineProcessKnown ? napcatProcess.recoveryRoot : null;
+      let reachableRecoveryReason = offlineRecoveryWriteUncertain ? "recovery_state_write_refused" : null;
+      let reachableRecoveryRan = false;
+      if (offlineRecovery && !offlineRecoveryWriteUncertain) {
+        const nextOffline = observeOfflineRecovery(offlineRecovery, { napcat, root: recoveryRoot, now: recoveryNow,
+          maxReadyGapMs: Math.max(120_000, 2 * scanIntervalMs) });
+        if (durableRecoveryChanged(offlineRecovery, nextOffline)) {
+          try { commitOfflineRecovery(nextOffline); }
+          catch { reachableRecoveryReason = "recovery_state_write_refused"; }
+        } else offlineRecovery = nextOffline;
+      }
+      if (offlineGuard && reachableOfflineProcessKnown && reachableRecoveryReason === null) {
+        reachableRecoveryReason = reachableOfflineDecision(offlineRecovery, recoveryNow, reachableOfflineGraceMs);
+        if (reachableRecoveryReason === "eligible" && !loginBlocked && napcatRuntime.known && napcatRuntime.ready
+          && cooldownReady(staleRecoveryLastAttemptAt, clock, staleNapCatRecoveryCooldownMs) && !detectStop()) {
+          try {
+            const quickProof = await checkNativeQuickLogin(recoveryNow);
+            if (!quickProof || typeof quickProof !== "object"
+              || (offlineRecovery.attemptAt !== null && !(quickProof.provedAt >= offlineRecovery.attemptAt))) {
+              commitOfflineRecovery({ ...offlineRecovery, needsManual: true, rearmed: false });
+              reachableRecoveryReason = "native_quick_login_not_verified";
+            } else {
+              const before = offlineRecovery;
+              const nativeInputs = snapshotNativeLoginInputs(guardPaths, fsImpl);
+              const guarded = await runRecoveryGuard("recover-reachable-offline", napcatProcess.processes, recoveryRoot,
+                loginTimeoutMs + 40_000, quickProof, () => {
+                  if (detectStop()) return false;
+                  reserveRecoveryMutation(reserveOfflineRecoveryAttempt(before, recoveryNow, reachableOfflineGraceMs));
+                  reachableRecoveryRan = true;
+                  staleRecoveryLastAttemptAt = checkAt;
+                  staleRecoveryNextAllowedAt = nextTimeIso(clock, staleNapCatRecoveryCooldownMs);
+                  return true;
+                });
+              if (reachableRecoveryRan && guarded.status === "deferred" && guarded.changed === false) restoreRecoveryMutation(before);
+              reachableRecoveryReason = guarded.reason;
+              actions.staleNapCatRecovery = { attempted: guarded.changed || guarded.status !== "deferred",
+                succeeded: guarded.status === "recovered", trigger: "reachable_offline", reason: guarded.reason };
+              if (guarded.status === "unknown") actions.staleNapCatRecovery.outcomeUnknown = true;
+              if (guarded.cleanupFailed) actions.staleNapCatRecovery.cleanupFailed = true;
+              if (rememberGuardedLogin(nativeInputs, guarded)) actions.staleNapCatRecovery.nativeQuickLoginEvidenceUpdated = true;
+              if (guarded.status === "recovered") {
+                staleRecoveryCount += 1;
+                try {
+                  commitOfflineRecovery({ ...offlineRecovery, needsManual: false, manualAfterVerifiedStopAt: null });
+                } catch {
+                  reachableRecoveryReason = "recovery_state_write_refused";
+                  actions.staleNapCatRecovery.stateWriteRefused = true;
+                }
+              } else if (guarded.status === "needs-manual" && guarded.changed === true) {
+                try {
+                  commitOfflineRecovery({ ...offlineRecovery, manualAfterVerifiedStopAt: nowMs(clock) });
+                } catch {
+                  reachableRecoveryReason = "recovery_state_write_refused";
+                  actions.staleNapCatRecovery.stateWriteRefused = true;
+                }
+              }
+            }
+          } catch (error) {
+            const reservationRestoreUnverified = error?.recoveryReservationRestoreUnverified === true;
+            reachableRecoveryReason = reachableRecoveryRan && !reservationRestoreUnverified
+              ? "recovery_outcome_unknown" : "recovery_state_write_refused";
+            if (reachableRecoveryRan || reservationRestoreUnverified) actions.staleNapCatRecovery = {
+              attempted: reachableRecoveryRan, succeeded: false, trigger: "reachable_offline", reason: reachableRecoveryReason,
+              ...(reservationRestoreUnverified ? { reservationRestoreUnverified: true } : { outcomeUnknown: true }),
+            };
+          }
+        } else if (reachableRecoveryReason === "eligible") {
+          reachableRecoveryReason = loginBlocked ? "manual_login_required" : "runtime_or_recovery_cooldown";
+        } else if (reachableRecoveryReason === "reachable_offline_recovery_embargo") {
+          try { commitOfflineRecovery({ ...offlineRecovery, needsManual: true, rearmed: false }); }
+          catch { reachableRecoveryReason = "recovery_state_write_refused"; }
+        }
+        if (offlineRecovery?.needsManual || offlineRecoveryWriteUncertain) {
+          loginBlocked = true;
+          loginBlockedAt ??= checkAt;
+          loginBlockedReason ??= { code: "NAPCAT_MANUAL_LOGIN_REQUIRED", message: "恢复状态待人工扫码确认" };
+        }
+      } else if (windowsOfflineRecovery && !offlineGuard && reachableOfflineProcessKnown && reachableRecoveryReason === null) {
+        reachableRecoveryReason = "reachable_offline_guard_not_configured";
+      }
       const restartableOfflineProcessKnown = offlineProcessKnown && napcat.reachable !== true;
       const staleProcessTrigger = restartableOfflineProcessKnown && offlineProcessDurationMs >= staleNapCatOfflineMs
         ? "explicit_offline"
@@ -1773,39 +2260,61 @@ export async function runSupervisorService(options = {}) {
       const manualBlockRecheckDue = false;
       if (
         staleProcessTrigger
-        && (!loginBlocked || manualBlockRecheckDue)
+        && (!loginBlocked || manualBlockRecheckDue) && !offlineRecoveryWriteUncertain
         && cooldownReady(staleRecoveryLastAttemptAt, clock, staleNapCatRecoveryCooldownMs)
+        && !detectStop()
       ) {
         staleRecoveryLastAttemptAt = checkAt;
         staleRecoveryNextAllowedAt = nextTimeIso(clock, staleNapCatRecoveryCooldownMs);
         try {
-          const stopped = await stopNapCatProcessTrees({
+          const stopped = offlineGuard ? await runLegacyGuardedRecovery("stop-stale-offline",
+            napcatProcess.processes, napcatProcess.staleLaunchRoot, 30_000) : await stopNapCatProcessTrees({
             processes: napcatProcess.processes,
             napcatRoot: options.napcatRoot ?? dependencies.napcatRoot,
             qqExePath: options.qqExePath ?? dependencies.qqExePath,
             startedAt: checkAt,
           });
-          staleRecoveryCount += 1;
-          staleRecoveryLastResult = "stopped";
-          offlineProcessSince = null;
-          offlineProcessFingerprint = null;
-          unknownProcessSince = null;
-          unknownProcessFingerprint = null;
-          staleProcessRecovered = true;
-          actions.staleNapCatRecovery = {
-            attempted: true,
-            succeeded: true,
-            trigger: staleProcessTrigger,
-            manualBlockRecheck: manualBlockRecheckDue,
-            stoppedProcessIds: stopped.rootProcessIds ?? [],
-          };
+          if (offlineGuard && stopped.status === "deferred" && stopped.changed === false) {
+            staleRecoveryLastResult = stopped.reason;
+            actions.staleNapCatRecovery = {
+              attempted: false, succeeded: false, trigger: staleProcessTrigger, reason: stopped.reason,
+              ...(stopped.cleanupFailed ? { cleanupFailed: true } : {}),
+            };
+          } else if (offlineGuard && stopped.status !== "stopped") {
+            const skipped = new Error(stopped.reason);
+            skipped.code = stopped.reason;
+            skipped.outcomeUnknown = stopped.status === "unknown";
+            throw skipped;
+          } else {
+            staleRecoveryCount += 1;
+            staleRecoveryLastResult = "stopped";
+            offlineProcessSince = null;
+            offlineProcessFingerprint = null;
+            unknownProcessSince = null;
+            unknownProcessFingerprint = null;
+            staleProcessRecovered = true;
+            actions.staleNapCatRecovery = {
+              attempted: true,
+              succeeded: true,
+              trigger: staleProcessTrigger,
+              manualBlockRecheck: manualBlockRecheckDue,
+              stoppedProcessIds: stopped.rootProcessIds ?? [],
+              ...(stopped?.cleanupFailed ? { cleanupFailed: true } : {}),
+            };
+          }
         } catch (error) {
           const value = actionError(error);
           staleRecoveryLastResult = value;
-          actions.staleNapCatRecovery = { attempted: true, succeeded: false, error: value };
+          actions.staleNapCatRecovery = { attempted: error?.guardDispatchStarted !== false, succeeded: false, error: value };
+          if (error?.recoveryReservationRestoreUnverified) actions.staleNapCatRecovery.reservationRestoreUnverified = true;
           errors.push({ source: "stale_napcat_recovery", error: value });
+          if (offlineRecovery?.needsManual) {
+            loginBlocked = true;
+            loginBlockedAt = checkAt;
+            loginBlockedReason = { code: "NAPCAT_MANUAL_LOGIN_REQUIRED", message: "恢复状态待人工扫码确认" };
+          }
         }
-      } else if (offlineProcessKnown || unknownProcessKnown) {
+      } else if (!actions.staleNapCatRecovery && (offlineProcessKnown || unknownProcessKnown)) {
         const activeDurationMs = offlineProcessKnown ? offlineProcessDurationMs : unknownProcessDurationMs;
         const activeThresholdMs = offlineProcessKnown ? staleNapCatOfflineMs : staleNapCatUnknownMs;
         actions.staleNapCatRecovery = {
@@ -1813,7 +2322,8 @@ export async function runSupervisorService(options = {}) {
           trigger: reachableOfflineProcessKnown ? "reachable_offline" : (offlineProcessKnown ? "explicit_offline" : "status_unknown"),
           reason: loginBlocked
             ? "manual_login_required"
-            : (reachableOfflineProcessKnown ? "reachable_offline_preserved" : (activeDurationMs < activeThresholdMs ? "grace_period" : "cooldown")),
+            : (reachableOfflineProcessKnown ? reachableRecoveryReason ?? "reachable_offline_preserved"
+              : (activeDurationMs < activeThresholdMs ? "grace_period" : "cooldown")),
           reachableOfflinePreserved: reachableOfflineProcessKnown,
           offlineProcessSince,
           offlineProcessFingerprint,
@@ -1825,7 +2335,7 @@ export async function runSupervisorService(options = {}) {
       }
 
       const quickLoginEligible = Boolean(
-        !napcat.online
+        !napcat.online && !reachableRecoveryRan && !offlineRecoveryWriteUncertain
         && napcatRuntime.known
         && napcatRuntime.ready
         && napcatProcess.known
@@ -1850,6 +2360,7 @@ export async function runSupervisorService(options = {}) {
         quickLoginEligible
         && typeof runLogin === "function"
         && (staleProcessRecovered || cooldownReady(loginLastAttemptAt, clock, loginCooldownMs))
+        && !detectStop()
       ) {
         loginLastAttemptAt = checkAt;
         loginNextAllowedAt = nextTimeIso(clock, loginCooldownMs);
@@ -1859,7 +2370,8 @@ export async function runSupervisorService(options = {}) {
           manualBlockRecheckCount += 1;
         }
         try {
-          const loginResult = await runLogin({
+          const nativeInputs = offlineGuard ? snapshotNativeLoginInputs(guardPaths, fsImpl) : null;
+          const loginResult = offlineGuard ? await runLegacyGuardedRecovery("quick-login", [], null, loginTimeoutMs + 30_000) : await runLogin({
             loginScriptPath: options.loginScriptPath ?? dependencies.loginScriptPath,
             napcatRoot: options.napcatRoot ?? dependencies.napcatRoot,
             qqExePath: options.qqExePath ?? dependencies.qqExePath,
@@ -1872,7 +2384,9 @@ export async function runSupervisorService(options = {}) {
             timeoutMs: loginTimeoutMs,
             hidden: true,
           });
-          if (requiresManualLogin(loginResult)) {
+          if (offlineGuard && loginResult.status === "deferred" && loginResult.changed === false) {
+            actions.quickLogin = { attempted: false, noQr: true, reason: loginResult.reason };
+          } else if (loginResult?.status === "needs-manual" || requiresManualLogin(loginResult)) {
             const value = { ...actionError(loginResult), code: "NAPCAT_MANUAL_LOGIN_REQUIRED" };
             loginBlocked = true;
             loginBlockedAt = checkAt;
@@ -1881,20 +2395,31 @@ export async function runSupervisorService(options = {}) {
             actions.quickLogin = { attempted: true, succeeded: false, noQr: true, manualBlockRecheck: recheckManualLoginBlock, error: value };
             errors.push({ source: "quick_login", error: value });
             status.login = { lastAttemptAt: loginLastAttemptAt, nextAllowedAt: loginNextAllowedAt, lastResult: value };
+            if (offlineGuard && staleProcessRecovered && offlineRecovery?.needsManual) {
+              try { commitOfflineRecovery({ ...offlineRecovery, manualAfterVerifiedStopAt: nowMs(clock) }); } catch {}
+            }
+          } else if (offlineGuard && !["started", "recovered"].includes(loginResult.status)) {
+            const failure = new Error(loginResult.reason);
+            failure.code = "NAPCAT_OFFLINE_GUARD_OUTCOME_UNKNOWN";
+            failure.outcomeUnknown = true;
+            throw failure;
           } else {
             actions.quickLogin = { attempted: true, succeeded: true, noQr: true, manualBlockRecheck: recheckManualLoginBlock };
+            if (rememberGuardedLogin(nativeInputs, loginResult)) actions.quickLogin.nativeQuickLoginEvidenceUpdated = true;
             status.login = { lastAttemptAt: loginLastAttemptAt, nextAllowedAt: loginNextAllowedAt, lastResult: loginResult?.state ?? "started" };
           }
         } catch (error) {
           let value = actionError(error);
-          if (requiresManualLogin(error) || requiresManualLogin(value)) {
+          if (requiresManualLogin(error) || requiresManualLogin(value) || offlineRecovery?.needsManual) {
             value = { ...value, code: "NAPCAT_MANUAL_LOGIN_REQUIRED" };
             loginBlocked = true;
             loginBlockedAt = checkAt;
             loginBlockedReason = value;
             manualBlockRecheckNextAllowedAt = null;
           }
-          actions.quickLogin = { attempted: true, succeeded: false, noQr: true, manualBlockRecheck: recheckManualLoginBlock, error: value };
+          actions.quickLogin = { attempted: error?.guardDispatchStarted !== false, succeeded: false, noQr: true,
+            manualBlockRecheck: recheckManualLoginBlock, error: value };
+          if (error?.recoveryReservationRestoreUnverified) actions.quickLogin.reservationRestoreUnverified = true;
           errors.push({ source: "quick_login", error: value });
           status.login = { lastAttemptAt: loginLastAttemptAt, nextAllowedAt: loginNextAllowedAt, lastResult: value };
         }
@@ -2118,6 +2643,26 @@ export async function runSupervisorService(options = {}) {
         actions.taskRouter = { attempted: false, reason: "already_running" };
       }
 
+      if (offlineRecovery && offlineGuard && loginBlocked && !offlineRecovery.needsManual && !offlineRecoveryWriteUncertain) {
+        try { commitOfflineRecovery({ ...offlineRecovery, needsManual: true, rearmed: false }); } catch {}
+      }
+      let noticeAttempt = null;
+      const offlineForNotice = (napcat.known && napcat.reachable && napcat.online === false)
+        || (napcat.reachable === false && Number.isSafeInteger(offlineRecovery?.manualAfterVerifiedStopAt)
+          && offlineRecovery.manualAfterVerifiedStopAt <= nowMs(clock));
+      if (typeof showOfflineNotice === "function" && loginBlocked && offlineRecovery?.needsManual && offlineRecovery.noticeAt === null
+        && offlineRecovery.noticeAttemptAt === null && (offlineRecovery.noticeRetryAt ?? 0) <= nowMs(clock)
+        && !offlineRecoveryWriteUncertain && offlineForNotice
+        && actions.staleNapCatRecovery?.succeeded !== true
+        && canonicalMachineRole(readJsonObject(bindingPath, fsImpl).controlPlane?.localMachine) === "development"
+        && !noticeExplicitlyDisabled() && !detectStop()) {
+        try {
+          const noticeAttemptAt = nowMs(clock);
+          commitOfflineRecovery({ ...offlineRecovery, noticeAttemptAt, noticeRetryAt: null });
+          noticeAttempt = { at: noticeAttemptAt, incidentKey: `napcat-offline-${noticeAttemptAt}` };
+          actions.offlineNotice = { attempted: true, incidentKey: noticeAttempt.incidentKey };
+        } catch {}
+      }
       const checkSummary = {
         broker: summarizeCheck(broker),
         napcat: summarizeCheck(napcat),
@@ -2164,11 +2709,27 @@ export async function runSupervisorService(options = {}) {
         nextCheckAt: nextTimeIso(clock, scanIntervalMs),
         checks: checkSummary,
         actions,
+        ...(offlineRecovery ? { autoOfflineRecovery: offlineRecovery } : {}),
         openTaskCount,
         maintenance: maintenanceSummary,
         alert: alertSummary,
         lastError: cycleError,
       });
+      if (noticeAttempt) {
+        let disposition;
+        try { disposition = detectStop() ? "notice_disabled" : await showOfflineNotice(noticeAttempt.incidentKey); } catch {}
+        actions.offlineNotice.result = "outcome_unknown";
+        try {
+          if (disposition === "notice_returned") {
+            commitOfflineRecovery({ ...offlineRecovery, noticeAt: noticeAttempt.at, noticeAttemptAt: null, noticeRetryAt: null });
+            actions.offlineNotice.result = "shown";
+          } else if (["notice_disabled", "notice_offline_unverified"].includes(disposition)) {
+            commitOfflineRecovery({ ...offlineRecovery, noticeAttemptAt: null, noticeRetryAt: nowMs(clock) + 5 * 60_000 });
+            actions.offlineNotice.result = "not_shown";
+          }
+          persist({ actions, autoOfflineRecovery: offlineRecovery });
+        } catch {}
+      }
       appendLog(logPath, {
         at: checkAt,
         type: "supervisor_check",
@@ -2280,7 +2841,7 @@ export async function main(argv = process.argv.slice(2), dependencies = {}) {
 
 const currentFilePath = fileURLToPath(import.meta.url);
 if (process.argv[1] && path.resolve(process.argv[1]) === currentFilePath) {
-  main().then((result) => {
+  main(process.argv.slice(2), { useWindowsOfflineGuard: process.platform === "win32" }).then((result) => {
     if (result.state === "failed") process.exitCode = 1;
   }).catch((error) => {
     console.error(`[supervisor-runner] ${error?.message || String(error)}`);
