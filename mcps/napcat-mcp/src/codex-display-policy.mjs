@@ -269,6 +269,25 @@ export function createCodexDisplayPolicyManager(options = {}) {
     forgetReminder(registration) {
       if (registrations.get(registration?.key) === registration) registrations.delete(registration.key);
     },
+    readUnregisteredNativeInput(threadId, item) {
+      const text = reminderText(item);
+      return text !== null && !registrations.has(JSON.stringify([threadId, crypto.createHash("sha256").update(text, "utf8").digest("hex")]));
+    },
+    readSavedReminderProjection(threadId, turnId, item) {
+      const text = reminderText(item);
+      if (text === null) return undefined;
+      const key = itemKey(threadId, turnId, item.id);
+      const hash = crypto.createHash("sha256").update(text, "utf8").digest("hex");
+      const registration = registrations.get(JSON.stringify([threadId, hash]));
+      if (!registration || registration.ambiguous || registration.itemKey !== key
+        || (item.clientId != null && item.clientId !== registration.visibilityClientId)) return undefined;
+      const saved = decisions.get(key)?.decision;
+      if (registration.hidden) return null;
+      if (!saved) return undefined;
+      if (saved.visibility === "hidden") return null;
+      return Object.hasOwn(saved, "text") && saved.text !== text
+        ? { ...item, content: [{ ...item.content[0], text: saved.text }] } : item;
+    },
     prepareReminderBinding(registration) {
       const known = decisions.get(registration.itemKey);
       if (known) return known;

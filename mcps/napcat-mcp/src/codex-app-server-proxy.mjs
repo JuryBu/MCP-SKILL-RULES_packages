@@ -1,6 +1,7 @@
 import crypto from "node:crypto";
 import { createProxyLiveCodeRuntime } from "./proxy-live-code-runtime.mjs";
 import { createOuterRuntime } from "./outer-runtime.mjs";
+import { hashIdentity } from "./observability-utils.mjs";
 import { createOuterRuntimeHost } from "./outer-runtime-host.mjs";
 import { createRecoveryNotificationRouter } from "./model-recovery-notifications.mjs";
 import { CodexAppServerProxyError } from "./outer-runtime-contract.mjs";
@@ -14,6 +15,8 @@ import { createReasoningPlaceholderView } from "./reasoning-placeholder.mjs";
 import { createTurnLifecycleObserver } from "./turn-observability.mjs";
 import { createCodexDisplayPolicyManager, createCodexDisplayPolicyControl } from "./codex-display-policy.mjs";
 import { createCodexRequestMetadata } from "./codex-request-metadata.mjs";
+import { matchesHistoryDisplayRepair, createHistoryDisplayRepairView, desktopHistoryReadBudget } from "./codex-history-display-repair.mjs";
+import { manualWorkerExitControl } from "./manual-worker-exit-control.mjs";
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 30000;
 const FIRST_INJECTED_REQUEST_ID = -1_000_000_000;
@@ -110,14 +113,14 @@ function parseJsonMessage(data, maximumBytes = DEFAULT_MAX_JSON_PARSE_BYTES, byt
   }
 }
 
-function scanRpcEnvelope(data, maximumBytes) {
+function scanRpcEnvelope(data, maximumBytes, pendingReplyLimit) {
   const bytes = Buffer.isBuffer(data) ? data : Buffer.from(data);
   const fields = new Map();
   const envelopeFields = new Set(["id", "method", "result", "error", "params"]);
   const identityFields = new Map();
   const identityParents = new Set(["params", "params.turn", "result", "result.turn", "error"]);
   const identityPaths = new Set([
-    "params.threadId", "params.turnId", "params.turn.id", "params.turn.threadId", "params.turn.status",
+    "params.threadId", "params.turnId", "params.willRetry", "params.turn.id", "params.turn.threadId", "params.turn.status",
     "result.threadId", "result.turnId", "result.turn.id", "result.turn.threadId", "result.turn.status",
     "error.code", "error.message",
   ]);
@@ -260,6 +263,14 @@ function scanRpcEnvelope(data, maximumBytes) {
   if (bytes[offset++] !== 125) invalid();
   whitespace();
   if (offset !== bytes.length) invalid();
+  if (pendingReplyLimit && fields.has("id") && !fields.has("method")
+    && fields.has("result") !== fields.has("error")) {
+    const id = decode(fields.get("id"));
+    const limit = pendingReplyLimit(id);
+    if (limit !== undefined && bytes.length > limit) {
+      return { bytes, fields, message: { id, [fields.has("result") ? "result" : "error"]: {} }, replyLimitExceeded: limit };
+    }
+  }
   const message = {};
   for (const [key, range] of fields) {
     if (["id", "method"].includes(key) || range.end - range.start <= valueBudget) {
@@ -472,6 +483,36 @@ export function createWakeJournal(options = {}) {
   const filePath = requiredString(options.filePath, "filePath", 32768);
   const fsImpl = options.fsImpl ?? fs;
   const now = options.now ?? (() => new Date());
+  let cachedStatus = null;
+  let cachedStatusFingerprint = null;
+  let pendingVisibilityThreads = null;
+  let pendingCurrentEpochHidden = null;
+  let pendingHasAnyHiddenUnbound = false;
+
+  function statusFingerprint() {
+    if (!["openSync", "fstatSync", "closeSync"].every((method) => typeof fsImpl[method] === "function")) return null;
+    try {
+      const descriptor = fsImpl.openSync(filePath, "r");
+      try {
+        const stats = fsImpl.fstatSync(descriptor, { bigint: true });
+        const fields = [stats.dev, stats.ino, stats.mode, stats.size, stats.mtimeNs, stats.ctimeNs];
+        return fields.every((value) => typeof value === "bigint") ? fields.join(":") : null;
+      } finally {
+        fsImpl.closeSync(descriptor);
+      }
+    } catch (error) {
+      return error?.code === "ENOENT" ? "missing" : null;
+    }
+  }
+
+  function writeJournal(state) {
+    cachedStatus = null;
+    cachedStatusFingerprint = null;
+    pendingVisibilityThreads = null;
+    pendingCurrentEpochHidden = null;
+    pendingHasAnyHiddenUnbound = false;
+    atomicWriteJson(filePath, state, fsImpl);
+  }
 
   function getWake(wakeId) {
     const state = readJournal(filePath, fsImpl);
@@ -496,7 +537,7 @@ export function createWakeJournal(options = {}) {
       updatedAt: now().toISOString(),
     };
     state.wakes[wakeId] = next;
-    atomicWriteJson(filePath, state, fsImpl);
+    writeJournal(state);
     return next;
   }
 
@@ -510,7 +551,7 @@ export function createWakeJournal(options = {}) {
     if (existing && subscription.generation > Number(existing.generation)) {
       const next = { ...subscription, createdAt: existing.createdAt, updatedAt: now().toISOString() };
       state.subscriptions[subscription.taskId] = next;
-      atomicWriteJson(filePath, state, fsImpl);
+      writeJournal(state);
       return { subscription: next, created: false, updated: true };
     }
     if (existing) {
@@ -523,7 +564,7 @@ export function createWakeJournal(options = {}) {
     const nowIso = now().toISOString();
     const next = { ...subscription, createdAt: nowIso, updatedAt: nowIso };
     state.subscriptions[subscription.taskId] = next;
-    atomicWriteJson(filePath, state, fsImpl);
+    writeJournal(state);
     return { subscription: next, created: true, updated: false };
   }
 
@@ -584,18 +625,62 @@ export function createWakeJournal(options = {}) {
       error: null,
     };
     state.wakes[wakeId] = next;
-    atomicWriteJson(filePath, state, fsImpl);
+    writeJournal(state);
     return { wake: next, acquired: true };
   }
 
   function status() {
+    const before = statusFingerprint();
+    if (before !== null && cachedStatus !== null && before === cachedStatusFingerprint) {
+      return { ...cachedStatus };
+    }
+    cachedStatus = null;
+    cachedStatusFingerprint = null;
+    pendingVisibilityThreads = null;
+    pendingCurrentEpochHidden = null;
+    pendingHasAnyHiddenUnbound = false;
     const state = readJournal(filePath, fsImpl);
-    return {
+    const summary = {
       schemaVersion: state.schemaVersion,
       subscriptionCount: Object.keys(state.subscriptions).length,
       wakeCount: Object.keys(state.wakes).length,
       unknownWakeCount: Object.values(state.wakes).filter((wake) => wake.status === "unknown").length,
     };
+    if (before !== null && before === statusFingerprint()) {
+      cachedStatus = summary;
+      cachedStatusFingerprint = before;
+      const unresolved = new Set();
+      const currentEpochHidden = new Map();
+      let hasAnyHiddenUnbound = false;
+      const allowedTerminal = new Set(["accepted", "completed", "recovered", "failed_before_send"]);
+      for (const wake of Object.values(state.wakes)) {
+        if (!wake || typeof wake !== "object" || Array.isArray(wake)) { unresolved.add(undefined); break; }
+        const validThread = typeof wake.threadId === "string" && wake.threadId.length > 0;
+        if (!allowedTerminal.has(wake.status)) {
+          unresolved.add(validThread ? wake.threadId : undefined);
+        } else if (wake.status === "accepted" && wake.messageVisibility === "hidden" && !wake.visibilityItemKey) {
+          if (!validThread || typeof wake.writerEpoch !== "string" || !wake.writerEpoch) {
+            unresolved.add(undefined);
+          } else {
+            hasAnyHiddenUnbound = true;
+            if (currentEpochHidden.size < 256 || currentEpochHidden.has(wake.writerEpoch)) {
+              let set = currentEpochHidden.get(wake.writerEpoch);
+              if (!set) { set = new Set(); currentEpochHidden.set(wake.writerEpoch, set); }
+              set.add(wake.threadId);
+            } else {
+              unresolved.add(undefined);
+            }
+          }
+        } else if (wake.status !== "failed_before_send" && !validThread) {
+          unresolved.add(undefined);
+        }
+        if (unresolved.size > 128 || unresolved.has(undefined)) break;
+      }
+      pendingVisibilityThreads = unresolved;
+      pendingCurrentEpochHidden = currentEpochHidden;
+      pendingHasAnyHiddenUnbound = hasAnyHiddenUnbound;
+    }
+    return { ...summary };
   }
 
   return {
@@ -609,6 +694,21 @@ export function createWakeJournal(options = {}) {
         .filter(wake => ["accepted", "completed", "unknown"].includes(wake.status))
         .sort((left, right) => String(left.createdAt).localeCompare(String(right.createdAt)))
         .slice(-2048);
+    },
+    readVisibilityRevision(threadId, writerEpoch = null) {
+      if (typeof threadId !== "string" || !threadId) return null;
+      const before = statusFingerprint();
+      if (!before || before === "missing") return null;
+      status();
+      if (before !== cachedStatusFingerprint || !(pendingVisibilityThreads?.size <= 128)
+        || pendingVisibilityThreads.has(threadId) || pendingVisibilityThreads.has(undefined)) return null;
+      if (typeof writerEpoch === "string" && writerEpoch) {
+        const curHidden = pendingCurrentEpochHidden?.get(writerEpoch);
+        if (curHidden && (curHidden.has(threadId) || curHidden.has(undefined))) return null;
+      } else if (pendingHasAnyHiddenUnbound) {
+        return null;
+      }
+      return before;
     },
     registerSubscription,
     claimWake,
@@ -855,6 +955,7 @@ export class CodexAppServerProxy {
       upstreamState: client.upstream?.readyState ?? this.WebSocketImpl.CLOSED,
       upstreamReady: client.upstreamReady,
       pendingInjectionCount: client.injected.size,
+      pendingDesktopRequestCount: client.desktopRequestIds.size,
       queuedMessageCount: client.queued.length,
       queuedBytes: client.queuedBytes,
       downstreamBufferedBytes: client.downstream.bufferedAmount ?? 0,
@@ -888,6 +989,7 @@ export class CodexAppServerProxy {
       wakeVisibility: this.wakeVisibility.snapshot(),
       displayPolicy: this.displayPolicy.status(),
       displayPolicyControl: this.displayPolicyControl.status(),
+      historyReadBudget: desktopHistoryReadBudget.describe(),
       outerRuntime: this.outerRuntime.status(),
       lastError: this.lastError,
       lastIncident: this.lastIncident,
@@ -924,6 +1026,7 @@ export class CodexAppServerProxy {
 
   async close() {
     if (this.closed) return { closed: true };
+    if (this.communicationAttachment) await this.communicationAttachment.close();
     this.closed = true;
     if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
     this.heartbeatTimer = null;
@@ -955,7 +1058,8 @@ export class CodexAppServerProxy {
       || client.metadataUpstreamGeneration !== binding?.connectionGeneration
       || client.downstream.readyState !== this.WebSocketImpl.OPEN
       || client.upstream?.readyState !== this.WebSocketImpl.OPEN
-      || notification?.method !== "error" || Object.hasOwn(notification, "id")) return false;
+      || notification?.method !== "error" || Object.hasOwn(notification, "id")
+      || notification.params?.willRetry !== true) return false;
     return this._liveSendOrClose(client, client.downstream, JSON.stringify(notification), false, "model_recovery_notification");
   }
 
@@ -1023,6 +1127,7 @@ export class CodexAppServerProxy {
       }),
     };
     this.clients.add(client);
+    this.communicationAttachment?.rememberProjectionClient?.(client);
     downstream.on("message", (data, isBinary) => this._liveReceiveDownstream(client, data, isBinary));
     downstream.on("close", () => this._liveCloseClient(client, "downstream_closed"));
     downstream.on("error", (error) => this._liveCloseClient(client, "downstream_error", error));
@@ -1045,12 +1150,6 @@ export class CodexAppServerProxy {
     const message = parseJsonMessage(data, this.maxJsonParseBytes, originalByteLength) ?? envelope.message;
     this._liveObserveRequestMetadata("downstream", isRpcResponse(message)
       ? client.metadataUpstreamGeneration : client.metadataDownstreamGeneration, message, originalByteLength);
-    this.outerRuntime.downstream(client, message);
-    if (message?.method === "initialize") {
-      client.initializationRequestId = message.id ?? null;
-    } else if (message?.method === "initialized") {
-      client.initialized = true;
-    }
     let payload = data;
     if (typeof message?.method === "string" && ["string", "number"].includes(typeof message.id)) {
       const idRange = envelope.fields.get("id");
@@ -1061,8 +1160,28 @@ export class CodexAppServerProxy {
         this._liveCloseClient(client, "desktop_request_tracking_conflict");
         return;
       }
+      const historyBudgetError = desktopHistoryReadBudget.check(client, message);
+      if (historyBudgetError) {
+        const budgetState = desktopHistoryReadBudget.snapshot(client, message.params?.threadId);
+        if (budgetState?.denials === 1) {
+          try { this.onEvent({ type: "desktop_history_load_paused", method: message.method,
+            threadId: message.params?.threadId, reason: historyBudgetError.error.data.reason,
+            continuations: budgetState.continuations, turnPages: budgetState.turnPages,
+            bytes: budgetState.bytes }); } catch {}
+        }
+        this._liveSendOrClose(client, client.downstream, JSON.stringify(historyBudgetError), false,
+          "desktop_history_read_budget", { requestId: message.id, method: message.method });
+        return;
+      }
+      if (matchesHistoryDisplayRepair(message)) client.historyDisplayRepairView = createHistoryDisplayRepairView(client.historyDisplayRepairView);
       client.desktopRequestIds.set(message.id, { bytes: requestIdBytes, upstreamId: message.id,
         method: message.method.slice(0, 128), threadId: message.params?.threadId?.slice?.(0, 512),
+        turnId: message.params?.turnId?.slice?.(0, 512),
+        readInput: message.method === "turn/start" ? this.communicationAttachment?.threadReadObservation?.()?.capture(message.params) : null,
+        firstHistoryPage: message.params?.cursor == null,
+        historySortDirection: message.params?.sortDirection,
+        excludeTurns: message.params?.excludeTurns === true,
+        displayRepairRevision: client.historyDisplayRepairView?.capture(message),
         includeTurns: message.params?.includeTurns === true });
       client.desktopRequestBytes += requestIdBytes;
       if (this._liveIsInternalRequestId(message.id)) {
@@ -1074,6 +1193,14 @@ export class CodexAppServerProxy {
         payload = rewriteRpcId(envelope, JSON.stringify(forwardedId));
       }
     }
+    this.outerRuntime.downstream(client, message);
+    if (message?.method === "initialize") {
+      client.initializationRequestId = message.id ?? null;
+    } else if (message?.method === "initialized") {
+      client.initialized = true;
+    }
+    if (this._liveRejectNativeUnsubscribe(client, { id: message.id, method: message.method,
+      threadId: message.params?.threadId })) return;
     if (message?.method === "thread/list" && isObject(message.params) && message.params.archived === true
       && (!Object.hasOwn(message.params, "modelProviders") || message.params.modelProviders === null)) {
       const providerEnvelope = payload === data ? envelope : scanRpcEnvelope(payload, this.maxJsonParseBytes);
@@ -1101,6 +1228,139 @@ export class CodexAppServerProxy {
     client.queuedBytes += payloadBytes;
   }
 
+  _liveObserveNativeBoundary(client, message, metadataGeneration, admissionOrigin = "native_notification") {
+    const threadId = message.params?.threadId;
+    const turnId = message.params?.turn?.id;
+    if (typeof threadId === "string" && threadId && threadId.length <= 512
+      && typeof turnId === "string" && turnId && turnId.length <= 512) {
+      const boundaries = client.nativeTurnBoundaries ??= new Map();
+      const identity = JSON.stringify([threadId, turnId]);
+      const previous = boundaries.get(identity);
+      const alreadySettled = [...this.clients].some(other => {
+        const boundary = other.nativeTurnBoundaries?.get(identity);
+        return boundary?.terminal || boundary?.superseded;
+      });
+      if (message.method === "turn/started" && (previous?.terminal || previous?.superseded || alreadySettled)) return;
+      if (message.method === "turn/started") {
+        for (const other of this.clients) {
+          for (const [key, boundary] of other.nativeTurnBoundaries ?? []) {
+            if (boundary.threadId === threadId && boundary.turnId !== turnId && boundary.active) {
+              other.nativeTurnBoundaries.set(key, { ...boundary, active: false, superseded: true });
+            }
+          }
+        }
+      }
+      if (message.method === "turn/completed" || !previous?.terminal) {
+        boundaries.set(identity, { threadId, turnId, active: message.method === "turn/started",
+          terminal: message.method === "turn/completed" });
+      }
+      if (message.method === "turn/completed") {
+        for (const other of this.clients) {
+          if (other.nativeTurnBoundaries?.has(identity)) {
+            other.nativeTurnBoundaries.set(identity, { threadId, turnId, active: false, terminal: true });
+          }
+        }
+      }
+      for (const [key, boundary] of boundaries) {
+        if (boundaries.size <= this.maxQueuedMessages) break;
+        if (boundary.terminal || boundary.superseded) boundaries.delete(key);
+      }
+    }
+    const recoverySubscribed = this.modelRecovery?.observeNative(client, message, metadataGeneration) === true;
+    if (this.onNativeTurn) {
+      try {
+        Promise.resolve(this.onNativeTurn(structuredClone(message), {
+          admissionOrigin,
+          ...(recoverySubscribed ? { connectionGeneration: metadataGeneration } : {}),
+        })).catch(error => this._liveRecordError("native_turn_observer", error));
+      } catch (error) { this._liveRecordError("native_turn_observer", error); }
+    }
+  }
+
+  _liveNativeSubscriptionRequired(client, threadId) {
+    if (typeof threadId !== "string" || !threadId) return false;
+    return [...(client.nativeTurnBoundaries?.values() ?? [])].some(boundary =>
+      boundary.threadId === threadId && boundary.active)
+      || [...client.desktopRequestIds.values(), ...client.injected.values()].some(tracking =>
+        tracking.threadId === threadId && NATIVE_TURN_START_METHODS.has(tracking.method));
+  }
+
+  _liveRejectNativeUnsubscribe(client, observation) {
+    if (observation.method !== "thread/unsubscribe"
+      || !this._liveNativeSubscriptionRequired(client, observation.threadId)) return false;
+    const tracking = client.desktopRequestIds.get(observation.id);
+    if (!tracking) return false;
+    client.desktopRequestIds.delete(observation.id);
+    client.desktopRequestBytes -= tracking.bytes;
+    client.forwardedRequestIds.delete(tracking.upstreamId);
+    const response = { jsonrpc: "2.0", id: observation.id, error: { code: -32001,
+      message: "The active turn still requires this subscription",
+      data: { code: "ACTIVE_TURN_SUBSCRIPTION_REQUIRED" } } };
+    this._liveObserveRequestMetadata("upstream", client.metadataDownstreamGeneration, response,
+      messageByteLength(JSON.stringify(response)));
+    this.outerRuntime.upstream(client, response, { projectionMessage: response });
+    this._liveSendOrClose(client, client.downstream, JSON.stringify(response), false, "active_turn_subscription");
+    this.onEvent({ type: "active_turn_unsubscribe_rejected", threadHash: hashIdentity(observation.threadId) });
+    return true;
+  }
+
+  _livePendingNativeUnsubscribe(client, threadId) {
+    return [...client.desktopRequestIds.values(), ...client.injected.values()].some(tracking =>
+      tracking.written && tracking.threadId === threadId && tracking.method === "thread/unsubscribe");
+  }
+
+  _liveWaitForNativeUnsubscribe(client, threadId) {
+    const upstream = client.upstream;
+    const deadline = Date.now() + boundedInteger(this.requestTimeoutMs, 1250, 250, 300000);
+    return new Promise((resolve, reject) => {
+      const check = () => {
+        if (client.closed || client.upstream !== upstream || upstream.readyState !== this.WebSocketImpl.OPEN) {
+          reject(new CodexAppServerProxyError("UPSTREAM_NOT_OPEN", "App Server 连接已关闭"));
+        } else if (!this._livePendingNativeUnsubscribe(client, threadId)) resolve();
+        else if (Date.now() >= deadline) {
+          reject(new CodexAppServerProxyError("APP_SERVER_TIMEOUT", "Subscription change has not settled",
+            { outcomeUnknown: true, details: { method: "thread/unsubscribe" } }));
+        } else setTimeout(check, 10);
+      };
+      check();
+    });
+  }
+
+  _liveObserveAcceptedNativeTurn(client, response, tracking, metadataGeneration) {
+    if (!response || response.error || typeof tracking?.threadId !== "string"
+      || !tracking.threadId || tracking.threadId.length > 512 || tracking.threadId.includes("\u0000")) return;
+    if (tracking.method === "thread/unsubscribe") {
+      if (response.result?.status === "unsubscribed") {
+        (client.nativeUnsubscribedThreads ??= new Set()).add(tracking.threadId);
+      }
+      return;
+    }
+    if (tracking.method === "thread/resume") {
+      const thread = response.result?.thread;
+      if (thread?.id !== tracking.threadId || !Array.isArray(thread.turns)) return;
+      client.nativeUnsubscribedThreads?.delete(tracking.threadId);
+      for (const resumed of thread.turns) {
+        if (resumed?.status === "inProgress" && typeof resumed.id === "string" && resumed.id
+          && resumed.id.length <= 512 && !resumed.id.includes("\u0000")) {
+          this._liveObserveNativeBoundary(client, { method: "turn/started",
+            params: { threadId: tracking.threadId, turn: resumed } }, metadataGeneration, "resume_existing");
+        }
+      }
+      return;
+    }
+    const turn = response?.result?.turn;
+    if (!NATIVE_TURN_START_METHODS.has(tracking.method)
+      || typeof turn?.id !== "string" || !turn.id || turn.id.length > 512 || turn.id.includes("\u0000")
+      || turn.status !== "inProgress"
+      || (turn.threadId !== undefined && turn.threadId !== tracking.threadId)
+      || (response.result.threadId !== undefined && response.result.threadId !== tracking.threadId)
+      || (response.result.thread?.id !== undefined && response.result.thread.id !== tracking.threadId)) return;
+    this._liveObserveNativeBoundary(client, { method: "turn/started",
+      params: { threadId: tracking.threadId, turn } }, metadataGeneration, "turn_start_rpc");
+    this.onEvent({ type: "native_turn_boundary_from_rpc", threadHash: hashIdentity(tracking.threadId),
+      turnHash: hashIdentity(turn.id) });
+  }
+
   _liveReceiveUpstream(client, upstream, metadataGeneration, data, isBinary) {
     const originalByteLength = messageByteLength(data);
     if (client.closed || client.upstream !== upstream) {
@@ -1108,12 +1368,13 @@ export class CodexAppServerProxy {
       return;
     }
     client.upstreamAlive = true;
-    const envelope = this._liveReadRpcEnvelope(client, data, "upstream");
+    const envelope = this._liveReadRpcEnvelope(client, data, "upstream",
+      client.threadReadReplies > 0 ? id => client.injected.get(id)?.maxReplyBytes : undefined);
     if (!envelope) {
       this._liveObserveRequestMetadata("upstream", null, null, originalByteLength);
       return;
     }
-    let message = parseJsonMessage(data, this.maxJsonParseBytes, originalByteLength);
+    let message = envelope.replyLimitExceeded === undefined ? parseJsonMessage(data, this.maxJsonParseBytes, originalByteLength) : null;
     let rpcMessage = message ?? envelope.message;
     const response = isRpcResponse(rpcMessage);
     let desktopResponse = null;
@@ -1132,25 +1393,28 @@ export class CodexAppServerProxy {
     this._liveObserveRequestMetadata("upstream", responseGeneration, metadataMessage, originalByteLength);
     if (response && client.injected.has(rpcMessage.id)) {
       const pending = client.injected.get(rpcMessage.id);
-      this.outerRuntime.injectedResponse(client, message ?? rpcMessage, pending.outerEntry);
       client.injected.delete(rpcMessage.id);
       clearTimeout(pending.timeout);
-      if (!message) {
-        pending.reject(new CodexAppServerProxyError(
-          "APP_SERVER_RESPONSE_TOO_LARGE",
-          `App Server 回复超过正文解析预算：${pending.method}`,
-          { outcomeUnknown: pending.mutating && pending.written,
-            details: { method: pending.method, id: pending.id, bytes: envelope.bytes.length, maxJsonParseBytes: this.maxJsonParseBytes } },
-        ));
-      } else if (message.error) {
-        this.modelRecovery?.rejectExpectedTurn?.(client, pending.id, metadataGeneration);
-        pending.reject(new CodexAppServerProxyError(
-          "APP_SERVER_RPC_ERROR",
-          message.error.message ?? `App Server 请求失败：${pending.method}`,
-          { details: { method: pending.method, rpcError: message.error } },
-        ));
-      } else {
-        pending.resolve(message.result);
+      const settlementError = !message ? new CodexAppServerProxyError(
+        "APP_SERVER_RESPONSE_TOO_LARGE",
+        `App Server 回复超过正文解析预算：${pending.method}`,
+        { outcomeUnknown: pending.mutating && pending.written,
+          details: { method: pending.method, id: pending.id, bytes: envelope.bytes.length,
+            maxJsonParseBytes: envelope.replyLimitExceeded ?? this.maxJsonParseBytes } },
+      ) : message.error ? new CodexAppServerProxyError(
+        "APP_SERVER_RPC_ERROR",
+        message.error.message ?? `App Server 请求失败：${pending.method}`,
+        { details: { method: pending.method, rpcError: message.error } },
+      ) : null;
+      try {
+        this.outerRuntime.injectedResponse(client, message ?? rpcMessage, pending.outerEntry);
+        if (message?.error) this.modelRecovery?.rejectExpectedTurn?.(client, pending.id, metadataGeneration);
+        else if (message) this._liveObserveAcceptedNativeTurn(client, message, pending, metadataGeneration);
+      } catch (error) {
+        this._liveRecordError("injected_response_observer", error);
+      } finally {
+        if (settlementError) pending.reject(settlementError);
+        else pending.resolve(message.result);
       }
       this.displayPolicyControl.observeRpc("consumed", pending.id, pending.method);
       return;
@@ -1171,7 +1435,21 @@ export class CodexAppServerProxy {
       if (tracking?.upstreamId === upstreamId) {
         if (Object.hasOwn(rpcMessage, "error")) this.modelRecovery?.rejectExpectedTurn?.(client, upstreamId, metadataGeneration);
         desktopResponse = { requestId: rpcMessage.id, method: tracking.method };
-        const budgetError = createDesktopResponseBudgetError({ requestId: rpcMessage.id, method: tracking.method,
+        const historyBudgetRequest = { id: rpcMessage.id, method: tracking.method,
+          params: { threadId: tracking.threadId, cursor: tracking.firstHistoryPage ? null : "continuation",
+            sortDirection: tracking.historySortDirection } };
+        const historyBudgetError = desktopHistoryReadBudget.observe(client, historyBudgetRequest,
+          rpcMessage, originalByteLength);
+        if (historyBudgetError) {
+          const budgetState = desktopHistoryReadBudget.snapshot(client, tracking.threadId);
+          if (budgetState?.denials === 1) {
+            try { this.onEvent({ type: "desktop_history_load_paused", method: tracking.method,
+              threadId: tracking.threadId, reason: historyBudgetError.error.data.reason,
+              continuations: budgetState.continuations, turnPages: budgetState.turnPages,
+              bytes: budgetState.bytes }); } catch {}
+          }
+        }
+        const budgetError = historyBudgetError ?? createDesktopResponseBudgetError({ requestId: rpcMessage.id, method: tracking.method,
           responseBytes: originalByteLength, limit: this.maxDesktopResponseBytes ?? DEFAULT_DESKTOP_RESPONSE_LIMIT_BYTES });
         if (originalByteLength > 1024 * 1024) this.onEvent({ type: "desktop_large_rpc_response",
           requestId: rpcMessage.id, method: tracking.method, threadId: tracking.threadId,
@@ -1183,24 +1461,47 @@ export class CodexAppServerProxy {
           data = JSON.stringify(budgetError);
           isBinary = false;
         }
+        if (!budgetError) {
+          const historyRequest = { id: rpcMessage.id, method: tracking.method,
+            params: { threadId: tracking.threadId, turnId: tracking.turnId, cursor: tracking.firstHistoryPage ? null : "continuation",
+              includeTurns: tracking.includeTurns, excludeTurns: tracking.excludeTurns } };
+          if (matchesHistoryDisplayRepair(historyRequest)) {
+            const historyMessage = message ?? parseJsonMessage(data, this.maxDesktopResponseBytes ?? DEFAULT_DESKTOP_RESPONSE_LIMIT_BYTES);
+            const historyProjection = client.historyDisplayRepairView?.project(historyRequest, historyMessage, tracking.displayRepairRevision);
+            if (historyProjection && historyProjection !== historyMessage) {
+              rpcMessage = historyProjection;
+              message = historyProjection;
+              data = JSON.stringify(historyProjection);
+              isBinary = false;
+              try {
+                this.onEvent({ type: "desktop_history_display_repaired", method: tracking.method,
+                  threadHash: hashIdentity(tracking.threadId), responseBytes: originalByteLength });
+              } catch {}
+            }
+          }
+        }
         if (client.initializationRequestId !== null && rpcMessage.id === client.initializationRequestId && !rpcMessage.error) {
           client.initialized = true;
           client.initializedUpstream = upstream;
         }
+        this.communicationAttachment?.threadReadObservation?.()?.reply(client, this.writerEpoch, tracking, message);
+        this._liveObserveAcceptedNativeTurn(client, message, tracking, metadataGeneration);
         client.turnObserver.observeUpstream(rpcMessage);
         client.desktopRequestBytes -= tracking.bytes;
         client.desktopRequestIds.delete(rpcMessage.id);
       }
     } else if (typeof rpcMessage.method === "string" && !Object.hasOwn(rpcMessage, "id")) {
-      const recoverySubscribed = this.modelRecovery?.observeNative(client, rpcMessage, metadataGeneration) === true;
-      if (this.onNativeTurn && ["turn/started", "turn/completed"].includes(rpcMessage.method)) {
-        try {
-          Promise.resolve(this.onNativeTurn(structuredClone(rpcMessage), {
-            ...(recoverySubscribed ? { connectionGeneration: metadataGeneration } : {}),
-          })).catch(error => this._liveRecordError("native_turn_observer", error));
-        } catch (error) { this._liveRecordError("native_turn_observer", error); }
-      }
+      this.communicationAttachment?.threadReadObservation?.()?.notify(client, this.writerEpoch, rpcMessage);
+      if (["turn/started", "turn/completed"].includes(rpcMessage.method)) {
+        this._liveObserveNativeBoundary(client, rpcMessage, metadataGeneration);
+      } else this.modelRecovery?.observeNative(client, rpcMessage, metadataGeneration);
       client.turnObserver.observeUpstream(rpcMessage);
+    }
+    if (rpcMessage.method === "error" && !Object.hasOwn(rpcMessage, "id")
+      && typeof rpcMessage.params?.threadId === "string" && rpcMessage.params.willRetry !== true) {
+      this.onEvent({ type: "desktop_model_failure_retained", threadHash: hashIdentity(rpcMessage.params.threadId),
+        turnHash: hashIdentity(rpcMessage.params.turnId) });
+      return;
     }
     const projected = this.outerRuntime.upstream(client, message ?? rpcMessage, { projectionMessage: message });
     if (!projected && message) return;
@@ -1225,6 +1526,8 @@ export class CodexAppServerProxy {
   pauseUpstream() {
     this.upstreamPaused = true;
     for (const client of [...this.clients]) {
+      client.nativeTurnBoundaries?.clear();
+      client.nativeUnsubscribedThreads?.clear();
       if (!client.upstream) continue;
       const upstream = client.upstream;
       upstream.terminate?.();
@@ -1352,13 +1655,23 @@ export class CodexAppServerProxy {
     }
     const forward = () => {
       if (client.closed || client.upstream !== upstream) return;
+      if (this._liveRejectNativeUnsubscribe(client, observation)) return;
       if (this._liveSendOrClose(client, upstream, queued.data, queued.isBinary, "downstream_to_upstream")) {
+        const tracking = client.desktopRequestIds.get(observation.id);
+        if (tracking) tracking.written = true;
+        if (tracking) this.communicationAttachment?.threadReadObservation?.()?.forwarded(
+          client, this.writerEpoch, observation.method, observation.threadId, tracking);
+        if (observation.method === "thread/unsubscribe") {
+          (client.nativeUnsubscribedThreads ??= new Set()).add(observation.threadId);
+        }
         if (NATIVE_TURN_START_METHODS.has(observation.method)) this.modelRecovery?.expectTurn(client, observation.threadId,
           client.desktopRequestIds.get(observation.id)?.upstreamId ?? observation.id, client.metadataUpstreamGeneration);
         client.turnObserver.markForwarded(observation);
       }
     };
-    if (!NATIVE_TURN_START_METHODS.has(observation.method) || !observation.threadId || !this.managedInnerControl) {
+    if (!NATIVE_TURN_START_METHODS.has(observation.method) || !observation.threadId
+      || (!this.managedInnerControl && !client.nativeUnsubscribedThreads?.has(observation.threadId)
+        && !this._livePendingNativeUnsubscribe(client, observation.threadId))) {
       forward();
       return;
     }
@@ -1393,6 +1706,15 @@ export class CodexAppServerProxy {
   }
 
   _liveRecoverBeforeTurn(client, threadId) {
+    if (this._livePendingNativeUnsubscribe(client, threadId)) {
+      return this._liveWaitForNativeUnsubscribe(client, threadId).then(() => this._liveRecoverBeforeTurn(client, threadId));
+    }
+    if (client.nativeUnsubscribedThreads?.has(threadId)) {
+      return this._liveInjectRequest(client, "thread/resume", { threadId, excludeTurns: true }, { timeoutMs: 1250 }).then(() => {
+        if (client.nativeUnsubscribedThreads?.has(threadId)) throw new Error("NATIVE_THREAD_SUBSCRIPTION_NOT_RESTORED");
+        return this._liveRecoverBeforeTurn(client, threadId);
+      });
+    }
     if (!this.managedInnerControl) return Promise.resolve();
     const upstream = client.upstream;
     const connectionActive = () => !client.closed && client.upstream === upstream
@@ -1407,9 +1729,9 @@ export class CodexAppServerProxy {
     });
   }
 
-  _liveReadRpcEnvelope(client, data, source) {
+  _liveReadRpcEnvelope(client, data, source, pendingReplyLimit) {
     try {
-      return scanRpcEnvelope(data, this.maxJsonParseBytes);
+      return scanRpcEnvelope(data, this.maxJsonParseBytes, pendingReplyLimit);
     } catch (error) {
       this._liveCloseClient(client, `${source}_protocol_error`, error instanceof CodexAppServerProxyError ? error
         : new CodexAppServerProxyError("APP_SERVER_PROTOCOL_ERROR", "RPC JSON envelope 无法解析", { cause: error }), 1002);
@@ -1496,59 +1818,87 @@ export class CodexAppServerProxy {
   }
 
   _liveInjectRequest(client, method, params, options = {}) {
-    if (NATIVE_TURN_START_METHODS.has(method) && params?.threadId && !options.turnRecoveryChecked) {
-      const recoverBeforeTurn = this._liveRecoverBeforeTurn.bind(this);
-      const injectRequest = this._liveInjectRequest.bind(this);
-      return Promise.resolve().then(() => recoverBeforeTurn(client, params.threadId)).then(() => {
-        if (client.closed) throw new CodexAppServerProxyError("UPSTREAM_NOT_OPEN", "App Server 连接已关闭");
-        return injectRequest(client, method, params, { ...options, turnRecoveryChecked: true });
-      });
+    if (method === "thread/unsubscribe" && this._liveNativeSubscriptionRequired(client, params?.threadId)) {
+      return Promise.reject(new CodexAppServerProxyError("ACTIVE_TURN_SUBSCRIPTION_REQUIRED",
+        "The active turn still requires this subscription", { outcomeUnknown: false }));
     }
     if (client.upstream?.readyState !== this.WebSocketImpl.OPEN) {
       return Promise.reject(new CodexAppServerProxyError("UPSTREAM_NOT_OPEN", "App Server 上游连接未就绪"));
     }
+    const upstream = client.upstream;
     const id = this._liveAllocateRequestId(client);
     const timeoutMs = boundedInteger(options.timeoutMs, this.requestTimeoutMs, 250, 300000);
+    const maxReplyBytes = !options.mutating && ["thread/list", "thread/turns/list", "thread/items/list"].includes(method)
+      && Number.isSafeInteger(options.maxReplyBytes) && options.maxReplyBytes >= 1024
+      ? Math.min(options.maxReplyBytes, this.maxJsonParseBytes) : undefined;
+    const signal = maxReplyBytes === undefined ? undefined : options.signal;
+    if (signal?.aborted) return Promise.reject(signal.reason);
     return new Promise((resolve, reject) => {
+      let readBudgetRemoved = false;
+      function removeReadBudget() {
+        if (readBudgetRemoved || maxReplyBytes === undefined) return;
+        readBudgetRemoved = true;
+        client.threadReadReplies -= 1;
+        signal?.removeEventListener("abort", handleAbort);
+      }
       const pending = {
         id,
         method,
+        threadId: params?.threadId,
         mutating: Boolean(options.mutating),
         outerEntry: options.outerEntry,
         written: false,
-        resolve,
-        reject,
+        maxReplyBytes,
+        resolve(result) { removeReadBudget(); resolve(result); },
+        reject(error) { removeReadBudget(); reject(error); },
         timeout: null,
       };
-      pending.timeout = setTimeout(() => {
-        if (!client.injected.delete(id)) return;
+      const rejectPending = error => {
+        if (client.injected.get(id) !== pending) return;
+        client.injected.delete(id);
+        clearTimeout(pending.timeout);
         this.outerRuntime.forgetRequest(client, id, { retainTurn: pending.mutating && pending.written });
-        reject(new CodexAppServerProxyError(
+        pending.reject(error);
+      };
+      function handleAbort() { rejectPending(signal.reason); }
+      pending.timeout = setTimeout(() => {
+        rejectPending(new CodexAppServerProxyError(
           "APP_SERVER_TIMEOUT",
           `App Server 在 ${timeoutMs}ms 内未响应：${method}`,
           { outcomeUnknown: pending.mutating && pending.written, details: { method, id } },
         ));
       }, timeoutMs);
       client.injected.set(id, pending);
-      try {
-        this.outerRuntime.injectedRequest(client, { id, method, params }, options.outerEntry);
-        const request = { jsonrpc: "2.0", id, method, params };
-        const payload = JSON.stringify(request);
-        this._liveObserveRequestMetadata("downstream", client.metadataUpstreamGeneration, request, messageByteLength(payload));
-        client.upstream.send(payload);
-        pending.written = true;
-        if (NATIVE_TURN_START_METHODS.has(method)) this.modelRecovery?.expectTurn(client, params?.threadId, id, client.metadataUpstreamGeneration);
-        this.displayPolicyControl.observeRpc("written", id, method);
-      } catch (cause) {
-        client.injected.delete(id);
-        this.outerRuntime.forgetRequest(client, id);
-        clearTimeout(pending.timeout);
-        reject(new CodexAppServerProxyError(
-          "APP_SERVER_WRITE_FAILED",
-          `无法向 App Server 写入请求：${method}`,
-          { cause, outcomeUnknown: pending.mutating, details: { method, id } },
-        ));
+      if (maxReplyBytes !== undefined) {
+        client.threadReadReplies = (client.threadReadReplies ?? 0) + 1;
+        signal?.addEventListener("abort", handleAbort, { once: true });
       }
+      const send = () => {
+        if (client.injected.get(id) !== pending) return;
+        if (client.closed || client.upstream !== upstream || upstream.readyState !== this.WebSocketImpl.OPEN) {
+          rejectPending(new CodexAppServerProxyError("UPSTREAM_NOT_OPEN", "App Server 连接已关闭"));
+          return;
+        }
+        try {
+          this.outerRuntime.injectedRequest(client, { id, method, params }, options.outerEntry);
+          const request = { jsonrpc: "2.0", id, method, params };
+          const payload = JSON.stringify(request);
+          this._liveObserveRequestMetadata("downstream", client.metadataUpstreamGeneration, request, messageByteLength(payload));
+          upstream.send(payload);
+          pending.written = true;
+          if (pending.mutating) this.communicationAttachment?.threadReadObservation?.()?.invalidate(params?.threadId);
+          if (method === "thread/unsubscribe") (client.nativeUnsubscribedThreads ??= new Set()).add(params?.threadId);
+          if (NATIVE_TURN_START_METHODS.has(method)) this.modelRecovery?.expectTurn(client, params?.threadId, id, client.metadataUpstreamGeneration);
+          this.displayPolicyControl.observeRpc("written", id, method);
+        } catch (cause) {
+          rejectPending(new CodexAppServerProxyError("APP_SERVER_WRITE_FAILED", `无法向 App Server 写入请求：${method}`,
+            { cause, outcomeUnknown: pending.mutating, details: { method, id } }));
+        }
+      };
+      if (NATIVE_TURN_START_METHODS.has(method) && params?.threadId && !options.turnRecoveryChecked) {
+        const recoverBeforeTurn = this._liveRecoverBeforeTurn.bind(this);
+        Promise.resolve().then(() => recoverBeforeTurn(client, params.threadId)).then(send, rejectPending);
+      } else send();
     });
   }
 
@@ -1630,6 +1980,82 @@ export class CodexAppServerProxy {
     const authorized = authorization.length === expectedAuthorization.length
       && crypto.timingSafeEqual(Buffer.from(authorization), Buffer.from(expectedAuthorization));
     if (!authorized) throw new CodexAppServerProxyError("UNAUTHORIZED", "代理控制口令不正确");
+    if (requestUrl.pathname === "/v1/communication/control") {
+      if (!["127.0.0.1", "::1", "::ffff:127.0.0.1"].includes(request.socket.remoteAddress)) {
+        throw new Error("COMMUNICATION_CONTROL_LOOPBACK_REQUIRED");
+      }
+      if (!["GET", "POST", "DELETE"].includes(request.method)) {
+        response.statusCode = 405;
+        response.end(JSON.stringify({ ok: false, error: { code: "METHOD_NOT_ALLOWED" } }));
+        return;
+      }
+      const operation = (this.communicationControlOperation ?? Promise.resolve()).catch(() => {}).then(async () => {
+        const input = request.method === "POST" ? JSON.parse(await this._liveReadBody(request, 16384)) : null;
+        const { createCodexCommunicationAttachment, communicationWriterFingerprint } = await import("./codex-communication-attachment.mjs");
+        const attachment = this.communicationAttachment;
+        const old = attachment?.status();
+        const state = this.liveCodeRuntime?.status?.();
+        const stale = () => Object.assign(new Error("Communication handoff no longer matches the pinned predecessor"),
+          { code: "COMMUNICATION_HANDOFF_CONFIGURATION_CHANGED" });
+        if (request.method === "DELETE" && old?.enabled && !state?.busy && !state?.failed
+          && this.communicationAttachmentFactory !== createCodexCommunicationAttachment
+          && typeof this.communicationAttachmentFactory === "function" && state?.selected?.id && state?.previous?.id
+          && old.binding?.instance_id === state.instanceId && old.binding?.manifest_sha256 === state.previous.manifestSha256) {
+          const fingerprint = communicationWriterFingerprint(old.configuration_path, old.binding.configuration_sha256);
+          this.communicationPreviousMount = Object.freeze({ factory: this.communicationAttachmentFactory,
+            binding: Object.freeze(old.binding), configurationPath: old.configuration_path, fingerprint,
+            selected: state.selected.id, previous: state.previous.id });
+        }
+        const previous = this.communicationPreviousMount;
+        if (request.method === "POST" && !old?.enabled && previous) {
+          if (state?.busy !== false || state?.failed !== false || state.instanceId !== previous.binding.instance_id
+            || state.selected?.id !== previous.selected || state.previous?.id !== previous.previous
+            || input?.expected_instance_id !== state.instanceId || input?.expected_manifest_sha256 !== state.selected.manifestSha256) throw stale();
+          const fingerprint = communicationWriterFingerprint(input.config_path, input.expected_configuration_sha256);
+          if (fingerprint !== previous.fingerprint) throw stale();
+          if (path.resolve(input.config_path) === previous.configurationPath) {
+            if (input.expected_configuration_sha256 !== previous.binding.configuration_sha256) throw stale();
+            const legacy = previous.factory(this);
+            const startPrevious = () => legacy.attach(input);
+            const result = attachment?.hasOwnedProjection?.()
+              ? await attachment.transferProjection(startPrevious) : await startPrevious();
+            this.communicationAttachment = legacy;
+            this.communicationAttachmentFactory = previous.factory;
+            this.communicationPreviousMount = null;
+            return result;
+          }
+        }
+        if (!attachment || (request.method === "POST" && !old.enabled
+          && this.communicationAttachmentFactory !== createCodexCommunicationAttachment)) {
+          await attachment?.close();
+          this.communicationAttachment = createCodexCommunicationAttachment(this);
+          this.communicationAttachmentFactory = createCodexCommunicationAttachment;
+        }
+        if (request.method === "POST") return this.communicationAttachment.attach(input);
+        if (request.method === "DELETE") return this.communicationAttachment.close();
+        return this.communicationAttachment.status();
+      });
+      this.communicationControlOperation = operation;
+      let result;
+      try { result = await operation; } catch (error) {
+        if (!["COMMUNICATION_VISIBILITY_OWNER_CHANGED", "COMMUNICATION_HANDOFF_CONFIGURATION_CHANGED",
+          "COMMUNICATION_VISIBILITY_LEGACY_CLIENT_PENDING", "COMMUNICATION_VISIBILITY_BINDINGS_PENDING"].includes(error?.code)) throw error;
+        response.statusCode = 409;
+        response.end(JSON.stringify({ ok: false, error: publicError(error) }));
+        return;
+      }
+      response.end(JSON.stringify({ ok: true, ...result }));
+      return;
+    }
+    if (requestUrl.pathname === "/v1/manual-worker-exit" && request.method === "POST") {
+      if (!["127.0.0.1", "::1", "::ffff:127.0.0.1"].includes(request.socket.remoteAddress)) throw new Error("LIVE_CODE_LOOPBACK_REQUIRED");
+      const input = JSON.parse(await this._liveReadBody(request, 16 * 1024));
+      const controlState = this.liveCodeRuntime?.liveCodeParticipant?.().snapshot().state;
+      const result = await manualWorkerExitControl({ coordinator: controlState?.coordinator, wholeRuntime: this.liveCodeRuntime,
+        instanceId: controlState?.instanceId, input });
+      response.end(JSON.stringify({ ok: true, ...result }));
+      return;
+    }
     if (/^\/v1\/inner\/(status|prepare|migrate|activate|rollback|reconcile-terminal|continue-http)$/.test(requestUrl.pathname)) {
       if (!this.managedInnerControl) {
         response.statusCode = 404;
@@ -1671,7 +2097,24 @@ export class CodexAppServerProxy {
     if (request.method === "POST" && /^\/v1\/full-runtime\/(register|prepare|discard|activate|restore)$/.test(requestUrl.pathname)) {
       if (!["127.0.0.1", "::1", "::ffff:127.0.0.1"].includes(request.socket.remoteAddress)) throw new Error("LIVE_CODE_LOOPBACK_REQUIRED");
       const input = JSON.parse(await this._liveReadBody(request, 16 * 1024));
-      const result = await this.liveCodeRuntime[requestUrl.pathname.split("/").at(-1)](input);
+      const action = requestUrl.pathname.split("/").at(-1);
+      let result;
+      if (action === "restore" || action === "activate") {
+        const operation = (this.communicationControlOperation ?? Promise.resolve()).catch(() => {}).then(() => {
+          const attachment = this.communicationAttachment;
+          if (attachment?.hasOwnedProjection && (attachment.status().enabled || attachment.hasOwnedProjection())) {
+            return { communicationHandoffRequired: true };
+          }
+          return this.liveCodeRuntime[action](input);
+        });
+        this.communicationControlOperation = operation;
+        result = await operation;
+        if (result?.communicationHandoffRequired) {
+          response.statusCode = 409;
+          response.end(JSON.stringify({ ok: false, error: { code: "COMMUNICATION_ROLLBACK_HANDOFF_REQUIRED" } }));
+          return;
+        }
+      } else result = await this.liveCodeRuntime[action](input);
       response.end(JSON.stringify({ ok: true, ...result }));
       return;
     }
