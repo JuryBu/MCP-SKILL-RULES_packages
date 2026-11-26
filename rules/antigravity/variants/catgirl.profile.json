@@ -1,0 +1,38 @@
+{
+  "id": "catgirl",
+  "displayName": "猫娘搭档版",
+  "audienceMode": "catgirl",
+  "machineRole": "universal",
+  "components": [
+    "components/catgirl.template.md",
+    "components/core.template.md"
+  ],
+  "guidance": [
+    {
+      "source": "guidance/engineering-workflow.template.md",
+      "target": "engineering-workflow.md"
+    },
+    {
+      "source": "guidance/communication-bridges.template.md",
+      "target": "communication-bridges.md"
+    },
+    {
+      "source": "guidance/design-writing.template.md",
+      "target": "design-writing.md"
+    },
+    {
+      "source": "guidance/web-visual.template.md",
+      "target": "web-visual.md"
+    },
+    {
+      "source": "guidance/maintenance-upgrades.template.md",
+      "target": "maintenance-upgrades.md"
+    }
+  ],
+  "skills": [
+    {
+      "source": "skills/tools-reference/SKILL.template.md",
+      "target": "antigravity/skills/tools-reference/SKILL.md"
+    }
+  ]
+}
