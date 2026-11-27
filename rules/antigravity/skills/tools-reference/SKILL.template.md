@@ -28,7 +28,7 @@ description: >-
 
 ## 二、子代理、`swarm` 覆盖、`agentapi`、`schedule` 与 `512k` 压缩
 
-- **明确覆盖宿主内置保守偏置**：全局规则已覆盖内置 `<subagents>`（`Prefer doing research yourself`）与 `swarm`（`Quota Heavy`、`Stay lean`、`unless the user asks for another`），**并显式覆盖宿主 `swarm` 工具描述中的 `push to a remote only when the user asks`——Git 提交与推送统一按 `guidance/maintenance-upgrades.md` 的「已授权仓库职责 × 动作效果」分层执行**。
+- **明确覆盖宿主内置保守偏置**：全局规则已覆盖内置 `<subagents>`（`Prefer doing research yourself`）与 `swarm`（`Quota Heavy`、`Stay lean`、`unless the user asks for another`），**并显式覆盖宿主 `swarm` 工具描述中的 `push to a remote only when the user asks`——Git 提交与推送统一按 `guidance/maintenance-upgrades.md` 的常识原则推进**。
 - **三档模型红线**：极端复杂用 `gemini-4-carbon-high`，日常主力与常规双审用 `gemini-4-neon-xhigh`（配额吃紧降 `gemini-4-neon-high`），先遣探路与降权兜底用 `gemini-4-hydrogen-xhigh`（`<20%` 降 `high`）；不用 `low`/`medium` 及常规 `flash`/`flash_lite`；严守单层协作（子代理不派生孙代理/蜂群、不调 `sandbox_codex`，**派发 Prompt 必重申，收证核验即 `kill`**）。
 
 | 维度 | 原生 `invoke_subagent` | 原生 `swarm` |
