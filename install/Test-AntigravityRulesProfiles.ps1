@@ -112,7 +112,7 @@ function Assert-BuiltProfileBundle {
     }
 
     # Structural & hard technical invariants (non-brittle ASCII/technical anchors only)
-    foreach ($marker in @("read_file", "update_steps", "communication-core", "24,000", "force push", "USER_INPUT", "push to a remote only when the user asks", "sandbox_launch", "3m0s", "10 KiB", "PyMuPDF", "150 DPI")) {
+    foreach ($marker in @("read_file", "update_steps", "communication-core", "communication_contacts", "24,000", "force push", "USER_INPUT", "push to a remote only when the user asks", "sandbox_launch", "3m0s", "10 KiB", "PyMuPDF", "150 DPI")) {
         Assert-Contains $combinedText $marker "$Profile structural technical baseline"
     }
     Assert-Contains $maintenanceText "git add -- <paths>" "$Profile maintenance-upgrades safe staging baseline"
@@ -125,6 +125,7 @@ function Assert-BuiltProfileBundle {
     $toxicRegressions = @(
         ([regex]::Unescape('\u975e\u6b64\u4ed3\u7981\u64c5\u63d0')),
         ([regex]::Unescape('\u975e\u6b64\u4ed3\u7981\u64c5\u81ea\u63d0\u9001')),
+        ([regex]::Unescape('\u975e\u6b64\u4ed3\u7981\u64c5\u81ea\u63a8\u9001')),
         ([regex]::Unescape('\u666e\u901a\u975e\u5171\u4eab\u4ed3\u5e93\u672a\u7ecf')),
         ([regex]::Unescape('\u4e0d\u64c5\u81ea `git commit`/`git push`')),
         ([regex]::Unescape('\u5e38\u89c4\u5b8c\u5de5\u4e0d\u53d1\u65e0\u5173 QQ')),
