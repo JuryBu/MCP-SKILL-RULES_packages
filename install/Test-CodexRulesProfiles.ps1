@@ -229,8 +229,16 @@ function Assert-Guidance {
     $audienceWord = if ($Profile -eq "neutral") { [regex]::Unescape('\u7528\u6237') } else { $ownerWord }
     $designText = Get-Content -LiteralPath (Join-Path $Root "guidance\design-writing.md") -Raw -Encoding UTF8
     $observerText = Get-Content -LiteralPath (Join-Path $Root "guidance\model-observer.md") -Raw -Encoding UTF8
-    Assert-Contains $agentsText "2026-11-27.1" "$Profile core content revision"
-    Assert-Contains $promptText "2026-11-27.1" "$Profile prompt content revision"
+    Assert-Contains $agentsText "2026-11-27.2" "$Profile core content revision"
+    Assert-Contains $promptText "2026-11-27.2" "$Profile prompt content revision"
+    Assert-Contains $promptText ([regex]::Unescape('\u957f\u671f\u6709\u6548\u7684\u539f\u5219\u4e0e\u5631\u6258')) "$Profile keep still-applicable long-term commitments"
+    Assert-Contains $promptText ([regex]::Unescape('\u79fb\u51fa\u8fd1\u671f\u8bb0\u5f55\u524d')) "$Profile distill commitments before rolling recent topics"
+    Assert-Contains $promptText ([regex]::Unescape('\u7eed\u539f\u504f\u79fb\u6216\u6e38\u6807')) "$Profile follow truncation continuation"
+    Assert-Contains $promptText ([regex]::Unescape('\u5728\u9996\u6b21\u4f9d\u8d56\u65e7\u4ea4\u6d41\u7684\u7b54\u590d\u6216\u52a8\u4f5c\u524d')) "$Profile replay original conversation after compaction"
+    Assert-Contains $agentsText ([regex]::Unescape('lastRounds=3,prepareCache=false')) "$Profile bounded Codex original-conversation read"
+    Assert-Contains $engineeringText ([regex]::Unescape('\u6392\u671f\u5ba1\u67e5\u6838\u65e7\u7ea6\u5b9a')) "$Profile include long-term requirements in independent schedule review"
+    Assert-Contains $engineeringText ([regex]::Unescape('\u8def\u7ebf\u5ba1\u67e5\u6838\u65e7\u7ea6\u5b9a')) "$Profile include long-term requirements in route and delivery review"
+    Assert-Contains $engineeringText ([regex]::Unescape('\u538b\u7f29\u6062\u590d\u65f6\u6309\u901a\u7528\u63d0\u793a\u8bcd\u56de\u8bfb\u8fd1\u671f\u771f\u5b9e\u539f\u6587')) "$Profile route compaction into the original read before execution"
     Assert-Contains $agentsText ([regex]::Unescape('\u8ba8\u8bba\u8bf4\u6e05\u5f53\u8f6e\u53d6\u820d\u5c31\u6536\u675f')) "$Profile discussion scope"
     Assert-Contains $promptText ([regex]::Unescape('\u5c31\u5f53\u8f6e\u5f00\u59cb\uff0c\u505a\u5230\u4e0b\u4e00\u4e2a\u53ef\u6838\u9a8c\u7684\u7ed3\u679c')) "$Profile execute the next authorized step"
     Assert-Contains $engineeringText ([regex]::Unescape('\u786e\u5b9e\u5df2\u529e\u7ed3\u4e14\u786e\u8ba4\u7f3a\u5931')) "$Profile verify missing receipt after completed business"
@@ -261,11 +269,11 @@ function Assert-Guidance {
         Assert-Contains $promptText ([regex]::Unescape($encodedMarker)) "$Profile discussion decisions and criticism response"
     }
     foreach ($recentExchangeMarker in @(
-        '\u6b63\u6587\u4ec5\u4fdd\u7559\u6700\u8fd1\u004b\u6b21\u771f\u5b9e\u4ea4\u6d41\u7684\u5b8c\u6574\u8bb0\u5f55',
-        '\u8d85\u51fa\u004b\u8303\u56f4\u7684\u65e7\u4ea4\u6d41',
-        '\u4fdd\u7559\u539f\u6587\u68c0\u7d22\u5165\u53e3',
-        '\u5c1a\u672a\u89e3\u51b3\u7684\u65e7\u8981\u6c42\u6301\u7eed\u4fdd\u7559\u5728\u5f85\u7b54\u533a',
-        '\u7981\u6b62\u628a\u8fd1\u51b5\u7ef4\u62a4\u6210\u65e0\u9650\u589e\u957f\u7684\u5386\u53f2\u5168\u6587'
+        '\u6b63\u6587\u4fdd\u7559\u6700\u8fd1\u004b\u6b21\u5b8c\u6574\u4ea4\u6d41',
+        '\u7559\u65e7\u8bdd\u9898\u77ed\u6458\u8981\u53ca\u539f\u6587\u5165\u53e3',
+        '\u5f85\u7b54\u4fdd\u7559\u539f\u610f\u4e0e\u672a\u51b3\u6761\u4ef6',
+        '\u7ea6\u0033\u0030\u0020\u004b\u0042\u4e3a\u76ee\u6807',
+        '\u63a5\u8fd1\u0034\u0030\u0020\u004b\u0042\u6216\u5f53\u524d\u8bfb\u53d6\u5165\u53e3\u7684\u8f83\u5c0f\u4e0a\u9650'
     )) {
         Assert-Contains $promptText ([regex]::Unescape($recentExchangeMarker)) "$Profile bounded recent exchanges and archive readability"
     }
@@ -480,7 +488,7 @@ try {
         }
     }
     $bundledPrompt = Get-Content -LiteralPath (Join-Path $buildRoot "neutral\prompts\system-prompt.md") -Raw -Encoding UTF8
-    $sameBaselineOldRevision = $bundledPrompt.Replace('2026-11-27.1','2026-11-18.2')
+    $sameBaselineOldRevision = $bundledPrompt.Replace('2026-11-27.2','2026-11-27.1')
     foreach ($case in @(
         @{ Name = 'old-version'; Config = ('model_instructions_file = "~/.codex/prompts/system-prompt.md"' + "`n" + $existingConfig); Prompt = $sameBaselineOldRevision },
         @{ Name = 'custom-pointer'; Config = ('model_instructions_file = "D:/private/custom-prompt.md"' + "`n" + $existingConfig); Prompt = $bundledPrompt },
