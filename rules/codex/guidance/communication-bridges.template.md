@@ -33,9 +33,9 @@
 
 仅在接收方已安装并启用交流核心服务 `communication-core` 时适用，工具命名空间为 `communication_core`。交流核心连接已登记的宿主与原有消息渠道，按可信绑定转交消息、保留来源与投递/处理记录；各宿主、NapCat与微信入口仍由各自组件负责。按已安装工具和私有配置选择路径，保留原来有效的消息通道，不擅自迁移路由或关闭其它对话。各端接入与验收状态分别核对。
 
-采用已安装的十工具接口时，交流核心提供联络前后的实时状态与近期消息快照：`communication_get_status`查宿主或对话状态，`communication_get_message`与`communication_wait`查已知核心消息的投递、处理与回复，`communication_read_channel_messages`只读获准QQ窗口近期原文。当前十工具没有宿主对话正文尾部或历史读取入口。宿主原文、用户原话与批注、正文检索和未知对话ID定位使用memory-store的`conversation_read_original`，按具体宿主、目标ID和所需范围选择`read_fast/prepare`、搜索或缓存读取；末N轮参数取当前schema的`lastRounds`。本机Codex联络、近期状态和短对话读取的优先顺序沿全局「Codex进程工具」段执行。
+按当前连接实际工具及参数执行。状态用 `communication_get_status`；已知消息用 `communication_get_message` 或 `communication_wait` 查投递、处理与回信；获准 QQ 窗口用 `communication_read_channel_messages`。宿主原文、批注、未知对话定位及历史搜索用 memory-store 的 `conversation_read_original`，指定实际宿主和目标，缺段沿原任务分页。本机短对话入口见全局「Codex进程工具」。
 
-`communication_list_conversations`列出本连接获准访问的绑定，`communication_resolve_target`返回当前身份和代次；发送、确认处理、窗口对应关系与QQ附件下载分别沿下方工具执行。当前工具目录仍显示旧八项时，保留实际可用范围，正常刷新后的目录另行核对。
+`communication_list_conversations` 查可访问绑定，`communication_resolve_target` 查身份和代次。当前连接实际提供 `communication_contacts` 或 `contact`、`targets` 字段时，才按其权限使用通讯录、别名或批量收件；板的私有连接按独立授权和安装验证使用。
 
 每次调用显式填写当前调用者真实的`machine_id`、`host`、`surface`与稳定`conversation_id`。machine_id逐字取当前连接的私有登记值，不用操作系统主机名或机器角色自行生成；host、surface取实际宿主，conversation_id填本对话，不借用其它对话。已登记的宿主统一入口供该宿主各对话使用，每条对话直接填写自己的具体CID，无需逐CID登记。门面按宿主登记选择连接，caller仍由调用方声明，broker尚未提供可信宿主CID；该入口限已获授权的本机可信调用方使用，实际来源与授权沿私有登记和原操作范围核对。新宿主尚未接入时沿已有获准入口继续独立工作。
 
@@ -55,7 +55,7 @@
 
 已授权的日常跨端协作默认用 `delivery_policy="next_model_boundary"`；向反重力（`host="antigravity"`）发送时也沿用这一策略。保留 `when_idle` 给明确提出要排队的需求，或已核实目标适配器只支持空闲投递的情形。反重力在等待定时（`Waiting for timer`）或有运行中的子代理时，已有 `when_idle` 消息长期积在 `Queued Messages` 的记录；明确要排队时告知这一影响，按原消息查结果。要晚些送可由发送方择时再发；只需晚些处理，就在正文写明时间和缓急。
 
-发给本人的普通提醒按本人明确的渠道和时段约定及工程专题的默认安排；已获准的代理协作沿原安排继续。需要读取历史正文时，使用memory-store的`conversation_read_original`并显式选择实际宿主入口；状态工具按已发布且验过的能力使用。
+给本人的消息按下方「通知、显示与健康验收」；已获准的代理协作沿原安排继续。
 
 接收方实际处理后，才用`communication_ack_processing`提交本条message_id、delivery_id和binding_generation，按实际进展选择processing、done或failed，未完成部分保留待办。投递状态仍为unknown或dispatching、但接收方已经实际读到并处理时，照实提交准确处理确认，保存`source=processing_ack`与原传输/注入状态分别核对。该确认只作用于交流核心的这份投递；NapCat和微信的原渠道ACK仍按各自协议与责任入口处理，不代替其它订阅确认。
 
@@ -109,7 +109,7 @@ NapCat主包/文件索引保存任务方向、原始 `file_id/fileUuid`、可用
 
 ## 通知、显示与健康验收
 
-工程主动通知以需用户行动、决定，或明确要求通知的完成、失败、安全暂停、人工登录、通信中断等事件为准，走已登记owner route。本人日常交流与轻量主动联系按私有常设范围判断，不因工程通知条件而屏蔽已授权的自然回复，也不借此扩大到第三方。普通心跳、例行进度和可自愈短异常不刷屏；通知说明发生什么及是否需行动，不倾倒日志和内部标识。回复按已绑定的引用/@规则归还原任务。
+重要完工、能让本人放心的实质结果、影响使用或需要行动的变化，走已获准的本人路由主动简短告知。渠道、时段、明确静默及轻量联系按本人约定。普通心跳和未变状态省略，同一件事核去重。说明实际结果与是否需要配合；回信沿原窗口和已登记引用关系。
 
 面向人的QQ／微信消息按接收者的渠道习惯组织，简短、少量分条，具体长度与人格沿用私有偏好；长文与材料使用附件或链接，不把整份报告拆成消息轰炸。从哪个渠道收到询问，调查前的简短说明与结果就回到哪个渠道，不能只在Codex或另一窗口回复，让对方空等。能立即答清的小问题直接答；需要调查时先说正在查什么，再继续工作。无发送授权、身份不明或渠道故障时记录明确缺口，不能把平台内回复冒充已送达。机器任务、回执及结构化协议保留必需字段，不受人类短消息长度约束。
 
