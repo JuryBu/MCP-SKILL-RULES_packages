@@ -109,6 +109,35 @@ test("rejects roster disclosure on a solo target, legacy overlap and non-boolean
   assert.equal(state.transfers.length, 0);
 });
 
+test("同群共存时绑定实际文件目录，换目录或关闭共存后旧记录不会改走根目录", async () => {
+  const { binding, routes, state } = fixture();
+  const rootRoute = await binding.resolveRoute(request);
+  const shared = { ...fixed, legacy_training_coexistence: true,
+    file_bundle_folder_id: "/actual-id", file_bundle_folder_name: "comm-relay-bundles" };
+  routes.set(fixed.relay_key, { ...shared, file_bundle_folder_id: null });
+  await assert.rejects(binding.resolveRoute(request), { code: "RELAY_FILE_ROUTE_DENIED" });
+  routes.set(fixed.relay_key, shared);
+  const pinned = await binding.resolveRoute(request);
+  assert.equal(pinned.fileBundleFolderId, shared.file_bundle_folder_id);
+  assert.equal(pinned.fileBundleFolderName, shared.file_bundle_folder_name);
+  assert.equal(await binding.routeAuthorized(rootRoute, "reconcile"), false);
+  assert.equal(await binding.routeAuthorized(pinned, "upload"), true);
+  for (const changed of [
+    { file_bundle_folder_id: "/different-id" },
+    { file_bundle_folder_name: "renamed" },
+    { legacy_training_coexistence: false },
+  ]) {
+    routes.set(fixed.relay_key, { ...shared, ...changed });
+    assert.equal(await binding.routeAuthorized(pinned, "delete"), false);
+    assert.equal(await binding.routeAuthorized(pinned, "reconcile_delete"), false);
+  }
+  routes.set(fixed.relay_key, { ...shared, role: "draining_read", allow_file_bundle_write: false });
+  assert.equal(await binding.routeAuthorized(pinned, "download"), true);
+  assert.equal(await binding.routeAuthorized(pinned, "upload"), false);
+  assert.equal((await binding.control.publish("file_ack", offer, pinned, nativeFile)).status, "sent");
+  assert.equal(state.transfers[0].route.file_bundle_folder_id, shared.file_bundle_folder_id);
+});
+
 test("a control action is only verified by matching route and native message, sequence and body hash", async () => {
   const { binding, state } = fixture();
   const route = await binding.resolveRoute(request);

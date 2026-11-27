@@ -22,20 +22,35 @@ async function fixture(context) {
   const journal = await openRelayFileJournal(journalRoot);
   const calls = [];
   const files = [];
-  const settings = { allow: true, dropDeleteReply: false, folders: [], capacity: 3, reportZeroBytes: false };
+  const scopedFiles = [];
+  const settings = { allow: true, dropDeleteReply: false, folders: [], capacity: 3, reportZeroBytes: false,
+    folderId: null, folderName: "comm-relay-bundles", folderCountDelta: 0 };
   const routeAuthorized = async (target) => settings.allow && target.groupId === route.groupId && target.generation === route.generation;
   const onebot = async (action, params) => {
     assert.equal(params.group_id, route.groupId);
     calls.push(action);
     if (action === "get_group_file_system_info") return {
-      file_count: String(files.length), limit_count: settings.capacity,
-      used_space: settings.reportZeroBytes ? 0 : files.reduce((total, file) => total + file.file_size, 0), total_space: 10000,
+      file_count: String(files.length + scopedFiles.length), limit_count: settings.capacity,
+      used_space: settings.reportZeroBytes ? 0 : [...files, ...scopedFiles].reduce((total, file) => total + file.file_size, 0),
+      total_space: 10000,
     };
-    if (action === "get_group_root_files") return { files: structuredClone(files), folders: settings.folders };
+    if (action === "get_group_root_files") return {
+      files: structuredClone(files),
+      folders: settings.folderId ? [...settings.folders, {
+        folder_id: settings.folderId, folder_name: settings.folderName,
+        total_file_count: scopedFiles.length + settings.folderCountDelta,
+      }] : settings.folders,
+    };
+    if (action === "get_group_files_by_folder") {
+      assert.equal(params.folder_id, settings.folderId);
+      return { files: structuredClone(scopedFiles), folders: [] };
+    }
     if (action === "upload_group_file") {
       assert.equal(path.relative(workRoot, params.file), "source.data");
       const file_id = "expected-file-id";
-      files.push({ file_id, file_name: params.name, file_size: (await fs.stat(params.file)).size, uploader: route.selfQqId, busid: 123 });
+      if (settings.folderId) assert.equal(params.folder, settings.folderId);
+      const target = params.folder ? scopedFiles : files;
+      target.push({ file_id, file_name: params.name, file_size: (await fs.stat(params.file)).size, uploader: route.selfQqId, busid: 123 });
       return { file_id };
     }
     if (action === "get_group_file_url") {
@@ -43,9 +58,10 @@ async function fixture(context) {
       return { url: settings.url ?? "https://files.fixture.invalid/transfer" };
     }
     if (action === "delete_group_file") {
-      const index = files.findIndex((file) => file.file_id === params.file_id);
+      const target = scopedFiles.some((file) => file.file_id === params.file_id) ? scopedFiles : files;
+      const index = target.findIndex((file) => file.file_id === params.file_id);
       assert.notEqual(index, -1);
-      files.splice(index, 1);
+      target.splice(index, 1);
       if (settings.dropDeleteReply) throw new Error("reply dropped after applying delete");
       return {};
     }
@@ -65,7 +81,7 @@ async function fixture(context) {
     });
     return key;
   }
-  return { calls, files, settings, workRoot, journalRoot, journal, adapter, remember, routeAuthorized };
+  return { calls, files, scopedFiles, settings, workRoot, journalRoot, journal, adapter, remember, routeAuthorized };
 }
 
 test("群非空却回报使用零字节时，仅凭完整根目录恢复用量，无法核清即保留旧档", async (context) => {
@@ -78,6 +94,60 @@ test("群非空却回报使用零字节时，仅凭完整根目录恢复用量�
   fixtureState.settings.folders = [{ folder_id: "unexamined" }];
   assert.equal((await adapter.readQuota(route)).usedBytes, null);
   assert.ok(fixtureState.calls.every((action) => ["get_group_file_system_info", "get_group_root_files"].includes(action)));
+});
+
+test("共用固定群时在已核目录发送与核档，回收仅作用于目录内的文件", async (context) => {
+  const fixtureState = await fixture(context);
+  fixtureState.settings.folderId = "/relay-board-v1";
+  fixtureState.settings.reportZeroBytes = true;
+  const sharedRoute = { ...route, legacyTrainingCoexistence: true,
+    fileBundleFolderId: fixtureState.settings.folderId, fileBundleFolderName: fixtureState.settings.folderName };
+  const offer = { name: "napcat-board-example.data", bytes: 4 };
+  const oldFile = { file_id: "old-root-id", file_name: offer.name, file_size: 4, uploader: route.selfQqId, busid: 123 };
+  fixtureState.files.push(oldFile);
+  const file = path.join(fixtureState.workRoot, "source.data");
+  await fs.writeFile(file, "data", { flag: "wx" });
+  const adapter = await fixtureState.adapter();
+  assert.equal((await adapter.readQuota(sharedRoute)).usedBytes, 4);
+  const uploaded = await adapter.upload(offer, sharedRoute, file);
+  assert.equal(uploaded.file.id, "expected-file-id");
+  assert.equal((await adapter.readQuota(sharedRoute)).usedBytes, 8);
+  assert.equal(await adapter.inspectFile(sharedRoute, oldFile.file_id), null);
+  const oldIdentity = { id: oldFile.file_id, name: oldFile.file_name, bytes: 4, uploaderId: route.selfQqId };
+  assert.equal(await adapter.inspectAbsence(sharedRoute, oldFile.file_id), false);
+  fixtureState.settings.folders = [{ folder_id: "/empty", folder_name: "ordinary", total_file_count: 0 }];
+  assert.equal((await adapter.readQuota(sharedRoute)).usedBytes, 8);
+  assert.equal(await adapter.inspectAbsence(sharedRoute, "unseen"), true);
+  fixtureState.settings.folders = [{ folder_id: "/other", folder_name: "unverified" }];
+  assert.equal((await adapter.readQuota(sharedRoute)).usedBytes, null);
+  assert.equal(await adapter.inspectAbsence(sharedRoute, "unseen"), null);
+  fixtureState.settings.folders = [];
+  assert.deepEqual(await adapter.removeConfirmedFile(sharedRoute, oldIdentity), { status: "not_sent" });
+  assert.equal(fixtureState.calls.filter((action) => action === "delete_group_file").length, 0);
+  assert.deepEqual(await adapter.removeConfirmedFile(sharedRoute, uploaded.file), { status: "removed" });
+  assert.deepEqual(fixtureState.files, [oldFile]);
+  assert.deepEqual(fixtureState.scopedFiles, []);
+  assert.equal((await adapter.readQuota(sharedRoute)).usedBytes, 4);
+});
+
+test("固定群独立目录缺失或清单截断时不回落到群根目录上传", async (context) => {
+  const fixtureState = await fixture(context);
+  const file = path.join(fixtureState.workRoot, "source.data");
+  await fs.writeFile(file, "data", { flag: "wx" });
+  const adapter = await fixtureState.adapter();
+  const offer = { name: "napcat-board-example.data", bytes: 4 };
+  const sharedRoute = { ...route, legacyTrainingCoexistence: true };
+  await assert.rejects(() => adapter.readQuota(sharedRoute), { code: "RELAY_FILE_FOLDER_REQUIRED" });
+  const pinned = { ...sharedRoute, fileBundleFolderId: "/relay-board-v1", fileBundleFolderName: fixtureState.settings.folderName };
+  assert.deepEqual(await adapter.upload(offer, pinned, file), { status: "not_sent", reason: "route_changed" });
+  fixtureState.settings.folderId = pinned.fileBundleFolderId;
+  fixtureState.settings.folderCountDelta = 1;
+  assert.deepEqual(await adapter.upload(offer, pinned, file), { status: "not_sent", reason: "route_changed" });
+  fixtureState.settings.folderCountDelta = 0;
+  fixtureState.settings.folderName = "renamed";
+  assert.deepEqual(await adapter.upload(offer, pinned, file), { status: "not_sent", reason: "route_changed" });
+  assert.equal(fixtureState.calls.includes("upload_group_file"), false);
+  assert.equal(fixtureState.calls.includes("delete_group_file"), false);
 });
 
 test("本机释放同时改账时仍合并同次删除的明确未送，重开不假报未知", async (context) => {

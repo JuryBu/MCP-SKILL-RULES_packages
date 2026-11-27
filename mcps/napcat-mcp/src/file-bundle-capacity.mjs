@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { ensureRelayFileSpace } from "./file-bundle-quota.mjs";
 import { relayFileJournalKey } from "./file-bundle-journal.mjs";
+import { sameFileBundleRouteScope } from "./file-bundle-route-scope.mjs";
 
 function snapshot(record) {
   const { offer, route, state, file, uploadedAt, receivedAt, cleanupState, direction } = record.value;
@@ -49,6 +50,7 @@ export function createFileBundleCapacity({ journal, localMachine, provider, rout
     const owned = original && snapshot(original);
     if (!owned || owned.direction !== "out" || owned.state !== "received" || owned.cleanupState != null
       || owned.relayId !== route.relayId || owned.groupId !== route.groupId || owned.generation !== route.generation
+      || !sameFileBundleRouteScope(owned, route)
       || owned.uploaderId !== route.selfQqId || original.value.offer.from !== localMachine
       || owned.nativeFileId !== candidate.nativeFileId || owned.name !== candidate.name || owned.bytes !== candidate.bytes
       || owned.bundleSha256 !== candidate.bundleSha256 || owned.receivedAt !== candidate.receivedAt

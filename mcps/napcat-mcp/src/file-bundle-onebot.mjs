@@ -2,6 +2,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { createHash } from "node:crypto";
 import { Readable } from "node:stream";
+import { pinnedFileBundleFolderId as pinnedFolderId } from "./file-bundle-route-scope.mjs";
 
 const decimal = /^[0-9]+$/u;
 const positiveId = /^[1-9][0-9]{0,31}$/u;
@@ -35,10 +36,24 @@ function sameFile(file, expected) {
     && file?.bytes === expected.bytes && file?.uploaderId === expected.uploaderId;
 }
 
-function isCompleteRoot(listed, expectedCount) {
-  return expectedCount === listed.all.length && Array.isArray(listed.folders) && !listed.folders.length
+function isCompleteFileList(listed, expectedCount) {
+  return expectedCount === listed.all.length
     && listed.identities.length === listed.all.length
     && new Set(listed.identities.map((file) => file.id)).size === listed.all.length;
+}
+
+function isCompleteRoot(listed, expectedCount) {
+  return isCompleteFileList(listed, expectedCount) && Array.isArray(listed.folders) && !listed.folders.length;
+}
+
+function completeScopedInventory(root, scoped, fileCount) {
+  if (!Array.isArray(root.folders) || root.folders.some((folder) => folder?.folder_id !== scoped.folderId
+    && (typeof folder?.folder_id !== "string" || !folder.folder_id || unsigned(folder.total_file_count) !== 0))
+    || !isCompleteFileList(root, fileCount - scoped.expectedFileCount)) {
+    return null;
+  }
+  const combined = [...root.identities, ...scoped.identities];
+  return new Set(combined.map((file) => file.id)).size === fileCount ? combined : null;
 }
 
 function withDeadline(parent, timeoutMs) {
@@ -100,20 +115,44 @@ export async function createFileBundleOneBot({
 
   async function checked(route, purpose, signal) {
     signal?.throwIfAborted();
+    pinnedFolderId(route);
     const allowed = id(route?.groupId) && await routeAuthorized(route, purpose, { signal }) === true;
     signal?.throwIfAborted();
     if (!allowed) issue("RELAY_FILE_ROUTE_DENIED", "原群文件路线当前未获准");
   }
 
-  async function rootFiles(route, signal) {
-    await checked(route, "list", signal);
-    const result = await callOneBot("get_group_root_files", {
-      group_id: route.groupId, file_count: fileCountLimit,
-    }, { signal });
+  function parseFileList(result) {
     if (!Array.isArray(result?.files) || result.files.length > fileCountLimit) {
       issue("RELAY_FILE_LIST_UNKNOWN", "群文件列表缺失或超出扫描上限");
     }
     return { all: result.files, identities: result.files.map(groupFile).filter(Boolean), folders: result.folders };
+  }
+
+  async function rootFiles(route, signal) {
+    await checked(route, "list", signal);
+    return parseFileList(await callOneBot("get_group_root_files", {
+      group_id: route.groupId, file_count: fileCountLimit,
+    }, { signal }));
+  }
+
+  async function scopedFiles(route, signal, rootListing) {
+    const folderId = pinnedFolderId(route);
+    if (!folderId) return rootListing ?? await rootFiles(route, signal);
+    const listed = rootListing ?? await rootFiles(route, signal);
+    const matches = Array.isArray(listed.folders) ? listed.folders.filter((folder) => folder?.folder_id === folderId) : [];
+    const expectedFileCount = unsigned(matches[0]?.total_file_count);
+    if (matches.length !== 1 || matches[0].folder_name !== route.fileBundleFolderName
+      || expectedFileCount === null || expectedFileCount > fileCountLimit) {
+      issue("RELAY_FILE_FOLDER_UNVERIFIED", "未能核实本次群文件目录及文件数");
+    }
+    await checked(route, "list", signal);
+    const scoped = parseFileList(await callOneBot("get_group_files_by_folder", {
+      group_id: route.groupId, folder_id: folderId, file_count: fileCountLimit,
+    }, { signal }));
+    if (!isCompleteRoot(scoped, expectedFileCount)) {
+      issue("RELAY_FILE_FOLDER_UNVERIFIED", "本次群文件目录清单不完整");
+    }
+    return { ...scoped, expectedFileCount, folderId };
   }
 
   async function readQuota(route, { signal } = {}) {
@@ -121,9 +160,17 @@ export async function createFileBundleOneBot({
     const raw = await callOneBot("get_group_file_system_info", { group_id: route.groupId }, { signal });
     const fileCount = unsigned(raw?.file_count);
     let usedBytes = unsigned(raw?.used_space);
-    if (fileCount > 0 && !(usedBytes > 0)) {
-      const root = await rootFiles(route, signal);
-      usedBytes = isCompleteRoot(root, fileCount) ? unsigned(root.identities.reduce((sum, file) => sum + file.bytes, 0)) : null;
+    const folderId = pinnedFolderId(route);
+    if (!(usedBytes > 0) && (fileCount > 0 || folderId)) {
+      const rootListing = await rootFiles(route, signal);
+      if (!folderId) {
+        usedBytes = isCompleteRoot(rootListing, fileCount)
+          ? unsigned(rootListing.identities.reduce((sum, file) => sum + file.bytes, 0)) : null;
+      } else {
+        const scoped = await scopedFiles(route, signal, rootListing);
+        const combined = completeScopedInventory(rootListing, scoped, fileCount);
+        usedBytes = combined ? unsigned(combined.reduce((sum, file) => sum + file.bytes, 0)) : null;
+      }
     }
     return {
       fileCount,
@@ -134,7 +181,7 @@ export async function createFileBundleOneBot({
   }
 
   async function findUpload(offer, route, uploaderId, { signal, fileId } = {}) {
-    const { all, identities } = await rootFiles(route, signal);
+    const { all, identities } = await scopedFiles(route, signal);
     const matches = identities.filter((file) => file.uploaderId === uploaderId
       && file.bytes === offer.bytes && file.name === offer.name && (fileId === undefined || file.id === fileId));
     return matches.length === 1 && all.filter((raw) => raw?.file_id === matches[0].id).length === 1
@@ -144,13 +191,21 @@ export async function createFileBundleOneBot({
   async function upload(offer, route, localBundle, { signal } = {}) {
     const file = await confirmLocalChild(root, localBundle, false);
     if ((await fs.stat(file)).size !== offer.bytes) return { status: "not_sent", reason: "local_size_changed" };
+    let folderId;
     try {
       await checked(route, "upload", signal);
+      folderId = pinnedFolderId(route);
+      if (folderId) {
+        await scopedFiles(route, signal);
+        await checked(route, "upload", signal);
+      }
     } catch {
       return { status: "not_sent", reason: "route_changed" };
     }
     try {
-      const result = await callOneBot("upload_group_file", { group_id: route.groupId, file, name: offer.name }, { signal });
+      const result = await callOneBot("upload_group_file", {
+        group_id: route.groupId, file, name: offer.name, ...(folderId ? { folder: folderId } : {}),
+      }, { signal });
       const fileId = typeof result?.file_id === "string" && result.file_id ? result.file_id : undefined;
       return await findUpload(offer, route, route.selfQqId, { signal, fileId });
     } catch {
@@ -159,7 +214,7 @@ export async function createFileBundleOneBot({
   }
 
   async function inspectFile(route, fileId, { signal } = {}) {
-    const { all, identities } = await rootFiles(route, signal);
+    const { all, identities } = await scopedFiles(route, signal);
     const matches = identities.filter((file) => file.id === fileId);
     if (matches.length !== 1 || all.filter((raw) => raw?.file_id === fileId).length !== 1) return null;
     return matches[0];
@@ -229,8 +284,24 @@ export async function createFileBundleOneBot({
   }
 
   async function inspectAbsence(route, fileId, { signal } = {}) {
-    function identity(listed) {
-      return JSON.stringify(listed.identities.map((file) => JSON.stringify(file)).sort());
+    function identity(identities) {
+      return JSON.stringify(identities.map((file) => JSON.stringify(file)).sort());
+    }
+    if (pinnedFolderId(route)) {
+      async function inspectSharedInventory() {
+        const rootListing = await rootFiles(route, signal);
+        if (rootListing.all.some((raw) => raw?.file_id === fileId)) return false;
+        const scoped = await scopedFiles(route, signal, rootListing);
+        if (scoped.all.some((raw) => raw?.file_id === fileId)) return false;
+        await checked(route, "quota", signal);
+        const raw = await callOneBot("get_group_file_system_info", { group_id: route.groupId }, { signal });
+        return completeScopedInventory(rootListing, scoped, unsigned(raw?.file_count));
+      }
+      const first = await inspectSharedInventory();
+      if (!first) return first;
+      const second = await inspectSharedInventory();
+      if (!second) return second;
+      return identity(first) === identity(second) ? true : null;
     }
     const first = await rootFiles(route, signal);
     if (first.all.some((raw) => raw?.file_id === fileId)) return false;
@@ -240,7 +311,7 @@ export async function createFileBundleOneBot({
     if (second.all.some((raw) => raw?.file_id === fileId)) return false;
     const secondQuota = await readQuota(route, { signal });
     return isCompleteRoot(second, secondQuota.fileCount) && JSON.stringify(firstQuota) === JSON.stringify(secondQuota)
-      && identity(first) === identity(second) ? true : null;
+      && identity(first.identities) === identity(second.identities) ? true : null;
   }
 
   async function removeConfirmedFile(route, proven, { signal } = {}) {

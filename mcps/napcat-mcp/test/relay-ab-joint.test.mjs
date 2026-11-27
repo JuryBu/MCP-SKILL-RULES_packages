@@ -39,11 +39,20 @@ function writeJson(filePath, data) {
   fs.writeFileSync(filePath, JSON.stringify(data, null, 2), "utf8");
 }
 
-function createDualMachineMockOneBot(t) {
+function createDualMachineMockOneBot(t, sharedGroup) {
   const groupId = "910002";
   const groupMeta = { group_id: 910002, group_name: "RelayV2", member_count: 3 };
   const histories = new Map([[groupId, []]]);
   const groupFiles = new Map(); // file_id -> { meta, contentBuffer }
+  const pinnedFolderId = "/board-folder-id";
+  const folderName = "comm-relay-bundles";
+  const uploads = [];
+  if (sharedGroup) {
+    groupFiles.set("/legacy-root-file", {
+      meta: { file_id: "/legacy-root-file", file_name: "legacy.data", busid: 102, file_size: 6, uploader: 200002 },
+      bytes: Buffer.from("legacy"),
+    });
+  }
   let nextMsgId = 70000;
   let nextSeq = 500;
   let nextFileNum = 1;
@@ -124,15 +133,25 @@ function createDualMachineMockOneBot(t) {
         if (action === "get_group_file_system_info") {
           const all = [...groupFiles.values()];
           const used = all.reduce((s, f) => s + f.bytes.length, 0);
-          return ok({ file_count: all.length, limit_count: 100, used_space: used, total_space: 1024 ** 3 });
+          return ok({ file_count: all.length, limit_count: 100, used_space: sharedGroup ? 0 : used, total_space: 1024 ** 3 });
         }
         if (action === "get_group_root_files") {
+          const all = [...groupFiles.values()];
           return ok({
-            files: [...groupFiles.values()].map((f) => f.meta),
+            files: all.filter((item) => !item.folder).map((item) => item.meta),
+            folders: sharedGroup ? [{ folder_id: pinnedFolderId, folder_name: folderName,
+              total_file_count: all.filter((item) => item.folder === pinnedFolderId).length }] : [],
+          });
+        }
+        if (action === "get_group_files_by_folder") {
+          if (!sharedGroup || String(body.group_id) !== groupId || body.folder_id !== pinnedFolderId) return fail();
+          return ok({
+            files: [...groupFiles.values()].filter((item) => item.folder === pinnedFolderId).map((item) => item.meta),
             folders: [],
           });
         }
         if (action === "upload_group_file") {
+          if (String(body.group_id) !== groupId || (sharedGroup && body.folder !== pinnedFolderId)) return fail();
           const buf = fs.readFileSync(body.file);
           const fid = `/fid_${nextFileNum++}`;
           const meta = {
@@ -143,7 +162,12 @@ function createDualMachineMockOneBot(t) {
             uploader: Number(selfId),
             upload_time: Math.floor(Date.now() / 1000),
           };
-          groupFiles.set(fid, { meta, bytes: buf });
+          groupFiles.set(fid, { meta, bytes: buf, folder: body.folder });
+          uploads.push({ fileId: fid, folder: body.folder });
+          if (sharedGroup && uploads.length === 1) {
+            const rootFileId = "/legacy-root-namesake";
+            groupFiles.set(rootFileId, { meta: { ...meta, file_id: rootFileId }, bytes: Buffer.alloc(buf.length, 1) });
+          }
           return ok({ file_id: fid });
         }
         if (action === "get_group_file_url") {
@@ -171,10 +195,10 @@ function createDualMachineMockOneBot(t) {
     });
   }
 
-  return { makeServer, groupFiles, histories };
+  return { makeServer, groupFiles, histories, pinnedFolderId, folderName, uploads };
 }
 
-test("6. Real A+B joint end-to-end: Block A bridge + Block B openFileBundleIntegration dual-machine bundle roundtrip", async (t) => {
+async function verifyRoundTrip(t, sharedGroup) {
   const bundleSrc = resolveBundleSrcDir();
   if (!bundleSrc) {
     t.skip("file-bundle-integration.mjs not present in this candidate tree");
@@ -204,7 +228,7 @@ test("6. Real A+B joint end-to-end: Block A bridge + Block B openFileBundleInteg
       import(pathToFileURL(path.join(jointSrc, "file-bundle-integration.mjs")).href),
     ]);
 
-  const dual = createDualMachineMockOneBot(t);
+  const dual = createDualMachineMockOneBot(t, sharedGroup);
   const devServer = await dual.makeServer("100001", "DevBot");
   const trnServer = await dual.makeServer("200002", "TrnBot");
 
@@ -220,8 +244,8 @@ test("6. Real A+B joint end-to-end: Block A bridge + Block B openFileBundleInteg
       schemaVersion: 2,
       expectedSelfId: selfId,
       expectedNickname: name,
-      groupId: "900001",
-      groupName: "LegacyTrainingGroup",
+      groupId: sharedGroup ? "910002" : "900001",
+      groupName: sharedGroup ? "RelayV2" : "LegacyTrainingGroup",
       expectedMemberCount: 3,
       controlPlane: {
         enabled: true,
@@ -247,6 +271,8 @@ test("6. Real A+B joint end-to-end: Block A bridge + Block B openFileBundleInteg
           target_machines: [peerName],
           allowed_peers: [peerName],
           allow_recipient_list_disclosure: true,
+          ...(sharedGroup ? { legacy_training_coexistence: true, allow_file_bundle_write: true,
+            file_bundle_folder_id: dual.pinnedFolderId, file_bundle_folder_name: dual.folderName } : {}),
           bootstrap_at: "2026-11-26T00:00:00.000Z",
           verify_member_count: false,
         },
@@ -260,7 +286,14 @@ test("6. Real A+B joint end-to-end: Block A bridge + Block B openFileBundleInteg
       NAPCAT_MCP_BINDING_PATH: bindingPath,
       NAPCAT_MCP_STATE_PATH: path.join(mDir, "state", "dedupe.json"),
     };
-    const notifier = createNapCatNotifier({ cwd: mDir, env });
+    const notifier = createNapCatNotifier({
+      cwd: mDir,
+      env,
+      fetchImpl: (url, options) => {
+        assert.equal(new URL(url).origin, serverInfo.origin);
+        return fetch(url, options);
+      },
+    });
     const relayService = createNapCatRelayService({ notifier, statePath: relayStatePath, relayGroupsPath: relayPath, env });
     const relayHost = createFileBundleRelayHost({ notifier, relayService, relayGroupsPath: relayPath, env });
 
@@ -302,9 +335,9 @@ test("6. Real A+B joint end-to-end: Block A bridge + Block B openFileBundleInteg
     dedupe_key: "joint-bundle-001",
     target_machine: "training",
     op: "message",
-    source: "antigravity/desktop/1a5df4f4",
-    recipients: ["codex/desktop/019f9012", "antigravity/desktop/trn-2"],
-    meta: { request_id: "req-joint-1", all_recipients: ["codex/desktop/019f9012", "antigravity/desktop/trn-2"] },
+    source: "antigravity/desktop/development-test",
+    recipients: ["codex/desktop/training-test", "antigravity/desktop/trn-2"],
+    meta: { request_id: "req-joint-1", all_recipients: ["codex/desktop/training-test", "antigravity/desktop/trn-2"] },
     payload_json: { text: "A+B 联合实测长正文 ".repeat(200) },
     attachments: [{ name: "report.txt", filePath: attPath }],
   }, dev.ctx);
@@ -352,9 +385,9 @@ test("6. Real A+B joint end-to-end: Block A bridge + Block B openFileBundleInteg
     dedupe_key: "joint-bundle-001",
     target_machine: "training",
     op: "message",
-    source: "antigravity/desktop/1a5df4f4",
-    recipients: ["codex/desktop/019f9012", "antigravity/desktop/trn-2"],
-    meta: { request_id: "req-joint-1", all_recipients: ["codex/desktop/019f9012", "antigravity/desktop/trn-2"] },
+    source: "antigravity/desktop/development-test",
+    recipients: ["codex/desktop/training-test", "antigravity/desktop/trn-2"],
+    meta: { request_id: "req-joint-1", all_recipients: ["codex/desktop/training-test", "antigravity/desktop/trn-2"] },
     payload_json: { text: "A+B 联合实测长正文 ".repeat(200) },
     attachments: [{ name: "report.txt", filePath: attPath }],
   }, dev.ctx);
@@ -366,4 +399,43 @@ test("6. Real A+B joint end-to-end: Block A bridge + Block B openFileBundleInteg
   }, trn.ctx);
   assert.equal(ackResp.ok, true);
   assert.equal(ackResp.results[0].release, "released");
-});
+
+  if (sharedGroup) {
+    const backPath = path.join(trn.mDir, "reverse.txt");
+    const backText = "同一个群反向文件";
+    fs.writeFileSync(backPath, backText, "utf8");
+    const reverse = {
+      dedupe_key: "shared-joint-bundle-reverse",
+      target_machine: "development",
+      op: "message",
+      source: "codex/desktop/training-peer",
+      recipients: ["codex/desktop/development-peer"],
+      meta: { request_id: "req-joint-reverse" },
+      payload_json: { text: backText },
+      attachments: [{ name: "reverse.txt", filePath: backPath }],
+    };
+    assert.equal((await trn.integration.invoke("napcat_file_bundle_send", reverse, trn.ctx)).ok, true);
+    await trn.integration.invoke("napcat_file_bundle_poll", {}, trn.ctx);
+    await dev.relayService.relayPoll({});
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+      await dev.integration.invoke("napcat_file_bundle_poll", {}, dev.ctx);
+    }
+    const back = (await dev.integration.invoke("napcat_file_bundle_events_read", {}, dev.ctx)).events;
+    assert.equal(back.length, 1);
+    assert.equal(back[0].sender_id, "200002");
+    assert.equal(back[0].payload_json.text, backText);
+    assert.equal(fs.readFileSync(back[0].staged_files[0].filePath, "utf8"), backText);
+    await trn.relayService.relayPoll({});
+    await trn.integration.invoke("napcat_file_bundle_poll", {}, trn.ctx);
+    assert.equal((await trn.integration.invoke("napcat_file_bundle_send", reverse, trn.ctx)).stage, "received");
+    assert.equal(dual.uploads.length, 2);
+    assert.ok(dual.uploads.every((upload) => upload.folder === dual.pinnedFolderId));
+    assert.deepEqual([...dual.groupFiles].filter(([, file]) => !file.folder).map(([id]) => id),
+      ["/legacy-root-file", "/legacy-root-namesake"]);
+  }
+}
+
+test("6. Real A+B joint end-to-end: Block A bridge + Block B openFileBundleIntegration dual-machine bundle roundtrip",
+  (context) => verifyRoundTrip(context, false));
+test("A+B 在原双机群的同一个固定目录双向收发，同名根部文件保持不变",
+  (context) => verifyRoundTrip(context, true));

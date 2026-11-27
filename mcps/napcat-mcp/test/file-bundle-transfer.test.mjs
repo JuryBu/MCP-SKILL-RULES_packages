@@ -29,7 +29,7 @@ async function setup(context) {
   for (const dir of [sourceWork, targetWork, sourceJournal, targetJournal, groupDir]) await fs.mkdir(dir);
   const counters = { announce: 0, upload: 0, download: 0, receipt: 0 };
   const group = { notices: new Map(), files: new Map(), receipts: new Map() };
-  const gate = { allowed: true, room: "ready", beforeUpload: null, lostReceipt: false };
+  const gate = { allowed: true, room: "ready", headroom: true, beforeUpload: null, lostReceipt: false };
   const io = {
     async authorize() { return gate.allowed; },
     async announce(offer) {
@@ -42,7 +42,7 @@ async function setup(context) {
       const notice = group.notices.get(offer.transferId);
       return notice ? { status: "sent", messageId: notice.messageId } : { status: "unknown" };
     },
-    async ensureSpace() { return { status: gate.room }; },
+    async ensureSpace() { return { status: gate.room, headroom: gate.headroom }; },
     async upload(offer, route, bundlePath) {
       counters.upload += 1;
       await gate.beforeUpload?.(offer);
@@ -78,7 +78,7 @@ async function setup(context) {
   });
   const source = await machine("source");
   const target = await machine("target");
-  async function prepare(contents = ["file-alpha", "file-beta"], engine = source) {
+  async function prepare(contents = ["file-alpha", "file-beta"], engine = source, route = originRoute) {
     const transferId = randomUUID();
     const files = await Promise.all(contents.map(async (content, index) => {
       const name = "附件 " + index + ".txt";
@@ -88,10 +88,10 @@ async function setup(context) {
     }));
     const bundle = await writeRelayFileBundle({ workRoot: sourceWork, files });
     const offer = createRelayFileOffer({
-      transferId, from: "development", to: "training", route: originRoute,
+      transferId, from: "development", to: "training", route,
       bytes: bundle.bytes, sha256: bundle.sha256, createdAt: epoch, expiresAt: epoch + 60_000,
     });
-    await engine.registerOutgoing({ offer, route: originRoute, bundlePath: bundle.bundlePath });
+    await engine.registerOutgoing({ offer, route, bundlePath: bundle.bundlePath });
     return { transferId, bundle, offer };
   }
   const accept = (prepared, engine = target) => engine.acceptAnnouncement({
@@ -105,6 +105,31 @@ async function setup(context) {
   };
   return { root, source, target, sourceWork, targetWork, sourceJournal, targetJournal, groupDir, counters, group, gate, io, machine, prepare, accept, acceptAck };
 }
+
+test("同群文件包两阶段都保留群档余量，容量恢复后沿原包继续", async (context) => {
+  const sample = await setup(context);
+  const route = { ...originRoute, legacyTrainingCoexistence: true,
+    fileBundleFolderId: "/pinned", fileBundleFolderName: "comm-relay-bundles" };
+  const { transferId } = await sample.prepare(["文件"], sample.source, route);
+  const reopened = await sample.machine("source");
+  assert.equal((await reopened.readOutgoing(transferId)).route.fileBundleFolderId, route.fileBundleFolderId);
+  sample.gate.headroom = false;
+  assert.deepEqual(await reopened.advanceOutgoing(transferId), {
+    status: "not_sent", reason: "pending_capacity", state: "prepared",
+  });
+  assert.equal(sample.counters.announce, 0);
+  sample.gate.headroom = true;
+  assert.equal((await reopened.advanceOutgoing(transferId)).status, "announced");
+  sample.gate.headroom = false;
+  assert.deepEqual(await reopened.advanceOutgoing(transferId), {
+    status: "not_sent", reason: "pending_capacity", state: "announced",
+  });
+  assert.equal(sample.counters.upload, 0);
+  sample.gate.headroom = true;
+  assert.equal((await reopened.advanceOutgoing(transferId)).status, "uploaded");
+  assert.equal(sample.counters.announce, 1);
+  assert.equal(sample.counters.upload, 1);
+});
 
 test("预告、文件、接收落盘和回执按同一编号：重复与乱序无重复上传", async (context) => {
   const sample = await setup(context);

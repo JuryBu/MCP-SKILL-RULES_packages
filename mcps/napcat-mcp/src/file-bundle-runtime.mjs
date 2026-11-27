@@ -7,6 +7,7 @@ import { openRelayFileJournal, relayFileJournalKey } from "./file-bundle-journal
 import { createFileBundleCapacity } from "./file-bundle-capacity.mjs";
 import { createFileBundleOneBot } from "./file-bundle-onebot.mjs";
 import { relayFileQuotaPolicy } from "./file-bundle-quota.mjs";
+import { sameFileBundleRouteScope } from "./file-bundle-route-scope.mjs";
 import { createRelayFileOffer, createRelayFileTransfer } from "./file-bundle-transfer.mjs";
 
 function reject(code, message) {
@@ -97,6 +98,7 @@ export async function createFileBundleRuntime({
       || record.route.selfQqId !== route.selfQqId || record.route.peerQqId !== route.peerQqId
       || record.route.channel !== (route.channel ?? "qq") || record.route.localMachineId !== (route.localMachineId ?? null)
       || record.route.peerMachineId !== (route.peerMachineId ?? null)
+      || !sameFileBundleRouteScope(record.route, route)
       || record.route.disclosesRecipients !== (route.disclosesRecipients ?? false) || record.requestFingerprint !== fingerprint) {
       reject("RELAY_FILE_ID_CONFLICT", "文件包编号已用于其它来源内容、目标或路线");
     }

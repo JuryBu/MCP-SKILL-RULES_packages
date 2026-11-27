@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { fileBundleRouteScope, pinnedFileBundleFolderId, sameFileBundleRouteScope } from "./file-bundle-route-scope.mjs";
 
 const writePurposes = new Set(["prepare", "announce", "upload", "file_space", "delete"]);
 const continuationPurposes = new Set(["list", "quota", "reconcile", "accept_offer", "download", "commit_received",
@@ -13,6 +14,10 @@ function capture(frozen, disclosesRecipients = false) {
     relayId: frozen.relay_key, generation: frozen.generation, groupId: frozen.group_id, channel: frozen.channel,
     selfQqId: frozen.expected_self_id, peerQqId: frozen.peer_qq_id,
     localMachineId: frozen.local_machine_id, peerMachineId: frozen.peer_machine_id,
+    ...fileBundleRouteScope({
+      legacyTrainingCoexistence: frozen.legacy_training_coexistence,
+      fileBundleFolderId: frozen.file_bundle_folder_id, fileBundleFolderName: frozen.file_bundle_folder_name,
+    }),
     disclosesRecipients,
   });
 }
@@ -22,11 +27,17 @@ function aRoute(route) {
     relay_key: route.relayId, generation: route.generation, group_id: route.groupId, channel: route.channel,
     expected_self_id: route.selfQqId, peer_qq_id: route.peerQqId,
     local_machine_id: route.localMachineId, peer_machine_id: route.peerMachineId,
+    ...(route.legacyTrainingCoexistence === true ? { legacy_training_coexistence: true } : {}),
+    ...(route.fileBundleFolderId != null ? { file_bundle_folder_id: route.fileBundleFolderId } : {}),
+    ...(route.fileBundleFolderName != null ? { file_bundle_folder_name: route.fileBundleFolderName } : {}),
   };
 }
 
 function identityMatches(left, right) {
-  return Object.keys(aRoute(left)).every((key) => aRoute(left)[key] === aRoute(right)[key]);
+  const expected = aRoute(left);
+  const current = aRoute(right);
+  return sameFileBundleRouteScope(left, right)
+    && Object.keys(expected).every((key) => expected[key] === current[key]);
 }
 
 function verifiedFileControl(result, route, expectedHash) {
@@ -52,6 +63,7 @@ export function createFileBundleRelayBinding({
     if (!route || route.channel !== "qq" || !route.localMachineId || !route.peerMachineId
       || (options.peer && options.peer !== route.peerMachineId)
       || (!writePurposes.has(purpose) && !continuationPurposes.has(purpose))) return null;
+    pinnedFileBundleFolderId(route);
     const allowDraining = !writePurposes.has(purpose);
     const config = await load();
     await reverifyFrozenRelayRoute(config, aRoute(route), { allowDraining, requireFileBundleWrite: !allowDraining });
@@ -59,7 +71,7 @@ export function createFileBundleRelayBinding({
       target_machine: route.peerMachineId, channel: route.channel, mode: "read",
       relay_key: route.relayId, expected_generation: route.generation, expected_group_id: route.groupId,
     });
-    if (!identityMatches(route, capture(current)) || current.legacy_training_coexistence === true
+    if (!identityMatches(route, capture(current))
       || (!allowDraining && (current.role !== "active_write" || current.allow_file_bundle_write !== true))
       || (["prepare", "announce", "upload", "read_received"].includes(purpose)
         && route.disclosesRecipients && current.allow_recipient_list_disclosure !== true)) return null;

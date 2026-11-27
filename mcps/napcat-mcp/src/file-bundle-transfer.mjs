@@ -4,6 +4,7 @@ import path from "node:path";
 import { createHash } from "node:crypto";
 import { relayBundleLimits, stageRelayFileBundle } from "./file-bundle-codec.mjs";
 import { relayFileJournalKey } from "./file-bundle-journal.mjs";
+import { fileBundleRouteScope, pinnedFileBundleFolderId } from "./file-bundle-route-scope.mjs";
 
 const token = /^[A-Za-z0-9_.-]{1,80}$/u;
 const uuid = /^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/u;
@@ -32,7 +33,9 @@ function presentRoute(value) {
     || (peerMachineId !== null && !textMatches(peerMachineId, token)) || typeof disclosesRecipients !== "boolean") {
     fail("RELAY_FILE_ROUTE_INVALID", "文件包路线不完整");
   }
-  return { relayId, generation, groupId, selfQqId, peerQqId, channel, localMachineId, peerMachineId, disclosesRecipients };
+  pinnedFileBundleFolderId(value);
+  return { relayId, generation, groupId, selfQqId, peerQqId, channel, localMachineId, peerMachineId,
+    disclosesRecipients, ...fileBundleRouteScope(value) };
 }
 
 function offerName(transferId, sha256) {
@@ -224,10 +227,15 @@ export async function createRelayFileTransfer({ localMachine, journal, workRoot,
     if (!current) return { status: "not_found" };
     const { offer, route, state, sourcePath } = current.value;
     const options = { signal };
+    const checkSpace = async () => {
+      const space = await io.ensureSpace(offer, route, options);
+      if (space?.status !== "ready") return space?.status ?? "quota_unknown";
+      return route.legacyTrainingCoexistence === true && space.headroom !== true ? "pending_capacity" : null;
+    };
     if (state === "prepared" || state === "announcing") {
       if (!(await authorized(route, offer.to, state === "prepared" ? "announce" : "reconcile", signal))
         || (state === "prepared" && !freshness(offer))) return { status: "blocked", state };
-      return runEffect(current, {
+      const announce = (record) => runEffect(record, {
         initial: "prepared",
         active: "announcing",
         perform: async () => (await authorized(route, offer.to, "announce", signal) && freshness(offer))
@@ -235,6 +243,22 @@ export async function createRelayFileTransfer({ localMachine, journal, workRoot,
         reconcile: () => io.findAnnouncement(offer, route, options),
         accept: (result) => nativeId(result.messageId) ? { state: "announced", announcementId: result.messageId } : null,
       });
+      if (state !== "prepared" || route.legacyTrainingCoexistence !== true) return announce(current);
+      return runGroupFileWrite(route.groupId, async () => {
+        const recent = await journal.read(current.key);
+        if (!recent || recent.revision !== current.revision) return { status: "changed" };
+        if (!(await authorized(route, offer.to, "announce", signal)) || !freshness(offer)) {
+          return { status: "not_sent", reason: "route_or_expiry", state };
+        }
+        let reason;
+        try {
+          reason = await checkSpace();
+        } catch (error) {
+          signal?.throwIfAborted();
+          reason = error?.code ?? "quota_unknown";
+        }
+        return reason ? { status: "not_sent", reason, state } : announce(recent);
+      }, signal);
     }
     if (state === "announced" || state === "uploading") {
       if (!(await authorized(route, offer.to, state === "announced" ? "upload" : "reconcile", signal))
@@ -249,8 +273,8 @@ export async function createRelayFileTransfer({ localMachine, journal, workRoot,
               return { status: "not_sent", reason: "route_or_expiry", state };
             }
             await ownedBundlePath(root, sourcePath);
-            const space = await io.ensureSpace(offer, route, options);
-            if (space?.status !== "ready") return { status: "not_sent", reason: space?.status ?? "quota_unknown", state };
+            const reason = await checkSpace();
+            if (reason) return { status: "not_sent", reason, state };
             source = await checkLocalBundle(root, sourcePath, offer, signal);
             if (!(await authorized(route, offer.to, "upload", signal)) || !freshness(offer)) {
               return { status: "not_sent", reason: "route_or_expiry", state };

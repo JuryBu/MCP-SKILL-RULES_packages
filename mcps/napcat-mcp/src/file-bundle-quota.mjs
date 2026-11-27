@@ -1,3 +1,5 @@
+import { fileBundleRouteScope, sameFileBundleRouteScope } from "./file-bundle-route-scope.mjs";
+
 const shaPattern = /^[a-f0-9]{64}$/u;
 
 function nonnegative(value) {
@@ -40,7 +42,7 @@ function measureSpace(quota, policy, incomingBytes) {
 
 function sameRoute(record, route) {
   return record.relayId === route.relayId && record.generation === route.generation
-    && record.groupId === route.groupId;
+    && record.groupId === route.groupId && sameFileBundleRouteScope(record, route);
 }
 
 function eligible(record, route, policy, now) {
@@ -71,6 +73,7 @@ export async function ensureRelayFileSpace({ route, incomingBytes, limits, io, n
     generation: route.generation,
     groupId: route.groupId,
     selfQqId: route.selfQqId,
+    ...fileBundleRouteScope(route),
   });
   const reclaimed = [];
   const result = (status, headroom = false) => ({ status, headroom, reclaimed });
