@@ -242,6 +242,9 @@ export function createManagedInnerProxySessionImplementation(shared) {
     try { return JSON.parse(fs.readFileSync(options.runtimeStatePath, "utf8")); }
     catch (error) { if (error.code === "ENOENT") return null; throw error; }
   };
+  const isOuterControlReady = outer => outer?.state === "running"
+    || (outer?.state === "waiting_for_desktop" && outer?.waitingForDesktop === true
+      && outer?.appServerPid === null && outer?.fallbackRequired !== true);
   function requireReady() {
     if (!shared.started || shared.closed || shared.outerFinished || !shared.nativeSource.status().healthy) throw new Error("MANAGED_SESSION_NOT_READY");
   }
@@ -269,7 +272,7 @@ export function createManagedInnerProxySessionImplementation(shared) {
     const current = coordinator.status();
     if (!current.nativeHealthy) throw new Error("MANAGED_SESSION_NOT_READY");
     const selected = current.workers.find(worker => worker.workerId === current.defaultWorkerId && worker.alive);
-    if (!shared.innerEndpoint || readRuntime()?.state !== "running" || !selected) throw new Error("INNER_CONTROL_NOT_READY");
+    if (!shared.innerEndpoint || !isOuterControlReady(readRuntime()) || !selected) throw new Error("INNER_CONTROL_NOT_READY");
     return { ok: true, ownerId: configuration.ownerId, nativeSourceId: configuration.nativeSourceId,
       instanceToken: options.instanceToken, revision: shared.controlRevision, busy: shared.controlBusy,
       selectedWorkerId: selected.workerId, selectedSourceHashes: selected.sourceHashes,
@@ -285,7 +288,7 @@ export function createManagedInnerProxySessionImplementation(shared) {
     const outer = readRuntime();
     const selected = current.workers.find(worker => worker.workerId === current.defaultWorkerId && worker.alive);
     const healthy = Boolean(shared.started && !shared.closed && !shared.outerFinished && shared.innerEndpoint
-      && outer?.state === "running" && source.healthy && current.running && current.nativeHealthy
+      && isOuterControlReady(outer) && source.healthy && current.running && current.nativeHealthy
       && !shared.selectionRecoveryError && selected);
     const operations = [...shared.controlOperations.values()];
     return { ok: healthy, healthy, state: healthy ? "running" : shared.closed ? "closed" : shared.started ? "degraded" : "starting",
