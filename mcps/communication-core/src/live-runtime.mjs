@@ -25,6 +25,7 @@ import { createWindsurfConversationContent } from "./windsurf-conversation-conte
 import { HostStatusProvider, createAntigravityStatusReader, createCodexStatusReader } from "./host-status.mjs";
 import { createWindsurfDesktopStatusReader } from "./windsurf-desktop-status.mjs";
 import { WindowIngressController } from "./window-ingress.mjs";
+import { CORE_RELAY_ADAPTER, attachCoreRelay, prepareCoreRelay } from "./core-relay-bridge.mjs";
 
 const MAX_ENTRIES = 256;
 const IDENTITY_FIELDS = ["machine_id", "host", "surface", "conversation_id"];
@@ -143,8 +144,25 @@ async function readConfiguration(configPath) {
     const text = await readFile(configPath, "utf8");
     if (Buffer.byteLength(text, "utf8") > 1048576) throw invalidConfiguration();
     const configuration = JSON.parse(text.replace(/^\uFEFF/, ""));
-    assertExactKeys(configuration, ["adapter_mode", "host", "port", "principals", "targets", "adapters", "allowed_conversation_ids", "delivery_timeout_ms", "reply_forwarding", "conversation_routes", "channel_windows", "window_ingress_enabled", "status_hosts"], "真实测试配置");
+    assertExactKeys(configuration, ["adapter_mode", "host", "port", "principals", "targets", "adapters", "allowed_conversation_ids", "delivery_timeout_ms", "reply_forwarding", "conversation_routes", "channel_windows", "window_ingress_enabled", "status_hosts", "address_book_file", "local_machine_id", "multi_recipient_enabled"], "真实测试配置");
     if (configuration.adapter_mode !== "live_test") throw invalidConfiguration();
+    let addressBook;
+    if (configuration.address_book_file !== undefined) {
+      const path = requireText(configuration.address_book_file, "address_book_file", 32768);
+      if (!isAbsolute(path)) throw invalidConfiguration();
+      const information = await stat(path);
+      if (!information.isFile() || information.size > 1048576) throw invalidConfiguration();
+      const text = await readFile(path, "utf8");
+      if (Buffer.byteLength(text, "utf8") > 1048576) throw invalidConfiguration();
+      const saved = JSON.parse(text.replace(/^\uFEFF/, ""));
+      assertExactKeys(saved, ["schema_version", "machine_id", "entries", "machine_routes"], "本机共有通讯录配置");
+      if (saved.schema_version !== 1) throw invalidConfiguration();
+      addressBook = {
+        machineId: requireText(saved.machine_id, "machine_id", 128),
+        sharedContacts: boundedList(saved.entries, 512, 0),
+        machineRoutes: boundedList(saved.machine_routes ?? [], 128, 0),
+      };
+    }
     const host = configuration.host === undefined ? "127.0.0.1" : configuration.host;
     if (!["127.0.0.1", "localhost"].includes(host)) throw invalidConfiguration();
     const port = requireInteger(configuration.port === undefined ? 0 : configuration.port, "port", 0, 65535);
@@ -209,7 +227,7 @@ async function readConfiguration(configPath) {
     const principalIds = new Set();
     const tokens = new Set();
     const principals = boundedList(configuration.principals).map(entry => {
-      assertExactKeys(entry, ["id", "token", "identity", "allowed_targets", "origin_kinds", "channel_component", "caller_scope", "allowed_target_scopes", "allowed_channel_reads", "allowed_channel_downloads", "allowed_host_lists", "allowed_host_snapshots"], "连接授权");
+      assertExactKeys(entry, ["id", "token", "identity", "allowed_targets", "origin_kinds", "channel_component", "caller_scope", "allowed_target_scopes", "allowed_channel_reads", "allowed_channel_downloads", "allowed_host_lists", "allowed_host_snapshots", "address_book_identity_bound"], "连接授权");
       assertExactKeys(entry.identity, IDENTITY_FIELDS, "来源对话身份");
       const id = requireText(entry.id, "principal.id", 128);
       const token = requireText(entry.token, "principal.token", 4096);
@@ -229,6 +247,8 @@ async function readConfiguration(configPath) {
       const callerScope = entry.caller_scope === undefined ? undefined : normalizeHostScope(entry.caller_scope);
       if (callerScope && (identity.conversation_id !== "*" || Object.entries(callerScope).some(([field, value]) => identity[field] !== value))) throw invalidConfiguration();
       if (!callerScope && identity.conversation_id === "*") throw invalidConfiguration();
+      if (entry.address_book_identity_bound !== undefined && typeof entry.address_book_identity_bound !== "boolean") throw invalidConfiguration();
+      if (entry.address_book_identity_bound === true && (callerScope || addressBook?.machineId !== identity.machine_id)) throw invalidConfiguration();
       const targetScopes = entry.allowed_target_scopes === undefined ? undefined : boundedList(entry.allowed_target_scopes, 32, 0).map(normalizeHostScope);
       if (targetScopes && new Set(targetScopes.map(scope => JSON.stringify(scope))).size !== targetScopes.length) throw invalidConfiguration();
       const originKinds = uniqueTextList(entry.origin_kinds ?? ["agent_message"], "origin_kind", 32, 1, 64);
@@ -246,6 +266,7 @@ async function readConfiguration(configPath) {
         ...(hostSnapshots === undefined ? {} : { allowed_host_snapshots: hostSnapshots }),
         ...(callerScope ? { caller_scope: callerScope } : {}),
         ...(targetScopes ? { allowed_target_scopes: targetScopes } : {}),
+        ...(entry.address_book_identity_bound === true ? { address_book_identity_bound: true } : {}),
         origin_kinds: originKinds,
         ...(entry.channel_component === undefined ? {} : { channel_component: requireText(entry.channel_component, "channel_component", 64) }),
       };
@@ -284,15 +305,23 @@ async function readConfiguration(configPath) {
     const ownerWindowSources = ownerWindowSourcesFor(channelWindows, targets, adapters);
     const statusHosts = uniqueTextList(configuration.status_hosts ?? [], "status_host", 1, 0, 64);
     if (statusHosts.some(entry => entry !== "windsurf")) throw invalidConfiguration();
+    const declaredMachineId = configuration.local_machine_id === undefined ? undefined : requireText(configuration.local_machine_id, "local_machine_id", 128);
+    if (declaredMachineId === "*" || declaredMachineId?.includes("\0")
+      || (declaredMachineId !== undefined && addressBook && declaredMachineId !== addressBook.machineId)) throw invalidConfiguration();
+    const knownMachines = new Set([...targets.map(target => target.machine_id), ...principals.map(principal => principal.identity.machine_id)]);
+    const localMachineId = declaredMachineId ?? addressBook?.machineId ?? (knownMachines.size === 1 ? knownMachines.values().next().value : null);
+    const multiRecipient = configuration.multi_recipient_enabled ?? false;
+    if (typeof multiRecipient !== "boolean" || (multiRecipient && localMachineId === null)) throw invalidConfiguration();
     return { host, port, deliveryTimeoutMs, targets, principals, adapters, replyForwarding, conversationRoutes, automaticReplyForwarding,
-      channelWindows, windowIngressEnabled, ownerWindowSources, statusHosts };
+      channelWindows, windowIngressEnabled, ownerWindowSources, statusHosts, addressBook, localMachineId, multiRecipient };
   } catch {
     throw invalidConfiguration();
   }
 }
 
-export async function startLiveFromConfig({ configPath, stateDir, endpointFile, onError = () => {}, factories = {}, recoverTerminated = false }) {
+export async function startLiveFromConfig({ configPath, stateDir, endpointFile, onError = () => {}, factories = {}, recoverTerminated = false, relay }) {
   let configuration;
+  let relayConfiguration;
   let directory;
   try {
     requireText(configPath, "configPath", 32768);
@@ -301,6 +330,10 @@ export async function startLiveFromConfig({ configPath, stateDir, endpointFile, 
     assertExactKeys(factories, [...ADAPTER_KINDS], "接入工厂");
     if (Object.values(factories).some(factory => typeof factory !== "function")) throw invalidConfiguration();
     configuration = await readConfiguration(configPath);
+    relayConfiguration = prepareCoreRelay(relay, configuration.localMachineId);
+    if (relayConfiguration && (configuration.adapters.some(entry => entry.id === CORE_RELAY_ADAPTER) ||
+      relayConfiguration.routes.some(route => configuration.conversationRoutes.some(existing =>
+        ["machine_id", "host", "surface"].every(field => existing[field] === route[field]))))) throw invalidConfiguration();
   } catch {
     throw invalidConfiguration();
   }
@@ -310,13 +343,16 @@ export async function startLiveFromConfig({ configPath, stateDir, endpointFile, 
   const externalAdapters = new Set();
   const transports = new Set();
   const windowTransports = new Map();
-  const statusProvider = new HostStatusProvider();
+  const localMachineId = configuration.localMachineId;
+  const machineProviders = new Map();
+  const statusProvider = new HostStatusProvider({ localMachineId, machineProviders });
   const hostContentProviders = Object.create(null);
   if (configuration.statusHosts.includes("windsurf")) statusProvider.providers.set("windsurf", createWindsurfDesktopStatusReader());
   let store;
   let downloadLedger;
   let core;
   let http;
+  let relayBridge;
   let windowIngress;
   let windowIngressNeedsSync = false;
   let timer;
@@ -332,6 +368,7 @@ export async function startLiveFromConfig({ configPath, stateDir, endpointFile, 
     closePromise = Promise.resolve().then(async () => {
       let failed = false;
       try { await windowIngress?.close(); } catch { failed = true; }
+      try { await relayBridge?.close(); } catch { failed = true; }
       const stopped = await Promise.allSettled([Promise.resolve().then(() => statusProvider.close()), Promise.resolve().then(() => core?.close()), Promise.resolve().then(() => http?.close())]);
       if (stopped.some(result => result.status === "rejected")) failed = true;
       for (const cleanup of [() => scheduledWork, ...[...ownedAdapters].map(adapter => () => adapter.close?.()), ...[...transports].map(transport => () => transport.close()), () => downloadLedger?.close(), () => store?.close()]) {
@@ -434,6 +471,8 @@ export async function startLiveFromConfig({ configPath, stateDir, endpointFile, 
       }
       const wrapped = created && Object.hasOwn(created, "adapter");
       const adapter = wrapped ? created.adapter : created;
+      if (wrapped && created.statusReader) statusProvider.providers.set(ADAPTER_HOSTS[entry.kind], created.statusReader);
+      if (wrapped && created.contentProvider) hostContentProviders[ADAPTER_HOSTS[entry.kind]] = created.contentProvider;
       if (entry.kind === "napcat_owner") windowTransports.set(entry.id,
         windowTransport ?? (wrapped ? created.windowTransport : undefined) ?? adapter?.windowTransport ?? adapter?.transport);
       if (wrapped && created.owned === false) {
@@ -452,13 +491,21 @@ export async function startLiveFromConfig({ configPath, stateDir, endpointFile, 
       }
     }
     core = new CommunicationCore({ targets: configuration.targets, principals: configuration.principals, adapters, replyForwarding: configuration.replyForwarding,
-      conversationRoutes: configuration.conversationRoutes, automaticReplyForwarding: configuration.automaticReplyForwarding, channelWindows: configuration.channelWindows,
+      conversationRoutes: [...configuration.conversationRoutes, ...(relayConfiguration?.routes ?? [])], automaticReplyForwarding: configuration.automaticReplyForwarding,
+      channelWindows: configuration.channelWindows,
       ownerWindowSources: configuration.ownerWindowSources, downloadLedger, channelDownloadFailure, autoCompleteOnReply: true,
-      statusProvider, hostContentProvider: new HostConversationContent({ providers: hostContentProviders }), deliveryTimeoutMs: configuration.deliveryTimeoutMs });
+      statusProvider, hostContentProvider: new HostConversationContent({ providers: hostContentProviders, localMachineId, machineProviders }),
+      deliveryTimeoutMs: configuration.deliveryTimeoutMs });
     if (typeof core.pollReplies !== "function") throw new CoreError("startup_failed", "真实测试核心依赖尚未就绪");
     await mkdir(directory, { recursive: true, mode: 0o700 });
     store = new MessageStore({ filePath: join(directory, "core.sqlite") });
     core.store = store;
+    if (configuration.addressBook) core.attachAddressBook(configuration.addressBook);
+    if (configuration.multiRecipient) core.attachMessageBatches({ machineId: localMachineId });
+    if (relayConfiguration) {
+      relayBridge = attachCoreRelay(core, relayConfiguration, machineProviders);
+      adapters.set(CORE_RELAY_ADAPTER, relayBridge.adapter);
+    }
     await core.start();
     if (configuration.ownerWindowSources.length) {
       if (typeof core.ingestOwnerWindowEvent !== "function") throw new CoreError("startup_failed", "窗口事件接纳依赖尚未就绪");
@@ -475,8 +522,10 @@ export async function startLiveFromConfig({ configPath, stateDir, endpointFile, 
     }
     http = await createMcpHttpServer({ core, principals: configuration.principals, host: configuration.host, port: configuration.port });
     await lease.setUrl(http.url);
+    relayBridge?.start();
     schedule();
-    return { url: http.url, address: http.address, close, core, ...(windowIngress ? { windowIngress } : {}) };
+    return { url: http.url, address: http.address, close, core, ...(windowIngress ? { windowIngress } : {}),
+      ...(relayBridge ? { relayDispatcher: relayBridge.dispatcher } : {}) };
   } catch {
     await close().catch(() => {});
     throw new CoreError("startup_failed", "真实测试服务启动失败，请核对配置、状态目录和本机依赖");

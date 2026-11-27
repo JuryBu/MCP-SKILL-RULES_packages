@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { CodexDeliveryAdapter } from "../src/adapters/codex.mjs";
+import { renderHostMessage } from "../src/adapters/host-message.mjs";
 
 const target = { machine_id: "isolation-machine", host: "codex", surface: "desktop", conversation_id: "receiver", binding_id: "receiver-binding", binding_generation: 2 };
 const input = {
@@ -37,6 +38,35 @@ test("generic Codex request carries authentic source and no QQ or model override
     assert.equal(JSON.stringify(submitted).includes(`"${forbidden}"`), false);
   }
   assert.equal(result.model_observed, undefined);
+});
+
+test("frozen group labels only change presentation; two scoped host renderings retain the original text and marker", async () => {
+  const adapter = new CodexDeliveryAdapter({ transport: { submit() { assert.fail("invalid group must never reach the transport"); }, query() {} } });
+  const grouped = structuredClone(input);
+  grouped.message.batch_meta = {
+    recipient_group: {
+      batch_id: "fixture-group", total_count: 2,
+      recipients: [target, { ...target, host: "antigravity", conversation_id: "second-fixture-recipient" }],
+    },
+    recipient_labels: ["本机给搭档取的名字"],
+  };
+  const original = structuredClone(grouped);
+  const notice = "同批收件人：本机给搭档取的名字";
+  const sharedHost = renderHostMessage(grouped);
+  assert.equal(sharedHost.split("\n")[1], notice);
+  assert.match(sharedHost, /\[COMMUNICATION_CORE message_id=isolated-message delivery_id=isolated-delivery\]/u);
+  assert.ok(sharedHost.endsWith("\n\n" + original.message.envelope.text));
+  const codex = adapter.request(grouped);
+  assert.equal(codex.body.text, notice + "\n\n" + original.message.envelope.text);
+  assert.deepEqual(grouped, original);
+  assert.equal(Object.hasOwn(codex, "batch_meta"), false);
+  grouped.message.batch_meta.recipient_labels = ["越界\n另起一行"];
+  assert.throws(() => renderHostMessage(grouped), { code: "invalid_input" });
+  assert.throws(() => adapter.request(grouped), { code: "invalid_input" });
+  assert.equal((await adapter.deliver(grouped)).outcome, "failed_before_send");
+  grouped.message.batch_meta.recipient_labels = original.message.batch_meta.recipient_labels;
+  grouped.message.envelope.text = "a".repeat(262144);
+  assert.equal((await adapter.deliver(grouped)).outcome, "failed_before_send");
 });
 
 test("transport disconnect remains unknown and query uses only original delivery", async () => {

@@ -16,7 +16,7 @@ const route = { route_key: "synthetic-events-only", conversation_id: "synthetic-
 const nativeEventId = "synthetic-quoted-owner-event";
 const rule = { id: "synthetic-return", source_principal_id: principal.id, from_binding_id: owner.binding_id, to_binding_id: returnTarget.binding_id, ttl_ms: 60000, owner_sender_allowlist: ["90001"] };
 
-async function fixture(context, { enabled = true, availability = "ready" } = {}) {
+async function fixture(context, { enabled = true, availability = "ready", viaContacts = false } = {}) {
   const directory = mkdtempSync(join(tmpdir(), "communication-reply-forward-"));
   const filePath = join(directory, "core.sqlite");
   const targets = [structuredClone(owner), structuredClone(returnTarget)];
@@ -52,12 +52,21 @@ async function fixture(context, { enabled = true, availability = "ready" } = {})
   let core;
   async function open(rules) {
     store = new MessageStore({ filePath });
-    core = new CommunicationCore({ store, targets, principals: [principal], adapters: { [owner.adapter_id]: ownerAdapter, [returnTarget.adapter_id]: returnAdapter }, replyForwarding: rules, now: () => clock });
+    const sender = viaContacts ? { ...principal, address_book_identity_bound: true } : principal;
+    core = new CommunicationCore({ store, targets, principals: [sender], adapters: { [owner.adapter_id]: ownerAdapter, [returnTarget.adapter_id]: returnAdapter }, replyForwarding: rules, now: () => clock });
+    if (viaContacts) core.attachAddressBook({ machineId: source.machine_id, sharedContacts: [
+      { id: "fixture-window", alias: "回信测试群", target: { machine_id: owner.machine_id, host: owner.host, surface: owner.surface, conversation_id: owner.conversation_id } },
+    ] });
     await core.start();
   }
   context.after(async () => { await core.close(); store.close(); await ownerAdapter.close(); rmSync(directory, { recursive: true, force: true }); });
   await open(enabled ? [rule] : []);
   const input = { caller: source, origin: { kind: "agent_message", channel: "test", source_ref: "synthetic-owner-notice" }, target: { machine_id: owner.machine_id, host: owner.host, surface: owner.surface, conversation_id: owner.conversation_id, binding_id: owner.binding_id, binding_generation: owner.binding_generation }, text: "由原模型发出的QQ通知", dedupe_key: "synthetic-forward-original", expires_at: "2031-01-01T00:00:00Z" };
+  if (viaContacts) {
+    input.caller = { host: source.host, conversation_id: source.conversation_id };
+    input.target = { contact: "回信测试群" };
+    delete input.origin;
+  }
   const original = await core.sendMessage({ principal_id: principal.id }, input);
   await core.drain();
   return {
@@ -102,6 +111,27 @@ test("no automatic forwarding is inferred when no explicit return rule is config
   assert.equal(state.forwards().length, 0);
   assert.equal(state.calls.received.length, 0);
   assert.equal(state.core.hasReply(state.original.message.message_id), true);
+});
+
+test("a QQ contact uses the same original quote, per-window return address, and durable receipts after reopen", async context => {
+  const state = await fixture(context, { viaContacts: true });
+  const before = state.core.result(state.original.message.message_id);
+  assert.equal(state.original.resolved_target.conversation_id, owner.conversation_id);
+  assert.equal(before.delivery.evidence.evidence.native_receipt.message_id, "80001");
+  assert.equal((await state.core.pollReplies()).replies, 1);
+  await state.core.drain();
+  const [reply] = state.forwards();
+  assert.equal(reply.delivery.status, "accepted");
+  assert.equal(reply.message.envelope.in_reply_to, before.message.message_id);
+  assert.equal(reply.message.target_key, identityKey(source));
+  await state.reopen();
+  const originalAgain = await state.core.sendMessage({ principal_id: principal.id }, state.input);
+  assert.equal(originalAgain.duplicate, true);
+  assert.equal(originalAgain.delivery.delivery_id, before.delivery.delivery_id);
+  assert.deepEqual(originalAgain.delivery.evidence, before.delivery.evidence);
+  assert.equal(state.forwards()[0].delivery.delivery_id, reply.delivery.delivery_id);
+  assert.equal(state.calls.qq, 1);
+  assert.equal(state.calls.received.length, 1);
 });
 
 test("absent originating host keeps the same return message and delivery through restart", async context => {

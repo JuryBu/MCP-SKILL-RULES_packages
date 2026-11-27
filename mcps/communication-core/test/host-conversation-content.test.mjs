@@ -34,6 +34,75 @@ test("list is an independent grant, signs scoped upstream cursors and projects o
   assert.equal(calls.length, 2);
 });
 
+test("remote content needs an exact machine and host provider, an independent grant, and a matching cursor", async () => {
+  const remoteScope = { ...scope, machine_id: "test-remote-machine" };
+  const remoteTarget = { ...target, ...remoteScope };
+  const both = { ...principal, allowed_host_lists: [scope, remoteScope], allowed_host_snapshots: [target, remoteTarget] };
+  const calls = [];
+  const make = label => ({
+    async list(address, { cursor }) {
+      calls.push({ label, address, cursor });
+      return { conversations: [{ conversation_id: "test-thread", title: label }], next_cursor: cursor ? null : label + "-page" };
+    },
+    async readRecent(address) {
+      calls.push({ label, address });
+      return { ...address, title: label, rounds: [] };
+    },
+  });
+  const routes = new Map();
+  const view = new HostConversationContent({ localMachineId: scope.machine_id, providers: { codex: make("local") }, machineProviders: routes });
+  const remoteRequest = { caller, ...remoteScope, scope: "host" };
+  await assert.rejects(view.list(both, remoteRequest), { code: "host_content_unavailable" });
+  await assert.rejects(view.snapshot(both, { caller, target: remoteTarget }), { code: "host_content_unavailable" });
+  assert.equal(calls.length, 0);
+  routes.set(remoteScope.machine_id, new Map([["codex", make("remote")]]));
+  await assert.rejects(view.list(principal, remoteRequest), { code: "forbidden" });
+  await assert.rejects(view.list(both, { ...remoteRequest, surface: "cli" }), { code: "forbidden" });
+  const localResult = await view.list(both, { caller, host: "codex", scope: "host" });
+  await assert.rejects(view.list(both, { ...remoteRequest, cursor: localResult.next_cursor }), { code: "invalid_cursor" });
+  const remoteResult = await view.list(both, remoteRequest);
+  assert.equal(remoteResult.conversations[0].title, "remote");
+  assert.equal(remoteResult.conversations[0].machine_id, remoteScope.machine_id);
+  assert.equal((await view.list(both, { ...remoteRequest, cursor: remoteResult.next_cursor })).has_more, false);
+  const recent = await view.snapshot(both, { caller, target: remoteTarget });
+  assert.equal(recent.target.machine_id, remoteScope.machine_id);
+  assert.deepEqual(calls.map(entry => entry.label), ["local", "remote", "remote", "remote"]);
+  routes.get(remoteScope.machine_id).get("codex").cursorGeneration = 2;
+  await assert.rejects(view.list(both, { ...remoteRequest, cursor: remoteResult.next_cursor }), { code: "invalid_cursor" });
+  const refreshed = await view.list(both, remoteRequest);
+  routes.set(remoteScope.machine_id, new Map([["codex", make("new-remote")]]));
+  await assert.rejects(view.list(both, { ...remoteRequest, cursor: refreshed.next_cursor }), { code: "invalid_cursor" });
+  assert.equal(calls.at(-1).label, "remote");
+});
+
+test("two authorized cores preserve a maximum-length native directory cursor through both signatures", async () => {
+  const remoteScope = { ...scope, machine_id: "fixture-second-directory-machine" };
+  const peer = { id: "fixture-directory-peer", identity: { ...remoteScope, conversation_id: "fixture-peer" }, allowed_host_lists: [remoteScope] };
+  const operator = { ...principal, allowed_host_lists: [remoteScope] };
+  const nativeCursor = "x".repeat(512);
+  const observed = [];
+  const destination = new HostConversationContent({ localMachineId: remoteScope.machine_id, providers: { codex: {
+    async list(address, { cursor }) {
+      observed.push(cursor);
+      return { conversations: [{ conversation_id: cursor ? "fixture-page-two" : "fixture-page-one" }], next_cursor: cursor ? null : nativeCursor };
+    },
+  } } });
+  const relayed = { list: (address, { cursor, limit, signal }) => destination.list(peer, { ...address, caller: peer.identity, scope: "host", cursor, limit }, { signal }) };
+  const source = new HostConversationContent({
+    localMachineId: scope.machine_id, machineProviders: new Map([[remoteScope.machine_id, new Map([[remoteScope.host, relayed]])]]),
+  });
+  const input = { ...remoteScope, caller, scope: "host", limit: 1 };
+  const first = await source.list(operator, input);
+  assert.equal(first.conversations[0].conversation_id, "fixture-page-one");
+  assert.equal(first.has_more, true);
+  assert.ok(first.next_cursor.length > 727 && first.next_cursor.length <= 1024);
+  await assert.rejects(source.list({ ...operator, id: "another-directory-principal" }, { ...input, cursor: first.next_cursor }), { code: "invalid_cursor" });
+  const second = await source.list(operator, { ...input, cursor: first.next_cursor });
+  assert.equal(second.conversations[0].conversation_id, "fixture-page-two");
+  assert.equal(second.has_more, false);
+  assert.deepEqual(observed, [null, nativeCursor]);
+});
+
 test("snapshot checks the exact target before reading and emits single-copy Markdown without hidden content", async () => {
   let count = 0;
   const view = new HostConversationContent({ providers: { codex: {

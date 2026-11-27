@@ -74,6 +74,95 @@ test("requires an explicit persistent file path", () => {
   }
 });
 
+test("optional multi-recipient ledger commits with child receipts and preserves the original batch on retry", context => {
+  const { open } = createFixture(context);
+  const first = open();
+  const ledger = first.openMessageBatches();
+  const original = { batch_id: "fixture-group", source_key: identityKey(SOURCE), dedupe_key: "fixture-batch",
+    batch_payload_hash: digest("fixed list and text"), created_at: CREATED_AT,
+    receipts: [{ message_id: "fixture-child", delivery_id: "fixture-child-delivery" }] };
+  assert.throws(() => first.transaction(() => {
+    ledger.insert(original);
+    first.insertMessage(makeMessage("fixture-child"));
+    first.insertDelivery(makeDelivery("fixture-child-delivery", "fixture-child"));
+    throw new Error("fixture transaction interrupted");
+  }), /fixture transaction interrupted/);
+  first.close();
+  const reopened = open();
+  const recovered = reopened.openMessageBatches();
+  assert.equal(recovered.find(original.source_key, original.dedupe_key), null);
+  assert.equal(reopened.getMessage("fixture-child"), null);
+  assert.equal(reopened.getDelivery("fixture-child-delivery"), null);
+  reopened.transaction(() => {
+    assert.equal(recovered.insert(original).duplicate, false);
+    reopened.insertMessage(makeMessage("fixture-child"));
+    reopened.insertDelivery(makeDelivery("fixture-child-delivery", "fixture-child"));
+  });
+  const duplicate = recovered.insert({ ...original, batch_id: "fixture-other-id" });
+  assert.deepEqual(duplicate, { duplicate: true, record: original });
+  assert.throws(() => recovered.insert({ ...original, batch_payload_hash: digest("changed recipients") }), { code: "dedupe_conflict" });
+  assert.equal(reopened.getDeliveryForMessage(original.receipts[0].message_id).delivery_id, "fixture-child-delivery");
+});
+
+test("a relay processing acknowledgement shares the local commit and recovers uncertain sends only by their original attempt", context => {
+  const { open } = createFixture(context);
+  let clock = Date.parse(CREATED_AT);
+  let store = open();
+  let relay = store.openRelayAcknowledgements({ now: () => clock });
+  const locallyReceived = "fixture-inbound-message";
+  const route = {
+    local_message_id: locallyReceived, origin_relay_id: "fixture-relay-entry", origin_message_id: "fixture-remote-message",
+    from_machine: SOURCE.machine_id, reply_relay_key: "fixture-draining-group", reply_group_id: "fixture-group",
+    reply_route_generation: 3, target_key: identityKey(TARGET),
+  };
+  assert.throws(() => relay.bindInbound(route), { code: "delivery_mismatch" });
+  store.insertMessage(makeMessage(locallyReceived));
+  assert.throws(() => relay.bindInbound({ ...route, from_machine: "fixture-wrong-source" }), { code: "delivery_mismatch" });
+  assert.deepEqual(relay.bindInbound(route), route);
+  assert.deepEqual(relay.bindInbound(route), route);
+  assert.throws(() => relay.bindInbound({ ...route, reply_route_generation: 4 }), { code: "relay_route_changed" });
+
+  assert.throws(() => store.transaction(() => {
+    store.updateMessage(locallyReceived, { processing: "processing" });
+    assert.equal(relay.stageProcessing(locallyReceived, "processing").ack_seq, 1);
+    throw new Error("fixture rolls back both writes");
+  }), /rolls back both/);
+  assert.equal(store.getMessage(locallyReceived).processing, "pending");
+  assert.deepEqual(relay.ready(), []);
+  const first = store.transaction(() => {
+    store.updateMessage(locallyReceived, { processing: "processing" });
+    return relay.stageProcessing(locallyReceived, "processing");
+  });
+  assert.equal(first.ack_seq, 1);
+  assert.equal(first.reply_route_generation, 3);
+  assert.equal(relay.stageProcessing(locallyReceived, "processing"), null);
+  assert.equal(relay.claim(first.event_id).attempt, 1);
+  assert.equal(relay.claim(first.event_id), null);
+  assert.equal(relay.settle(first.event_id, 1, "failed_before_send"), true);
+  assert.deepEqual(relay.ready(), []);
+  clock += 1000;
+  assert.equal(relay.claim(first.event_id).attempt, 2);
+  assert.equal(relay.settle(first.event_id, 1, "accepted"), false);
+
+  store.close();
+  store = open();
+  relay = store.openRelayAcknowledgements({ now: () => clock });
+  assert.equal(relay.recoverInterrupted(), 1);
+  assert.equal(relay.read(first.event_id).state, "unknown");
+  assert.equal(relay.claim(first.event_id), null);
+  assert.equal(relay.settle(first.event_id, 2, "failed_before_send"), false);
+  assert.equal(relay.settle(first.event_id, 2, "accepted"), true);
+  assert.equal(relay.read(first.event_id).state, "sent");
+  const second = store.transaction(() => {
+    store.updateMessage(locallyReceived, { processing: "done" });
+    return relay.stageProcessing(locallyReceived, "done");
+  });
+  assert.equal(second.ack_seq, 2);
+  assert.equal(second.reply_group_id, route.reply_group_id);
+  assert.deepEqual(relay.ready().map(item => item.event_id), [second.event_id]);
+  assert.throws(() => relay.stageProcessing(locallyReceived, "processing"), { code: "processing_conflict" });
+});
+
 test("enables WAL, FULL synchronous writes and foreign keys on its connection", context => {
   const originalExec = DatabaseSync.prototype.exec;
   const settings = [];

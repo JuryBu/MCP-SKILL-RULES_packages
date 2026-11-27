@@ -188,9 +188,10 @@ test("caller_scope admits fresh concrete CIDs absent from config and retains cal
   for (const caller of callers) {
     assert.equal(value.allowed_conversation_ids.includes(caller.conversation_id), false);
     assert.equal(value.targets.some(target => target.conversation_id === caller.conversation_id), false);
-    const result = await service.core.readChannelMessages(invocation, request(caller));
+    const shortCaller = { host: caller.host, conversation_id: caller.conversation_id };
+    const result = await service.core.readChannelMessages(invocation, request(shortCaller));
     references.push(result.messages[0].attachments[0].attachment_ref);
-    assert.equal((await service.core.downloadAttachment(invocation, downloadRequest(references.at(-1), caller))).status, "downloaded");
+    assert.equal((await service.core.downloadAttachment(invocation, downloadRequest(references.at(-1), shortCaller))).status, "downloaded");
   }
   assert.notEqual(references[0], references[1]);
   await assert.rejects(service.core.downloadAttachment(invocation, downloadRequest(references[0], callers[1])), rejectsCode("invalid_attachment_ref"));

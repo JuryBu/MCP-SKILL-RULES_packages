@@ -1,4 +1,5 @@
-import { CoreError, identityKey } from "../contracts.mjs";
+import { CoreError, identityKey, requireText } from "../contracts.mjs";
+import { batchRecipientNotice } from "./host-message.mjs";
 
 function confirmedBusyRetry({ message, delivery, target }) {
   const previous = delivery.evidence;
@@ -23,6 +24,14 @@ export class CodexDeliveryAdapter {
   }
 
   request({ message, delivery, target }) {
+    let bodyText = message.envelope.text;
+    try {
+      const batchNotice = batchRecipientNotice(message);
+      if (batchNotice) bodyText = requireText(batchNotice + "\n\n" + bodyText, "群发到 Codex 的正文");
+    } catch (error) {
+      if (!(error instanceof CoreError)) throw error;
+      throw new CoreError(error.code, error.message, { request_sent: false, local_rejection: true });
+    }
     return {
       delivery_id: delivery.delivery_id,
       message_id: message.message_id,
@@ -37,7 +46,7 @@ export class CodexDeliveryAdapter {
         binding_generation: target.binding_generation,
       },
       body: {
-        text: message.envelope.text,
+        text: bodyText,
         attachment_refs: message.envelope.attachment_refs,
       },
       delivery_policy: message.envelope.delivery_policy,

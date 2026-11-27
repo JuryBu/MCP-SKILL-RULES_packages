@@ -1,6 +1,7 @@
 import { codexModelObservation, projectModelObservation, unknownModelObservation } from "./host-model-observation.mjs";
 
 const UNKNOWN = "unknown";
+const REMOTE_STATUS_TIMEOUT_MS = 15000;
 const MODES = ["next_model_boundary", "when_idle"];
 const RUNNING = new Set(["RUNNING", "CASCADE_RUN_STATUS_RUNNING"]);
 const IDLE = new Set(["IDLE", "NOT_LOADED", "CASCADE_RUN_STATUS_IDLE", "CASCADE_RUN_STATUS_NOT_LOADED"]);
@@ -10,6 +11,7 @@ const ERROR_CODES = new Set([
   "codex_no_ready_client", "codex_proxy_closed", "codex_control_disabled", "codex_control_unknown", "codex_control_not_ready",
   "codex_target_mismatch", "codex_thread_system_error", "codex_thread_status_missing",
   "codex_direct_input_disabled", "codex_direct_input_unknown",
+  "remote_timeout",
 ]);
 
 function record(value) {
@@ -103,6 +105,7 @@ function diagnostic(code) {
     status_host_unsupported: "读取器未提供宿主状态接口",
     status_conversation_unsupported: "读取器未提供单对话状态接口",
     status_timeout: "状态探测达到期限，未完成的项目保持未知",
+    remote_timeout: "远端机器在等待窗口内未返回状态",
     status_cancelled: "本次状态查询已取消",
     status_closed: "状态读取器已关闭",
     status_invalid_target: "状态查询目标无效",
@@ -252,11 +255,13 @@ export function createCodexStatusReader({ readHostStatus, inspectThread, configu
 }
 
 export class HostStatusProvider {
-  constructor({ providers = {}, now = () => Date.now(), timeoutMs = 8000, modelTimeoutMs = 500 } = {}) {
+  constructor({ providers = {}, machineProviders = new Map(), localMachineId, now = () => Date.now(), timeoutMs = 8000, modelTimeoutMs = 500 } = {}) {
     if (!record(providers) || typeof now !== "function") throw new TypeError("Invalid status providers or clock");
     if (!Number.isInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 8000) throw new RangeError("timeoutMs must be an integer in 1..8000");
     if (!Number.isInteger(modelTimeoutMs) || modelTimeoutMs < 1 || modelTimeoutMs > 2000) throw new RangeError("modelTimeoutMs must be an integer in 1..2000");
     this.providers = new Map(Object.entries(providers));
+    this.machineProviders = machineProviders;
+    this.localMachineId = localMachineId;
     this.now = now;
     this.timeoutMs = timeoutMs;
     this.modelTimeoutMs = modelTimeoutMs;
@@ -279,15 +284,40 @@ export class HostStatusProvider {
     };
   }
 
-  async probe(target, reader, signal, source, hostObserved = () => {}) {
+  async probe(target, reader, signal, source, remote, hostObserved) {
     const hasConversation = target.conversation_id !== undefined;
     const configured = configurationFor(reader, target);
+    if (remote && typeof reader.getRemoteStatus === "function") {
+      const received = await read(reader, "getRemoteStatus", target, signal, "status_host_unsupported");
+      hostObserved();
+      const value = received.value;
+      const relaySource = "remote_core_relay";
+      if (received.code === "status_timeout" || received.code === "remote_timeout" || value?.code === "remote_timeout") {
+        return this.snapshot(target, relaySource, "remote_timeout");
+      }
+      if (!record(value?.target) || ["machine_id", "host", "surface", "conversation_id"].some(key => target[key] !== value.target[key])) {
+        return this.snapshot(target, relaySource, received.code ?? "status_invalid_response");
+      }
+      const status = this.snapshot(target, relaySource, value.code === "forbidden" ? "forbidden" : undefined);
+      if (value.code === "forbidden") return status;
+      for (const key of ["host_online", "conversation_exists", "conversation_running", "can_deliver", "transport_ready", "control_enabled",
+        "control_ready", "host_can_receive"]) status[key] = truth(value[key]);
+      status.configured_delivery_modes = modes(value.configured_delivery_modes);
+      status.delivery_modes = modes(value.delivery_modes);
+      if (hasConversation) status.model_observation = projectModelObservation(value.model_observation, relaySource);
+      if (rawStatus(value) !== undefined) status.raw_status = rawStatus(value);
+      return status;
+    }
     const result = this.snapshot(target, source, undefined, configured, sendingConfigured(reader));
     const [host, conversation] = await Promise.all([
       read(reader, "getHostStatus", target, signal, "status_host_unsupported"),
       hasConversation ? read(reader, "describeConversation", target, signal, "status_conversation_unsupported") : Promise.resolve({}),
     ]);
     hostObserved();
+    if (remote && (signal.reason === "status_timeout" ||
+      [host, conversation].some(status => status.code === "remote_timeout" || status.value?.code === "remote_timeout"))) {
+      return this.snapshot(target, "remote_core_relay", "remote_timeout", configured);
+    }
     result.host_online = truth(host.value?.host_online);
     result.transport_ready = truth(host.value?.transport_ready);
     result.control_enabled = truth(host.value?.control_enabled);
@@ -380,13 +410,14 @@ export class HostStatusProvider {
     return result;
   }
 
-  start(target, reader, key, source) {
+  start(target, reader, key, source, { remote, generation }) {
     const controller = new AbortController();
-    const entry = { controller, startedAt: this.now(), waiters: 0, settled: false };
-    const timer = setTimeout(() => controller.abort("status_timeout"), this.timeoutMs);
+    const entry = { controller, reader, generation, startedAt: this.now(), waiters: 0, settled: false };
+    const timeoutMs = remote ? REMOTE_STATUS_TIMEOUT_MS : this.timeoutMs;
+    const timer = setTimeout(() => controller.abort("status_timeout"), timeoutMs);
     this.active.add(entry);
     this.inflight.set(key, entry);
-    entry.promise = this.probe(target, reader, controller.signal, source, () => clearTimeout(timer)).catch(() => this.snapshot(target, source, "status_probe_failed", configurationFor(reader, target), sendingConfigured(reader))).finally(() => {
+    entry.promise = this.probe(target, reader, controller.signal, source, remote, () => clearTimeout(timer)).catch(() => this.snapshot(target, source, "status_probe_failed", configurationFor(reader, target), sendingConfigured(reader))).finally(() => {
       entry.settled = true;
       clearTimeout(timer);
       this.active.delete(entry);
@@ -402,17 +433,23 @@ export class HostStatusProvider {
       return this.snapshot(target ?? null, source, "status_invalid_target");
     }
     target = structuredClone(target);
-    const reader = this.providers.get(target.host);
+    const home = this.localMachineId;
+    const remote = home === null || (home !== undefined && target.machine_id !== undefined && target.machine_id !== home);
+    const reader = this.machineProviders.get(target.machine_id)?.get(target.host) ?? (remote ? null : this.providers.get(target.host));
     const configuration = record(reader) ? configurationFor(reader, target) : undefined;
     const receptionConfigured = record(reader) ? sendingConfigured(reader) : UNKNOWN;
     if (this.closed) return this.snapshot(target, source, "status_closed", configuration, receptionConfigured);
     if (signal?.aborted) return this.snapshot(target, source, "status_cancelled", configuration, receptionConfigured);
     if (!record(reader)) return this.snapshot(target, source, "status_reader_not_configured");
     const readerSource = typeof reader.source === "string" && reader.source.length <= 128 ? reader.source : `${target.host}_status_reader`;
+    const generation = remote && Number.isSafeInteger(reader.cursorGeneration) ? reader.cursorGeneration : null;
     const key = JSON.stringify(Object.entries(target).sort(([left], [right]) => left.localeCompare(right)));
     let entry = this.inflight.get(key);
     const age = entry ? this.now() - entry.startedAt : Infinity;
-    if (!entry || entry.settled || entry.controller.signal.aborted || age < 0 || age >= 1000) entry = this.start(target, reader, key, readerSource);
+    if (!entry || entry.reader !== reader || entry.generation !== generation || (remote && generation === null) ||
+      entry.settled || entry.controller.signal.aborted || age < 0 || age >= 1000) {
+      entry = this.start(target, reader, key, readerSource, { remote, generation });
+    }
     return new Promise(resolve => {
       let settled = false;
       entry.waiters += 1;

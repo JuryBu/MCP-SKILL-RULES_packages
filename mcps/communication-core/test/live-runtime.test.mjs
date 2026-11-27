@@ -12,12 +12,81 @@ import { setTimeout as delay } from "node:timers/promises";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { startLiveFromConfig } from "../src/live-runtime.mjs";
+import { createMcpStdioFacade } from "../src/mcp-stdio-facade.mjs";
 import { runLiveCli } from "../scripts/live.mjs";
 import { startLiveService } from "../scripts/live-service.mjs";
 import { MockAdapter } from "../src/adapters/mock.mjs";
 
 const root = fileURLToPath(new URL("../", import.meta.url));
 const mockFactories = { antigravity: () => new MockAdapter() };
+
+test("isolated live launch loads its machine book; the real shared facade leaves personal contacts private", async context => {
+  const value = configuration();
+  const files = await fixture(context, value);
+  const endpointFile = join(files.directory, "fixture-endpoint.json");
+  value.address_book_file = join(files.directory, "shared-contacts.json");
+  value.multi_recipient_enabled = true;
+  value.principals[0].address_book_identity_bound = true;
+  const identity = { ...value.principals[0].identity, surface: "desktop" };
+  const caller = { host: identity.host, conversation_id: identity.conversation_id };
+  const configured = value.targets[0];
+  const target = { machine_id: configured.machine_id, host: configured.host, surface: configured.surface, conversation_id: configured.conversation_id };
+  await writeFile(value.address_book_file, JSON.stringify({
+    schema_version: 1, machine_id: identity.machine_id, entries: [{ id: "fixture-shared-note", alias: "共有", target, note: "默认" }],
+  }), "utf8");
+  await writeFile(files.configPath, JSON.stringify(value), "utf8");
+
+  const service = await startLiveService({ ...files, endpointFile }, {
+    startRuntime: options => startLiveFromConfig({ ...options, factories: mockFactories }),
+  });
+  files.cleanup(() => service.close());
+  const direct = new Client({ name: "fixture-address-book-launch", version: "1.0.0" });
+  files.cleanup(() => direct.close());
+  await direct.connect(new StreamableHTTPClientTransport(new URL(service.url), {
+    requestInit: { headers: { Authorization: `Bearer ${value.principals[0].token}` } },
+  }));
+  const saved = await direct.callTool({ name: "communication_contacts", arguments: { caller, action: "save", alias: "个人", target } });
+  assert.equal(saved.structuredContent?.scope, "personal");
+
+  const profile = join(files.directory, "fixture-connection.json");
+  const registry = join(files.directory, "fixture-registry.json");
+  await writeFile(profile, JSON.stringify({ endpoint_file: endpointFile, identity, token: value.principals[0].token }), "utf8");
+  await writeFile(registry, JSON.stringify({ version: 1, connections: [{ connection_file: profile }] }), "utf8");
+  const facade = await createMcpStdioFacade({ registryFile: registry, includeContacts: true, includeMultiRecipient: true });
+  files.cleanup(() => facade.close());
+  const visible = await facade.callTool("communication_contacts", { caller, action: "list" });
+  assert.deepEqual(visible.structuredContent?.contacts.map(entry => entry.alias), ["共有"]);
+  const denied = await facade.callTool("communication_contacts", { caller, action: "set_note", contact: "共有", note: "不得覆盖" });
+  assert.equal(denied.structuredContent?.error?.code, "caller_unverified");
+  const grouped = await facade.callTool("communication_send_message", { caller, targets: [{ contact: "共有" }], text: "真实隔离门面群发",
+    dedupe_key: "fixture-live-one-recipient-batch" });
+  assert.notEqual(grouped.isError, true, JSON.stringify(grouped.structuredContent));
+  assert.deepEqual(grouped.structuredContent.results.map(entry => entry.target), [target]);
+});
+
+test("an ambiguous live machine config will not label a local reader with the incoming caller's machine", async context => {
+  const value = configuration();
+  const callerConfig = value.principals[0];
+  callerConfig.identity.machine_id = "fixture-other-machine";
+  const scope = { machine_id: callerConfig.identity.machine_id, host: "antigravity", surface: "desktop" };
+  callerConfig.allowed_host_lists = [scope];
+  callerConfig.allowed_target_scopes = [scope];
+  const files = await fixture(context, value);
+  const service = await startLiveFromConfig({ ...files, factories: mockFactories });
+  files.cleanup(() => service.close());
+  assert.equal(service.core.statusProvider.localMachineId, null);
+  assert.equal(service.core.hostContentProvider.localMachineId, null);
+  let reads = 0;
+  service.core.statusProvider.providers.set("antigravity", { async getHostStatus() { reads++; return { host_online: true }; } });
+  service.core.hostContentProvider.providers.antigravity = { async list() { reads++; return { conversations: [] }; } };
+  const caller = { host: callerConfig.identity.host, conversation_id: callerConfig.identity.conversation_id };
+  const auth = { principal_id: callerConfig.id };
+  const status = await service.core.getStatus(auth, { caller, ...scope });
+  assert.equal(status.host_online, "unknown");
+  assert.equal(status.code, "status_reader_not_configured");
+  await assert.rejects(service.core.listConversations(auth, { caller, ...scope, scope: "host" }), { code: "host_content_unavailable" });
+  assert.equal(reads, 0);
+});
 
 test("同stateDir第二runtime在adapter构造与SQLite调度前被拒绝", async context => {
   const files = await fixture(context);

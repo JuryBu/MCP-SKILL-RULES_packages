@@ -3,6 +3,8 @@ import { dirname, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { isDeepStrictEqual, types } from "node:util";
 import { assertExactKeys, CoreError, identityKey, requireInteger, requireText } from "./contracts.mjs";
+import { ConversationAddressBook } from "./conversation-address-book.mjs";
+import { RelayAckStore } from "./relay-ack-store.mjs";
 
 const MAX_PAGE_SIZE = 1000;
 const MAX_DIRECTORY_PAGE_SIZE = 100;
@@ -12,7 +14,7 @@ const MAX_DIRECTORY_KEY_BYTES = 4096;
 const UNSAFE_DIRECTORY_KEYS = new Set(["__proto__", "prototype", "constructor"]);
 const MESSAGE_PATCH_FIELDS = [
   "delivery_status", "processing", "processing_note", "model_observed", "ui_observed",
-  "error", "last_error", "evidence", "updated_at",
+  "error", "last_error", "evidence", "updated_at", "relay_request_id", "remote_processing_sequence",
 ];
 const DELIVERY_PATCH_FIELDS = [
   "status", "attempt_count", "updated_at", "error", "last_error", "evidence",
@@ -150,6 +152,8 @@ function validateMessage(record) {
   if (!record.envelope || typeof record.envelope !== "object" || Array.isArray(record.envelope)) {
     throw new CoreError("invalid_input", "envelope必须是JSON对象");
   }
+  if (record.relay_request_id !== undefined) requireText(record.relay_request_id, "中继原请求", 128);
+  if (record.remote_processing_sequence !== undefined) requireInteger(record.remote_processing_sequence, "跨机处理次序", 1);
 }
 
 function validateDelivery(record) {
@@ -270,6 +274,103 @@ export class MessageStore {
 
   #assertOpen() {
     if (!this.#database.isOpen) throw new CoreError("store_closed", "存储已关闭");
+  }
+
+  openAddressBook(options) {
+    return this.transaction(() => new ConversationAddressBook({ ...options, database: this.#database }));
+  }
+
+  openRelayAcknowledgements({ now } = {}) {
+    return this.transaction(() => new RelayAckStore({ database: this.#database,
+      transaction: callback => this.transaction(callback), readMessage: messageId => this.getMessage(messageId), now }));
+  }
+
+  openRelayDispatches() {
+    this.transaction(() => this.#database.exec(`
+      CREATE TABLE IF NOT EXISTS relay_dispatches (
+        request_id TEXT NOT NULL PRIMARY KEY,
+        phase TEXT NOT NULL CHECK (phase IN ('prepared','submitting','relayed','unknown')),
+        record_json TEXT NOT NULL CHECK (json_valid(record_json))
+      ) STRICT;
+    `));
+    const read = requestId => {
+      this.#assertOpen();
+      const row = this.#database.prepare("SELECT phase, record_json FROM relay_dispatches WHERE request_id = ?")
+        .get(requireText(requestId, "中继原请求", 128));
+      return row ? { ...decodeRecord(row), phase: row.phase } : null;
+    };
+    const encode = value => {
+      const data = encodeJson(value, "中继原请求记录");
+      if (Buffer.byteLength(data, "utf8") > 65536) throw new CoreError("invalid_input", "中继原请求记录超限");
+      return data;
+    };
+    return Object.freeze({
+      read,
+      stage: record => {
+        const requestId = requireText(record.request_id, "中继原请求", 128);
+        this.#database.prepare("INSERT INTO relay_dispatches(request_id, phase, record_json) VALUES (?, 'prepared', ?)")
+          .run(requestId, encode(record));
+      },
+      claim: requestId => {
+        const row = this.#database.prepare("UPDATE relay_dispatches SET phase = 'submitting' WHERE request_id = ? AND phase = 'prepared' RETURNING request_id")
+          .get(requireText(requestId, "中继原请求", 128));
+        return row ? read(row.request_id) : null;
+      },
+      update: (requestId, transform) => this.transaction(() => {
+        const old = read(requestId);
+        if (!old) return null;
+        const next = transform(old);
+        if (!next || next.request_id !== requestId) return old;
+        const { phase, ...record } = next;
+        this.#database.prepare("UPDATE relay_dispatches SET phase = ?, record_json = ? WHERE request_id = ?")
+          .run(phase, encode(record), requestId);
+        return next;
+      }),
+      recoverInterrupted: () => this.#database.prepare("UPDATE relay_dispatches SET phase = 'unknown' WHERE phase = 'submitting'").run().changes,
+    });
+  }
+
+  openMessageBatches() {
+    this.transaction(() => this.#database.exec(`
+      CREATE TABLE IF NOT EXISTS message_batches (
+        batch_id TEXT NOT NULL PRIMARY KEY,
+        source_key TEXT NOT NULL,
+        dedupe_key TEXT NOT NULL,
+        batch_payload_hash TEXT NOT NULL,
+        record_json TEXT NOT NULL CHECK (json_valid(record_json)),
+        created_at TEXT NOT NULL,
+        UNIQUE(source_key, dedupe_key)
+      ) STRICT;
+    `));
+    const find = (sourceKey, dedupeKey) => {
+      this.#assertOpen();
+      requireText(sourceKey, "source_key", 1024);
+      requireText(dedupeKey, "dedupe_key", 128);
+      return decodeRecord(this.#database.prepare("SELECT record_json FROM message_batches WHERE source_key = ? AND dedupe_key = ?").get(sourceKey, dedupeKey));
+    };
+    return Object.freeze({
+      find,
+      insert: value => {
+        const record = copyRecord(value, "群发记录");
+        requireText(record.batch_id, "batch_id", 128);
+        requireText(record.batch_payload_hash, "batch_payload_hash", 64);
+        if (!/^[0-9a-f]{64}$/u.test(record.batch_payload_hash) || !Number.isFinite(Date.parse(requireText(record.created_at, "created_at", 64)))) {
+          throw new CoreError("invalid_input", "群发记录缺少有效时间或内容指纹");
+        }
+        return this.transaction(() => {
+          const original = find(record.source_key, record.dedupe_key);
+          if (original) {
+            if (original.batch_payload_hash !== record.batch_payload_hash) throw new CoreError("dedupe_conflict", "同一群发去重键已经对应另一批消息");
+            return { record: original, duplicate: true };
+          }
+          const serialized = encodeJson(record, "群发记录");
+          if (Buffer.byteLength(serialized, "utf8") > 1048576) throw new CoreError("invalid_input", "群发记录超出体积限制");
+          this.#database.prepare("INSERT INTO message_batches(batch_id, source_key, dedupe_key, batch_payload_hash, record_json, created_at) VALUES (?, ?, ?, ?, ?, ?)")
+            .run(record.batch_id, record.source_key, record.dedupe_key, record.batch_payload_hash, serialized, record.created_at);
+          return { record, duplicate: false };
+        });
+      },
+    });
   }
 
   transaction(callback) {
@@ -505,6 +606,9 @@ export class MessageStore {
     return this.transaction(() => {
       const current = this.getMessage(messageId);
       if (!current) return null;
+      if (changes.relay_request_id && current.relay_request_id && changes.relay_request_id !== current.relay_request_id) {
+        throw new CoreError("dedupe_conflict", "本消息已绑定原中继请求");
+      }
       const updated = { ...current, ...changes };
       validateMessage(updated);
       this.#database.prepare("UPDATE messages SET record_json = ? WHERE message_id = ?")

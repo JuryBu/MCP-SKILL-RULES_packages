@@ -41,7 +41,7 @@ CLI支持Ctrl+C，以及由启动者持有的stdin管道输入shutdown后正常�
 {"version":1,"connections":[{"connection_file":"<absolute-private-dir>/source.connection.json"}]}
 ```
 
-示例中的尖括号内容均为占位值，使用前替换为本机实际配置。每个connection文件包含`endpoint_file`、完整`identity`和独立`token`；宿主统一入口再配置与核心principal一致的`caller_scope`，配置身份中的`conversation_id`为`*`。每次工具调用显式填写真实caller的`machine_id`、`host`、`surface`和具体`conversation_id`，门面据此选择连接，再核对登记与连接版本。来源由本机可信入口声明，当前门面核对的是登记授权，宿主来源鉴别仍依赖该可信入口。
+示例中的尖括号内容均为占位值，使用前替换为本机实际配置。每个connection文件包含`endpoint_file`、完整`identity`和独立`token`；宿主统一入口再配置与核心principal一致的`caller_scope`，配置身份中的`conversation_id`为`*`。调用时填写真实`caller`的`host`和具体`conversation_id`，连接唯一时可省略`machine_id`和`surface`。原四字段写法继续支持。存在多条候选时填写能区分的字段，门面再选取并核对连接版本。
 
 共享broker另有可选`/communication-core/mcp`入口。启用时设置`CODEX_TOOLKIT_ENABLE_COMMUNICATION_CORE_MCP=1`、私有登记表指针及可选`COMMUNICATION_CORE_MCP_ROOT`，仍启动同一stdio门面。现役broker新增静态端点所需的进程加载与共享会话保护须单独核验；宿主可先直接使用stdio，保持原核心和原状态目录。
 
@@ -51,7 +51,7 @@ CLI支持Ctrl+C，以及由启动者持有的stdin管道输入shutdown后正常�
 |---|---|---|
 | communication_list_conversations | 默认列已授权绑定；获准时可单独分页列宿主对话 | caller；可选host、limit、cursor、scope |
 | communication_resolve_target | 解析对话地址或旧绑定 | caller、host＋conversation_id，或binding_id |
-| communication_send_message | 持久保存并提交原消息 | caller、origin、target、dedupe_key、text、expires_at |
+| communication_send_message | 持久保存并提交原消息 | caller、target、text；可选origin、dedupe_key、expires_at |
 | communication_get_message | 查询原消息与投递状态 | caller、message_id |
 
 | 工具 | 动作 | 主要输入 |
@@ -66,6 +66,14 @@ CLI支持Ctrl+C，以及由启动者持有的stdin管道输入shutdown后正常�
 | communication_read_recent_snapshot | 将获准的近期对话整理成有界Markdown | caller、target；可选last_rounds |
 | communication_read_channel_messages | 读取获准QQ窗口最近消息，包含普通未@内容 | caller、channel、window_type、window_id；可选count、cursor |
 | communication_download_attachment | 按原消息中的受限引用下载附件 | caller、窗口地址、attachment_ref；可选destination_dir、name |
+
+### 通讯录
+
+配置本机的私有 `address_book_file` 后，`communication_contacts` 可查联系人。共享门面设置 `COMMUNICATION_CORE_FACADE_CONTACTS=1` 时可列本机共有联系人，只读。个人保存、来源收录、备注以及移除使用由可信宿主为该对话单独绑定的凭据。对应独立 principal 私有配置可设 `address_book_identity_bound: true`，该凭据不登记在共享门面中。共享入口仍照常用明确地址发送。
+
+发信可写 `target: {"contact":"同伴"}`，回执带实际地址，权限沿原规则检查。首次成功发信或查个人通讯录会建册。普通代理消息省略 `origin` 时由服务按实际身份写入，显式的本人来源继续受原规则约束。交流板预留条目可查，不能作为对话地址投递。
+
+隔离服务可用 `multi_recipient_enabled: true` 开启本机群发，工具门面相应设置 `COMMUNICATION_CORE_FACADE_MULTI_RECIPIENT=1`。使用 `targets` 代替 `target`，最多 16 个地址；进入同一批之前会逐个检查权限。回执逐人给出消息 ID 和投递状态，收件人分别确认处理。收到的消息按各自通讯录显示同批收件人。未启用时旧参数照常；跨机群发另需获准的中继接线。
 
 ### 列对话和看最近内容
 

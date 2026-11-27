@@ -162,18 +162,22 @@ test("different host, machine and surface profiles use only their own token", as
     assert.deepEqual((await facade.callTool(listTool, { caller: actual })).structuredContent, { caller: actual, token: files.profiles[index].token });
   }
   assert.equal(mocks.created.length, identities.length);
+  assert.equal(errorCode(await facade.callTool(listTool, { caller: { host: caller.host, conversation_id: caller.conversation_id } })), "caller_unregistered");
+  assert.equal(mocks.created.length, identities.length);
 });
 
-test("a real caller cannot use the profile wildcard, omit identity fields or add caller_scope", async context => {
+test("a real caller cannot use the profile wildcard, omit its conversation ID or add caller_scope", async context => {
   const files = await fixture(context);
   const mocks = mockClients();
   const facade = await files.facade(mocks);
-  const withoutSurface = { ...caller };
-  delete withoutSurface.surface;
-  for (const identity of [{ ...caller, conversation_id: "*" }, { ...caller, conversation_id: " " }, withoutSurface, { ...caller, caller_scope: files.profiles[0].caller_scope }]) {
+  const withoutConversation = { ...caller };
+  delete withoutConversation.conversation_id;
+  for (const identity of [{ ...caller, conversation_id: "*" }, { ...caller, conversation_id: " " }, withoutConversation, { ...caller, caller_scope: files.profiles[0].caller_scope }]) {
     assert.equal(errorCode(await facade.callTool(listTool, { caller: identity })), "invalid_input");
   }
   assert.equal(mocks.created.length, 0);
+  assert.deepEqual((await facade.callTool(listTool, { caller: { host: caller.host, conversation_id: caller.conversation_id } })).structuredContent,
+    { caller, token: files.profiles[0].token });
 });
 
 test("scoped and legacy identities enforce the wildcard contract and exact matching fields", async context => {

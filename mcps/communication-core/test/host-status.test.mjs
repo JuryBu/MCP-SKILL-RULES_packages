@@ -129,6 +129,100 @@ test("missing reader and inherited object names cannot impersonate a supported h
   }
 });
 
+test("a status target on another machine cannot reuse this machine's same-host reader", async context => {
+  const remote = { ...target, machine_id: "test-status-remote" };
+  const routes = new Map();
+  let localCalls = 0;
+  let remoteCalls = 0;
+  const instance = new HostStatusProvider({
+    localMachineId: target.machine_id,
+    providers: { [target.host]: reader({
+      source: "fixture-local-status",
+      async getHostStatus() { localCalls++; return { host_online: true, transport_ready: true }; },
+    }) },
+    machineProviders: routes,
+  });
+  context.after(() => instance.close());
+  assert.equal((await instance.getStatus(remote)).code, "status_reader_not_configured");
+  assert.equal(localCalls, 0);
+  routes.set(remote.machine_id, new Map([[target.host, reader({
+    source: "fixture-remote-status",
+    async getHostStatus(address) { remoteCalls++; assert.equal(address.machine_id, remote.machine_id); return { host_online: false }; },
+  })]]));
+  assert.equal((await instance.getStatus(target)).source, "fixture-local-status");
+  const result = await instance.getStatus(remote);
+  assert.equal(result.source, "fixture-remote-status");
+  assert.equal(result.host_online, false);
+  assert.deepEqual([localCalls, remoteCalls], [1, 1]);
+});
+
+test("remote deadline stays separate from a local probe and returns only unknown current status", async context => {
+  context.mock.timers.enable({ apis: ["setTimeout"] });
+  const remote = { ...target, machine_id: "test-remote-deadline" };
+  const silent = () => new Promise(() => {});
+  const remoteReader = reader({
+    getHostStatus() { return { host_online: true, transport_ready: true }; },
+    describeConversation: silent,
+  });
+  const instance = new HostStatusProvider({
+    localMachineId: target.machine_id, timeoutMs: 25,
+    providers: { [target.host]: reader({ getHostStatus: silent, describeConversation: silent }) },
+    machineProviders: new Map([[remote.machine_id, new Map([[remote.host, remoteReader]])]]),
+  });
+  context.after(() => instance.close());
+  const localPending = instance.getStatus(target);
+  let remoteFinished = false;
+  const remotePending = instance.getStatus(remote).finally(() => { remoteFinished = true; });
+  await nextTick();
+  context.mock.timers.tick(25);
+  assert.equal((await localPending).code, "status_timeout");
+  context.mock.timers.tick(14974);
+  await nextTick();
+  assert.equal(remoteFinished, false);
+  context.mock.timers.tick(1);
+  const status = await remotePending;
+  assert.deepEqual(status.target, remote);
+  assert.equal(status.source, "remote_core_relay");
+  assert.equal(status.code, "remote_timeout");
+  for (const field of ["host_online", "conversation_exists", "conversation_running", "can_deliver"]) {
+    assert.equal(status[field], "unknown");
+  }
+  remoteReader.describeConversation = () => { throw Object.assign(new Error("provider receipt"), { code: "remote_timeout" }); };
+  assert.equal((await instance.getStatus(remote)).code, "remote_timeout");
+  const controller = new AbortController();
+  remoteReader.describeConversation = silent;
+  const cancelled = instance.getStatus(remote, { signal: controller.signal });
+  controller.abort();
+  assert.equal((await cancelled).code, "status_cancelled");
+});
+
+test("new remote status calls do not join an in-flight query from the previous route generation", async context => {
+  const remote = { ...target, machine_id: "test-remote-generation" };
+  let resolveOld;
+  const old = new Promise(resolve => { resolveOld = resolve; });
+  let calls = 0;
+  const remoteReader = reader({
+    cursorGeneration: 1,
+    getHostStatus() { calls++; return this.cursorGeneration === 1 ? old : { host_online: false }; },
+  });
+  const instance = new HostStatusProvider({
+    localMachineId: target.machine_id,
+    machineProviders: new Map([[remote.machine_id, new Map([[remote.host, remoteReader]])]]),
+  });
+  context.after(() => instance.close());
+  const early = instance.getStatus(remote);
+  await nextTick();
+  remoteReader.cursorGeneration = 2;
+  assert.equal((await instance.getStatus(remote)).host_online, false);
+  resolveOld({ host_online: true });
+  assert.equal((await early).host_online, true);
+  assert.equal(calls, 2);
+  remoteReader.cursorGeneration = undefined;
+  const unversioned = await Promise.all([instance.getStatus(remote), instance.getStatus(remote)]);
+  assert.equal(unversioned.every(observation => observation.host_online === false), true);
+  assert.equal(calls, 4);
+});
+
 for (const code of ["ls_target_unavailable", "ls_target_ambiguous"]) {
   test(`${code} keeps online separate from unconfirmed existence`, async context => {
     const instance = provider(context, { antigravity: reader({ describeConversation() { throw Object.assign(new Error("private diagnostic"), { code }); } }) });

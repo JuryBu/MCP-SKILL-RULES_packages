@@ -80,7 +80,12 @@ export function hasTargetPermission(principal, target) {
 }
 
 export function principalForCaller(principal, caller) {
-  const identity = normalizeIdentity(caller);
+  if (!caller || typeof caller !== "object" || Array.isArray(caller)) throw new CoreError("invalid_input", "缺少明确对话身份");
+  const identity = normalizeIdentity({
+    ...caller,
+    machine_id: caller.machine_id === undefined ? principal.identity.machine_id : caller.machine_id,
+    surface: caller.surface === undefined ? principal.identity.surface : caller.surface,
+  });
   if (identity.conversation_id === "*") throw new CoreError("invalid_input", "调用者必须填写自己的具体对话ID");
   if (identityKey(identity) === identityKey(principal.identity)) return principal;
   const scope = principal.caller_scope;

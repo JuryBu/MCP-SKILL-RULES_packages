@@ -16,6 +16,33 @@ const messages = {
   invalid_input: "调用参数无效，请核对工具参数与大小限制",
   invalid_cursor: "游标无效，请使用当前消息返回的游标",
   caller_mismatch: "来源对话与当前连接授权不一致",
+  caller_unverified: "当前入口只能查看共有通讯录；个人通讯录需要能核实具体对话的连接",
+  contacts_unavailable: "本机通讯录尚未启用",
+  shared_alias_reserved: "此别名已用于本机共有联系人，请另取个人别名",
+  contact_alias_conflict: "别名有重名或已用于另一地址，请核对原联系人",
+  contact_not_found: "这本通讯录里没有该联系人",
+  contact_limit: "个人通讯录已达到容量上限，请先移除不用的联系人",
+  message_not_recipient: "当前对话无权收录这封原信的发件人，或原信缺少可核实的发件对话",
+  board_not_direct_target: "交流板需要使用交流板入口，不能作为对话收件人",
+  mixed_channel_recipients_not_allowed: "请把人类聊天窗口和模型对话分开；每次只发一个人类聊天窗口",
+  bundle_transport_unavailable: "文件包通道尚未启用，请缩短正文或先启用文件包通道",
+  unsupported_op: "当前对端还不支持这项操作",
+  remote_timeout: "远端机器在等待窗口内未返回，请沿原请求查询",
+  relay_frame_too_large: "消息超过中继单帧限制，请改用文件包",
+  relay_rate_limited: "中继群暂时达到频率限制，请按返回的时间等待",
+  relay_recipient_disclosure_blocked: "当前中继路线尚未获准公开本次的完整收件人名单",
+  relay_route_not_found: "没有找到通往目标机器的获准中继路线",
+  relay_route_ambiguous: "通往目标机器的中继路线不唯一，请核对当前写入路线",
+  relay_route_drain_expired: "原中继群的排空期已过，请核对原回执",
+  relay_route_changed: "中继路线已改变，请沿原请求核对结果",
+  relay_dedupe_conflict: "中继去重键对应的原请求与本次参数不同",
+  relay_cursor_expired: "中继游标已过期，请核对从哪个位置恢复",
+  relay_history_expired: "中继原消息已超过保留期限",
+  relay_history_gap: "中继历史有断档，请从原群核对未接收的范围",
+  relay_cursor_invalid: "中继游标无效，请使用本次查询返回的游标",
+  relay_cursor_scope_mismatch: "中继游标属于另一条路线或查询范围",
+  relay_provider_error: "中继提供方未能完成操作，请核对原请求状态",
+  relay_outbox_full: "跨机回执队列已满，本次处理确认未提交，请先核对原队列",
   forbidden: "当前连接没有这项操作的授权",
   source_unverified: "消息来源缺少对应授权",
   channel_download_state_unavailable: "附件原操作记录未就绪，已停止新下载，请核对原操作与目录",
@@ -101,12 +128,18 @@ const identityFields = {
   surface: optional(textField(64)),
   conversation_id: textField(256),
 };
-const callerField = objectField(identityFields);
+const callerField = objectField({ ...identityFields, machine_id: optional(textField(128)) });
 const boundTargetField = objectField({ ...identityFields, binding_id: textField(128), binding_generation: integerField(1) });
 const addressField = objectField({ machine_id: optional(textField(128)), host: textField(64), surface: optional(textField(64)), conversation_id: textField(256) });
+const contactField = textField(256);
+const contactAddressField = objectField({ contact: contactField });
 const targetField = {
-  schema: { anyOf: [boundTargetField.schema, addressField.schema] },
-  validator: z.union([boundTargetField.validator, addressField.validator]),
+  schema: { anyOf: [boundTargetField.schema, addressField.schema, contactAddressField.schema] },
+  validator: z.union([boundTargetField.validator, addressField.validator, contactAddressField.validator]),
+};
+const lookupAddressField = {
+  schema: { anyOf: [addressField.schema, contactAddressField.schema] },
+  validator: z.union([addressField.validator, contactAddressField.validator]),
 };
 const receiptField = objectField({
   component: textField(64),
@@ -131,13 +164,13 @@ function tool(name, method, description, fields, readOnly) {
   };
 }
 
-const tools = [
-  tool("send_message", "sendMessage", "向端和对话ID或已有绑定发消息（最小必填4项示例：{caller:{machine_id,host,surface,conversation_id},origin:{kind:\"agent_message\",channel,source_ref},target:{host,conversation_id},text}；dedupe_key与expires_at可选，默认按同分钟自动生成/24h过期）。默认next_model_boundary中途送入并保留原工具；when_idle仅用于明确延后；Codex默认hidden；in_reply_to仅填本对话收到的入站message_id（普通发送可省）；超240字默认返回精简预览回执（verbose_receipt=true返回全文）；未知结果沿原ID查询。", {
-    origin: objectField({
+const sendMessageDescription = "用真实 caller、收件地址 target 和正文 text 发消息。target 支持明确地址、已有绑定或已启用通讯录中的联系人；普通代理消息可省 origin，由实际入口补齐来源。默认 next_model_boundary 中途送入，when_idle 仅明确延后，Codex 默认 hidden。未知结果沿原 ID 查询，保持原去重键。";
+const sendMessageFields = {
+    origin: optional(objectField({
       kind: textField(64, "普通代理协作填写agent_message；本人消息仅由已授权的渠道入口使用human_message，其它来源类型须已在当前连接授权。"),
       channel: textField(64, "原始来源渠道，例如codex或antigravity；保留实际来源。"),
       source_ref: textField(512, "可核对的原来源引用；代理协作通常填写当前真实对话ID。"),
-    }),
+    })),
     target: targetField,
     dedupe_key: optional(textField(128, "可选；省略时按来源、目标、回复对象、正文与当前分钟桶自动生成去重键，显式传入须非空。")),
     text: textField(262144),
@@ -149,9 +182,23 @@ const tools = [
     in_reply_to: optional(nullable(textField(256))),
     origin_receipt_binding: optional(nullable(receiptField)),
     verbose_receipt: optional({ ...booleanField, schema: { type: "boolean", description: "传true返回完整长envelope.text，默认超240字返回预览（text_preview/text_length）。" } }),
-  }, false),
+};
+const multiRecipientTool = tool("send_message", "sendMessage", sendMessageDescription +
+  "本机启用群发时，可用 targets 一次注明 1–16 位收件人，与 target 二选一。实际收件对话各有原消息 ID 和处理确认；每次重试保持原去重键与收件人名单。", {
+  ...sendMessageFields,
+  target: optional(targetField),
+  targets: optional({
+    schema: { type: "array", minItems: 1, maxItems: 16, items: targetField.schema },
+    validator: z.array(targetField.validator).min(1).max(16),
+  }),
+}, false);
+multiRecipientTool.definition.inputSchema.oneOf = [{ required: ["target"] }, { required: ["targets"] }];
+multiRecipientTool.validator = multiRecipientTool.validator.refine(input => (input.target !== undefined) !== (input.targets !== undefined));
+
+const tools = [
+  tool("send_message", "sendMessage", sendMessageDescription, sendMessageFields, false),
   tool("get_status", "getStatus", "只读查询宿主在线、目标对话运行与中途投递能力；具体对话另含可取得的模型观察及其来源、时间，区分当前配置与最近实际调用。未知明确保留，不从旧回复或本人休息推断状态。", {
-    binding_id: optional(textField(128)), machine_id: optional(textField(128)), host: optional(textField(64)), surface: optional(textField(64)), conversation_id: optional(textField(256)),
+    binding_id: optional(textField(128)), machine_id: optional(textField(128)), host: optional(textField(64)), surface: optional(textField(64)), conversation_id: optional(textField(256)), contact: optional(contactField),
   }, true),
   tool("ack_processing", "ackProcessing", "由接收对话确认指定消息的处理状态（必填：caller、message_id、processing；delivery_id与binding_generation可选，省略时由核心按已鉴权接收方自动解析；可选note附简短进度备注），具体状态由核心校验。", {
     message_id: textField(256),
@@ -170,17 +217,18 @@ const tools = [
     wait_ms: optional(integerField(0, 45000)),
     limit: optional(integerField(1, 100)),
   }, true),
-  tool("list_conversations", "listConversations", "默认列获准对话绑定。scope=host 时显式指定本机宿主并分页列获准宿主对话，单页最多50条。", {
+  tool("list_conversations", "listConversations", "默认列获准对话绑定。scope=host 时指定宿主，分页列已授权的对话，单页最多50条；可选机器和入口类型。", {
     host: optional(textField(64)), limit: optional(integerField(1, 100)), cursor: optional(nullable(textField(1024))),
+    machine_id: optional(textField(128)), surface: optional(textField(64)),
     scope: optional({ schema: { type: "string", enum: ["bindings", "host"], default: "bindings" }, validator: z.enum(["bindings", "host"]) }),
   }, true),
-  tool("read_recent_snapshot", "readRecentSnapshot", "只读扫一眼获准的本机 Codex、反重力或 WSF 对话。按发言者、时间和实际来源整理近期 Markdown；完整历史与搜索使用 memory-store。", {
-    target: addressField,
+  tool("read_recent_snapshot", "readRecentSnapshot", "只读扫一眼获准的 Codex、反重力或 WSF 对话。跨机读取须两端单独授权到具体对话；按发言者、时间和实际来源整理近期 Markdown。完整历史与搜索使用 memory-store。", {
+    target: lookupAddressField,
     last_rounds: optional(integerField(1, 5)),
   }, true),
   tool("resolve_target", "resolveTarget", "按宿主端和对话ID解析目标，或兼容旧binding_id。已启用宿主无需逐对话开通；返回身份及投递接线，实际在线状态另查。", {
     binding_id: optional(textField(128)),
-    machine_id: optional(textField(128)), host: optional(textField(64)), surface: optional(textField(64)), conversation_id: optional(textField(256)),
+    machine_id: optional(textField(128)), host: optional(textField(64)), surface: optional(textField(64)), conversation_id: optional(textField(256)), contact: optional(contactField),
   }, true),
   tool("read_channel_messages", "readChannelMessages", "只读查询已获准QQ窗口的最近消息，包含未@或未引用的普通内容。无需登记采集，不确认原事件；完整宿主历史继续使用原文读取入口。", {
     channel: { schema: { type: "string", enum: ["qq"] }, validator: z.enum(["qq"]) },
@@ -211,8 +259,29 @@ const tools = [
 
 export { tools as communicationTools };
 
-export function listCommunicationToolDefinitions() {
-  return tools.map(({ definition }) => structuredClone(definition));
+const contactActions = ["list", "get", "save", "set_note", "save_sender", "remove"];
+const contactNoteField = {
+  schema: { type: "string", maxLength: 256 },
+  validator: z.string().refine(value => [...value].length <= 256 && Buffer.byteLength(value, "utf8") <= 1024),
+};
+
+export const communicationContactsTool = tool("contacts", "contacts", "查本机共有或个人联系人；确认对话身份的入口可保存地址、按原来信存发件人、改自己的备注或移除个人条目。联系人不会增加发送或读取目标的授权。", {
+  action: { schema: { type: "string", enum: contactActions }, validator: z.enum(contactActions) },
+  contact: optional(contactField),
+  alias: optional(contactField),
+  target: optional(addressField),
+  note: optional(contactNoteField),
+  message_id: optional(textField(256)),
+  include_machine_routes: optional(booleanField),
+}, false);
+
+export function communicationToolEntries({ includeContacts = false, includeMultiRecipient = false } = {}) {
+  const entries = includeMultiRecipient ? [multiRecipientTool, ...tools.slice(1)] : tools;
+  return includeContacts ? [...entries, communicationContactsTool] : entries;
+}
+
+export function listCommunicationToolDefinitions(options) {
+  return communicationToolEntries(options).map(({ definition }) => structuredClone(definition));
 }
 
 function toolFailure(error) {
@@ -281,22 +350,27 @@ function projectSendMessageResult(result, verboseReceipt) {
   };
 }
 
-function makeServer(core, principalId, requestSignal) {
+function makeServer(core, principalId, requestSignal, sharedFacade = false) {
   const server = new Server({ name: "communication-core-mcp", version: "0.1.0" }, { capabilities: { tools: {} } });
-  server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: listCommunicationToolDefinitions() }));
+  const features = { includeContacts: Boolean(core.addressBook), includeMultiRecipient: Boolean(core.messageBatches) };
+  const entries = communicationToolEntries(features);
+  server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: listCommunicationToolDefinitions(features) }));
   server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
     try {
-      const entry = tools.find(candidate => candidate.definition.name === request.params.name);
+      const entry = entries.find(candidate => candidate.definition.name === request.params.name);
       if (!entry) throw new CoreError("invalid_input", "未知工具");
       const parsed = entry.validator.safeParse(request.params.arguments);
       if (!parsed.success) throw new CoreError("invalid_input", "工具参数无效");
       const signal = AbortSignal.any([requestSignal, extra.signal]);
       const verboseReceipt = entry.method === "sendMessage" && parsed.data.verbose_receipt === true;
       const coreArgs = stripUndefinedFields(parsed.data, entry.method === "sendMessage" ? ["verbose_receipt"] : []);
-      const value = await abortable(() => core[entry.method]({ principal_id: principalId, signal }, coreArgs), signal);
+      const value = await abortable(() => core[entry.method]({ principal_id: principalId, signal, shared_facade: sharedFacade }, coreArgs), signal);
       const rawResult = value === null && entry.method === "manageChannelBinding" && parsed.data.action === "get" ? { binding: null } : value;
       if (!rawResult || typeof rawResult !== "object" || Array.isArray(rawResult)) throw new Error("Invalid result");
       if (entry.method === "readRecentSnapshot") return formatRecentSnapshotMcp(rawResult);
+      if (entry.method === "sendMessage" && coreArgs.targets !== undefined) {
+        return { structuredContent: rawResult, content: [{ type: "text", text: `本次共有 ${rawResult.recipient_count} 位收件人，逐人投递与处理状态、原消息 ID 见结构化回执。` }] };
+      }
       const result = entry.method === "sendMessage" ? projectSendMessageResult(rawResult, verboseReceipt) : rawResult;
       const serialized = JSON.stringify(result);
       return { structuredContent: result, content: [{ type: "text", text: `交流操作结果：\n${serialized}` }] };
@@ -472,7 +546,7 @@ export async function createMcpHttpServer({ core, principals, host = "127.0.0.1"
           if (failure) return httpFailure(response, failure === "busy" ? 503 : 400, failure, "请求ID无效或取消关联容量已满");
         }
       }
-      entry.mcp = makeServer(core, response.locals.principalId, entry.controller.signal);
+      entry.mcp = makeServer(core, response.locals.principalId, entry.controller.signal, request.headers["x-communication-core-shared-facade"] !== undefined);
       entry.transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined, enableJsonResponse: true });
       await entry.mcp.connect(entry.transport);
       if (entry.controller.signal.aborted) return await entry.cleanup();

@@ -395,7 +395,8 @@ test("U1: agent_message 在 marker 之前注入主人指令最高优先级提示
 
 test("U2: send_message 短文原样保留、长文默认精简预览与 status_hint/query_hint、verbose_receipt 展开及 facade 透传", { timeout: 15000 }, async context => {
   const sendDef = communicationTools.find(entry => entry.definition.name === "communication_send_message").definition;
-  assert.deepEqual([...sendDef.inputSchema.required].sort(), ["caller", "origin", "target", "text"]);
+  assert.deepEqual([...sendDef.inputSchema.required].sort(), ["caller", "target", "text"]);
+  assert.equal(sendDef.inputSchema.properties.origin.type, "object");
   assert.equal(sendDef.inputSchema.properties.verbose_receipt.type, "boolean");
   for (const keyword of ["caller", "origin", "target", "text", "next_model_boundary", "hidden"]) {
     assert.ok(sendDef.description.includes(keyword), `description should mention ${keyword}`);

@@ -135,6 +135,18 @@ test("startup fails closed without a valid absolute registry; no fallback client
   assert.equal(mocks.created.length, 0);
 });
 
+test("the shared contacts facade refuses writes before making a Core connection", async context => {
+  const files = await fixture(context);
+  const mocks = mockClients();
+  const facade = await files.facade({ includeContacts: true, ...mocks });
+  const denied = await facade.callTool("communication_contacts", {
+    caller: { host: caller.host, conversation_id: caller.conversation_id },
+    action: "set_note", contact: "共有联系人", note: "共享入口只读",
+  });
+  assert.equal(errorCode(denied), "caller_unverified");
+  assert.equal(mocks.created.length, 0);
+});
+
 test("duplicate files, identities and tokens are rejected rather than selecting the first profile", async context => {
   const files = await fixture(context);
   await writeJson(files.registryFile, { version: 1, connections: [files.registry.connections[0], files.registry.connections[0]] });
@@ -164,11 +176,11 @@ test("endpoint/profile structure is checked locally before connecting", async co
   assert.equal(mocks.created.length, 0);
 });
 
-test("caller must have all four exact fields; extra paths and business fields cannot change the connection", async context => {
+test("caller requires a host and conversation; connection fields can be filled only from a matching profile", async context => {
   const files = await fixture(context);
   const mocks = mockClients();
   const facade = await files.facade(mocks);
-  for (const field of Object.keys(caller)) {
+  for (const field of ["host", "conversation_id"]) {
     const incomplete = { ...caller };
     delete incomplete[field];
     assert.equal(errorCode(await facade.callTool(listTool, { caller: incomplete })), "invalid_input");
@@ -178,6 +190,9 @@ test("caller must have all four exact fields; extra paths and business fields ca
   assert.equal(errorCode(await facade.callTool("unknown", { caller })), "invalid_input");
   assert.equal(errorCode(await facade.callTool("communication_wait", { caller, message_id: "synthetic", wait_ms: 45001 })), "invalid_input");
   assert.equal(mocks.created.length, 0);
+  const short = await facade.callTool(listTool, { caller: { host: caller.host, conversation_id: caller.conversation_id } });
+  assert.notEqual(short.isError, true);
+  assert.equal(mocks.created.length, 1);
 });
 
 test("an unsupported model field never reaches a backend, even for an exact profile", async context => {

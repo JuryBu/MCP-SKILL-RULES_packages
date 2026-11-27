@@ -20,6 +20,9 @@ import { ConversationDirectory, normalizeConversationAddress, normalizeHostScope
 import { ChannelBindingManager } from "./channel-bindings.mjs";
 import { OwnerWindowMessages } from "./owner-window-messages.mjs";
 import { ChannelContentReader } from "./channel-content.mjs";
+import { batchRecipientNotice } from "./adapters/host-message.mjs";
+import { deriveBatchDedupeKeys, normalizeRecipientsInput, planReplyAllSubMessages, projectBatchSendReceipt, projectVisibilityForRecipient,
+  renderPeerRecipientsForReceiver, validateAndDedupeRecipients } from "./multi-recipient.mjs";
 
 const DELIVERY_RESULTS = new Set(["accepted", "busy", "failed_before_send", "unknown"]);
 const DELIVERY_BOUNDARIES = new Set(["accepted", "failed_before_send", "unknown", "expired", "unsupported"]);
@@ -244,6 +247,8 @@ export class CommunicationCore {
     this.directory = conversationRoutes.length ? new ConversationDirectory({ store, targets: registryValues(this.targets), routes: conversationRoutes }) : null;
     this.statusProvider = statusProvider;
     this.hostContentProvider = hostContentProvider;
+    this.addressBook = null;
+    this.relayAcknowledgements = null;
     this.automaticReplyForwarding = automaticReplyForwarding;
     this.autoCompleteOnReply = autoCompleteOnReply === true;
     this.channelBindings = new ChannelBindingManager({ store, windows: channelWindows, resolveCallerTarget: principal => this.directory
@@ -304,7 +309,82 @@ export class CommunicationCore {
     const principal = matches[0];
     const effective = principalForCaller(principal, caller);
     if (remember && principal.caller_scope) this.directory?.rememberCaller(effective.identity);
+    if (context.shared_facade === true && effective.address_book_identity_bound === true) {
+      return { ...effective, address_book_identity_bound: false };
+    }
     return effective;
+  }
+
+  attachAddressBook(options) {
+    if (this.addressBook) throw new CoreError("invalid_config", "通讯录已经接入");
+    const machineId = requireText(options.machineId, "本机标识", 128);
+    this.addressBook = this.store.openAddressBook({
+      ...options,
+      machineId,
+      now: () => this.timestamp(),
+      readInbound: (actor, id) => {
+        const message = this.store.getMessage(id);
+        const sender = message?.envelope?.caller;
+        const recipient = message?.envelope?.target;
+        if (message?.source_identity_verified !== true || message?.delivery_status !== "accepted" ||
+          message.target_key !== identityKey(actor) || !sender || !recipient ||
+          identityKey(sender) !== message.source_key || identityKey(recipient) !== message.target_key) return null;
+        return { message_id: id, sender: normalizeIdentity(sender), recipient: normalizeIdentity(recipient), source_verified: true };
+      },
+    });
+    this.addressBookMachineId = machineId;
+  }
+
+  attachRelayAcknowledgements({ onReady } = {}) {
+    if (this.relayAcknowledgements || (onReady !== undefined && typeof onReady !== "function")) {
+      throw new CoreError("invalid_config", "跨机回执入口已配置或参数无效");
+    }
+    this.relayAcknowledgements = this.store.openRelayAcknowledgements({ now: () => this.nowMs() });
+    this.relayAcknowledgementReady = onReady;
+    return this.relayAcknowledgements;
+  }
+
+  attachMessageBatches({ machineId }) {
+    if (this.messageBatches) throw new CoreError("invalid_config", "群发入口已经接入");
+    this.batchMachineId = requireText(machineId, "本机标识", 128);
+    this.messageBatches = this.store.openMessageBatches();
+  }
+
+  contactAccess(principal) {
+    if (!this.addressBook) throw new CoreError("contacts_unavailable", "本机通讯录尚未启用");
+    if (principal.identity.machine_id !== this.addressBookMachineId) throw new CoreError("forbidden", "只可查看本机通讯录");
+    return principal.address_book_identity_bound === true && principal.caller_scope == null;
+  }
+
+  contactForCaller(principal, alias) {
+    const entry = this.contactAccess(principal) ? this.addressBook.resolve(principal, alias) : this.addressBook.resolveShared(alias);
+    if (entry.entry_kind === "board") throw new CoreError("board_not_direct_target", "请使用交流板入口，板子不能作为对话收件人");
+    return entry;
+  }
+
+  resolveDisplayName(receiverIdentity, peerAddress) {
+    const receiver = normalizeIdentity(receiverIdentity);
+    const peer = normalizeIdentity(peerAddress);
+    const name = receiver.machine_id === this.addressBookMachineId ? this.addressBook?.resolveDisplayName(receiver, peer) : undefined;
+    return name ?? [peer.machine_id, peer.host, peer.conversation_id].join("/");
+  }
+
+  contacts(context, input) {
+    const fields = new Map([
+      ["list", ["include_machine_routes"]], ["get", ["contact"]], ["save", ["alias", "target", "note"]],
+      ["set_note", ["contact", "note"]], ["save_sender", ["message_id", "alias", "note"]], ["remove", ["contact"]],
+    ]).get(input?.action);
+    if (!fields) throw new CoreError("invalid_input", "通讯录操作无效");
+    assertExactKeys(input, ["caller", "action", ...fields], "通讯录");
+    const principal = this.principal(context, input.caller, { remember: false });
+    const personal = this.contactAccess(principal);
+    if (input.action === "list") return personal ? this.addressBook.list(principal, input) : this.addressBook.listShared(input);
+    if (input.action === "get") return personal ? this.addressBook.resolve(principal, input.contact) : this.addressBook.resolveShared(input.contact);
+    if (!personal) throw new CoreError("caller_unverified", "当前入口仅能查看共有通讯录");
+    if (input.action === "save") return this.addressBook.saveAddress(principal, input);
+    if (input.action === "save_sender") return this.addressBook.saveSender(principal, input);
+    if (input.action === "set_note") return this.addressBook.setNote(principal, input);
+    return this.addressBook.remove(principal, input.contact);
   }
 
   target(bindingId) {
@@ -324,20 +404,37 @@ export class CommunicationCore {
   }
 
   result(messageId) {
+    const message = this.store.getMessage(messageId);
+    if (message?.batch_meta && Object.hasOwn(message.batch_meta, "recipient_labels")) {
+      const { recipient_labels: privateLabels, ...publicMetadata } = message.batch_meta;
+      message.batch_meta = publicMetadata;
+    }
+    const relayed = this.remoteRelay?.observation(message);
     return copy({
-      message: this.store.getMessage(messageId),
+      message,
       delivery: this.store.getDeliveryForMessage(messageId),
       next_cursor: encodeCursor(messageId, 0),
+      ...(relayed ? { remote_delivery: relayed } : {}),
     });
   }
 
   transaction(callback) {
     const changed = new Set();
+    let relayAckStaged = false;
     const result = this.store.transaction(() => callback((messageId, kind, data = {}) => {
       const event = this.store.appendEvent(messageId, kind, copy(data));
+      if (kind === "processing" && this.relayAcknowledgements?.stageProcessing(messageId, data.processing)) relayAckStaged = true;
       changed.add(messageId);
       return event;
     }));
+    if (relayAckStaged && this.relayAcknowledgementReady && !this.relayAcknowledgementSignalPending) {
+      this.relayAcknowledgementSignalPending = true;
+      queueMicrotask(() => {
+        this.relayAcknowledgementSignalPending = false;
+        if (this.closed) return;
+        Promise.resolve().then(() => this.relayAcknowledgementReady()).catch(error => { this.relayAcknowledgementSignalError = error; });
+      });
+    }
     for (const messageId of changed) {
       for (const notify of [...(this.waiters.get(messageId) ?? [])]) notify(false);
     }
@@ -399,13 +496,14 @@ export class CommunicationCore {
   }
 
   listConversations(context, input) {
-    assertExactKeys(input, ["caller", "host", "limit", "cursor", "scope"], "对话列表查询");
+    assertExactKeys(input, ["caller", "machine_id", "host", "surface", "limit", "cursor", "scope"], "对话列表查询");
     if (input.scope === "host") {
       const principal = this.principal(context, input.caller, { remember: false });
       if (!this.hostContentProvider) throw new CoreError("host_content_unavailable", "宿主列表入口未就绪");
       return this.hostContentProvider.list(principal, input, { signal: context.signal });
     }
     if (input.scope !== undefined && input.scope !== "bindings") throw new CoreError("invalid_input", "不支持的列表范围");
+    if (input.machine_id !== undefined || input.surface !== undefined) throw new CoreError("invalid_input", "机器和入口类型筛选仅用于宿主列表");
     const { scope: unusedScope, ...bindingInput } = input;
     const principal = this.principal(context, input.caller);
     if (this.directory) return this.directory.list(principal, bindingInput);
@@ -426,12 +524,20 @@ export class CommunicationCore {
   readRecentSnapshot(context, input) {
     const principal = this.principal(context, input?.caller, { remember: false });
     if (!this.hostContentProvider) throw new CoreError("host_content_unavailable", "宿主近期内容入口未就绪");
+    if (input?.target?.contact !== undefined) {
+      assertExactKeys(input.target, ["contact"], "联系人地址");
+      input = { ...input, target: this.contactForCaller(principal, input.target.contact).target };
+    }
     return this.hostContentProvider.snapshot(principal, input, { signal: context.signal });
   }
 
   resolveTarget(context, input) {
-    assertExactKeys(input, ["caller", "binding_id", "machine_id", "host", "surface", "conversation_id"], "目标解析");
+    assertExactKeys(input, ["caller", "binding_id", "machine_id", "host", "surface", "conversation_id", "contact"], "目标解析");
     const principal = this.principal(context, input.caller);
+    if (input.contact !== undefined) {
+      assertExactKeys(input, ["caller", "contact"], "联系人地址");
+      input = { caller: input.caller, ...this.contactForCaller(principal, input.contact).target };
+    }
     let target;
     if (input.binding_id !== undefined) {
       if (["machine_id", "host", "surface", "conversation_id"].some(field => input[field] !== undefined)) throw new CoreError("invalid_input", "请选择绑定ID或对话地址其中一种目标写法");
@@ -456,8 +562,12 @@ export class CommunicationCore {
   }
 
   async getStatus(context, input) {
-    assertExactKeys(input, ["caller", "binding_id", "machine_id", "host", "surface", "conversation_id"], "状态查询");
+    assertExactKeys(input, ["caller", "binding_id", "machine_id", "host", "surface", "conversation_id", "contact"], "状态查询");
     const principal = this.principal(context, input.caller);
+    if (input.contact !== undefined) {
+      assertExactKeys(input, ["caller", "contact"], "联系人地址");
+      input = { caller: input.caller, ...this.contactForCaller(principal, input.contact).target };
+    }
     const { caller, ...reference } = input;
     let target;
     if (reference.binding_id !== undefined) target = this.resolveTarget(context, input).target;
@@ -546,7 +656,7 @@ export class CommunicationCore {
   manageChannelBinding(context, input) {
     const principal = this.principal(context, input?.caller);
     if (!this.channelBindings) throw new CoreError("channel_not_enabled", "当前服务尚未启用窗口对应关系管理");
-    return this.channelBindings.manage(principal, input);
+    return this.channelBindings.manage(principal, { ...input, caller: principal.identity });
   }
 
   ingestOwnerWindowEvent(event, context) {
@@ -647,9 +757,18 @@ export class CommunicationCore {
     }
   }
 
-  async sendMessage(context, input) {
+  #prepareOutgoing(context, input, batchMeta, relayIngress) {
     if (!input || typeof input !== "object" || Array.isArray(input)) throw new CoreError("invalid_input", "消息必须是对象");
-    const principal = this.principal(context, input.caller);
+    const principal = relayIngress?.principal ?? this.principal(context, input.caller);
+    input = { ...input, caller: principal.identity };
+    const viaContact = input.target?.contact;
+    if (viaContact !== undefined) {
+      assertExactKeys(input.target, ["contact"], "联系人地址");
+      input = { ...input, target: this.contactForCaller(principal, viaContact).target };
+    }
+    if (input.origin === undefined) {
+      input = { ...input, origin: { kind: "agent_message", channel: principal.identity.host, source_ref: principal.identity.conversation_id } };
+    }
     const sourceKey = identityKey(principal.identity);
     const addressed = input.target?.binding_id === undefined;
     let dedupeKey;
@@ -693,7 +812,9 @@ export class CommunicationCore {
     const payloadHash = digest(envelope);
     if (existing && existing.payload_hash !== payloadHash) throw new CoreError("dedupe_conflict", "同一去重键已经对应其它消息内容");
     this.validateReply(envelope);
-    const persisted = this.transaction(append => {
+    const persist = append => {
+      if (this.addressBook && principal.address_book_identity_bound === true && principal.caller_scope == null &&
+        principal.identity.machine_id === this.addressBookMachineId) this.addressBook.openForSend(principal);
       const original = this.store.findMessageByDedupe(sourceKey, dedupeKey);
       if (original) {
         if (original.payload_hash !== payloadHash) throw new CoreError("dedupe_conflict", "同一去重键已经对应其它消息内容");
@@ -711,7 +832,11 @@ export class CommunicationCore {
         payload_hash: payloadHash,
         principal_id: principal.id,
         source_identity_version: 2,
+        ...(relayIngress?.sourceVerified === true || (principal.address_book_identity_bound === true && principal.caller_scope == null)
+          ? { source_identity_verified: true } : {}),
+        ...(relayIngress ? { relay_inbound: true } : {}),
         envelope,
+        ...(batchMeta ? { batch_meta: copy(batchMeta) } : {}),
         ...(replyForwardBinding ? { reply_forward_binding: copy(replyForwardBinding) } : {}),
         created_at: createdAt,
         delivery_status: "prepared",
@@ -763,22 +888,202 @@ export class CommunicationCore {
         }
       }
       return { message_id: messageId, delivery_id: deliveryId, duplicate: false };
+    };
+    return { persist, viaContact, existingId: existing?.message_id, envelope };
+  }
+
+  #resolveBatchTarget(principal, reference) {
+    if (typeof reference === "string") reference = { contact: reference };
+    assertExactKeys(reference, ["contact", "binding_id", "binding_generation", "machine_id", "host", "surface", "conversation_id"], "群发收件人");
+    if (reference.contact !== undefined) {
+      assertExactKeys(reference, ["contact"], "联系人地址");
+      return this.resolveAddress(principal, this.contactForCaller(principal, reference.contact).target);
+    }
+    if (reference.binding_id === undefined) {
+      if (reference.binding_generation !== undefined) throw new CoreError("invalid_input", "绑定代次必须与绑定地址一起填写");
+      return this.resolveAddress(principal, reference);
+    }
+    const target = this.target(reference.binding_id);
+    if (["machine_id", "host", "surface", "conversation_id", "binding_generation"].some(field => reference[field] !== undefined && reference[field] !== target[field])) {
+      throw new CoreError("binding_changed", "群发收件人的绑定已变化");
+    }
+    return target;
+  }
+
+  #sendBatch(context, input) {
+    if (!this.messageBatches) throw new CoreError("unsupported_op", "本机尚未启用多收件人发送");
+    const { receipt, deliveries } = this.transaction(append => this.#stageBatch(context, input, append));
+    for (const deliveryId of deliveries) this.enqueue(deliveryId).catch(error => { this.backgroundError = error; });
+    return receipt;
+  }
+
+  #stageBatch(context, input, append) {
+    assertExactKeys(input, ["caller", "origin", "target", "targets", "dedupe_key", "text", "attachment_refs", "delivery_policy", "reply_required",
+      "expires_at", "in_reply_to", "origin_receipt_binding", "message_visibility"], "群发消息");
+    const { rawTargets, isBatch } = normalizeRecipientsInput(input);
+    if (!isBatch) throw new CoreError("invalid_input", "群发需要提供收件人列表");
+    const principal = this.principal(context, input.caller, { remember: false });
+    const sourceKey = identityKey(principal.identity);
+    const { targets, targetKeys, deduplicatedCount } = validateAndDedupeRecipients(rawTargets.map(target => this.#resolveBatchTarget(principal, target)), { principal });
+    if (!this.remoteRelay && targets.some(target => target.machine_id !== this.batchMachineId)) {
+      throw new CoreError("unsupported_op", "远端群发尚未接入；本次没有登记或投递任何收件人");
+    }
+    const original = input.in_reply_to ? this.store.getMessage(requireText(input.in_reply_to, "in_reply_to", 256)) : undefined;
+    const reply = input.in_reply_to ? planReplyAllSubMessages({ originalMessage: original, callerIdentity: principal.identity, targets }) : null;
+    const replyPlan = new Map(reply?.subMessages.map(entry => [entry.targetKey, entry.envelopeInReplyTo]));
+    const messageVisibility = targets.some(target => target.host === "codex") ? input.message_visibility ?? "hidden" : undefined;
+    const { batchId, parentDedupeKey, batchPayloadHash, entries } = deriveBatchDedupeKeys({
+      parentDedupeKey: input.dedupe_key === undefined ? undefined : requireText(input.dedupe_key, "dedupe_key", 128),
+      sourceKey, canonicalTargets: targetKeys, text: input.text, deliveryPolicy: input.delivery_policy, minuteBucket: Math.floor(this.nowMs() / 60000),
+      replyToBatchId: reply?.replyToBatchId, replyToMessageId: reply?.replyToMessageId,
+      attachmentRefs: input.attachment_refs, replyRequired: input.reply_required, messageVisibility,
+    });
+    const previous = this.messageBatches.find(sourceKey, parentDedupeKey);
+    if (previous && previous.batch_payload_hash !== batchPayloadHash) throw new CoreError("dedupe_conflict", "原去重键已经用于另一批收件人或消息");
+    if (input.message_visibility !== undefined && !["hidden", "visible"].includes(input.message_visibility)) throw new CoreError("invalid_input", "Codex 显示方式无效");
+    const recipients = targets.map(normalizeIdentity);
+    const project = (results, duplicate) => {
+      const receipt = projectBatchSendReceipt({ batchId, text: input.text, deduplicatedCount, results });
+      const received = results.filter(entry => entry.delivery_status === "accepted").length;
+      return { ...receipt, succeeded_count: received, pending_count: results.length - received - receipt.failed_count, duplicate };
+    };
+    const idsForSizing = "00000000-0000-0000-0000-000000000000";
+    const bound = project(recipients.map(target => ({ target, message_id: idsForSizing, delivery_id: idsForSizing,
+      delivery_status: "failed_before_send", processing: "processing", duplicate: true,
+      error: { code: "failed_before_send", message: "详见原投递" } })), true);
+    if (Buffer.byteLength(JSON.stringify(bound), "utf8") > 8704) throw new CoreError("invalid_input", "收件地址太长，无法返回逐人回执，请分两批发送");
+    const prepared = targets.map((target, index) => {
+      const identity = recipients[index];
+      const { targetKey, subDedupeKey } = entries[index];
+      const batchMeta = previous ? undefined : {
+        batch_id: batchId,
+        recipient_group: { batch_id: batchId, recipients },
+        recipient_labels: renderPeerRecipientsForReceiver({ receiver: identity, allRecipients: recipients,
+          resolveDisplayName: (receiver, peer) => this.resolveDisplayName(receiver, peer) }).recipient_labels,
+        ...(reply ? { reply_to_batch_id: reply.replyToBatchId, reply_to_message_id: reply.replyToMessageId } : {}),
+      };
+      const childVisibility = projectVisibilityForRecipient(messageVisibility, target);
+      const chosenTarget = previous ? identity : { ...identity, binding_id: target.binding_id, binding_generation: target.binding_generation };
+      const child = this.#prepareOutgoing(context, { caller: principal.identity, target: chosenTarget, origin: input.origin,
+        dedupe_key: subDedupeKey, text: input.text, attachment_refs: input.attachment_refs, delivery_policy: input.delivery_policy,
+        reply_required: input.reply_required, expires_at: input.expires_at, in_reply_to: replyPlan.get(targetKey) ?? null,
+        ...(childVisibility === undefined ? {} : { message_visibility: childVisibility }),
+      }, batchMeta);
+      if (child.envelope.origin.kind !== "agent_message") throw new CoreError("source_unverified", "群发入口只接受已获准的代理消息");
+      const notice = batchMeta ? batchRecipientNotice({ batch_meta: batchMeta, envelope: child.envelope }) : null;
+      if (notice && target.host === "codex") requireText(notice + "\n\n" + child.envelope.text, "群发到 Codex 的正文");
+      return { targetKey, child };
+    });
+    const priorChildren = previous ? new Map(previous.members.map(member => [member.target_key, member.message_id])) : null;
+    if (previous && prepared.some(({ targetKey, child }) => !child.existingId || priorChildren.get(targetKey) !== child.existingId)) {
+      throw new CoreError("dedupe_conflict", "原群发登记没有对应全部子回执；保留原件，请核对原投递");
+    }
+    const committed = previous ?? (() => {
+      const members = prepared.map(({ targetKey, child }) => {
+        const record = child.persist(append);
+        if (record.duplicate) throw new CoreError("dedupe_conflict", "子投递已属于其它消息，整批未提交");
+        return { target_key: targetKey, message_id: record.message_id, delivery_id: record.delivery_id };
+      });
+      this.remoteRelay?.stageOutgoing(members, recipients);
+      return this.messageBatches.insert({ batch_id: batchId, source_key: sourceKey, dedupe_key: parentDedupeKey,
+        batch_payload_hash: batchPayloadHash, created_at: this.timestamp(), members }).record;
+    })();
+    const results = committed.members.map(member => {
+      const { message, delivery } = this.result(member.message_id);
+      const failure = ["failed_before_send", "expired", "unsupported", "failed"].includes(delivery.status);
+      return { target: message.envelope.target, message_id: member.message_id, delivery_id: member.delivery_id,
+        delivery_status: delivery.status, processing: message.processing, duplicate: Boolean(previous),
+        ...(failure ? { error: { code: delivery.status, message: "详见原投递" } } : {}) };
+    });
+    return { receipt: project(results, Boolean(previous)), deliveries: previous ? [] : committed.members.map(member => member.delivery_id) };
+  }
+
+  async sendMessage(context, input) {
+    if (input?.targets !== undefined) return this.#sendBatch(context, input);
+    const { persist, viaContact } = this.#prepareOutgoing(context, input);
+    const persisted = this.transaction(append => {
+      const record = persist(append);
+      if (!record.duplicate) this.remoteRelay?.stageOutgoing([record]);
+      return record;
     });
     const snapshot = { ...this.result(persisted.message_id), duplicate: persisted.duplicate };
     if (!persisted.duplicate) this.enqueue(persisted.delivery_id).catch(error => { this.backgroundError = error; });
-    return snapshot;
+    return viaContact === undefined ? snapshot : { ...snapshot, resolved_target: { ...snapshot.message.envelope.target, via_contact: viaContact } };
+  }
+
+  async ingestRelayMessage(inbound) {
+    if (!this.remoteRelay) throw new CoreError("unsupported_op", "本机未启用跨机投递");
+    const rows = this.transaction(append => {
+      const relay = this.remoteRelay.planInbound(inbound);
+      return relay.recipients.map(item => {
+        const { target, originMessageId } = item;
+        const targetKey = identityKey(target);
+        const principal = this.remoteRelay.inboundPrincipal(relay.source, target);
+        const batchMeta = relay.recipientsVisible.length > 1 && relay.recipientsVisible.some(peer => identityKey(peer) === targetKey) ? {
+          batch_id: relay.requestId,
+          recipient_group: { batch_id: relay.requestId, recipients: relay.recipientsVisible },
+          recipient_labels: renderPeerRecipientsForReceiver({ receiver: target, allRecipients: relay.recipientsVisible,
+            resolveDisplayName: (receiver, peer) => this.resolveDisplayName(receiver, peer) }).recipient_labels,
+        } : undefined;
+        const dedupeKey = `relay-in:${digest({ origin: relay.relayId, request: relay.requestId, targetKey }).slice(0, 48)}`;
+        const direct = this.#prepareOutgoing(null, {
+          caller: relay.source, target, text: relay.body, origin: { kind: "agent_message", channel: "remote_relay", source_ref: relay.relayId },
+          dedupe_key: dedupeKey, delivery_policy: relay.deliveryPolicy, expires_at: relay.expiresAt,
+          ...(item.inReplyTo ? { in_reply_to: item.inReplyTo } : {}),
+          ...(target.host === "codex" && item.visibility ? { message_visibility: item.visibility } : {}),
+        }, batchMeta, { principal, sourceVerified: relay.sourceVerified });
+        const notice = batchMeta ? batchRecipientNotice({ batch_meta: batchMeta, envelope: direct.envelope }) : null;
+        if (notice && target.host === "codex") requireText(notice + "\n\n" + direct.envelope.text, "群发到 Codex 的正文");
+        const record = direct.persist(append);
+        const originalDelivery = this.store.getDeliveryForMessage(record.message_id);
+        this.relayAcknowledgements.bindInbound({
+          local_message_id: record.message_id, origin_relay_id: relay.relayId, origin_message_id: originMessageId,
+          from_machine: relay.source.machine_id, reply_relay_key: relay.route.relay_key, reply_group_id: relay.route.group_id,
+          reply_route_generation: relay.route.route_generation, target_key: targetKey,
+        });
+        return { ...record, delivery_id: originalDelivery.delivery_id, target_key: targetKey, origin_message_id: originMessageId };
+      });
+    });
+    const tasks = rows.filter(row => !row.duplicate).map(row => this.enqueue(row.delivery_id));
+    let timer;
+    try {
+      if (tasks.length) await Promise.race([Promise.allSettled(tasks), new Promise(resolve => { timer = setTimeout(resolve, 150); })]);
+    } finally { clearTimeout(timer); }
+    return { deliveries: rows.map(row => ({ local_message_id: row.message_id, target_key: row.target_key,
+      origin_message_id: row.origin_message_id, delivery_status: this.store.getDelivery(row.delivery_id)?.status ?? "unknown" })) };
+  }
+
+  recordRelayedProcessing(messageId, { processing, sequence }) {
+    const message = this.store.getMessage(messageId);
+    if (!message?.relay_request_id || !["processing", "done", "failed"].includes(processing) ||
+      !Number.isSafeInteger(sequence) || sequence <= (message.remote_processing_sequence ?? 0) ||
+      (PROCESSING_TERMINALS.has(message.processing) && message.processing !== processing)) return false;
+    return this.transaction(append => {
+      const delivery = this.store.getDeliveryForMessage(messageId);
+      if (!delivery || !["prepared", "dispatching", "unknown", "accepted"].includes(delivery.status)) return false;
+      if (delivery.status !== "accepted") this.changeDelivery(delivery.delivery_id, "accepted",
+        { outcome: "accepted", error: null, attempt_count: Math.max(1, delivery.attempt_count),
+          evidence: { source: "remote_processing_receipt" } }, append);
+      this.store.updateMessage(messageId, { processing, remote_processing_sequence: sequence,
+        ...(message.model_observed === "unknown" ? { model_observed: "observed" } : {}) });
+      if (message.processing !== processing) append(messageId, "processing", {
+        processing, delivery_id: delivery.delivery_id, binding_generation: delivery.target_snapshot.binding_generation,
+      });
+      return true;
+    });
   }
 
   async readChannelMessages(context, input) {
     const principal = this.principal(context, input.caller);
+    const attributed = { ...input, caller: principal.identity };
     let result;
     try {
-      result = await (this.channelHistoryFallback ?? this.channelContent).read(principal, input, { signal: context.signal });
+      result = await (this.channelHistoryFallback ?? this.channelContent).read(principal, attributed, { signal: context.signal });
     } catch (error) {
       if (!(error instanceof CoreError) || !/^channel_download_ledger_(?:io|changed|closed)$/.test(error.code)) throw error;
       this.channelDownloadsAvailable = false;
       this.channelHistoryFallback ??= this.createChannelHistoryFallback();
-      result = await this.channelHistoryFallback.read(principal, input, { signal: context.signal });
+      result = await this.channelHistoryFallback.read(principal, attributed, { signal: context.signal });
     }
     if (!this.channelDownloadsAvailable) {
       result.download_service = { available: false, code: "channel_download_state_unavailable" };
@@ -796,7 +1101,7 @@ export class CommunicationCore {
     const principal = this.principal(context, input.caller);
     if (!this.channelDownloadsAvailable) throw new CoreError("channel_download_state_unavailable", "下载原操作记录未就绪，已保留原件并停止新下载", { request_sent: false });
     try {
-      return await this.channelContent.download(principal, input, { signal: context.signal });
+      return await this.channelContent.download(principal, { ...input, caller: principal.identity }, { signal: context.signal });
     } catch (error) {
       if (error instanceof CoreError && /^channel_download_ledger_(?:io|changed|closed)$/.test(error.code)) {
         this.channelDownloadsAvailable = false;
@@ -1003,7 +1308,10 @@ export class CommunicationCore {
     const ownerReply = message.envelope.origin.kind === "human_message" && message.envelope.origin.channel === "napcat_owner_reply";
     const dynamicForward = ownerReply && !this.replyForwardPrincipals.some(principal => principal.id === message.principal_id);
     const forwarded = dynamicForward ? this.forwardedMessagePrincipal(message) : null;
-    const principal = windowPrincipal ?? forwarded ?? this.principal({ principal_id: message.principal_id }, message.envelope.caller);
+    const target = this.target(message.envelope.target.binding_id);
+    if (message.relay_inbound && !this.remoteRelay) throw new CoreError("target_not_found", "跨机原授权入口尚未接回");
+    const relayPrincipal = message.relay_inbound ? this.remoteRelay.inboundPrincipal(message.envelope.caller, target) : null;
+    const principal = relayPrincipal ?? windowPrincipal ?? forwarded ?? this.principal({ principal_id: message.principal_id }, message.envelope.caller);
     if (ownerReply && !forwarded) {
       const rules = this.replyForwarding.filter(rule => rule.principal_id === principal.id);
       const sender = message.forward_of?.native_source?.event?.sender_id;
@@ -1011,7 +1319,6 @@ export class CommunicationCore {
         throw new CoreError("source_unverified", "原回信发送者已不在当前本人授权范围");
       }
     }
-    const target = this.target(message.envelope.target.binding_id);
     normalizeSendInput(message.envelope, principal, target);
     if (identityKey(target) !== delivery.target_key || target.adapter_id !== delivery.target_snapshot?.adapter_id) {
       throw new CoreError("binding_changed", "原投递绑定的身份或适配器已经变化");
