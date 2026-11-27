@@ -162,6 +162,19 @@ function Assert-BuiltProfileBundle {
     $escapeToothpasteWord = [regex]::Unescape('\u540c\u6e90\u6e90\u7801\u5728\u624b\u6324\u7259\u818f\u5fae\u6b65')
     $oldThreeHardScenesWord = [regex]::Unescape('\u4e09\u7c7b\u786c\u573a\u666f')
     $oldZeroReleaseWord = [regex]::Unescape('\u96f6\u653e\u884c')
+    $fiveToTenMinWord = '5' + [regex]::Unescape('\uff5e') + '10m'
+    $oldTenToThirtyMinWord = '10' + [regex]::Unescape('\uff5e') + '30m'
+    $twentyToThirtyMinWord = '20' + [regex]::Unescape('\uff5e') + '30m'
+    $encourageDelayCritiqueWord = [regex]::Unescape('\u9f13\u52b1\u5bf9\u7aef\u63d0\u672c\u7aef\u62d6\u5ef6')
+    $transientOmitWord = [regex]::Unescape('\u77ac\u6001\u6f0f\u663e')
+    $maybeTransientOmitWord = [regex]::Unescape('\u53ef\u80fd\u77ac\u6001\u6f0f\u663e')
+    $noBlindStackWord = [regex]::Unescape('\u76f2\u76ee\u53e0\u6302')
+    $omitStackWord = [regex]::Unescape('\u6f0f\u663e\u53e0\u6302')
+    $hostDeadlockWord = [regex]::Unescape('\u5bbf\u4e3b\u7ea7\u5361\u6b7b')
+    $platformDeadlockNoBypassWord = [regex]::Unescape('\u5e73\u53f0\u7ea7\u5361\u6b7b\u7f29\u95f4\u9694\u65e0\u6548')
+    $soloSwitch8mWord = [regex]::Unescape('\u6539\u5355\u5e72 `*/8`')
+    $cannotBypassDeadlockWord = [regex]::Unescape('\u5355\u9760\u7f29\u95f4\u9694\u65e0\u6cd5\u7ed5\u5f00')
+    $nonShrinkBypassWord = [regex]::Unescape('\u975e\u7f29\u95f4\u9694\u53ef\u7ed5')
     $oldSharedGitBlockers = @(
         ([regex]::Unescape('\u4ec5\u83b7\u51c6\u5e76\u786e\u8ba4\u4e32\u884c')),
         ([regex]::Unescape('\u786e\u8ba4\u65e0\u5360\u7528\u5373\u53ef')),
@@ -180,7 +193,7 @@ function Assert-BuiltProfileBundle {
     foreach ($marker in @("read_file", $videoWord, $audioWord, "PDF", "PyMuPDF", "150 DPI")) {
         Assert-Contains $webVisualText $marker "$Profile web-visual multimodal contract"
     }
-    foreach ($marker in @("read_file", "update_steps", "done", "skipped", "< 24,000", "10 KiB", "communication-core", $liftedPrereqWord, $relockPrereqWord, $safetyGateWord, "USER_INPUT", $proxyEnvelopeWord, $privateRuleFirstWord, $maintPubDutyWord, $serialWriteWindowWord, $actualTurnWord, $fromUserArrWord, $autoStagePushCleanWord, $noManualApproveEachWord, $wholeBlockDeliveryWord, $helperHandWord, $beforeCheckpointWord, $noStepwiseReportWord, $dailyOnlyReportScopeWord, $agreedReportWord, $onlyTrueDepWaitWord, $riskDeviationSyncWord, $scheduleMutualReviewWord, $smallFactQueryWord, $noForcedDualReviewWord)) {
+    foreach ($marker in @("read_file", "update_steps", "done", "skipped", "< 24,000", "10 KiB", "communication-core", $liftedPrereqWord, $relockPrereqWord, $safetyGateWord, "USER_INPUT", $proxyEnvelopeWord, $privateRuleFirstWord, $maintPubDutyWord, $serialWriteWindowWord, $actualTurnWord, $fromUserArrWord, $autoStagePushCleanWord, $noManualApproveEachWord, $wholeBlockDeliveryWord, $helperHandWord, $beforeCheckpointWord, $noStepwiseReportWord, $dailyOnlyReportScopeWord, $agreedReportWord, $onlyTrueDepWaitWord, $riskDeviationSyncWord, $scheduleMutualReviewWord, $smallFactQueryWord, $noForcedDualReviewWord, "*/8 * * * *", $fiveToTenMinWord, "*/30 * * * *", $encourageDelayCritiqueWord, $platformDeadlockNoBypassWord, $omitStackWord)) {
         Assert-Contains $geminiText $marker "$Profile GEMINI core contract"
     }
     foreach ($marker in @($channelWindowWord, $immediateReturnWord, $maintPubDutyWord, $serialWriteWindowWord, $actualTurnWord, $validHandoffWord, $prevStillPushingWord, $fromUserArrWord, "maintenance-upgrades.md", $autoStageCommitPushWord, ".git/index.lock", "reconnect-sync.md", $keepSharedWriteStepWord, $indepVerifyNoStageWord, "worktree", $mixOthersChangesWord, $wholeBlockDeliveryWord, $helperHandWord, $beforeCheckpointWord, $noStepwiseReportWord, $dailyOnlyReportScopeWord, $agreedReportWord, $onlyTrueDepWaitWord, $riskDeviationSyncWord, $equalScheduleReviewWord, $smallFactQueryWord)) {
@@ -194,10 +207,10 @@ function Assert-BuiltProfileBundle {
         Assert-NotContains $maintenanceText $blocker "$Profile maintenance-upgrades obsolete shared-repo blocker"
         Assert-NotContains $commBridgesText $blocker "$Profile communication-bridges obsolete shared-repo blocker"
     }
-    foreach ($marker in @($liftedPrereqWord, $relockPrereqWord, $safetyGateWord, $batchScopeWord, "USER_INPUT", "USER_EXPLICIT", "[COMMUNICATION_CORE", $agentMsgTypeWord, "@[Quote]", "conversation_read_original", $noTagOnlyWord, $proxyRelayEnvelopeWord, $directOriginalWord, $oralRelayOnlyWord, $wholeBlockDeliveryWord, $helperHandWord, $beforeCheckpointWord, $noStepwiseReportWord, $dailyOnlyReportScopeWord, $agreedReportWord, $scheduleDeviationWord, $onlyTrueDepWaitWord, $scheduleMutualReviewWord, $ignoreScheduleObjectionWord, $smallFactQueryWord, $noForcedDualReviewWord, $noPartnerMicroPlanWord, $escapePreviewWord, $escapeSuggestCheckWord, $escapeSingleWaitAllSleepWord, $escapeToothpasteWord)) {
+    foreach ($marker in @($liftedPrereqWord, $relockPrereqWord, $safetyGateWord, $batchScopeWord, "USER_INPUT", "USER_EXPLICIT", "[COMMUNICATION_CORE", $agentMsgTypeWord, "@[Quote]", "conversation_read_original", $noTagOnlyWord, $proxyRelayEnvelopeWord, $directOriginalWord, $oralRelayOnlyWord, $wholeBlockDeliveryWord, $helperHandWord, $beforeCheckpointWord, $noStepwiseReportWord, $dailyOnlyReportScopeWord, $agreedReportWord, $scheduleDeviationWord, $onlyTrueDepWaitWord, $scheduleMutualReviewWord, $ignoreScheduleObjectionWord, $smallFactQueryWord, $noForcedDualReviewWord, $noPartnerMicroPlanWord, $escapePreviewWord, $escapeSuggestCheckWord, $escapeSingleWaitAllSleepWord, $escapeToothpasteWord, "*/8 * * * *", $fiveToTenMinWord, "*/5", "<5m", "400/503", "Error Unknown", "manage_task(list)", $maybeTransientOmitWord, $noBlindStackWord, $hostDeadlockWord, $cannotBypassDeadlockWord, $soloSwitch8mWord, "*/30 * * * *", $twentyToThirtyMinWord)) {
         Assert-Contains $engineeringText $marker "$Profile engineering-workflow recovery & USER_INPUT contract"
     }
-    foreach ($marker in @("USER_INPUT", "USER_EXPLICIT", "[COMMUNICATION_CORE", $agentMsgTypeWord, "@[Quote]", "conversation_read_original", $noTagOnlyWord, $proxyRelayEnvelopeWord, $directOriginalWord, $oralRelayOnlyWord)) {
+    foreach ($marker in @("USER_INPUT", "USER_EXPLICIT", "[COMMUNICATION_CORE", $agentMsgTypeWord, "@[Quote]", "conversation_read_original", $noTagOnlyWord, $proxyRelayEnvelopeWord, $directOriginalWord, $oralRelayOnlyWord, "*/8 * * * *", $fiveToTenMinWord, "*/5", "<5m", "400/503", "Error Unknown", "manage_task(list)", $transientOmitWord, $noBlindStackWord, $nonShrinkBypassWord)) {
         Assert-Contains $skillText $marker "$Profile tools-reference USER_INPUT envelope contract"
     }
 
@@ -207,6 +220,10 @@ function Assert-BuiltProfileBundle {
         Assert-NotContains $text "4+1" "$Profile ($rel) obsolete 4+1 rule"
         Assert-NotContains $text $oldThreeHardScenesWord "$Profile ($rel) obsolete narrowed cross-host confirmation rule"
         Assert-NotContains $text $oldZeroReleaseWord "$Profile ($rel) obsolete zero-release heading wording"
+        Assert-NotContains $text "*/20" "$Profile ($rel) obsolete 20m cron interval"
+        Assert-NotContains $text $oldTenToThirtyMinWord "$Profile ($rel) obsolete 10-30m fullwidth cron window"
+        Assert-NotContains $text "10~30m" "$Profile ($rel) obsolete 10~30m ascii cron window"
+        Assert-NotContains $text "10-30m" "$Profile ($rel) obsolete 10-30m hyphen cron window"
     }
 
     $ownerWord = [regex]::Unescape('\u4e3b\u4eba')
