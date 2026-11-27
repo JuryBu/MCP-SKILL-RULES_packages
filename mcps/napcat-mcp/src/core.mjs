@@ -23,6 +23,7 @@ const STALE_LOCK_MINUTES = 15;
 const DEFAULT_GROUP_FILE_COUNT_LIMIT = 1500;
 const DEFAULT_GROUP_FILE_CLEANUP_BATCH = 100;
 const DEFAULT_GROUP_FILE_SCAN_COUNT = 2000;
+const RELAY_FILE_BUNDLE_NAME_RE = /^ncr-[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}-[a-f0-9]{16}\.ncp$/u;
 const RECONCILIATION_CLOCK_SKEW_MS = 60 * 60 * 1000;
 const SUPERVISOR_RUNTIME_MAX_AGE_MS = 150_000;
 const SUPERVISOR_RUNTIME_MAX_BYTES = 256 * 1024;
@@ -632,6 +633,7 @@ function structuredTaskMetadata(text) {
   };
   const normalizedText = normalizeComparableText(text);
   const firstLine = normalizedText.split("\n").find((line) => line.trim())?.trim() ?? "";
+  if (firstLine === "[COMM_RELAY_V1]") return metadata;
   if (firstLine === "[Codex][CONNECTION_REQUEST]") metadata.messageType = "connection_request";
   else if (firstLine === "[Codex][DELIVERY_RECEIPT]") metadata.messageType = "delivery_receipt";
   else if (firstLine === "[Codex][OWNER_REPLY]") metadata.messageType = "owner_reply";
@@ -714,6 +716,8 @@ function oneBotControlSegments(message) {
 
 function taskFileIndexMetadata(text) {
   const normalizedText = normalizeComparableText(text);
+  const firstLine = normalizedText.split("\n").find((line) => line.trim())?.trim() ?? "";
+  if (firstLine === "[COMM_RELAY_V1]") return null;
   if (!normalizedText.includes("[Codex][TASK_FILE_INDEX]")) return null;
   const metadata = {
     fileId: "",
@@ -1634,7 +1638,11 @@ export function createNapCatNotifier(options = {}) {
 
     const candidates = rootFiles
       .map((file, index) => ({ file, index, timestamp: groupFileTimestamp(file) }))
-      .filter(({ file }) => String(file?.file_id ?? ""))
+      .filter(({ file }) => {
+        const fileId = String(file?.file_id ?? "");
+        const fileName = String(file?.file_name ?? "");
+        return Boolean(fileId) && !RELAY_FILE_BUNDLE_NAME_RE.test(fileName);
+      })
       .sort((left, right) => {
         const leftTime = left.timestamp ?? Number.MAX_SAFE_INTEGER;
         const rightTime = right.timestamp ?? Number.MAX_SAFE_INTEGER;

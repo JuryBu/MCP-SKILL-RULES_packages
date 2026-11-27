@@ -63,6 +63,8 @@ const RELAY_KEYS = [
   "allow_recipient_list_disclosure",
   "legacy_training_coexistence",
   "allow_file_bundle_write",
+  "file_bundle_folder_id",
+  "file_bundle_folder_name",
 ];
 
 const RESOLVE_ROUTE_OPTION_KEYS = [
@@ -94,6 +96,8 @@ const FROZEN_ROUTE_KEYS = [
   "allow_recipient_list_disclosure",
   "legacy_training_coexistence",
   "allow_file_bundle_write",
+  "file_bundle_folder_id",
+  "file_bundle_folder_name",
 ];
 
 export class RelayError extends Error {
@@ -253,6 +257,37 @@ function validateBoolean(value, name, defaultValue, errorCode = "RELAY_CONFIG_IN
   if (value === undefined) return defaultValue;
   if (typeof value !== "boolean") {
     throw new RelayError(errorCode, `${name} 必须是布尔值`);
+  }
+  return value;
+}
+
+function validateOptionalBundleFolderId(value, name, errorCode = "RELAY_CONFIG_INVALID") {
+  if (value === undefined || value === null) return null;
+  if (
+    typeof value !== "string"
+    || !value
+    || value.length > 512
+    || value === "/"
+    || value === "."
+    || value === ".."
+    || /[\\\s\u0000-\u001f\u007f]/u.test(value)
+  ) {
+    throw new RelayError(errorCode, `${name} 必须是非根、无空白与控制字符的有效群文件目录 ID（1-512 位）`);
+  }
+  return value;
+}
+
+function validateOptionalBundleFolderName(value, name, errorCode = "RELAY_CONFIG_INVALID") {
+  if (value === undefined || value === null) return null;
+  if (
+    typeof value !== "string"
+    || !value
+    || value.trim() !== value
+    || CONTROL_CHAR_RE.test(value)
+    || FORBIDDEN_KEYS.has(value)
+    || !SAFE_ID_RE.test(value)
+  ) {
+    throw new RelayError(errorCode, `${name} 必须是合法单级目录名（1-64 位字母数字及 ._-）`);
   }
   return value;
 }
@@ -488,6 +523,8 @@ function buildFrozenRouteSnapshot(config, route, peer) {
     allow_recipient_list_disclosure: route.allow_recipient_list_disclosure,
     legacy_training_coexistence: route.legacy_training_coexistence,
     allow_file_bundle_write: route.allow_file_bundle_write,
+    file_bundle_folder_id: route.file_bundle_folder_id,
+    file_bundle_folder_name: route.file_bundle_folder_name,
   });
 }
 
@@ -747,24 +784,40 @@ export function loadAndValidateRelayConfig({ bindingPath, relayGroupsPath, env =
       false,
     );
 
+    const fileBundleFolderId = validateOptionalBundleFolderId(
+      rawRelay.file_bundle_folder_id,
+      `relays.${relayKey}.file_bundle_folder_id`,
+    );
+    const fileBundleFolderName = validateOptionalBundleFolderName(
+      rawRelay.file_bundle_folder_name,
+      `relays.${relayKey}.file_bundle_folder_name`,
+    );
+    if ((fileBundleFolderId !== null) !== (fileBundleFolderName !== null)) {
+      throw new RelayError(
+        "RELAY_CONFIG_INVALID",
+        `relays.${relayKey} 的 file_bundle_folder_id 与 file_bundle_folder_name 必须同时声明或同时省略`,
+      );
+    }
+
     const explicitAllowFileBundleWrite = rawRelay.allow_file_bundle_write;
     if (explicitAllowFileBundleWrite !== undefined && typeof explicitAllowFileBundleWrite !== "boolean") {
       throw new RelayError("RELAY_CONFIG_INVALID", `relays.${relayKey}.allow_file_bundle_write 必须是布尔值`);
     }
 
+    const hasPinnedBundleFolder = fileBundleFolderId !== null && fileBundleFolderName !== null;
     let allowFileBundleWrite = legacyTrainingCoexistence
-      ? false
+      ? (explicitAllowFileBundleWrite === true && hasPinnedBundleFolder)
       : (explicitAllowFileBundleWrite ?? true);
 
-    if (legacyTrainingCoexistence && explicitAllowFileBundleWrite === true) {
+    if (legacyTrainingCoexistence && explicitAllowFileBundleWrite === true && !hasPinnedBundleFolder) {
       allowFileBundleWrite = false;
       recordConflict(makeConflict({
-        code: "RELAY_LEGACY_COEXISTENCE_FORBIDS_FILE_BUNDLE_WRITE",
+        code: "RELAY_COEXISTENCE_FILE_BUNDLE_FOLDER_REQUIRED",
         scope: "route",
         relay_key: relayKey,
         group_id: groupId,
         channel,
-        message: `中继路由 ${relayKey} 声明了 legacy_training_coexistence=true，严禁开启 allow_file_bundle_write=true`,
+        message: `中继路由 ${relayKey} 声明了 legacy_training_coexistence=true 且开启 allow_file_bundle_write=true，必须同时绑定独立的 file_bundle_folder_id 与 file_bundle_folder_name`,
         details: { relay_key: relayKey, group_id: groupId },
       }));
     }
@@ -862,6 +915,8 @@ export function loadAndValidateRelayConfig({ bindingPath, relayGroupsPath, env =
       allow_recipient_list_disclosure: allowRecipientListDisclosure,
       legacy_training_coexistence: legacyTrainingCoexistence,
       allow_file_bundle_write: allowFileBundleWrite,
+      file_bundle_folder_id: fileBundleFolderId,
+      file_bundle_folder_name: fileBundleFolderName,
       conflicts: [],
       valid: true,
     };
@@ -960,6 +1015,8 @@ export function loadAndValidateRelayConfig({ bindingPath, relayGroupsPath, env =
       allow_recipient_list_disclosure: r.allow_recipient_list_disclosure,
       legacy_training_coexistence: r.legacy_training_coexistence,
       allow_file_bundle_write: r.allow_file_bundle_write,
+      file_bundle_folder_id: r.file_bundle_folder_id,
+      file_bundle_folder_name: r.file_bundle_folder_name,
     }])),
   });
   const configHash = createHash("sha256").update(JSON.stringify(hashPayload), "utf8").digest("hex");
@@ -1272,10 +1329,25 @@ export function reverifyFrozenRelayRoute(config, frozenRoute, options = {}) {
   const peerQqId = frozenRoute.peer_qq_id === null || frozenRoute.peer_qq_id === undefined
     ? null
     : normalizeNumericId(frozenRoute.peer_qq_id, "frozenRoute.peer_qq_id", "RELAY_INVALID_ARGUMENT", true);
+  const frozenFolderId = validateOptionalBundleFolderId(
+    frozenRoute.file_bundle_folder_id,
+    "frozenRoute.file_bundle_folder_id",
+    "RELAY_INVALID_ARGUMENT",
+  );
+  const frozenFolderName = validateOptionalBundleFolderName(
+    frozenRoute.file_bundle_folder_name,
+    "frozenRoute.file_bundle_folder_name",
+    "RELAY_INVALID_ARGUMENT",
+  );
 
   if ((peerMachineId === null) !== (peerQqId === null)) {
     throw new RelayError("RELAY_ROUTE_CHANGED", "冻结路由的 peer_machine_id 与 peer_qq_id 必须同时提供或同时为空", {
       change_reason: "peer_pair_incomplete",
+    });
+  }
+  if ((frozenFolderId === null) !== (frozenFolderName === null)) {
+    throw new RelayError("RELAY_ROUTE_CHANGED", "冻结路由的 file_bundle_folder_id 与 file_bundle_folder_name 必须同时提供或同时为空", {
+      change_reason: "file_bundle_folder_pair_incomplete",
     });
   }
 
@@ -1401,7 +1473,29 @@ export function reverifyFrozenRelayRoute(config, frozenRoute, options = {}) {
     }
   }
 
-  if (requireFileBundleWrite && (currentRoute.legacy_training_coexistence === true || currentRoute.allow_file_bundle_write !== true)) {
+  if (
+    currentRoute.file_bundle_folder_id !== frozenFolderId
+    || currentRoute.file_bundle_folder_name !== frozenFolderName
+  ) {
+    throw new RelayError(
+      "RELAY_ROUTE_CHANGED",
+      `原冻结中继路由 ${relayKey} 的独立群文件目录已变化（冻结=${frozenFolderId ?? "null"}/${frozenFolderName ?? "null"}，当前=${currentRoute.file_bundle_folder_id ?? "null"}/${currentRoute.file_bundle_folder_name ?? "null"}）`,
+      {
+        relay_key: relayKey,
+        change_reason: "file_bundle_folder_mismatch",
+        frozen_file_bundle_folder_id: frozenFolderId,
+        actual_file_bundle_folder_id: currentRoute.file_bundle_folder_id,
+        frozen_file_bundle_folder_name: frozenFolderName,
+        actual_file_bundle_folder_name: currentRoute.file_bundle_folder_name,
+      },
+    );
+  }
+
+  const folderPinned = Boolean(currentRoute.file_bundle_folder_id && currentRoute.file_bundle_folder_name);
+  if (
+    requireFileBundleWrite
+    && (currentRoute.allow_file_bundle_write !== true || (currentRoute.legacy_training_coexistence === true && !folderPinned))
+  ) {
     throw new RelayError(
       "RELAY_FILE_BUNDLE_WRITE_FORBIDDEN",
       `中继路由 ${relayKey} 禁止文件包写入操作`,
@@ -1410,6 +1504,8 @@ export function reverifyFrozenRelayRoute(config, frozenRoute, options = {}) {
         group_id: currentRoute.group_id,
         legacy_training_coexistence: currentRoute.legacy_training_coexistence,
         allow_file_bundle_write: currentRoute.allow_file_bundle_write,
+        file_bundle_folder_id: currentRoute.file_bundle_folder_id,
+        file_bundle_folder_name: currentRoute.file_bundle_folder_name,
       },
     );
   }
@@ -1489,6 +1585,8 @@ export function buildSanitizedRelayView(config) {
         allow_recipient_list_disclosure: route.allow_recipient_list_disclosure,
         legacy_training_coexistence: route.legacy_training_coexistence,
         allow_file_bundle_write: route.allow_file_bundle_write,
+        file_bundle_folder_id: route.file_bundle_folder_id,
+        file_bundle_folder_name: route.file_bundle_folder_name,
         valid: route.valid,
         conflicts: route.conflicts.map((conflict) => ({ ...conflict })),
       };

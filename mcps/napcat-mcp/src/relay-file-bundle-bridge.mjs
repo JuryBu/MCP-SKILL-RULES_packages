@@ -89,9 +89,13 @@ export function createFileBundleRelayHost({
     if (options.requireRecipientListDisclosure === true && latestRoute.allow_recipient_list_disclosure !== true) {
       return { status: "not_sent", reason: "RELAY_RECIPIENT_DISCLOSURE_BLOCKED" };
     }
+    const folderPinned = Boolean(latestRoute.file_bundle_folder_id && latestRoute.file_bundle_folder_name);
+    if (latestRoute.legacy_training_coexistence === true && !folderPinned) {
+      return { status: "not_sent", reason: "RELAY_FILE_ROUTE_DENIED" };
+    }
     if (
       options.requireFileBundleWrite === true
-      && (latestRoute.role !== "active_write" || latestRoute.allow_file_bundle_write !== true || latestRoute.legacy_training_coexistence === true)
+      && (latestRoute.role !== "active_write" || latestRoute.allow_file_bundle_write !== true)
     ) {
       return { status: "not_sent", reason: "RELAY_FILE_ROUTE_DENIED" };
     }
@@ -193,7 +197,8 @@ export function createFileBundleRelayHost({
     for (const [relayKey, relay] of Object.entries(config.relays)) {
       if (!relay.enabled) continue;
       if (relay.valid !== true) continue;
-      if (relay.legacy_training_coexistence === true) continue;
+      const folderPinned = Boolean(relay.file_bundle_folder_id && relay.file_bundle_folder_name);
+      if (relay.legacy_training_coexistence === true && !folderPinned) continue;
       if (isRelayRouteDrainExpired(relay, currentNowMs)) continue;
       if (allowedSet && !allowedSet.has(relayKey)) continue;
       scopes.push({
@@ -213,11 +218,12 @@ export function createFileBundleRelayHost({
       throw new RelayError("RELAY_CONFIG_CONFLICT", "中继全局配置存在冲突，已拒绝读取文件控制帧");
     }
     const relay = Object.hasOwn(config.relays, relay_key) ? config.relays[relay_key] : null;
+    const folderPinned = Boolean(relay?.file_bundle_folder_id && relay?.file_bundle_folder_name);
     if (
       !relay
       || !relay.enabled
       || relay.valid !== true
-      || relay.legacy_training_coexistence === true
+      || (relay.legacy_training_coexistence === true && !folderPinned)
       || isRelayRouteDrainExpired(relay, nowProvider())
       || relay.group_id !== group_id
       || relay.generation !== route_generation
