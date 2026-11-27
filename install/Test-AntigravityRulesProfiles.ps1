@@ -214,6 +214,69 @@ function Assert-BuiltProfileBundle {
         Assert-Contains $skillText $marker "$Profile tools-reference USER_INPUT envelope contract"
     }
 
+    # Round 18: four-layer living recent-status + compaction dual-anchor raw read (strict R18-exclusive anchors)
+    $r18GeminiMarkers = @(
+        ([regex]::Unescape('\u773c\u524d\u5148\u987e\u4ec0\u4e48\uff08\u7f6e\u9876\u8986\u76d6\u5237\u65b0\uff09')),
+        ([regex]::Unescape('\u957f\u671f\u6709\u6548\u539f\u5219\u3001\u5e95\u7ebf\u4e0e\u6838\u5fc3\u5631\u6258')),
+        ([regex]::Unescape('\u7edd\u4e0d\u968f `K` \u6ed1\u7a97\u6dd8\u6c70')),
+        ([regex]::Unescape('\u8fc7\u7a0b/\u65e7\u72b6\u6001/\u6d41\u6c34\u6218\u62a5\u7981\u5165')),
+        ([regex]::Unescape('\u5df2\u56fa\u5316\u81ea\u52a8\u95e8\u7981\u7559\u53ef\u5bfb\u7d22\u5f15')),
+        ([regex]::Unescape('\u8bdd\u9898\u81ea\u7136\u7ed3\u675f\u6216\u8f6c\u5411')),
+        ([regex]::Unescape('\u51fa\u7a97\u63d0\u7eaf')),
+        ([regex]::Unescape('\u7ea6 `30 KB` \u76ee\u6807')),
+        ([regex]::Unescape('`40 KB` \u89e6\u53d1\u7626\u8eab')),
+        ([regex]::Unescape('\u9047 `Partial read` \u622a\u65ad\u6cbf\u539f `ByteOffset`/\u6e38\u6807\u7eed\u8bfb\u5168')),
+        ([regex]::Unescape('\u4e25\u7981\u53ea\u8bfb\u524d\u534a\u622a\u5f00\u5e72')),
+        ([regex]::Unescape('\u9996\u62cd\u5e76\u884c\u53cc\u951a\u70b9\u56de\u8bfb')),
+        ([regex]::Unescape('\u538b\u7f29\u524d\u8fd1\u671f\u7eaf\u51c0\u4eba\u673a\u539f\u6587')),
+        ([regex]::Unescape('\u539f\u53e5\u4ecd\u5728\u5f53\u524d\u4e0a\u4e0b\u6587\u5219\u53ea\u8865\u7f3a\u4e0d\u91cd\u8bfb\uff0c\u6458\u8981\u53ea\u5b9a\u4f4d')),
+        ([regex]::Unescape('\u8bfb\u538b\u7f29\u524d `3\uff5e5` \u8f6e\u4ec5\u4f5c\u7269\u7406\u8d77\u70b9\u7a97\u53e3')),
+        ([regex]::Unescape('\u5fc5\u5148\u5254\u9664\u4ee3\u7406\u5c01\u5957')),
+        ([regex]::Unescape('\u9996\u6279\u88ab\u4ee3\u7406/\u5524\u9192\u5360\u6ee1\u672a\u89c1\u65e0\u5c01\u5957\u539f\u8bdd\u65f6\u5fc5\u5b9a\u70b9\u5411\u4e0a\u6269\u7a97')),
+        ([regex]::Unescape('\u5f53\u8f6e\u8865\u5f55\u8fd1\u51b5\u518d\u63a8')),
+        ([regex]::Unescape('\u4ec5\u6682\u7f13\u786e\u5b9e\u4f9d\u8d56\u8be5\u539f\u8bdd\u7684\u51b3\u5b9a\uff0c\u4f59\u660e\u786e\u6388\u6743\u7167\u63a8'))
+    )
+    foreach ($marker in $r18GeminiMarkers) {
+        Assert-Contains $geminiText $marker "$Profile GEMINI Round 18 living-memory & compaction contract"
+    }
+    $r18EngineeringMarkers = @(
+        ([regex]::Unescape('\u4e0d\u56e0\u5355\u7eaf\u538b\u7f29/\u5524\u9192\u6062\u590d\u989d\u5916\u65b0\u8d77\u53cc\u5ba1')),
+        ([regex]::Unescape('\u5c06\u9a8c\u8bc1\u5de5\u5e8f\u6216\u65e9\u671f\u6838\u5fc3\u8981\u6c42\u6324\u51fa\u6392\u671f')),
+        ([regex]::Unescape('\u9002\u7528\u957f\u671f\u539f\u5219\u4e0e\u6838\u5fc3\u5631\u6258\u672a\u771f\u6b63\u6539\u53d8\u67b6\u6784\u9009\u62e9\u4e0e\u771f\u5b9e\u4ea4\u4ed8\u6210\u54c1')),
+        ([regex]::Unescape('\u5b64\u7acb\u5355\u6d4b/Mock')),
+        ([regex]::Unescape('\u538b\u7f29\u540e\u6f0f\u8bfb\u8fd1\u671f\u7eaf\u51c0\u539f\u6587')),
+        ([regex]::Unescape('\u6574\u4efd\u8fd1\u51b5\u7ea6 `30 KB` \u76ee\u6807\u3001`40 KB` \u89e6\u53d1\u7626\u8eab')),
+        ([regex]::Unescape('\u9047 `Partial read` \u622a\u65ad\u5fc5\u6cbf\u539f `ByteOffset`/\u6e38\u6807\u7eed\u8bfb\u5168')),
+        ([regex]::Unescape('\u4e25\u7981\u53ea\u8bfb\u524d\u534a\u622a\u5f00\u5e72')),
+        ([regex]::Unescape('\u9996\u62cd\u5e76\u884c\u53cc\u951a\u70b9\u56de\u8bfb')),
+        ([regex]::Unescape('\u538b\u7f29\u524d\u8fd1\u671f\u7eaf\u51c0\u4eba\u673a\u539f\u6587')),
+        ([regex]::Unescape('\u6700\u8fd1\u539f\u53e5\u4ecd\u5b8c\u6574\u7559\u5728\u5f53\u524d\u4e0a\u4e0b\u6587\u5219\u53ea\u8865\u7f3a\u4e0d\u91cd\u8bfb\uff0c\u6458\u8981\u4ec5\u4f5c\u5b9a\u4f4d')),
+        ([regex]::Unescape('\u4ece\u538b\u7f29\u70b9\u524d\u8bfb `3\uff5e5` \u8f6e\u4ec5\u4f5c\u7269\u7406\u8d77\u70b9\u7a97\u53e3')),
+        ([regex]::Unescape('\u5fc5\u5148\u5254\u9664\u4ee3\u7406\u8f6c\u9001\u5c01\u5957')),
+        ([regex]::Unescape('\u82e5\u9996\u6279\u7a97\u53e3\u5168\u88ab\u4ee3\u7406/\u5524\u9192\u5360\u6ee1\u672a\u89c1\u65e0\u5c01\u5957\u539f\u8bdd\uff0c\u5fc5\u5b9a\u70b9\u5411\u4e0a\u6269\u7a97')),
+        ([regex]::Unescape('\u5f53\u8f6e\u8865\u5f55\u8fd1\u51b5\u518d\u63a8')),
+        ([regex]::Unescape('\u4ec5\u6682\u7f13\u786e\u5b9e\u4f9d\u8d56\u8be5\u539f\u8bdd\u7684\u51b3\u5b9a\uff0c\u4f59\u5df2\u83b7\u660e\u786e\u6388\u6743\u5de5\u4f5c\u7167\u63a8')),
+        ([regex]::Unescape('\u6309\u8bdd\u9898\u81ea\u7136\u7ed3\u675f/\u8f6c\u5411\u8ba1')),
+        ([regex]::Unescape('\u5df2\u56fa\u5316\u95e8\u7981\u7559\u53ef\u5bfb\u7d22\u5f15')),
+        ([regex]::Unescape('\u8de8\u5bf9\u8bdd\u6309\u539f\u6388\u6743\u540c\u6b65 `memory-store` \u5e76\u6838\u672a\u7b54\u9879'))
+    )
+    foreach ($marker in $r18EngineeringMarkers) {
+        Assert-Contains $engineeringText $marker "$Profile engineering-workflow Round 18 dual-review & recovery contract"
+    }
+    $r18SkillMarkers = @(
+        ([regex]::Unescape('\u81ea\u52a8/`/compact` \u538b\u7f29\u53cc\u5165\u53e3\u62bd\u8bfb')),
+        ([regex]::Unescape('\u7d27\u90bb\u538b\u7f29\u70b9\u524d **`3\uff5e5` \u8f6e\u7269\u7406\u8d77\u70b9**')),
+        ([regex]::Unescape('\u517c\u5bb9 `content`/`response` \u5b57\u6bb5')),
+        ([regex]::Unescape('\u9047 `truncated_fields` \u5b9a\u70b9\u6309\u884c\u8865\u8bfb `transcript_full.jsonl`')),
+        'lastRounds=3~5, prepareCache=false',
+        ([regex]::Unescape('\u53cc\u5165\u53e3\u5747\u5fc5\u5148\u5254\u9664\u4ee3\u7406\u5c01\u5957')),
+        ([regex]::Unescape('Rules \u6ce8\u5165\u4e0e\u538b\u7f29\u6458\u8981')),
+        ([regex]::Unescape('\u82e5\u9996\u6279 3\uff5e5 \u8f6e\u88ab\u4ee3\u7406\u4fe1/\u5524\u9192\u5360\u6ee1\u672a\u89c1\u65e0\u5c01\u5957\u539f\u8bdd\uff0c\u5fc5\u5b9a\u70b9\u5411\u4e0a\u6269\u7a97\u6216\u6cbf\u6765\u6e90\u7ee7\u7eed\u67e5'))
+    )
+    foreach ($marker in $r18SkillMarkers) {
+        Assert-Contains $skillText $marker "$Profile tools-reference Round 18 compaction raw-read contract"
+    }
+
     foreach ($rel in $expectedManagedRelativePaths) {
         $text = $fileMap[$rel]
         Assert-NotContains $text $obsoleteKeyframe "$Profile ($rel) obsolete multimodal rule"
@@ -418,6 +481,20 @@ try {
     $localCareExampleText = Assert-FileFormatAndBudget -Path $localCareExamplePath -Context "Public local-care.example.md"
     Assert-Contains $localCareExampleText "<your-shared-toolkit-repo>" "local-care.example.md shared-repo placeholder"
     Assert-Contains $localCareExampleText ([regex]::Unescape('\u4e0d\u64c5\u81ea commit/push')) "local-care.example.md non-shared default guardrail"
+    $r18CareMarkers = @(
+        ([regex]::Unescape('\u56db\u5c42\u6d3b\u8fd1\u51b5')),
+        ([regex]::Unescape('\u773c\u524d\u5148\u987e\u4ec0\u4e48\uff08\u7f6e\u9876\u8986\u76d6\u5237\u65b0\uff09')),
+        ([regex]::Unescape('\u957f\u671f\u6709\u6548\u539f\u5219\u3001\u5e95\u7ebf\u4e0e\u6838\u5fc3\u5631\u6258')),
+        ([regex]::Unescape('\u4e0d\u968f `K` \u6ed1\u7a97\u6dd8\u6c70')),
+        ([regex]::Unescape('\u5df2\u56fa\u5316\u4e3a\u81ea\u52a8\u95e8\u7981\u4ecd\u7559\u53ef\u5bfb\u7d22\u5f15')),
+        ([regex]::Unescape('\u6309\u8bdd\u9898\u81ea\u7136\u7ed3\u675f/\u8f6c\u5411\u8ba1 1 \u6b21')),
+        ([regex]::Unescape('\u65e7\u8bdd\u9898\u51fa\u7a97\u524d\u5148\u62bd\u63d0\u4ecd\u751f\u6548\u539f\u5219\u664b\u5347\u7b2c 2 \u5c42\u5e76\u6838\u672a\u7b54\u9879')),
+        ([regex]::Unescape('\u7ea6 `30 KB` \u76ee\u6807\u3001`40 KB` \u89e6\u53d1\u7626\u8eab\u9632 `46,080 B` \u622a\u65ad')),
+        ([regex]::Unescape('\u9047\u622a\u65ad\u5fc5\u7eed\u8bfb\u5168\uff0c\u538b\u7f29\u6062\u590d\u9996\u62cd\u540c\u65f6\u56de\u8bfb\u8fd1\u51b5\u4e0e\u538b\u7f29\u524d\u8fd1\u671f\u7eaf\u51c0\u539f\u6587'))
+    )
+    foreach ($marker in $r18CareMarkers) {
+        Assert-Contains $localCareExampleText $marker "local-care.example.md Round 18 four-layer living-memory contract"
+    }
 
     # 3. Verify top-level GEMINI.template.md matches catgirl -KeepTemplatePlaceholders byte-for-byte
     $templateOutDir = Join-Path $testRoot "template-drift-check"
