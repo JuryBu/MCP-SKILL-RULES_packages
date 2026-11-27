@@ -11,7 +11,7 @@ import { CodexDeliveryAdapter } from "./adapters/codex.mjs";
 import { CodexProxyTransport } from "./transports/codex-proxy.mjs";
 import { loadCodexSourceRecovery, loadCodexStatusSource } from "./codex-source-recovery.mjs";
 import { NapcatMcpTransport } from "./transports/napcat-mcp.mjs";
-import { NapcatOwnerAdapter } from "./adapters/napcat-owner.mjs";
+import { createOwnerSourceTitleReader, NapcatOwnerAdapter } from "./adapters/napcat-owner.mjs";
 import { acquireRuntimeLease } from "./runtime-lease.mjs";
 import { normalizeReplyForwardingRules } from "./reply-forwarding.mjs";
 import { normalizeHostScope } from "./conversation-directory.mjs";
@@ -392,6 +392,8 @@ export async function startLiveFromConfig({ configPath, stateDir, endpointFile, 
   const machineProviders = new Map();
   const statusProvider = new HostStatusProvider({ localMachineId, machineProviders });
   const hostContentProviders = Object.create(null);
+  const ownerTitleProviders = new Map();
+  const readOwnerSourceTitle = createOwnerSourceTitleReader({ localMachineId, principals: configuration.principals, readers: ownerTitleProviders });
   if (configuration.statusHosts.includes("windsurf")) statusProvider.providers.set("windsurf", createWindsurfDesktopStatusReader());
   let store;
   let downloadLedger;
@@ -471,6 +473,16 @@ export async function startLiveFromConfig({ configPath, stateDir, endpointFile, 
         statusProvider.providers.set("antigravity", createAntigravityStatusReader(transport, { configured_delivery_modes: { next_model_boundary: true, when_idle: true } }));
         const summaryIndex = entry.conversation_index_file ? createAntigravitySummaryIndex({ filePath: entry.conversation_index_file }) : undefined;
         if (summaryIndex) transports.add(summaryIndex);
+        ownerTitleProviders.set("antigravity", async (source, { signal, canList }) => {
+          if (canList) {
+            const liveIndex = await transport.listContentIndex({ signal }).catch(() => null);
+            const named = liveIndex?.conversations.find(row => row.cascade_id === source.conversation_id)?.title;
+            if (typeof named === "string" && named.trim()) return named;
+          }
+          if (!summaryIndex || signal?.aborted) return null;
+          const result = await summaryIndex.find({ conversationId: source.conversation_id, signal });
+          return result?.cascade_id === source.conversation_id ? result.title : null;
+        });
         hostContentProviders.antigravity = createAntigravityConversationContent(transport, { summaryIndex, getMessageForDelivery: id => {
           const delivery = store?.getDelivery(id);
           return delivery ? store.getMessage(delivery.message_id) : null;
@@ -490,6 +502,13 @@ export async function startLiveFromConfig({ configPath, stateDir, endpointFile, 
         }));
         if (connection.content_read_token !== undefined) {
           hostContentProviders.codex = createCodexConversationContent(transport, { inspectThread: codexStatus?.inspectThread });
+          ownerTitleProviders.set("codex", async (source, { signal, canList }) => {
+            if (!canList) return null;
+            const list = await transport.readHostContent("list", { limit: 50 }, { signal });
+            if (!Array.isArray(list?.threads) || list.threads.length > 50) return null;
+            const matches = list.threads.filter(row => row?.thread_id === source.conversation_id);
+            return matches.length === 1 ? matches[0].title : null;
+          });
         }
       } else if (entry.kind === "windsurf_acp") {
         const priorWindsurfReader = statusProvider.providers.get("windsurf");
@@ -521,6 +540,7 @@ export async function startLiveFromConfig({ configPath, stateDir, endpointFile, 
         transports.add(transport);
         windowTransport = transport;
         created = new NapcatOwnerAdapter({ transport, routeKey: entry.route_key, replyHint: entry.reply_hint, conversationId: entry.conversation_id,
+          readSourceTitle: readOwnerSourceTitle,
           ...(entry.reply_events === undefined ? {} : { replyEvents: { ...entry.reply_events, callerConversationId: entry.conversation_id } }),
         });
       }

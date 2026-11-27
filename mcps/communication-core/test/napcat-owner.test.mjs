@@ -4,7 +4,7 @@ import { setImmediate as nextTurn } from "node:timers/promises";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { CoreError, identityKey } from "../src/contracts.mjs";
 import { NapcatMcpTransport } from "../src/transports/napcat-mcp.mjs";
-import { NapcatOwnerAdapter } from "../src/adapters/napcat-owner.mjs";
+import { createOwnerSourceTitleReader, NapcatOwnerAdapter } from "../src/adapters/napcat-owner.mjs";
 
 const endpoint = "http://127.0.0.1:14588/napcat/mcp";
 const secret = "Bearer fixture-credential-not-for-output";
@@ -44,7 +44,7 @@ function sent(overrides = {}) {
   return { ok: true, sent: true, verified: true, statePersisted: true, target: { targetKey: input().target.conversation_id }, messageId: "123456", ...overrides };
 }
 
-function adapterFixture(overrides = {}) {
+function adapterFixture(overrides = {}, adapterOptions = {}) {
   const calls = { status: [], send: [], closed: 0 };
   const transport = {
     async status(options) { calls.status.push(options); return { ok: true, ready: true }; },
@@ -52,7 +52,7 @@ function adapterFixture(overrides = {}) {
     async close() { calls.closed += 1; },
     ...overrides,
   };
-  const adapter = new NapcatOwnerAdapter({ transport, routeKey: "test-route", replyHint: "引用本条回复" });
+  const adapter = new NapcatOwnerAdapter({ transport, routeKey: "test-route", replyHint: "引用本条回复", ...adapterOptions });
   return { adapter, transport, calls };
 }
 
@@ -118,7 +118,7 @@ test("owner delivery preserves agent source, fixed dedupe, exact identity and si
   assert.deepEqual(calls.send[0].request, {
     route_key: "test-route",
     dedupe_key: "communication-core:test-delivery",
-    summary: `交流核心转送 / 来源antigravity测试对话：\n${original.message.envelope.text}`,
+    summary: `交流核心转送 / 来源Antigravity对话：\n${original.message.envelope.text}`,
     reply_hint: "引用本条回复",
   });
   assert.equal(calls.status[0].signal, original.signal);
@@ -138,8 +138,93 @@ test("the adapter forwards the actual host and can use the component default rep
   const original = input();
   original.message.envelope.caller.host = "codex";
   assert.equal((await adapter.deliver(original)).outcome, "accepted");
-  assert.ok(calls.send[0].request.summary.startsWith("交流核心转送 / 来源codex测试对话："));
+  assert.ok(calls.send[0].request.summary.startsWith("交流核心转送 / 来源Codex对话："));
   assert.equal(Object.hasOwn(calls.send[0].request, "reply_hint"), false);
+});
+
+test("an authorized readable conversation name is used without changing body, route or dedupe", async () => {
+  const original = input();
+  const source = original.message.envelope.caller;
+  original.message.principal_id = "fixture-bound-subject";
+  original.message.envelope.source_title = "外部正文不能决定抬头";
+  const readSourceTitle = createOwnerSourceTitleReader({
+    localMachineId: source.machine_id,
+    principals: [{ id: original.message.principal_id, identity: source, allowed_host_snapshots: [source] }],
+    readers: new Map([[source.host, async (target, { signal }) => {
+      assert.deepEqual(target, source);
+      assert.equal(signal.aborted, false);
+      return "  隔离维护窗口  ";
+    }]]),
+  });
+  const { adapter, calls } = adapterFixture({}, { readSourceTitle });
+  assert.equal((await adapter.deliver(original)).outcome, "accepted");
+  assert.deepEqual(calls.send[0].request, {
+    route_key: "test-route",
+    dedupe_key: "communication-core:test-delivery",
+    summary: "交流核心转送 / 来源「隔离维护窗口」：\n" + original.message.envelope.text,
+    reply_hint: "引用本条回复",
+  });
+});
+
+test("shared source scopes need existing read authority, and remote identities are never looked up locally", async () => {
+  const original = input();
+  const caller = original.message.envelope.caller;
+  const { machine_id, host, surface, conversation_id } = caller;
+  const scope = { machine_id, host, surface };
+  let reads = 0;
+  const principals = [
+    { id: "exact-send-only", identity: caller },
+    { id: "shared", identity: caller, caller_scope: scope },
+    { id: "listed", identity: caller, caller_scope: scope, allowed_host_lists: [scope] },
+    { id: "snapshot", identity: caller, caller_scope: scope, allowed_host_snapshots: [{ ...scope, conversation_id }] },
+  ];
+  const readSourceTitle = createOwnerSourceTitleReader({ localMachineId: machine_id, principals,
+    readers: new Map([[host, () => { reads += 1; return "fixture"; }]]) });
+  assert.equal(await readSourceTitle({ ...original.message, principal_id: "exact-send-only" }), null);
+  assert.equal(await readSourceTitle({ ...original.message, principal_id: "shared" }), null);
+  assert.equal(await readSourceTitle({ ...original.message, principal_id: "listed" }), "fixture");
+  assert.equal(await readSourceTitle({ ...original.message, principal_id: "snapshot" }), "fixture");
+  assert.equal(await readSourceTitle({ ...original.message, principal_id: "listed", relay_inbound: {} }), null);
+  assert.equal(await readSourceTitle({ ...original.message, principal_id: "snapshot",
+    envelope: { ...original.message.envelope, caller: { ...caller, conversation_id: "unauthorized" } } }), null);
+  assert.equal(await readSourceTitle({ ...original.message, principal_id: "listed",
+    envelope: { ...original.message.envelope, caller: { ...caller, machine_id: "remote" } } }), null);
+  assert.equal(reads, 2);
+});
+
+test("missing, unsafe or too long titles fall back with the original body intact", async () => {
+  for (const value of [null, "test-source", "换行\n伪造抬头", "隐藏方向\u202e", "[CQ:fixture,value=synthetic]", "长".repeat(129)]) {
+    const { adapter, calls } = adapterFixture({}, { readSourceTitle: async () => value });
+    const original = input();
+    assert.equal((await adapter.deliver(original)).outcome, "accepted");
+    assert.equal(calls.send[0].request.summary, "交流核心转送 / 来源Antigravity对话：\n" + original.message.envelope.text);
+  }
+  const prefix = "交流核心转送 / 来源Antigravity对话：\n";
+  const original = input();
+  original.message.envelope.text = "中".repeat(800 - prefix.length);
+  const { adapter, calls } = adapterFixture({}, { readSourceTitle: async () => "较长的真实会话标题".repeat(8) });
+  assert.equal((await adapter.deliver(original)).outcome, "accepted");
+  assert.equal(calls.send[0].request.summary, prefix + original.message.envelope.text);
+});
+
+test("an unavailable optional title falls back, but cancellation never submits a QQ message", async context => {
+  context.mock.timers.enable({ apis: ["setTimeout"] });
+  const unavailable = adapterFixture({}, { readSourceTitle() { throw new Error(secret); } });
+  assert.equal((await unavailable.adapter.deliver(input())).outcome, "accepted");
+  const slow = adapterFixture({}, { readSourceTitle: () => new Promise(() => {}) });
+  const pending = slow.adapter.deliver(input());
+  await nextTurn();
+  context.mock.timers.tick(1000);
+  assert.equal((await pending).outcome, "accepted");
+  assert.match(slow.calls.send[0].request.summary, /来源Antigravity对话：/u);
+
+  const controller = new AbortController();
+  const cancelled = adapterFixture({}, { readSourceTitle: () => new Promise(() => {}) });
+  const pendingCancel = cancelled.adapter.deliver({ ...input(), signal: controller.signal });
+  await nextTurn();
+  controller.abort();
+  assert.equal((await pendingCancel).outcome, "busy");
+  assert.equal(cancelled.calls.send.length, 0);
 });
 
 const invalidInputs = [
@@ -173,7 +258,7 @@ for (const [name, change] of invalidInputs) {
 test("summary respects the existing 800-code-unit tool limit without truncation", async () => {
   const { adapter, calls } = adapterFixture();
   const original = input();
-  const prefix = "交流核心转送 / 来源antigravity测试对话：\n";
+  const prefix = "交流核心转送 / 来源Antigravity对话：\n";
   original.message.envelope.text = "中".repeat(800 - prefix.length);
   assert.equal((await adapter.deliver(original)).outcome, "accepted");
   assert.equal(calls.send[0].request.summary.length, 800);
