@@ -42,7 +42,7 @@ async function fixture(context) {
     await rm(directory, { recursive: true, force: true });
   });
   return async ({ enableContacts = true, sharedEntries = sharedContacts, autoCompleteOnReply = false, enableMultiRecipient = false,
-    extraGroupTargets = [] } = {}) => {
+    extraGroupTargets = [], boardInvoke, boardPrincipalIndexes = [0, 1] } = {}) => {
     const filePath = join(directory, "core.sqlite");
     const store = new MessageStore({ filePath });
     const adapter = new MockAdapter();
@@ -70,10 +70,13 @@ async function fixture(context) {
     active.add(close);
     if (enableContacts) core.attachAddressBook({ machineId: machine, sharedContacts: sharedEntries });
     if (enableMultiRecipient) core.attachMessageBatches({ machineId: machine });
+    const detachBoard = boardInvoke ? core.attachBoardEntry({
+      invoke: boardInvoke, principalIds: boardPrincipalIndexes.map(index => configured[index].id),
+    }) : undefined;
     await core.start();
     server = await createMcpHttpServer({ core, principals: configured });
     return {
-      close, core, store, filePath, adapter,
+      close, core, store, filePath, adapter, detachBoard,
       async connect(index, { shared = false } = {}) {
         const client = new Client({ name: "contact-integration-fixture", version: "1.0.0" });
         clients.push(client);
@@ -110,6 +113,73 @@ async function delivered(client, caller, message_id) {
   }
   assert.fail("mock delivery did not arrive");
 }
+
+test("the board tool is absent by default, and a running board tool is visible only to bound local identities", async context => {
+  const open = await fixture(context);
+  const baseline = await open();
+  const baselineClient = await baseline.connect(0);
+  assert.ok(!(await baselineClient.listTools()).tools.some(tool => tool.name === "communication_board"));
+  await baseline.close();
+  const requests = [];
+  const live = await open({ boardPrincipalIndexes: [0], boardInvoke: input => {
+    requests.push(input);
+    return { items: [] };
+  } });
+  const direct = await live.connect(0);
+  const shared = await live.connect(0, { shared: true });
+  const host = await live.connect(2);
+  const notGranted = await live.connect(1);
+  const definition = (await direct.listTools()).tools.find(tool => tool.name === "communication_board");
+  assert.equal(definition.inputSchema.properties.action.enum.length, 13);
+  assert.ok(definition.inputSchema.properties.action.enum.includes("subscribe"));
+  assert.ok(definition.inputSchema.properties.action.enum.includes("unsubscribe"));
+  assert.equal(definition.annotations.destructiveHint, true);
+  const input = { caller: short(first), action: "list" };
+  for (const client of [shared, host, notGranted]) {
+    assert.ok(!(await client.listTools()).tools.some(tool => tool.name === "communication_board"));
+    await expectError(client, "board", input, "invalid_input");
+  }
+  await expectError(direct, "board", { ...input, caller: short(second) }, "caller_mismatch");
+  await expectError(direct, "board", { ...input, caller: { ...short(first), conversation_id: "*" } }, "invalid_input");
+  await expectError(direct, "board", { ...input, actorIdentity: second }, "invalid_input");
+  assert.equal(requests.length, 0);
+  assert.deepEqual(await ok(direct, "board", input), { items: [] });
+  assert.equal(requests.length, 1);
+  assert.deepEqual(requests[0].actorIdentity, first);
+  assert.equal(requests[0].board, undefined);
+  assert.deepEqual(requests[0].params, {});
+  assert.ok(Object.isFrozen(requests[0].actorIdentity));
+});
+
+test("the board tool resolves only the caller's alias and checks each action's address and parameters", async context => {
+  const open = await fixture(context);
+  const requests = [];
+  const live = await open({ boardInvoke: input => {
+    requests.push(input);
+    return { accepted: true };
+  } });
+  const owner = await live.connect(0);
+  const other = await live.connect(1);
+  const address = { machine_id: machine, board_id: "fixture-board" };
+  assert.deepEqual(live.core.addressBook.saveBoardForIdentity(first, { ...address, baseTitle: "我的交流板" }),
+    { alias_allocated: true, alias: "我的交流板" });
+  const board = { contact: "我的交流板" };
+  const operation = { caller: short(first), board, action: "subscribe" };
+  await expectError(other, "board", { ...operation, caller: short(second) }, "contact_not_found");
+  await expectError(owner, "board", { ...operation, board: { contact: "共有" } }, "invalid_input");
+  await expectError(owner, "board", { ...operation, board: { ...address, contact: "我的交流板" } }, "invalid_input");
+  await expectError(owner, "board", { ...operation, board: { ...address, board_id: "../other" } }, "invalid_input");
+  await expectError(owner, "board", { ...operation, action: "delete_archived" }, "invalid_input");
+  await expectError(owner, "board", { ...operation, limit: 5 }, "invalid_input");
+  assert.equal(requests.length, 0);
+  assert.deepEqual(await ok(owner, "board", operation), { accepted: true });
+  assert.deepEqual(await ok(owner, "board", { ...operation, action: "unsubscribe", board: { board_id: address.board_id } }),
+    { accepted: true });
+  assert.deepEqual(requests.map(({ action, board: target }) => ({ action, target })), [
+    { action: "subscribe", target: address },
+    { action: "unsubscribe", target: address },
+  ]);
+});
 
 test("group send through MCP commits per recipient, hides private labels, and uses only one reply event", async context => {
   const open = await fixture(context);

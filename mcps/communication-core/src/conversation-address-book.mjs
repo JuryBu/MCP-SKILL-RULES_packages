@@ -2,6 +2,7 @@ import { assertExactKeys, CoreError, identityKey, normalizeIdentity, requireText
 
 const ADDRESS_KEYS = ["machine_id", "host", "surface", "conversation_id"];
 const CONTROL = /[\u0000-\u001f\u007f]/u;
+const BOARD_ID = /^[a-z0-9][a-z0-9_-]{0,127}$/u;
 const MAX_CONTACTS = 512;
 
 function checkedText(value, name, maximum) {
@@ -30,6 +31,16 @@ function checkedAddress(value, fallbackMachine) {
     throw new CoreError("invalid_input", "联系人需要一个完整、明确的地址");
   }
   return address;
+}
+
+export function normalizeBoardAddress(value, fallbackMachine) {
+  assertExactKeys(value, ["machine_id", "board_id"], "交流板地址");
+  const machine = requireText(value.machine_id ?? fallbackMachine, "建板机标识", 128);
+  const boardId = requireText(value.board_id, "交流板标识", 128);
+  if (machine !== machine.trim() || machine === "*" || CONTROL.test(machine) || !BOARD_ID.test(boardId)) {
+    throw new CoreError("invalid_input", "交流板需要完整的建板机和板标识");
+  }
+  return { machine_id: machine, board_id: boardId };
 }
 
 function bookActor(principal, machineId) {
@@ -86,13 +97,8 @@ export class ConversationAddressBook {
       const entryKind = entry.entry_kind ?? "contact";
       let target;
       if (entryKind === "contact") target = checkedAddress(entry.target, this.#machineId);
-      else if (entryKind === "board") {
-        assertExactKeys(entry.target, ["machine_id", "board_id"], "交流板地址");
-        target = {
-          machine_id: checkedText(entry.target.machine_id ?? this.#machineId, "建板机标识", 128),
-          board_id: checkedText(entry.target.board_id, "交流板标识", 128),
-        };
-      } else throw new CoreError("invalid_config", "共有条目类型无效");
+      else if (entryKind === "board") target = normalizeBoardAddress(entry.target, this.#machineId);
+      else throw new CoreError("invalid_config", "共有条目类型无效");
       this.#shared.set(key, Object.freeze({
         id, alias, entry_kind: entryKind, target: Object.freeze(target), note: checkedNote(entry.note ?? ""),
       }));
@@ -198,6 +204,12 @@ export class ConversationAddressBook {
     return this.#resolve(ownerKey(bookActor(principal, this.#machineId)), aliasKey(alias));
   }
 
+  resolveBoard(principal, alias) {
+    const entry = this.resolve(principal, alias);
+    if (entry.entry_kind !== "board") throw new CoreError("invalid_input", "请填写交流板的代号或地址");
+    return normalizeBoardAddress(entry.target);
+  }
+
   listShared({ include_machine_routes = false } = {}) {
     return {
       contacts: [...this.#shared.values()].map(entry => this.#sharedContact(null, entry)),
@@ -218,6 +230,60 @@ export class ConversationAddressBook {
   saveAddress(principal, { alias, target, note }) {
     const key = ownerKey(bookActor(principal, this.#machineId));
     return this.#put(key, alias, checkedAddress(target, this.#machineId), note);
+  }
+
+  saveBoard(principal, board) {
+    return this.saveBoardForIdentity(bookActor(principal, this.#machineId), board);
+  }
+
+  #localBoardMember(memberIdentity) {
+    requireText(memberIdentity?.surface, "surface", 64);
+    const member = checkedAddress(memberIdentity);
+    if (member.machine_id !== this.#machineId) throw new CoreError("forbidden", "只能查改本机对话的交流板代号");
+    return member;
+  }
+
+  listBoardsForIdentity(memberIdentity) {
+    const key = ownerKey(this.#localBoardMember(memberIdentity));
+    const rows = this.#database.prepare(
+      "SELECT alias_key, alias, target_json FROM caller_contacts WHERE owner_key = ? AND entry_kind = 'board' ORDER BY alias_key, alias");
+    return rows.all(key).filter(row => !this.#shared.has(row.alias_key))
+      .map(row => ({ alias: row.alias, target: normalizeBoardAddress(JSON.parse(row.target_json)) }));
+  }
+
+  saveBoardForIdentity(memberIdentity, board) {
+    const member = this.#localBoardMember(memberIdentity);
+    assertExactKeys(board, ["machine_id", "board_id", "baseTitle"], "交流板登记");
+    const target = JSON.stringify(normalizeBoardAddress({ machine_id: board.machine_id, board_id: board.board_id }));
+    const title = [...checkedText(board.baseTitle, "交流板标题", 512)];
+    if (title.length > 128) throw new CoreError("invalid_input", "交流板标题过长");
+    const key = ownerKey(member);
+    const findTarget = this.#database.prepare(
+      "SELECT alias FROM caller_contacts WHERE owner_key = ? AND entry_kind = 'board' AND target_json = ? ORDER BY alias_key LIMIT 1");
+    const count = this.#database.prepare("SELECT count(*) AS total FROM caller_contacts WHERE owner_key = ?");
+    const existing = findTarget.get(key, target);
+    if (existing) return { alias_allocated: true, alias: existing.alias };
+    if (count.get(key).total >= MAX_CONTACTS) return { alias_allocated: false, alias_warning: "contact_limit" };
+    const insert = this.#database.prepare(`
+      INSERT INTO caller_contacts(owner_key, alias_key, alias, target_json, entry_kind, note, updated_at)
+      SELECT ?, ?, ?, ?, 'board', '', ?
+      WHERE NOT EXISTS (SELECT 1 FROM caller_contacts WHERE owner_key = ? AND entry_kind = 'board' AND target_json = ?)
+        AND (SELECT count(*) FROM caller_contacts WHERE owner_key = ?) < ?
+      ON CONFLICT(owner_key, alias_key) DO NOTHING
+      RETURNING alias
+    `);
+    this.#open(key);
+    for (let attempt = 1; attempt <= MAX_CONTACTS + this.#shared.size + 1; attempt += 1) {
+      const suffix = attempt === 1 ? "" : "#" + attempt;
+      const alias = title.slice(0, 64 - suffix.length).join("").trimEnd() + suffix;
+      const name = aliasKey(alias);
+      if (this.#shared.has(name) || this.#get(key, name)) continue;
+      const saved = insert.get(key, name, alias, target, this.#now(), key, target, key, MAX_CONTACTS);
+      const matched = saved ?? findTarget.get(key, target);
+      if (matched) return { alias_allocated: true, alias: matched.alias };
+      if (count.get(key).total >= MAX_CONTACTS) return { alias_allocated: false, alias_warning: "contact_limit" };
+    }
+    throw new CoreError("contact_alias_conflict", "未找到可用的交流板短代号");
   }
 
   saveSender(principal, { message_id, alias, note }) {

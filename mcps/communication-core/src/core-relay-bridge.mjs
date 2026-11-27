@@ -395,6 +395,7 @@ export function attachCoreRelay(core, configuration, machineProviders) {
   const policies = Object.fromEntries([...peers].map(([id, peer]) => [id, {
     allow_message: peer.inbound.size > 0, allow_status: peer.status.size > 0 || peer.statusHosts.size > 0,
     allow_directory: peer.directory.length > 0, allow_snapshot: peer.snapshots.size > 0,
+    trust_source_identity: peer.sourceVerified,
     allow_file_bundle: true, group_visibility_policy: peer.fullList ? "full" : "none",
   }]));
   dispatcher = new RemoteCoreDispatcher({

@@ -7,6 +7,7 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import { CallToolRequestSchema, CancelledNotificationSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import { CoreError, normalizeIdentity } from "./contracts.mjs";
 import { formatRecentSnapshotMcp } from "./host-conversation-content.mjs";
+import { boardOperations } from "./board-entry-contract.mjs";
 
 const REQUEST_TIMEOUT_MS = 50000;
 const MAX_ACTIVE_REQUESTS = 16;
@@ -24,6 +25,13 @@ const messages = {
   contact_limit: "个人通讯录已达到容量上限，请先移除不用的联系人",
   message_not_recipient: "当前对话无权收录这封原信的发件人，或原信缺少可核实的发件对话",
   board_not_direct_target: "交流板需要使用交流板入口，不能作为对话收件人",
+  board_unavailable: "本机尚未启用交流板",
+  board_not_found: "没有可访问的交流板，请核对板代号或地址",
+  board_archived: "交流板已归档，请核对已有权限与板状态",
+  board_post_conflict: "这条发帖标识已用于另一份内容，请查原帖",
+  board_file_too_large: "附件超过交流板单文件限制",
+  board_file_hash_conflict: "附件与本机已有同标识文件内容不同，请保留原操作并核对",
+  board_quota_exceeded: "交流板已达到文件容量上限，请核对现有用量",
   mixed_channel_recipients_not_allowed: "请把人类聊天窗口和模型对话分开；每次只发一个人类聊天窗口",
   bundle_transport_unavailable: "文件包通道尚未启用，请缩短正文或先启用文件包通道",
   unsupported_op: "当前对端还不支持这项操作",
@@ -102,6 +110,14 @@ function objectField(fields) {
 
 function arrayField(field, maximum) {
   return { schema: { type: "array", items: field.schema, maxItems: maximum }, validator: z.array(field.validator).max(maximum) };
+}
+
+function choiceField(choices) {
+  return { schema: { type: "string", enum: choices }, validator: z.enum(choices) };
+}
+
+function oneOfFields(fields) {
+  return { schema: { anyOf: fields.map(field => field.schema) }, validator: z.union(fields.map(field => field.validator)) };
 }
 
 const booleanField = { schema: { type: "boolean" }, validator: z.boolean() };
@@ -275,9 +291,51 @@ export const communicationContactsTool = tool("contacts", "contacts", "查本机
   include_machine_routes: optional(booleanField),
 }, false);
 
-export function communicationToolEntries({ includeContacts = false, includeMultiRecipient = false } = {}) {
-  const entries = includeMultiRecipient ? [multiRecipientTool, ...tools.slice(1)] : tools;
-  return includeContacts ? [...entries, communicationContactsTool] : entries;
+const boardAddressField = objectField({ machine_id: optional(textField(128)), board_id: textField(128) });
+const boardMemberField = oneOfFields([addressField, contactAddressField, textField(768)]);
+const boardSettingsField = objectField({
+  default_file_sync_machines: optional(arrayField(textField(128), 64)),
+  default_poll_interval_sec: optional(integerField(60, 3600)),
+  auto_archive_days: optional(integerField(1, 3650)),
+});
+const boardFileField = objectField({
+  path: textField(4096, "本机已获准上传目录内的文件"),
+  name: optional(textField(480)),
+  bundle_id: optional(textField(128)),
+  bundle_label: optional(textField(512)),
+});
+const boardTool = tool("board", "board",
+  "用已核实的本机对话查看或操作交流板。create 和 list 无需填写 board；其他动作可用个人短代号 {contact} 或板地址 {machine_id,board_id}。delete_archived 会永久移除已归档的板，须提供该次归档版本。", {
+    action: choiceField(Object.keys(boardOperations)),
+    board: optional(oneOfFields([boardAddressField, contactAddressField])),
+    title: optional(textField(512)),
+    settings: optional(boardSettingsField),
+    limit: optional(integerField(1, 100)),
+    cursor: optional(textField(1024)),
+    members: optional(arrayField(boardMemberField, 128)),
+    body: optional(textField(65_536)),
+    mentions: optional(arrayField(boardMemberField, 128)),
+    files: optional(arrayField(boardFileField, 16)),
+    sync_machines: optional(arrayField(textField(128), 64)),
+    client_post_id: optional(textField(256)),
+    after_seq: optional(integerField(0)),
+    seq: optional(integerField(1)),
+    max_total_chars: optional(integerField(1, 65_536)),
+    author_keys: optional(arrayField(textField(768), 128)),
+    delivery_mode: optional(choiceField(["poll", "event"])),
+    filter_mode: optional(choiceField(["all", "mute", "only"])),
+    filter_targets: optional(arrayField(boardMemberField, 128)),
+    expected_archive_version: optional(integerField(1)),
+    expected_state_version: optional(integerField(0)),
+  }, false);
+boardTool.definition.annotations = { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true };
+
+export function communicationToolEntries({ includeContacts = false, includeMultiRecipient = false, includeBoard = false } = {}) {
+  return [
+    ...(includeMultiRecipient ? [multiRecipientTool, ...tools.slice(1)] : tools),
+    ...(includeContacts ? [communicationContactsTool] : []),
+    ...(includeBoard ? [boardTool] : []),
+  ];
 }
 
 export function listCommunicationToolDefinitions(options) {
@@ -352,7 +410,11 @@ function projectSendMessageResult(result, verboseReceipt) {
 
 function makeServer(core, principalId, requestSignal, sharedFacade = false) {
   const server = new Server({ name: "communication-core-mcp", version: "0.1.0" }, { capabilities: { tools: {} } });
-  const features = { includeContacts: Boolean(core.addressBook), includeMultiRecipient: Boolean(core.messageBatches) };
+  const features = {
+    includeContacts: Boolean(core.addressBook),
+    includeMultiRecipient: Boolean(core.messageBatches),
+    includeBoard: core.canUseBoardTool?.(principalId, sharedFacade) === true,
+  };
   const entries = communicationToolEntries(features);
   server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: listCommunicationToolDefinitions(features) }));
   server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {

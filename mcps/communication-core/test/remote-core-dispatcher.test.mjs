@@ -2063,3 +2063,325 @@ describe("确定性清理与 Node 24 活跃句柄归零", () => {
     }
   });
 });
+
+describe("Wave 2 §0: dispatchCustomOp, opHandlers identity/retain_bundle, bundle control frame ignore, and pollOnce poison isolation", () => {
+  it("dispatchCustomOp enforces board op whitelist, 429 backoff, CQ budget auto-upgrade to sendBundle, and rejects system source_identity_verified", async () => {
+    let nowMs = 2_000_000;
+    const sentFrames = [];
+    const sentBundles = [];
+    const transport = {
+      async sendFrame(req) {
+        sentFrames.push(req);
+        return { ok: true, status: "sent_verified", relay_id: "rly_custom_1", relay_key: "r-main", group_id: "900", route_generation: 1 };
+      },
+      async sendBundle(req) {
+        sentBundles.push(req);
+        return { ok: true, status: "announced", bundle_id: "bnd_custom_1", relay_key: "r-main", group_id: "900", route_generation: 1 };
+      },
+    };
+    const dispatcher = new RemoteCoreDispatcher({
+      localMachineId: MACHINE_DEV,
+      transport,
+      localHandlers: {},
+      now: () => nowMs,
+    });
+
+    // Rejects non-board op
+    await assert.rejects(
+      () => dispatcher.dispatchCustomOp({ op: "message", dedupeKey: "dk-bad", targetMachine: MACHINE_TRAIN }),
+      err => err instanceof CoreError && err.code === "invalid_input",
+    );
+
+    // Small payload goes via sendFrame and core/system/* never sets source_identity_verified=true
+    // Also verify replyRoute translates to reply_relay_key / reply_group_id / reply_route_generation
+    const smallRes = await dispatcher.dispatchCustomOp({
+      op: "board_dissolved",
+      dedupeKey: "dk-dissolve-1",
+      targetMachine: MACHINE_TRAIN,
+      source: "core/system/board_sync",
+      sourceIdentityVerified: true,
+      payloadJson: { board_id: "b-1", state_version: 2 },
+      replyRoute: { relay_key: "r-orig", group_id: "900", route_generation: 2 },
+      allowBundle: false,
+    });
+    assert.equal(smallRes.ok, true);
+    assert.equal(smallRes.transport_mode, "text_relay");
+    assert.equal(sentFrames.length, 1);
+    assert.equal(sentFrames[0].meta.source_identity_verified, undefined);
+    assert.equal(sentFrames[0].reply_relay_key, "r-orig");
+    assert.equal(sentFrames[0].reply_group_id, "900");
+    assert.equal(sentFrames[0].reply_route_generation, 2);
+    assert.equal("relay_key" in sentFrames[0], false);
+
+    // Oversized payload auto-upgrades to sendBundle when allowBundle=true
+    const bigRes = await dispatcher.dispatchCustomOp({
+      op: "board_delta",
+      dedupeKey: "dk-delta-big",
+      targetMachine: MACHINE_TRAIN,
+      source: "codex/desktop/conv-remote-actor",
+      sourceIdentityVerified: true,
+      payloadJson: { board_id: "b-1", bulk: "x".repeat(3000) },
+      allowBundle: true,
+    });
+    assert.equal(bigRes.ok, true);
+    assert.equal(bigRes.transport_mode, "file_bundle");
+    assert.equal(bigRes.relay_id, "bnd_custom_1");
+    assert.equal(sentBundles.length, 1);
+    assert.equal(sentBundles[0].meta.source_identity_verified, true);
+
+    // 429 rate-limit triggers backoff window for subsequent dispatchCustomOp
+    transport.sendFrame = async () => {
+      throw new CoreError("relay_rate_limited", "rate limited", { retry_after_ms: 5000 });
+    };
+    await assert.rejects(
+      () => dispatcher.dispatchCustomOp({
+        op: "board_ack",
+        dedupeKey: "dk-ack-429",
+        targetMachine: MACHINE_TRAIN,
+        body: "{}",
+        allowBundle: false,
+      }),
+      err => err instanceof CoreError && err.code === "relay_rate_limited",
+    );
+    await assert.rejects(
+      () => dispatcher.dispatchCustomOp({
+        op: "board_ack",
+        dedupeKey: "dk-ack-blocked",
+        targetMachine: MACHINE_TRAIN,
+        body: "{}",
+        allowBundle: false,
+      }),
+      err => err instanceof CoreError && err.code === "relay_rate_limited",
+    );
+    nowMs += 6000;
+    await dispatcher.close();
+  });
+
+  it("opHandlers receive frozen source_endpoint/source_identity_verified/trust_source_identity (excluding core/system/*) and retain_bundle defers spool ack", async () => {
+    const ackedBundles = [];
+    const bundleQueue = [
+      {
+        event_id: "ev-sys-1",
+        bundle_id: "bnd-sys-1",
+        source_machine: MACHINE_TRAIN,
+        sender_id: "200001",
+        sender_verified: true,
+        relay_key: "r-main",
+        group_id: "900",
+        route_generation: 1,
+        payload_json: {
+          op: "board_delta",
+          from_machine: MACHINE_TRAIN,
+          to_machine: MACHINE_DEV,
+          source: "core/system/board_sync",
+          recipients: ["core/system/board_sync"],
+          body: "",
+          meta: { hop_count: 1, source_identity_verified: true },
+        },
+      },
+      {
+        event_id: "ev-user-defer",
+        bundle_id: "bnd-user-defer",
+        source_machine: MACHINE_TRAIN,
+        sender_id: "200001",
+        sender_verified: true,
+        relay_key: "r-main",
+        group_id: "900",
+        route_generation: 1,
+        payload_json: {
+          op: "board_state_sync",
+          from_machine: MACHINE_TRAIN,
+          to_machine: MACHINE_DEV,
+          source: "codex/desktop/conv-train-1",
+          recipients: ["core/system/board_sync"],
+          body: "",
+          meta: { hop_count: 1, source_identity_verified: true },
+        },
+      },
+    ];
+    const observed = [];
+    let deferFirst = true;
+    const dispatcher = new RemoteCoreDispatcher({
+      localMachineId: MACHINE_DEV,
+      transport: {
+        async readBundleEvents() {
+          return { events: bundleQueue.splice(0), errors: [], next_cursor: null };
+        },
+        async ackBundleEvents({ event_ids }) {
+          ackedBundles.push(...event_ids);
+        },
+      },
+      policy: { peers: { [MACHINE_TRAIN]: { trust_source_identity: true } } },
+      localHandlers: {},
+    });
+
+    dispatcher.registerOpHandler("board_delta", async ctx => {
+      observed.push({ op: "board_delta", ep: ctx.source_endpoint, verified: ctx.source_identity_verified, trusted: ctx.remotePrincipal.trust_source_identity });
+      return { ok: true };
+    });
+    dispatcher.registerOpHandler("board_state_sync", async ctx => {
+      observed.push({ op: "board_state_sync", ep: ctx.source_endpoint, verified: ctx.source_identity_verified, trusted: ctx.remotePrincipal.trust_source_identity, defer: deferFirst });
+      if (deferFirst) {
+        deferFirst = false;
+        return { retain_bundle: true, code: "storage_enospc" };
+      }
+      return { ok: true };
+    });
+
+    const summary = await dispatcher.pollOnce();
+    assert.equal(summary.processed, 1);
+    assert.deepEqual(ackedBundles, ["ev-sys-1"]);
+    // core/system/board_sync must NEVER be marked source_identity_verified=true
+    assert.deepEqual(observed[0], { op: "board_delta", ep: null, verified: false, trusted: true });
+    // Real 3-segment endpoint gets verified=true + trusted=true, and retain_bundle prevented spool ack and processedCache entry
+    assert.deepEqual(observed[1], { op: "board_state_sync", ep: "codex/desktop/conv-train-1", verified: true, trusted: true, defer: true });
+
+    // Re-delivering ev-user-defer succeeds because it was NOT put in processedCache when deferred
+    const retryOutcome = await dispatcher.handleInboundEvent({
+      event_id: "ev-user-defer",
+      bundle_id: "bnd-user-defer",
+      source_machine: MACHINE_TRAIN,
+      sender_id: "200001",
+      sender_verified: true,
+      relay_key: "r-main",
+      group_id: "900",
+      route_generation: 1,
+      payload_json: {
+        op: "board_state_sync",
+        from_machine: MACHINE_TRAIN,
+        to_machine: MACHINE_DEV,
+        source: "codex/desktop/conv-train-1",
+        recipients: ["core/system/board_sync"],
+        body: "",
+        meta: { hop_count: 1, source_identity_verified: true },
+      },
+    }, { isBundle: true });
+    assert.equal(retryOutcome.handled, true);
+    await dispatcher.close();
+  });
+
+  it("silently ignores file_notice/file_ack/file_cancel/file_resume in text stream and isolates poison exceptions in pollOnce", async () => {
+    const errors = [];
+    const ackedBundles = [];
+    const handledTexts = [];
+    const dispatcher = new RemoteCoreDispatcher({
+      localMachineId: MACHINE_DEV,
+      transport: {
+        async readEvents() {
+          return {
+            events: [
+              { event_id: "ctrl-1", frame_text: "[COMM_RELAY_V1]\nop: file_notice\n---\n[END_COMM_RELAY_V1]" },
+              { event_id: "ctrl-2", frame_text: "[COMM_RELAY_V1]\nop: file_cancel\n---\n[END_COMM_RELAY_V1]" },
+              { event_id: "ctrl-3", frame_text: "[COMM_RELAY_V1]\nop: file_resume\n---\n[END_COMM_RELAY_V1]" },
+              {
+                event_id: "poison-text",
+                source_machine: MACHINE_TRAIN,
+                sender_verified: true,
+                relay_key: "r-main",
+                group_id: "900",
+                route_generation: 1,
+                frame: {
+                  relay_id: "rly-poison-1",
+                  op: "board_delta",
+                  from_machine: MACHINE_TRAIN,
+                  to_machine: MACHINE_DEV,
+                  source: "core/system/board_sync",
+                  recipients: ["core/system/board_sync"],
+                  body: "boom",
+                  meta: { hop_count: 1 },
+                },
+              },
+              {
+                event_id: "good-text",
+                source_machine: MACHINE_TRAIN,
+                sender_verified: true,
+                relay_key: "r-main",
+                group_id: "900",
+                route_generation: 1,
+                frame: {
+                  relay_id: "rly-good-1",
+                  op: "board_ack",
+                  from_machine: MACHINE_TRAIN,
+                  to_machine: MACHINE_DEV,
+                  source: "core/system/board_sync",
+                  recipients: ["core/system/board_sync"],
+                  body: "ok",
+                  meta: { hop_count: 1 },
+                },
+              },
+            ],
+            next_cursor: "c2",
+          };
+        },
+        async readBundleEvents() {
+          return {
+            events: [
+              {
+                event_id: "poison-bnd",
+                bundle_id: "bnd-poison",
+                source_machine: MACHINE_TRAIN,
+                sender_id: "200001",
+                sender_verified: true,
+                relay_key: "r-main",
+                group_id: "900",
+                route_generation: 1,
+                payload_json: {
+                  op: "board_delta",
+                  from_machine: MACHINE_TRAIN,
+                  to_machine: MACHINE_DEV,
+                  source: "core/system/board_sync",
+                  recipients: ["core/system/board_sync"],
+                  body: "boom",
+                  meta: { hop_count: 1 },
+                },
+              },
+              {
+                event_id: "good-bnd",
+                bundle_id: "bnd-good",
+                source_machine: MACHINE_TRAIN,
+                sender_id: "200001",
+                sender_verified: true,
+                relay_key: "r-main",
+                group_id: "900",
+                route_generation: 1,
+                payload_json: {
+                  op: "board_ack",
+                  from_machine: MACHINE_TRAIN,
+                  to_machine: MACHINE_DEV,
+                  source: "core/system/board_sync",
+                  recipients: ["core/system/board_sync"],
+                  body: "ok",
+                  meta: { hop_count: 1 },
+                },
+              },
+            ],
+            errors: [],
+            next_cursor: null,
+          };
+        },
+        async ackBundleEvents({ event_ids }) {
+          ackedBundles.push(...event_ids);
+        },
+      },
+      localHandlers: {},
+      onError: err => errors.push(err),
+    });
+
+    dispatcher.registerOpHandler("board_delta", async () => {
+      throw new Error("simulated_poison_crash");
+    });
+    dispatcher.registerOpHandler("board_ack", async ({ frame }) => {
+      handledTexts.push(frame.relay_id);
+      return { ok: true };
+    });
+
+    const summary = await dispatcher.pollOnce();
+    assert.equal(summary.ignored, 3); // file_notice + file_cancel + file_resume (colon format!) silently ignored
+    assert.equal(summary.processed, 2); // good-text + good-bnd both survived poison!
+    assert.equal(summary.rejected.length, 2); // poison-text + poison-bnd isolated
+    assert.equal(errors.length, 2);
+    assert.deepEqual(ackedBundles, ["good-bnd"]); // poison-bnd NOT acked/released!
+    assert.deepEqual(handledTexts, ["rly-good-1", "bnd-good"]);
+    await dispatcher.close();
+  });
+});

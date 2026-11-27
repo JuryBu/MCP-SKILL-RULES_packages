@@ -280,6 +280,11 @@ export class MessageStore {
     return this.transaction(() => new ConversationAddressBook({ ...options, database: this.#database }));
   }
 
+  openBoardStore(create, options) {
+    if (typeof create !== "function") throw new CoreError("invalid_config", "交流板存储入口无效");
+    return this.transaction(() => create({ ...options, database: this.#database, transaction: callback => this.transaction(callback) }));
+  }
+
   openRelayAcknowledgements({ now } = {}) {
     return this.transaction(() => new RelayAckStore({ database: this.#database,
       transaction: callback => this.transaction(callback), readMessage: messageId => this.getMessage(messageId), now }));

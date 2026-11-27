@@ -104,6 +104,69 @@ test("only a trusted concrete local identity opens a personal book", context => 
   assert.equal(bookCount(database), 0);
 });
 
+test("board aliases are stable across repeated invitations and only appear in each member's book", context => {
+  const { open } = setup(context);
+  const { book, database } = open();
+  const board = { machine_id: peerMachine, board_id: "fixture-board", baseTitle: "协作窗口" };
+  book.saveAddress(principal(recipient), { alias: "协作窗口＃２", target: remote });
+  assert.deepEqual(book.saveBoard(principal(recipient), board), { alias_allocated: true, alias: "协作窗口#3" });
+  assert.deepEqual(book.saveBoardForIdentity(sibling, board), { alias_allocated: true, alias: "协作窗口#2" });
+  assert.throws(() => book.resolveBoard(principal(sibling), "协作窗口#3"), { code: "contact_not_found" });
+  assert.throws(() => book.resolveBoard(principal(recipient), "协作窗口＃２"), { code: "invalid_input" });
+  book.setNote(principal(recipient), { contact: "协作窗口#3", note: "我自己的板备注" });
+  database.close();
+  const reopened = open().book;
+  assert.deepEqual(reopened.saveBoard(principal(recipient), { ...board, baseTitle: "更名后的标题" }),
+    { alias_allocated: true, alias: "协作窗口#3" });
+  const saved = reopened.list(principal(recipient)).contacts.find(entry => entry.entry_kind === "board");
+  assert.equal(saved.note, "我自己的板备注");
+  assert.deepEqual(reopened.resolveBoard(principal(recipient), saved.alias), { machine_id: peerMachine, board_id: "fixture-board" });
+  assert.equal(reopened.list(principal(sibling)).contacts.find(entry => entry.entry_kind === "board").note, "");
+});
+
+test("board alias suffixes respect the Unicode length cap and preserve both board targets", context => {
+  const { book } = setup(context).open();
+  const baseTitle = "屋".repeat(120);
+  const first = book.saveBoardForIdentity(recipient, { machine_id: localMachine, board_id: "board-one", baseTitle });
+  const second = book.saveBoardForIdentity(recipient, { machine_id: localMachine, board_id: "board-two", baseTitle });
+  assert.equal(first.alias, "屋".repeat(64));
+  assert.equal(second.alias, "屋".repeat(62) + "#2");
+  assert.equal(book.resolveBoard(principal(recipient), first.alias).board_id, "board-one");
+  assert.equal(book.resolveBoard(principal(recipient), second.alias).board_id, "board-two");
+});
+
+test("board registration refuses foreign, incomplete, wildcard, or untrusted owners and invalid board references", context => {
+  const { book, database } = setup(context).open();
+  const board = { machine_id: peerMachine, board_id: "fixture-board", baseTitle: "来信板" };
+  assert.throws(() => book.saveBoard({ identity: recipient }, board), { code: "forbidden" });
+  assert.throws(() => book.saveBoardForIdentity(remote, board), { code: "forbidden" });
+  assert.throws(() => book.saveBoardForIdentity({ ...recipient, surface: undefined }, board), { code: "invalid_input" });
+  assert.throws(() => book.saveBoardForIdentity({ ...recipient, conversation_id: "*" }, board), { code: "invalid_input" });
+  assert.throws(() => book.saveBoard(principal(recipient), { ...board, board_id: "../fixture" }), { code: "invalid_input" });
+  assert.throws(() => book.saveBoard(principal(recipient), { ...board, machine_id: "*" }), { code: "invalid_input" });
+  assert.equal(bookCount(database), 0);
+});
+
+test("a full personal book declines a new board alias without mutating saved entries", context => {
+  const { book, database } = setup(context).open();
+  const board = { machine_id: localMachine, board_id: "fixture-board", baseTitle: "第一块板" };
+  const actor = principal(recipient);
+  database.exec("BEGIN");
+  try {
+    book.saveBoard(actor, board);
+    for (let index = 0; index < 511; index += 1) book.saveAddress(actor, { alias: "测试联系人" + index, target: remote });
+    database.exec("COMMIT");
+  } catch (error) {
+    database.exec("ROLLBACK");
+    throw error;
+  }
+  const before = book.list(actor);
+  assert.deepEqual(book.saveBoard(actor, { ...board, board_id: "next-board" }),
+    { alias_allocated: false, alias_warning: "contact_limit" });
+  assert.deepEqual(book.saveBoard(actor, board), { alias_allocated: true, alias: "第一块板" });
+  assert.deepEqual(book.list(actor), before);
+});
+
 test("save sender uses the verified inbound address for precisely its original recipient", context => {
   const inbound = {
     message_id: "sample-message", recipient, sender: remote, source_verified: true,

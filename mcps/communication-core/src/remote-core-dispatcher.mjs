@@ -66,6 +66,8 @@ const TWO_PART_HOSTS = new Set(["antigravity", "codex", "windsurf"]);
 const ENDPOINT_FORBIDDEN_RE = /[/,\s*\u0000-\u001f\u007f]/u;
 const VALID_ACK_PROCESSING = new Set(["processing", "done", "failed"]);
 const REPLY_OPS = new Set(["status_reply", "list_reply", "snapshot_reply"]);
+const BOARD_CUSTOM_OPS = new Set(["board_delta", "board_dissolved", "board_state_sync", "board_ack"]);
+const FILE_BUNDLE_CONTROL_OPS = new Set(["file_notice", "file_ack", "file_cancel", "file_resume"]);
 const BUNDLE_DEGRADE_ERROR_CODES = new Set([
   "bundle_transport_unavailable",
   "relay_file_route_denied",
@@ -1579,9 +1581,65 @@ export class RemoteCoreDispatcher {
       allow_directory: true,
       allow_snapshot: true,
       allow_file_bundle: true,
+      trust_source_identity: false,
       group_visibility_policy: "full",
       ...defaults,
       ...override,
+    };
+  }
+
+  /**
+   * 只读导出已配置的 peer 策略快照，供第二波交流板 openBoardRuntime 自动派生 peerMachines 与 peerCapabilitiesProvider。
+   */
+  getPeerPolicy(machineId) {
+    const clean = requireText(machineId, "machineId", 128);
+    const peers = isPlainObject(this.#policy.peers) ? this.#policy.peers : this.#policy;
+    const known = clean !== this.#localMachineId && isPlainObject(peers[clean]);
+    return {
+      machine_id: clean,
+      known,
+      ...this.#peerPolicy(clean),
+    };
+  }
+
+  listPeerPolicies() {
+    const peers = isPlainObject(this.#policy.peers) ? this.#policy.peers : this.#policy;
+    const result = {};
+    for (const [key, val] of Object.entries(peers)) {
+      if (key === "defaults" || key === "peers" || key === this.#localMachineId) continue;
+      if (!isPlainObject(val)) continue;
+      result[key] = {
+        machine_id: key,
+        known: true,
+        ...this.#peerPolicy(key),
+      };
+    }
+    return result;
+  }
+
+  #resolveInboundSourceIdentity(event, frame, verifiedSenderId) {
+    let sourceEndpoint = null;
+    try {
+      if (typeof frame.source === "string" && !frame.source.startsWith("core/system/")) {
+        const parsedSource = parseEndpoint(frame.source);
+        if (parsedSource.host && parsedSource.surface && parsedSource.conversation_id) {
+          sourceEndpoint = frame.source;
+        }
+      }
+    } catch {
+      sourceEndpoint = null;
+    }
+    const senderAccountOk = event.sender_id === undefined || Boolean(verifiedSenderId);
+    const sourceIdentityVerified = Boolean(
+      sourceEndpoint
+      && senderAccountOk
+      && event.source_machine === frame.from_machine
+      && event.sender_verified !== false
+      && frame.meta?.source_identity_verified === true,
+    );
+    return {
+      source_endpoint: sourceEndpoint,
+      source_identity_verified: sourceIdentityVerified,
     };
   }
 
@@ -1680,6 +1738,227 @@ export class RemoteCoreDispatcher {
       if (this.#opHandlers.get(normalizedOp) === handler) {
         this.#opHandlers.delete(normalizedOp);
       }
+    };
+  }
+
+  /**
+   * 第二波交流板等自定义协议出站统一入口（白名单 op，复用并发槽、429 退避、CQ 1800 预算与自动升格 sendBundle）。
+   */
+  async dispatchCustomOp({
+    op,
+    dedupeKey,
+    targetMachine,
+    channel,
+    source = "core/system/board_sync",
+    recipients = ["core/system/board_sync"],
+    body = "",
+    inReplyTo = null,
+    meta = {},
+    payloadJson = null,
+    attachments = [],
+    allowBundle = true,
+    allowDiscloseRecipients = false,
+    replyRoute = null,
+    sourceIdentityVerified = false,
+    signal,
+  } = {}) {
+    this.#assertOpen();
+    const cleanOp = requireText(op, "op", 64);
+    if (!BOARD_CUSTOM_OPS.has(cleanOp)) {
+      throw new CoreError("invalid_input", `dispatchCustomOp 不支持的自定义 op: ${cleanOp}`);
+    }
+    const cleanDedupeKey = requireText(dedupeKey, "dedupeKey", 128);
+    const cleanTargetMachine = requireText(targetMachine, "targetMachine", 128);
+    if (cleanTargetMachine === this.#localMachineId) {
+      throw new CoreError("invalid_input", "跨机派发目标机器不能是本机");
+    }
+    if (!Array.isArray(recipients) || recipients.length === 0) {
+      throw new CoreError("invalid_input", "recipients必须是非空数组");
+    }
+    if (typeof body !== "string") {
+      throw new CoreError("invalid_input", "body必须是字符串");
+    }
+    if (!Array.isArray(attachments) || attachments.length > this.#limits.maxAttachments) {
+      throw new CoreError("invalid_input", `attachments数量不能超过${this.#limits.maxAttachments}`);
+    }
+    if (payloadJson !== null && !isPlainObject(payloadJson)) {
+      throw new CoreError("invalid_input", "payloadJson必须是普通对象或null");
+    }
+
+    const nowMs = this.#now();
+    if (nowMs < this.#backoffUntilMs) {
+      const retryAfterMs = Math.max(1, this.#backoffUntilMs - nowMs);
+      throw new CoreError("relay_rate_limited", "跨机调度器当前处于429退避窗口", {
+        retry_after_ms: retryAfterMs,
+        backoff_until_ms: this.#backoffUntilMs,
+      });
+    }
+
+    const sourceEndpoint = formatEndpoint(source, "source");
+    const recipientEndpoints = recipients.map((item, idx) => formatEndpoint(item, `recipients[${idx}]`));
+    const cleanMeta = isPlainObject(meta) ? cloneJson(meta) : {};
+    const requestId = cleanMeta.request_id
+      ? requireText(cleanMeta.request_id, "meta.request_id", 128)
+      : `req_${randomUUID()}`;
+    const isSystemSource = sourceEndpoint.startsWith("core/system/");
+    const effectiveSourceVerified = !isSystemSource && Boolean(sourceIdentityVerified);
+    const effectiveBody = payloadJson !== null && body === ""
+      ? JSON.stringify(payloadJson)
+      : body;
+    const frameMeta = {
+      ...cleanMeta,
+      request_id: requestId,
+      hop_count: 1,
+      ...(payloadJson !== null && body === "" ? { structured_body: true } : {}),
+      ...(effectiveSourceVerified ? { source_identity_verified: true } : {}),
+    };
+    const cleanInReplyTo = inReplyTo ? requireText(inReplyTo, "inReplyTo", 256) : null;
+    const bodySha256 = computeBodySha256(effectiveBody);
+
+    let routeFields = {};
+    if (isPlainObject(replyRoute)) {
+      const rrKey = typeof replyRoute.reply_relay_key === "string" && replyRoute.reply_relay_key.trim()
+        ? replyRoute.reply_relay_key.trim()
+        : (typeof replyRoute.relay_key === "string" && replyRoute.relay_key.trim() ? replyRoute.relay_key.trim() : null);
+      const rrGroupRaw = replyRoute.reply_group_id !== undefined && replyRoute.reply_group_id !== null
+        ? replyRoute.reply_group_id
+        : replyRoute.group_id;
+      const rrGroup = rrGroupRaw !== undefined && rrGroupRaw !== null && String(rrGroupRaw).trim()
+        ? String(rrGroupRaw).trim()
+        : null;
+      const rrGen = Number.isSafeInteger(replyRoute.reply_route_generation)
+        ? replyRoute.reply_route_generation
+        : (Number.isSafeInteger(replyRoute.route_generation) ? replyRoute.route_generation : null);
+      if (rrKey && rrGroup && rrGen !== null) {
+        routeFields = {
+          reply_relay_key: rrKey,
+          reply_group_id: rrGroup,
+          reply_route_generation: rrGen,
+        };
+      }
+    }
+
+    const frameEstimate = this.#measureFrame({
+      relay_id: "rly_00000000-0000-0000-0000-000000000000",
+      op: cleanOp,
+      from_machine: this.#localMachineId,
+      to_machine: cleanTargetMachine,
+      source: sourceEndpoint,
+      recipients: recipientEndpoints,
+      in_reply_to: cleanInReplyTo,
+      body: effectiveBody,
+      meta: frameMeta,
+    });
+
+    const hasAttachments = attachments.length > 0;
+    const exceedsTextBudget = frameEstimate.charLength > this.#limits.maxFrameChars
+      || frameEstimate.cqLength > this.#limits.maxFrameChars;
+    const canSendBundle = Boolean(allowBundle) && typeof this.#transport.sendBundle === "function";
+
+    const sendViaBundle = async () => {
+      if (!canSendBundle) {
+        if (hasAttachments) {
+          throw new CoreError("bundle_transport_unavailable", "纯数据文件包通道未启用，无法发送附件");
+        }
+        throw new CoreError("relay_frame_too_large", "文本帧超出长度或CQ膨胀上限且未启用文件包升格", {
+          frame_length: frameEstimate.charLength,
+          cq_encoded_length: frameEstimate.cqLength,
+          max_frame_chars: this.#limits.maxFrameChars,
+          suggest_file_bundle: true,
+        });
+      }
+      const bundleInput = {
+        dedupe_key: cleanDedupeKey,
+        target_machine: cleanTargetMachine,
+        ...(channel ? { channel } : {}),
+        ...routeFields,
+        op: cleanOp,
+        source: sourceEndpoint,
+        recipients: recipientEndpoints,
+        meta: frameMeta,
+        payload_json: {
+          op: cleanOp,
+          from_machine: this.#localMachineId,
+          to_machine: cleanTargetMachine,
+          source: sourceEndpoint,
+          recipients: recipientEndpoints,
+          ...(cleanInReplyTo ? { in_reply_to: cleanInReplyTo } : {}),
+          body: effectiveBody,
+          body_sha256: bodySha256,
+          meta: frameMeta,
+          ...(payloadJson !== null ? { data: cloneJson(payloadJson) } : {}),
+        },
+        allow_disclose_recipients: Boolean(allowDiscloseRecipients),
+        ...(hasAttachments ? { attachments: [...attachments] } : {}),
+      };
+      return this.#transport.sendBundle(bundleInput, { signal });
+    };
+
+    let viaBundle = hasAttachments || exceedsTextBudget;
+    let transportResult;
+
+    try {
+      transportResult = await this.#withConcurrency(signal, async () => {
+        if (viaBundle) return sendViaBundle();
+        try {
+          return await this.#transport.sendFrame({
+            dedupe_key: cleanDedupeKey,
+            target_machine: cleanTargetMachine,
+            ...(channel ? { channel } : {}),
+            ...routeFields,
+            op: cleanOp,
+            source: sourceEndpoint,
+            recipients: recipientEndpoints,
+            body: effectiveBody,
+            ...(cleanInReplyTo ? { in_reply_to: cleanInReplyTo } : {}),
+            meta: frameMeta,
+            allow_disclose_recipients: Boolean(allowDiscloseRecipients),
+          }, { signal });
+        } catch (error) {
+          if (normalizeRelayErrorCode(error) === "relay_frame_too_large" && canSendBundle) {
+            viaBundle = true;
+            return sendViaBundle();
+          }
+          throw error;
+        }
+      });
+    } catch (error) {
+      this.#recordRateLimit(error);
+      throw error;
+    }
+
+    const resultStatus = typeof transportResult?.status === "string" ? transportResult.status : "sent_verified";
+    if (resultStatus === "too_large") {
+      throw new CoreError("relay_bundle_too_large", "纯数据文件包超出单包体积限制", {
+        target_machine: cleanTargetMachine,
+        status: resultStatus,
+        reason: transportResult?.reason ?? "too_large",
+      });
+    }
+
+    const relayId = viaBundle
+      ? (transportResult?.bundle_id ?? transportResult?.relay_id ?? null)
+      : (transportResult?.relay_id ?? transportResult?.bundle_id ?? null);
+    const isPendingCapacity = resultStatus === "pending_capacity";
+    const isUnknown = resultStatus === "unknown" || isOutcomeUnknownResult(transportResult);
+    const acceptedOk = !isPendingCapacity && !isUnknown && transportResult?.ok !== false;
+    const stage = isPendingCapacity
+      ? "pending_capacity"
+      : (isUnknown ? "relay_unknown" : "relay_accepted");
+
+    return {
+      ok: acceptedOk,
+      op: cleanOp,
+      request_id: requestId,
+      relay_id: relayId,
+      transport_mode: viaBundle ? "file_bundle" : "text_relay",
+      status: resultStatus,
+      stage,
+      ...(isUnknown ? { outcome_unknown: true } : {}),
+      relay_key: transportResult?.relay_key ?? null,
+      group_id: transportResult?.group_id ?? null,
+      route_generation: transportResult?.route_generation ?? null,
+      transport_result: cloneJson(transportResult ?? {}),
     };
   }
 
@@ -2517,12 +2796,54 @@ export class RemoteCoreDispatcher {
       return { handled: false, status: "rejected", code: "invalid_event" };
     }
 
+    // 0. 整块 B 纯数据文件包传输层控制帧在文本流透出时静默忽略，交由文件包传输层处理，不污染 summary.rejected
+    if (!isBundle) {
+      let controlOp = typeof event.op === "string" && FILE_BUNDLE_CONTROL_OPS.has(event.op) ? event.op : null;
+      if (!controlOp && isPlainObject(event.frame) && typeof event.frame.op === "string" && FILE_BUNDLE_CONTROL_OPS.has(event.frame.op)) {
+        controlOp = event.frame.op;
+      }
+      if (!controlOp && typeof event.frame_text === "string") {
+        const normalizedText = normalizeLineEndings(event.frame_text);
+        const startIdx = normalizedText.indexOf(RELAY_FRAME_START);
+        if (startIdx !== -1) {
+          const afterStart = normalizedText.slice(startIdx + RELAY_FRAME_START.length);
+          const sepMatch = afterStart.match(/\n---(?:\n|$)/);
+          const headerSection = sepMatch ? afterStart.slice(0, sepMatch.index) : afterStart.slice(0, 1024);
+          const opMatch = headerSection.match(/^\s*op\s*[:=]\s*(file_notice|file_ack|file_cancel|file_resume)\s*$/m);
+          if (opMatch) controlOp = opMatch[1];
+        }
+      }
+      if (controlOp) {
+        const ctrlDedupeId = event.event_id ? `text:${event.event_id}` : (event.relay_id ? `text:${event.relay_id}` : null);
+        if (ctrlDedupeId) this.#processedCache.set(ctrlDedupeId, this.#now());
+        return {
+          handled: false,
+          status: "ignored",
+          code: "handled_by_file_bundle_layer",
+          op: controlOp,
+          relay_id: event.relay_id ?? null,
+        };
+      }
+    }
+
     const parsed = this.#normalizeInboundEventFrame(event, isBundle);
     if (!parsed.ok) {
       return { handled: false, status: "rejected", code: parsed.reason };
     }
     const frame = parsed.frame;
     const fromMachine = frame.from_machine;
+
+    if (!isBundle && FILE_BUNDLE_CONTROL_OPS.has(frame.op)) {
+      const ctrlDedupeId = `text:${event.event_id ?? frame.relay_id}`;
+      if (ctrlDedupeId) this.#processedCache.set(ctrlDedupeId, this.#now());
+      return {
+        handled: false,
+        status: "ignored",
+        code: "handled_by_file_bundle_layer",
+        op: frame.op,
+        relay_id: frame.relay_id,
+      };
+    }
 
     // 1. 自回声丢弃
     if (fromMachine === this.#localMachineId || event.source_machine === this.#localMachineId) {
@@ -2775,10 +3096,14 @@ export class RemoteCoreDispatcher {
     const verifiedSenderId = typeof event.sender_id === "string" && event.sender_id.trim()
       ? event.sender_id.trim()
       : null;
+    const inboundIdentity = this.#resolveInboundSourceIdentity(event, frame, verifiedSenderId);
     const remotePrincipal = Object.freeze({
       kind: "remote_peer_principal",
       from_machine: fromMachine,
       sender_id: verifiedSenderId,
+      source_endpoint: inboundIdentity.source_endpoint,
+      source_identity_verified: inboundIdentity.source_identity_verified,
+      trust_source_identity: peerPolicy.trust_source_identity === true,
       relay_key: event.relay_key,
       group_id: event.group_id,
       route_generation: event.route_generation,
@@ -2792,7 +3117,9 @@ export class RemoteCoreDispatcher {
         event,
         frame,
         isBundle,
-        staged_files: event.staged_files ?? [],
+        staged_files: Array.isArray(event.staged_files) ? cloneJson(event.staged_files) : [],
+        source_endpoint: inboundIdentity.source_endpoint,
+        source_identity_verified: inboundIdentity.source_identity_verified,
         remotePrincipal,
         reply: async ({ op: replyOp, body = "", meta = {}, payloadJson, allowBundle = false }) => {
           return this.#sendOriginalRouteReply(event, frame, {
@@ -2806,6 +3133,17 @@ export class RemoteCoreDispatcher {
           });
         },
       });
+      if (isPlainObject(result) && result.retain_bundle === true) {
+        return {
+          handled: false,
+          status: "deferred",
+          code: typeof result.code === "string" && result.code ? result.code : "handler_deferred",
+          op,
+          relay_id: frame.relay_id,
+          retain_bundle: true,
+          result,
+        };
+      }
       this.#processedCache.set(dedupeId, this.#now());
       return { handled: true, status: "applied", op, relay_id: frame.relay_id, result };
     }
@@ -2828,23 +3166,8 @@ export class RemoteCoreDispatcher {
         return { handled: false, status: "rejected", code: "forbidden", op, relay_id: frame.relay_id };
       }
 
-      let sourceEndpointValid = false;
-      try {
-        if (typeof frame.source === "string" && frame.source !== "core/system/dispatcher") {
-          const parsedSource = parseEndpoint(frame.source);
-          sourceEndpointValid = Boolean(parsedSource.host && parsedSource.surface && parsedSource.conversation_id);
-        }
-      } catch {
-        sourceEndpointValid = false;
-      }
-      const senderAccountOk = event.sender_id === undefined || Boolean(verifiedSenderId);
-      const sourceIdentityVerified = Boolean(
-        sourceEndpointValid
-        && senderAccountOk
-        && event.source_machine === frame.from_machine
-        && event.sender_verified !== false
-        && frame.meta?.source_identity_verified === true,
-      );
+      const sourceEndpointValid = Boolean(inboundIdentity.source_endpoint);
+      const sourceIdentityVerified = inboundIdentity.source_identity_verified;
       const visibleAllRecipients = this.#applyGroupVisibilityToRecipients(
         frame.meta?.all_recipients ?? [],
         frame.recipients ?? [],
@@ -3192,30 +3515,9 @@ export class RemoteCoreDispatcher {
         return { handled: true, status: "applied", op, relay_id: frame.relay_id };
       }
 
-      let snapSourceEndpoint = null;
-      try {
-        if (typeof frame.source === "string" && frame.source !== "core/system/dispatcher") {
-          const parsedSnapSource = parseEndpoint(frame.source);
-          if (parsedSnapSource.host && parsedSnapSource.surface && parsedSnapSource.conversation_id) {
-            snapSourceEndpoint = frame.source;
-          }
-        }
-      } catch {
-        snapSourceEndpoint = null;
-      }
-      const snapSenderAccountOk = event.sender_id === undefined || Boolean(verifiedSenderId);
-      const snapSourceIdentityVerified = Boolean(
-        snapSourceEndpoint
-        && snapSenderAccountOk
-        && event.source_machine === frame.from_machine
-        && event.sender_verified !== false
-        && frame.meta?.source_identity_verified === true,
-      );
-      const snapshotPrincipal = Object.freeze({
-        ...remotePrincipal,
-        source_endpoint: snapSourceEndpoint,
-        source_identity_verified: snapSourceIdentityVerified,
-      });
+      const snapSourceEndpoint = inboundIdentity.source_endpoint;
+      const snapSourceIdentityVerified = inboundIdentity.source_identity_verified;
+      const snapshotPrincipal = remotePrincipal;
 
       let rawSnapshot;
       let snapDenial = null;
@@ -3434,10 +3736,25 @@ export class RemoteCoreDispatcher {
               textPageCompleted = false;
               break;
             }
-            const outcome = await this.handleInboundEvent(event, { isBundle: false, signal: mergedSignal });
-            if (outcome.handled) summary.processed += 1;
-            else if (outcome.status === "rejected") summary.rejected.push(outcome);
-            else summary.ignored += 1;
+            try {
+              const outcome = await this.handleInboundEvent(event, { isBundle: false, signal: mergedSignal });
+              if (outcome.handled) summary.processed += 1;
+              else if (outcome.status === "rejected") summary.rejected.push(outcome);
+              else summary.ignored += 1;
+            } catch (error) {
+              if (this.#closed || mergedSignal?.aborted) {
+                textPageCompleted = false;
+                break;
+              }
+              this.#onError(error);
+              summary.rejected.push({
+                handled: false,
+                status: "rejected",
+                code: normalizeRelayErrorCode(error) || "inbound_handler_error",
+                event_id: event?.event_id ?? null,
+                message: error?.message ?? String(error),
+              });
+            }
           }
           if (textPageCompleted && textResult?.next_cursor !== undefined && textResult.next_cursor !== null) {
             this.#textCursor = textResult.next_cursor;
@@ -3510,7 +3827,25 @@ export class RemoteCoreDispatcher {
                 break;
               }
               const takeoverStarted = this.#now();
-              const outcome = await this.handleInboundEvent(event, { isBundle: true, signal: mergedSignal });
+              let outcome;
+              try {
+                outcome = await this.handleInboundEvent(event, { isBundle: true, signal: mergedSignal });
+              } catch (error) {
+                if (this.#closed || mergedSignal?.aborted) {
+                  pageAborted = true;
+                  break;
+                }
+                this.#onError(error);
+                summary.rejected.push({
+                  handled: false,
+                  status: "rejected",
+                  code: normalizeRelayErrorCode(error) || "inbound_handler_error",
+                  event_id: event?.event_id ?? null,
+                  retain_bundle: true,
+                  message: error?.message ?? String(error),
+                });
+                continue;
+              }
               if (outcome.handled) summary.processed += 1;
               else if (outcome.status === "rejected") summary.rejected.push(outcome);
               else summary.ignored += 1;
@@ -3522,17 +3857,25 @@ export class RemoteCoreDispatcher {
                 && (outcome.handled || outcome.status === "duplicate" || outcome.status === "ignored" || outcome.status === "rejected"),
               );
               if (shouldAckBundle) {
-                await this.#transport.ackBundleEvents({ event_ids: [event.event_id] }, { signal: mergedSignal });
-                const latencyMs = Math.max(0, this.#now() - takeoverStarted);
-                this.#bundleAckLatencies.push(latencyMs);
-                if (this.#bundleAckLatencies.length > 64) this.#bundleAckLatencies.shift();
-                summary.bundle_acked += 1;
-                if (latencyMs > this.#limits.bundleAckDeadlineMs) {
-                  this.#onError(new CoreError("bundle_ack_deadline_exceeded", "文件包 spool 释放超过预设时限", {
-                    event_id: event.event_id,
-                    latency_ms: latencyMs,
-                    deadline_ms: this.#limits.bundleAckDeadlineMs,
-                  }));
+                try {
+                  await this.#transport.ackBundleEvents({ event_ids: [event.event_id] }, { signal: mergedSignal });
+                  const latencyMs = Math.max(0, this.#now() - takeoverStarted);
+                  this.#bundleAckLatencies.push(latencyMs);
+                  if (this.#bundleAckLatencies.length > 64) this.#bundleAckLatencies.shift();
+                  summary.bundle_acked += 1;
+                  if (latencyMs > this.#limits.bundleAckDeadlineMs) {
+                    this.#onError(new CoreError("bundle_ack_deadline_exceeded", "文件包 spool 释放超过预设时限", {
+                      event_id: event.event_id,
+                      latency_ms: latencyMs,
+                      deadline_ms: this.#limits.bundleAckDeadlineMs,
+                    }));
+                  }
+                } catch (error) {
+                  if (this.#closed || mergedSignal?.aborted) {
+                    pageAborted = true;
+                    break;
+                  }
+                  this.#onError(error);
                 }
               }
             }

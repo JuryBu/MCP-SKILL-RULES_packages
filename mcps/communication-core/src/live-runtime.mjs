@@ -26,6 +26,7 @@ import { HostStatusProvider, createAntigravityStatusReader, createCodexStatusRea
 import { createWindsurfDesktopStatusReader } from "./windsurf-desktop-status.mjs";
 import { WindowIngressController } from "./window-ingress.mjs";
 import { CORE_RELAY_ADAPTER, attachCoreRelay, prepareCoreRelay } from "./core-relay-bridge.mjs";
+import { isLocalBoardCaller, restrictBoardRelayDispatcher } from "./board-entry-contract.mjs";
 
 const MAX_ENTRIES = 256;
 const IDENTITY_FIELDS = ["machine_id", "host", "surface", "conversation_id"];
@@ -319,9 +320,52 @@ async function readConfiguration(configPath) {
   }
 }
 
-export async function startLiveFromConfig({ configPath, stateDir, endpointFile, onError = () => {}, factories = {}, recoverTerminated = false, relay }) {
+function prepareBoardRuntimeOptions(value, configuration, directory, relayConfiguration) {
+  if (value === undefined) return null;
+  assertExactKeys(value, ["enabled", "open", "principalIds", "superAdminIdentities", "allowedUploadRoots", "peerMachineIds", "fileBundlePeers",
+    "notifyLocalMember", "syncIntervalMs", "notifyIntervalMs"], "私有交流板配置");
+  if (value.enabled === false) return null;
+  if (value.enabled !== true || (value.open !== undefined && typeof value.open !== "function") ||
+    (value.notifyLocalMember !== undefined && typeof value.notifyLocalMember !== "function") || !configuration.addressBook) throw invalidConfiguration();
+  const principalIds = uniqueTextList(value.principalIds, "交流板连接授权", MAX_ENTRIES, 1, 128);
+  if (principalIds.some(id => !configuration.principals.some(principal => principal.id === id &&
+    isLocalBoardCaller(principal, configuration.localMachineId)))) throw invalidConfiguration();
+  const superAdminIdentities = boundedList(value.superAdminIdentities ?? [], MAX_ENTRIES, 0).map(identity => {
+    assertExactKeys(identity, IDENTITY_FIELDS, "交流板管理员");
+    if (IDENTITY_FIELDS.some(field => typeof identity[field] !== "string" || identity[field] === "*" ||
+      identity[field] !== identity[field].trim() || /[\u0000-\u001f\u007f]/u.test(identity[field]))) throw invalidConfiguration();
+    return Object.freeze(normalizeIdentity(identity));
+  });
+  if (new Set(superAdminIdentities.map(identityKey)).size !== superAdminIdentities.length) throw invalidConfiguration();
+  const allowedUploadRoots = uniqueTextList(value.allowedUploadRoots ?? [], "交流板上传根", 32, 0, 32768).map(path => {
+    if (!isAbsolute(path) || path !== path.trim() || /[\u0000-\u001f\u007f]/u.test(path)) throw invalidConfiguration();
+    return resolve(path);
+  });
+  const pathKey = path => process.platform === "win32" ? path.toLowerCase() : path;
+  if (new Set(allowedUploadRoots.map(pathKey)).size !== allowedUploadRoots.length) throw invalidConfiguration();
+  const peers = relayConfiguration?.peers ?? new Map();
+  const peerMachines = uniqueTextList(value.peerMachineIds ?? [], "交流板同步机器", 16, 0, 128);
+  const fileBundlePeers = new Set(uniqueTextList(value.fileBundlePeers ?? [], "交流板附件同步机器", 16, 0, 128));
+  if (peerMachines.some(id => !peers.has(id)) || [...fileBundlePeers].some(id => !peerMachines.includes(id))) throw invalidConfiguration();
+  const peerCapabilities = new Map(peerMachines.map(id => [id, Object.freeze({
+    known: true,
+    allow_file_bundle: fileBundlePeers.has(id) && relayConfiguration?.transport.bundleEnabled !== false &&
+      typeof relayConfiguration?.transport.sendBundle === "function",
+  })]));
+  const syncIntervalMs = value.syncIntervalMs === undefined ? undefined : requireInteger(value.syncIntervalMs, "交流板同步间隔", 10, 3_600_000);
+  const notifyIntervalMs = value.notifyIntervalMs === undefined ? (peerMachines.length > 0 && !value.notifyLocalMember ? 0 : undefined) :
+    requireInteger(value.notifyIntervalMs, "交流板提醒间隔", 0, 3_600_000);
+  if (notifyIntervalMs > 0 && notifyIntervalMs < 10) throw invalidConfiguration();
+  return { open: value.open, principalIds, privateRoot: directory, boardRoot: join(directory, "boards"),
+    superAdminIdentities: Object.freeze(superAdminIdentities), allowedUploadRoots: Object.freeze(allowedUploadRoots),
+    peerMachines: Object.freeze(peerMachines), peerCapabilitiesProvider: id => peerCapabilities.get(id) ?? null,
+    notifyLocalMember: value.notifyLocalMember, syncIntervalMs, notifyIntervalMs };
+}
+
+export async function startLiveFromConfig({ configPath, stateDir, endpointFile, onError = () => {}, factories = {}, recoverTerminated = false, relay, boards }) {
   let configuration;
   let relayConfiguration;
+  let boardConfiguration;
   let directory;
   try {
     requireText(configPath, "configPath", 32768);
@@ -331,6 +375,7 @@ export async function startLiveFromConfig({ configPath, stateDir, endpointFile, 
     if (Object.values(factories).some(factory => typeof factory !== "function")) throw invalidConfiguration();
     configuration = await readConfiguration(configPath);
     relayConfiguration = prepareCoreRelay(relay, configuration.localMachineId);
+    boardConfiguration = prepareBoardRuntimeOptions(boards, configuration, directory, relayConfiguration);
     if (relayConfiguration && (configuration.adapters.some(entry => entry.id === CORE_RELAY_ADAPTER) ||
       relayConfiguration.routes.some(route => configuration.conversationRoutes.some(existing =>
         ["machine_id", "host", "surface"].every(field => existing[field] === route[field]))))) throw invalidConfiguration();
@@ -353,6 +398,8 @@ export async function startLiveFromConfig({ configPath, stateDir, endpointFile, 
   let core;
   let http;
   let relayBridge;
+  let boardRuntime;
+  let detachBoard;
   let windowIngress;
   let windowIngressNeedsSync = false;
   let timer;
@@ -365,9 +412,17 @@ export async function startLiveFromConfig({ configPath, stateDir, endpointFile, 
     if (closePromise) return closePromise;
     closing = true;
     clearTimeout(timer);
+    const boardDrain = detachBoard?.();
     closePromise = Promise.resolve().then(async () => {
       let failed = false;
       try { await windowIngress?.close(); } catch { failed = true; }
+      if (boardRuntime || boardDrain) {
+        const boardCleanup = await Promise.allSettled([
+          Promise.resolve().then(() => typeof boardRuntime?.close === "function" ? boardRuntime.close() : undefined),
+          boardDrain,
+        ]);
+        if (boardCleanup.some(result => result.status === "rejected")) failed = true;
+      }
       try { await relayBridge?.close(); } catch { failed = true; }
       const stopped = await Promise.allSettled([Promise.resolve().then(() => statusProvider.close()), Promise.resolve().then(() => core?.close()), Promise.resolve().then(() => http?.close())]);
       if (stopped.some(result => result.status === "rejected")) failed = true;
@@ -519,6 +574,29 @@ export async function startLiveFromConfig({ configPath, stateDir, endpointFile, 
       });
       connectWindowManagement(core, windowIngress, configuration.ownerWindowSources, configuration.windowIngressEnabled, () => closing, report);
       windowIngressNeedsSync = true;
+    }
+    if (boardConfiguration) {
+      const { open, principalIds, privateRoot, boardRoot, allowedUploadRoots, superAdminIdentities,
+        peerMachines, peerCapabilitiesProvider, notifyLocalMember, syncIntervalMs, notifyIntervalMs } = boardConfiguration;
+      const openBoards = open ?? (await import("./board-sync.mjs")).openBoardRuntime;
+      boardRuntime = await openBoards({
+        localMachineId, privateRoot, boardRoot, superAdminIdentities, allowedUploadRoots,
+        openStore: create => store.openBoardStore(create, { privateRoot, allowedUploadRoots, now: () => core.nowMs() }),
+        addressBookAdapter: Object.freeze({
+          saveBoardForIdentity: (member, board) => core.addressBook.saveBoardForIdentity(member, board),
+          listBoardsForIdentity: member => core.addressBook.listBoardsForIdentity(member),
+          resolve: (principal, alias) => core.addressBook.resolve(principal, alias),
+          resolveDisplayName: (receiver, peer) => core.resolveDisplayName(receiver, peer),
+        }),
+        relayDispatcher: restrictBoardRelayDispatcher(relayBridge?.dispatcher, peerMachines, peerCapabilitiesProvider),
+        peerMachines, peerCapabilitiesProvider,
+        notifyLocalMember, syncIntervalMs, notifyIntervalMs, now: () => core.nowMs(),
+        onError: error => report(error instanceof CoreError ? error.code : "board_runtime_error"),
+      });
+      if (typeof boardRuntime?.invoke !== "function" || typeof boardRuntime.close !== "function" ||
+        (boardRuntime.start !== undefined && typeof boardRuntime.start !== "function")) throw invalidConfiguration();
+      await boardRuntime.start?.();
+      detachBoard = core.attachBoardEntry({ invoke: invocation => boardRuntime.invoke(invocation), principalIds });
     }
     http = await createMcpHttpServer({ core, principals: configuration.principals, host: configuration.host, port: configuration.port });
     await lease.setUrl(http.url);

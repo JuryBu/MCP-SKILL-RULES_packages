@@ -23,6 +23,7 @@ import { ChannelContentReader } from "./channel-content.mjs";
 import { batchRecipientNotice } from "./adapters/host-message.mjs";
 import { deriveBatchDedupeKeys, normalizeRecipientsInput, planReplyAllSubMessages, projectBatchSendReceipt, projectVisibilityForRecipient,
   renderPeerRecipientsForReceiver, validateAndDedupeRecipients } from "./multi-recipient.mjs";
+import { isLocalBoardCaller, normalizeBoardInvocation } from "./board-entry-contract.mjs";
 
 const DELIVERY_RESULTS = new Set(["accepted", "busy", "failed_before_send", "unknown"]);
 const DELIVERY_BOUNDARIES = new Set(["accepted", "failed_before_send", "unknown", "expired", "unsupported"]);
@@ -239,6 +240,8 @@ class CodexReplyPacer {
 }
 
 export class CommunicationCore {
+  #boardEntry;
+
   constructor({ store, targets, principals, adapters, replyForwarding = [], conversationRoutes = [], channelWindows = [], ownerWindowSources = [], downloadLedger, channelDownloadFailure = false, statusProvider, hostContentProvider, automaticReplyForwarding = [], autoCompleteOnReply = false, now = () => Date.now(), deliveryTimeoutMs = 5000, maxConcurrent = 2 }) {
     this.store = store;
     this.targets = targets ?? [];
@@ -342,6 +345,55 @@ export class CommunicationCore {
     this.relayAcknowledgements = this.store.openRelayAcknowledgements({ now: () => this.nowMs() });
     this.relayAcknowledgementReady = onReady;
     return this.relayAcknowledgements;
+  }
+
+  attachBoardEntry({ invoke, principalIds } = {}) {
+    this.assertOpen();
+    if (this.#boardEntry || !this.addressBook || typeof invoke !== "function" ||
+      !Array.isArray(principalIds) || principalIds.length < 1 || principalIds.length > 256) {
+      throw new CoreError("invalid_config", "交流板入口需要本机通讯录和唯一的引擎");
+    }
+    const allowed = new Set(principalIds);
+    const principals = registryValues(this.principals);
+    if (allowed.size !== principalIds.length || principalIds.some(id => typeof id !== "string" ||
+      !principals.some(principal => principal.id === id && isLocalBoardCaller(principal, this.addressBookMachineId)))) {
+      throw new CoreError("invalid_config", "交流板只可授权本机具名连接");
+    }
+    const lifetime = new AbortController();
+    const detach = () => {
+      if (this.#boardEntry === entry) this.#boardEntry = undefined;
+      lifetime.abort(new CoreError("server_closed", "交流板入口正在关闭"));
+      return Promise.allSettled(entry.pending);
+    };
+    const entry = { invoke, allowed, detach, signal: lifetime.signal, pending: new Set() };
+    this.#boardEntry = entry;
+    return detach;
+  }
+
+  canUseBoardTool(principalId, sharedFacade = false) {
+    if (!this.#boardEntry?.allowed.has(principalId) || sharedFacade) return false;
+    const matches = registryValues(this.principals).filter(principal => principal.id === principalId);
+    return matches.length === 1 && isLocalBoardCaller(matches[0], this.addressBookMachineId);
+  }
+
+  board(context, input) {
+    const entry = this.#boardEntry;
+    if (!entry) throw new CoreError("board_unavailable", "本机交流板尚未启用");
+    const principal = this.principal(context, input?.caller, { remember: false });
+    if (!entry.allowed.has(principal.id) || !isLocalBoardCaller(principal, this.addressBookMachineId)) {
+      throw new CoreError("caller_unverified", "交流板需要能核实本机具体对话的连接");
+    }
+    const signal = context?.signal ? AbortSignal.any([context.signal, entry.signal]) : entry.signal;
+    if (signal.aborted) throw new CoreError("request_cancelled", "交流板请求已取消");
+    const invocation = normalizeBoardInvocation(input, principal, this.addressBook, this.addressBookMachineId);
+    const pending = Promise.resolve().then(() => {
+      if (signal.aborted) throw new CoreError("request_cancelled", "交流板请求已取消");
+      return entry.invoke({ ...invocation, signal });
+    });
+    entry.pending.add(pending);
+    const clear = () => entry.pending.delete(pending);
+    pending.then(clear, clear);
+    return pending;
   }
 
   attachMessageBatches({ machineId }) {
@@ -1642,6 +1694,7 @@ export class CommunicationCore {
   async close() {
     if (this.closePromise) return this.closePromise;
     this.closed = true;
+    const boardDrain = this.#boardEntry?.detach();
     this.closePromise = (async () => {
       for (const listeners of [...this.waiters.values()]) {
         for (const notify of [...listeners]) notify(false);
@@ -1653,6 +1706,7 @@ export class CommunicationCore {
       for (const controller of this.controllers) controller.abort({ code: "closed" });
       await this.channelContent.close();
       if (this.channelHistoryFallback && this.channelHistoryFallback !== this.channelContent) await this.channelHistoryFallback.close();
+      await boardDrain;
       await Promise.allSettled([this.replyPollPromise, ...this.replyInvocations]);
       await this.drain();
       return { closed: true };

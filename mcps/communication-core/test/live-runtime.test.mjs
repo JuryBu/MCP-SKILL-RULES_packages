@@ -8,6 +8,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { spawn } from "node:child_process";
 import { createServer } from "node:net";
 import { createServer as createHttpServer } from "node:http";
+import { DatabaseSync } from "node:sqlite";
 import { setTimeout as delay } from "node:timers/promises";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
@@ -16,6 +17,7 @@ import { createMcpStdioFacade } from "../src/mcp-stdio-facade.mjs";
 import { runLiveCli } from "../scripts/live.mjs";
 import { startLiveService } from "../scripts/live-service.mjs";
 import { MockAdapter } from "../src/adapters/mock.mjs";
+import { restrictBoardRelayDispatcher } from "../src/board-entry-contract.mjs";
 
 const root = fileURLToPath(new URL("../", import.meta.url));
 const mockFactories = { antigravity: () => new MockAdapter() };
@@ -62,6 +64,326 @@ test("isolated live launch loads its machine book; the real shared facade leaves
     dedupe_key: "fixture-live-one-recipient-batch" });
   assert.notEqual(grouped.isError, true, JSON.stringify(grouped.structuredContent));
   assert.deepEqual(grouped.structuredContent.results.map(entry => entry.target), [target]);
+});
+
+async function prepareBoardFixture(context) {
+  const value = configuration();
+  const files = await fixture(context, value);
+  const principal = value.principals[0];
+  const identity = { ...principal.identity, surface: principal.identity.surface ?? "desktop" };
+  value.address_book_file = join(files.directory, "fixture-board-book.json");
+  principal.address_book_identity_bound = true;
+  const facadePrincipal = { ...principal, id: "fixture-facade-board", token: "fixture-board-facade-token", address_book_identity_bound: false };
+  value.principals.push(facadePrincipal);
+  await writeFile(value.address_book_file, JSON.stringify({ schema_version: 1, machine_id: identity.machine_id, entries: [] }), "utf8");
+  await writeFile(files.configPath, JSON.stringify(value), "utf8");
+  return { files, principal, facadePrincipal, identity, caller: { host: identity.host, conversation_id: identity.conversation_id } };
+}
+
+test("private board startup uses its own root, retains local identity, and closes before the state store", async context => {
+  const { files, principal, facadePrincipal, identity, caller } = await prepareBoardFixture(context);
+  const endpointFile = join(files.directory, "fixture-board-endpoint.json");
+  const events = [];
+  let entered;
+  let confirmAbort;
+  let finishAction;
+  let signal;
+  const inFlight = new Promise(resolveEntry => { entered = resolveEntry; });
+  const aborted = new Promise(resolveAbort => { confirmAbort = resolveAbort; });
+  const boards = {
+    enabled: true,
+    principalIds: [principal.id],
+    superAdminIdentities: [identity],
+    open(options) {
+      assert.equal(options.privateRoot, resolve(files.stateDir));
+      assert.equal(options.boardRoot, join(resolve(files.stateDir), "boards"));
+      assert.equal(options.localMachineId, identity.machine_id);
+      assert.deepEqual(options.allowedUploadRoots, []);
+      assert.deepEqual(options.superAdminIdentities, [identity]);
+      assert.ok(Object.isFrozen(options.superAdminIdentities[0]));
+      const probe = options.openStore(({ database, transaction, now, privateRoot, allowedUploadRoots }) => {
+        assert.equal(privateRoot, options.privateRoot);
+        assert.deepEqual(allowedUploadRoots, []);
+        assert.ok(Number.isSafeInteger(now()));
+        database.exec("CREATE TABLE fixture_board_probe (value TEXT NOT NULL) STRICT");
+        transaction(() => database.prepare("INSERT INTO fixture_board_probe VALUES (?)").run("ready"));
+        return () => database.prepare("SELECT value FROM fixture_board_probe").get().value;
+      });
+      events.push("opened");
+      return {
+        start() { events.push("started"); },
+        invoke(input) {
+          assert.deepEqual(input.actorIdentity, identity);
+          if (input.action === "list") return { status: probe() };
+          signal = input.signal;
+          return new Promise((resolveDone, rejectDone) => {
+            finishAction = () => {
+              try { resolveDone({ cancelled: true, stateStore: probe() }); } catch (error) { rejectDone(error); }
+            };
+            input.signal.addEventListener("abort", confirmAbort, { once: true });
+            entered();
+          });
+        },
+        close() {
+          if (signal) assert.equal(signal.aborted, true);
+          assert.equal(probe(), "ready");
+          events.push("closed");
+        },
+      };
+    },
+  };
+  let runtime;
+  const service = await startLiveService({ ...files, endpointFile }, {
+    startRuntime: async options => {
+      runtime = await startLiveFromConfig({ ...options, factories: mockFactories, boards });
+      return runtime;
+    },
+  });
+  files.cleanup(() => service.close());
+  const direct = new Client({ name: "fixture-private-board", version: "1.0.0" });
+  files.cleanup(() => direct.close());
+  await direct.connect(new StreamableHTTPClientTransport(new URL(service.url), {
+    requestInit: { headers: { Authorization: "Bearer " + principal.token } },
+  }));
+  const listed = await direct.callTool({ name: "communication_board", arguments: { caller, action: "list" } });
+  assert.deepEqual(listed.structuredContent, { status: "ready" });
+  const profile = join(files.directory, "fixture-board-connection.json");
+  const registry = join(files.directory, "fixture-board-registry.json");
+  await writeFile(profile, JSON.stringify({ endpoint_file: endpointFile, identity, token: facadePrincipal.token }), "utf8");
+  await writeFile(registry, JSON.stringify({ version: 1, connections: [{ connection_file: profile }] }), "utf8");
+  const facade = await createMcpStdioFacade({ registryFile: registry, includeContacts: true, includeMultiRecipient: true });
+  files.cleanup(() => facade.close());
+  const refused = await facade.callTool("communication_board", { caller, action: "list" });
+  assert.equal(refused.isError, true);
+  assert.equal(runtime.core.canUseBoardTool(facadePrincipal.id), false);
+  const ongoing = runtime.core.board({ principal_id: principal.id }, { caller, action: "create", title: "测试板" });
+  await inFlight;
+  await direct.close();
+  let stopped = false;
+  const closing = service.close().then(() => { stopped = true; });
+  await aborted;
+  try {
+    await delay(30);
+    assert.equal(stopped, false);
+  } finally {
+    finishAction();
+  }
+  assert.deepEqual(await ongoing, { cancelled: true, stateStore: "ready" });
+  await closing;
+  assert.throws(() => runtime.core.board({ principal_id: principal.id }, { caller, action: "list" }), { code: "board_unavailable" });
+  assert.deepEqual(events, ["opened", "started", "closed"]);
+});
+
+test("a disabled private board or malformed admin and upload settings never open the runtime", async context => {
+  const { files, identity, principal } = await prepareBoardFixture(context);
+  let constructed = 0;
+  const open = () => { constructed += 1; throw new Error("must not open"); };
+  const options = { ...files, factories: mockFactories };
+  const privateBoard = { enabled: true, open, principalIds: [principal.id] };
+  await assert.rejects(startLiveFromConfig({ ...options,
+    boards: { ...privateBoard, superAdminIdentities: [{ ...identity, conversation_id: "*" }] } }), { code: "invalid_config" });
+  await assert.rejects(startLiveFromConfig({ ...options,
+    boards: { ...privateBoard, superAdminIdentities: [{ ...identity, surface: undefined }] } }), { code: "invalid_config" });
+  await assert.rejects(startLiveFromConfig({ ...options,
+    boards: { ...privateBoard, allowedUploadRoots: ["relative"] } }), { code: "invalid_config" });
+  await assert.rejects(startLiveFromConfig({ ...options,
+    boards: { ...privateBoard, principalIds: ["fixture-missing-board"] } }), { code: "invalid_config" });
+  await assert.rejects(startLiveFromConfig({ ...options,
+    boards: { ...privateBoard, peerMachineIds: ["fixture-unknown-machine"] } }), { code: "invalid_config" });
+  await assert.rejects(startLiveFromConfig({ ...options,
+    boards: { ...privateBoard, fileBundlePeers: ["fixture-unknown-machine"] } }), { code: "invalid_config" });
+  const service = await startLiveFromConfig({ ...options, boards: { enabled: false, open } });
+  files.cleanup(() => service.close());
+  assert.equal(constructed, 0);
+  assert.equal(service.core.canUseBoardTool(principal.id), false);
+});
+
+test("board retries and incoming events consult the narrower board and attachment permissions", async () => {
+  const connected = new Map();
+  const outbound = [];
+  const inbound = [];
+  const dispatcher = {
+    registerOpHandler(op, handler) {
+      connected.set(op, handler);
+      return () => connected.delete(op);
+    },
+    async dispatchCustomOp(request) {
+      outbound.push(request);
+      return { status: "accepted" };
+    },
+  };
+  const capabilities = new Map([["board-peer", { allow_file_bundle: true }]]);
+  const readCaps = peer => capabilities.get(peer);
+  assert.equal(restrictBoardRelayDispatcher(dispatcher, [], readCaps), undefined);
+  const scoped = restrictBoardRelayDispatcher(dispatcher, ["board-peer"], readCaps);
+  const unregister = scoped.registerOpHandler("board_delta", context => {
+    inbound.push(context);
+    return { handled: true };
+  });
+  const acceptDelta = connected.get("board_delta");
+  const request = { targetMachine: "board-peer", attachments: [{ name: "fixture-file" }] };
+  const verified = { remotePrincipal: { from_machine: "board-peer" }, staged_files: [{ name: "fixture-file" }] };
+  assert.deepEqual(acceptDelta(verified), { handled: true });
+  assert.equal((await scoped.dispatchCustomOp(request)).status, "accepted");
+
+  const unrelated = { ...verified, remotePrincipal: { from_machine: "message-only-peer" } };
+  assert.equal(acceptDelta(unrelated).code, "forbidden");
+  await assert.rejects(scoped.dispatchCustomOp({ ...request, targetMachine: "message-only-peer" }), { code: "forbidden" });
+
+  capabilities.set("board-peer", { allow_file_bundle: false });
+  assert.equal(acceptDelta(verified).code, "relay_file_route_denied");
+  await assert.rejects(scoped.dispatchCustomOp(request), { code: "relay_file_route_denied" });
+  assert.equal(outbound.length, 1);
+  assert.equal(inbound.length, 1);
+  assert.deepEqual(acceptDelta({ ...verified, staged_files: [] }), { handled: true });
+  assert.equal((await scoped.dispatchCustomOp({ ...request, attachments: [] })).status, "accepted");
+  unregister();
+  assert.equal(connected.has("board_delta"), false);
+});
+
+test("the real private board MCP entry keeps each member's alias and post across a live restart", async context => {
+  const { files, principal, identity } = await prepareBoardFixture(context);
+  const member = { ...principal, id: "fixture-board-invitee", token: "fixture-board-invitee-token",
+    identity: { ...identity, conversation_id: "fixture-board-invitee-conversation" } };
+  const outsider = { ...principal, id: "fixture-board-outsider", token: "fixture-board-outsider-token",
+    identity: { ...identity, conversation_id: "fixture-board-outsider-conversation" } };
+  files.value.principals.push(member, outsider);
+  await writeFile(files.configPath, JSON.stringify(files.value), "utf8");
+  const endpointFile = join(files.directory, "fixture-real-board-endpoint.json");
+  const notices = [];
+  const boards = {
+    enabled: true, principalIds: [principal.id, member.id, outsider.id], notifyIntervalMs: 0,
+    async notifyLocalMember(notification) {
+      notices.push({ member: notification.member, board_id: notification.board_id, kind: notification.kind });
+      return { delivered: true };
+    },
+  };
+  const start = async () => {
+    const instance = await startLiveService({ ...files, endpointFile }, {
+      startRuntime: options => startLiveFromConfig({ ...options, factories: mockFactories, boards }),
+    });
+    files.cleanup(() => instance.close());
+    return instance;
+  };
+  async function connect(instance, memberPrincipal) {
+    const client = new Client({ name: memberPrincipal.id, version: "1.0.0" });
+    files.cleanup(() => client.close());
+    await client.connect(new StreamableHTTPClientTransport(new URL(instance.url), {
+      requestInit: { headers: { Authorization: "Bearer " + memberPrincipal.token } },
+    }));
+    const { host, conversation_id } = memberPrincipal.identity;
+    return {
+      client,
+      request: async (action, extra = {}) => client.callTool({
+        name: "communication_board", arguments: { caller: { host, conversation_id }, action, ...extra },
+      }),
+    };
+  }
+  async function boardCall(connection, action, extra) {
+    const response = await connection.request(action, extra);
+    assert.notEqual(response.isError, true, JSON.stringify(response.structuredContent));
+    return response.structuredContent;
+  }
+
+  const first = await start();
+  const creatorConnection = await connect(first, principal);
+  const memberConnection = await connect(first, member);
+  const outsiderConnection = await connect(first, outsider);
+  const boardTitle = "测试公告";
+  const created = await boardCall(creatorConnection, "create", { title: boardTitle });
+  await boardCall(memberConnection, "create", { title: boardTitle });
+  const board = { machine_id: identity.machine_id, board_id: created.board_id };
+  const contactAlias = "试验收件对话";
+  const saved = await creatorConnection.client.callTool({ name: "communication_contacts", arguments: {
+    caller: identity, action: "save", alias: contactAlias, target: member.identity,
+  } });
+  assert.notEqual(saved.isError, true, JSON.stringify(saved.structuredContent));
+  const wrongAlias = await creatorConnection.request("invite", { board, members: [{ contact: boardTitle }] });
+  assert.equal(wrongAlias.structuredContent?.error?.code, "board_not_direct_target");
+  const invited = await boardCall(creatorConnection, "invite", { board, members: [{ contact: contactAlias }] });
+  const memberAlias = boardTitle + "#2";
+  assert.equal(JSON.stringify(invited).includes(memberAlias), false);
+  const listedCreator = await boardCall(creatorConnection, "list");
+  const listedMember = await boardCall(memberConnection, "list");
+  assert.equal(listedCreator.boards.find(entry => entry.board_id === board.board_id)?.alias, boardTitle);
+  assert.equal(listedMember.boards.find(entry => entry.board_id === board.board_id)?.alias, memberAlias);
+  assert.equal(listedMember.total, 2);
+  assert.equal(listedMember.has_more, false);
+  assert.deepEqual((await boardCall(outsiderConnection, "list")).boards, []);
+
+  const outsideFile = join(files.directory, "fixture-file-not-authorized.txt");
+  await writeFile(outsideFile, "not authorized for upload", "utf8");
+  const deniedUpload = await creatorConnection.request("post", { board, body: "不得保存", files: [{ path: outsideFile }] });
+  assert.equal(deniedUpload.structuredContent?.error?.code, "upload_path_denied");
+  const memberAddress = { contact: memberAlias };
+  await boardCall(memberConnection, "set_subscription", { board: memberAddress, delivery_mode: "event", filter_mode: "mute" });
+  const mutedBody = "板仍可读，普通帖不提醒";
+  await boardCall(creatorConnection, "post", { board: { contact: boardTitle }, body: mutedBody });
+  assert.deepEqual(notices, []);
+  const body = "真实交流板隔离入口发帖";
+  const post = await boardCall(creatorConnection, "post", {
+    board: { contact: boardTitle }, body, mentions: [{ contact: contactAlias }], client_post_id: "fixture-board-mention",
+  });
+  assert.deepEqual(notices, [{ member: member.identity, board_id: board.board_id, kind: "event_post" }]);
+  const readByMember = await boardCall(memberConnection, "read", { board: memberAddress });
+  assert.deepEqual(readByMember.posts.map(entry => entry.body), [mutedBody, body]);
+  assert.ok(JSON.stringify(readByMember.posts[1].mentions).includes(member.identity.conversation_id));
+  const deniedRead = await outsiderConnection.request("read", { board });
+  assert.equal(deniedRead.structuredContent?.error?.code, "forbidden");
+
+  await Promise.all([creatorConnection, memberConnection, outsiderConnection].map(connection => connection.client.close()));
+  await first.close();
+  const second = await start();
+  const reopened = await connect(second, member);
+  const recoveredList = await boardCall(reopened, "list");
+  assert.equal(recoveredList.boards.find(entry => entry.board_id === board.board_id)?.alias, memberAlias);
+  const recoveredPost = await boardCall(reopened, "read", { board: memberAddress, seq: post.seq });
+  assert.deepEqual(recoveredPost.posts.map(post => post.body), [body]);
+  assert.equal(notices.length, 1);
+});
+
+test("the live local-only board archives after 31 days without a relay or notice callback", async context => {
+  const { files, principal, caller } = await prepareBoardFixture(context);
+  const startMs = Date.UTC(2031, 0, 1);
+  const threshold = startMs + 31 * 86_400_000;
+  context.mock.timers.enable({ apis: ["Date", "setTimeout"], now: startMs });
+  const adapter = new MockAdapter();
+  const service = await startLiveService({ ...files, endpointFile: join(files.directory, "board-archive-endpoint.json") }, {
+    startRuntime: options => startLiveFromConfig({
+      ...options, factories: { antigravity: () => adapter }, boards: { enabled: true, principalIds: [principal.id] },
+    }),
+  });
+  files.cleanup(() => service.close());
+  const client = new Client({ name: "fixture-silent-board-archive", version: "1.0.0" });
+  files.cleanup(() => client.close());
+  await client.connect(new StreamableHTTPClientTransport(new URL(service.url), {
+    requestInit: { headers: { Authorization: "Bearer " + principal.token } },
+  }));
+  const request = async (action, fields = {}) => {
+    const result = await client.callTool({ name: "communication_board", arguments: { caller, action, ...fields } });
+    assert.notEqual(result.isError, true, JSON.stringify(result.structuredContent));
+    return result.structuredContent;
+  };
+  const created = await request("create", { title: "归档验收" });
+  const status = async () => (await request("list")).boards.find(entry => entry.board_id === created.board_id)?.status;
+
+  context.mock.timers.setTime(threshold - 90_001);
+  context.mock.timers.tick(90_000);
+  assert.equal(Date.now(), threshold - 1);
+  assert.equal(await status(), "active");
+  context.mock.timers.tick(90_001);
+  assert.equal(await status(), "archived");
+  assert.equal(adapter.calls.length, 0);
+
+  await client.close();
+  await service.close();
+  const database = new DatabaseSync(join(files.stateDir, "core.sqlite"), { readOnly: true });
+  try {
+    const row = database.prepare("SELECT status, archive_reason FROM boards WHERE board_id = ?").get(created.board_id);
+    assert.equal(row?.status, "archived");
+    assert.equal(row?.archive_reason, "auto_inactive_31d");
+    assert.equal(database.prepare("SELECT count(*) AS count FROM board_notifications WHERE board_id = ?").get(created.board_id).count, 0);
+  } finally { database.close(); }
 });
 
 test("an ambiguous live machine config will not label a local reader with the incoming caller's machine", async context => {
