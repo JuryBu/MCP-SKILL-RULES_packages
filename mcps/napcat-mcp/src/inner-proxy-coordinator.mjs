@@ -294,8 +294,42 @@ export function createInnerProxyCoordinatorImplementation(shared) {
     onProgress: (job, event) => publishRootRecovery(job, event),
     maxAnchorBytes: options.rootAdmissionMaxAnchorBytes,
   };
-  const rootAdmissions = shared.rootAdmissions ??= createRootAdmissionState(rootAdmissionOptions);
+  let rootAdmissions = shared.rootAdmissions ??= createRootAdmissionState(rootAdmissionOptions);
   if (rootAdmissions.sourcePayloadVersion !== 1) fail("ROOT_ADMISSION_SOURCE_REQUIRES_COLD_START");
+  const upgradeIdleRootLayersIfNeeded = () => {
+    if (shared.closing || shared.nativeResponsesClosing || shared.implementation?.status !== implementation.status) return;
+    if (shared.rootAdmissions && shared.rootAdmissions.anchorFixVersion !== 1) {
+      const rootStatus = shared.rootAdmissions.status?.();
+      const hasActiveThread = [...threads.values()].some(state => state.phase === "active");
+      if (rootStatus && rootStatus.jobs === 0 && rootStatus.anchors === 0
+        && shared.requests.size === 0 && !hasActiveThread) {
+        const previousRoot = shared.rootAdmissions;
+        shared.rootAdmissions = createRootAdmissionState(rootAdmissionOptions);
+        rootAdmissions = shared.rootAdmissions;
+        void Promise.resolve(previousRoot.close?.()).catch(() => {});
+      }
+    } else if (shared.rootAdmissions && rootAdmissions !== shared.rootAdmissions) {
+      rootAdmissions = shared.rootAdmissions;
+    }
+    if (shared.server && shared.nativeResponsesRelay && shared.nativeResponsesRelay.anchorFixVersion !== 1) {
+      const relayStatus = shared.nativeResponsesRelay.status?.();
+      if (relayStatus && relayStatus.closed !== true && relayStatus.connections === 0) {
+        const previousRelay = shared.nativeResponsesRelay;
+        void Promise.resolve(previousRelay.close?.()).catch(() => {});
+        shared.nativeResponsesRelay = attachNativeResponsesRelay({
+          server: shared.server,
+          acquire: input => {
+            if (typeof shared.implementation.acquireNativeResponse !== "function") fail("COORDINATOR_NATIVE_WS_UNAVAILABLE");
+            return shared.dispatch("acquireNativeResponse", input);
+          },
+          isClosing: () => shared.closing || shared.nativeResponsesClosing || options.isShutdownRequested?.() === true,
+          onEvent,
+          maxPayload: options.nativeWsMaxPayload,
+          maxConnections: options.nativeWsMaxConnections,
+        });
+      }
+    }
+  };
   const rootBodyBudget = shared.rootBodyBudget ??= createRequestBufferBudget(options.rootAdmissionMaxBufferedBytes ?? 256 * 1024 * 1024);
   const rootProducerHashes = Object.fromEntries(Object.entries({ core: "inner-proxy-coordinator.mjs", helper: "root-admission-state.mjs",
     runner: "inner-managed-session.mjs", control: "native-responses-ws-bridge.mjs" }).map(([key, filename]) => {
@@ -2536,12 +2570,15 @@ export function createInnerProxyCoordinatorImplementation(shared) {
     acquireNativeResponse,
     recoveryControl,
     status() {
+      upgradeIdleRootLayersIfNeeded();
       const nativeResponses = shared.nativeResponsesRelay?.status();
       if (!shared.closing && !shared.nativeResponsesClosing && nativeResponses?.closed !== true
         && shared.implementation?.status === implementation.status && shared.server) installNativeResponseSocketGuard(shared.server, onEvent);
       return { running: shared.server.listening, nativeHealthy: shared.nativeHealthy,
       nativeResponseSocketGuardInstalled: Boolean(shared.server[Symbol.for("napcat.native.responses.endpointSocketGuard")]),
-      nativeResponses: nativeResponses ? { closed: nativeResponses.closed, connections: nativeResponses.connections } : null,
+      nativeResponses: nativeResponses ? { closed: nativeResponses.closed, connections: nativeResponses.connections,
+        ...(nativeResponses.anchorFixVersion ? { anchorFixVersion: nativeResponses.anchorFixVersion } : {}) } : null,
+      ...(rootAdmissions.anchorFixVersion ? { rootAnchorFixVersion: rootAdmissions.anchorFixVersion } : {}),
       coldStart: shared.coldStart?.status ?? null,
       transactionActive: shared.transactionActive, defaultWorkerId: shared.defaultWorker?.workerId ?? null,
       liveCode: { stateSchema: coordinatorStateSchema, generation: shared.implementationGeneration },

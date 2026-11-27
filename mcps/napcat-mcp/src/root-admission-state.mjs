@@ -18,6 +18,30 @@ const ordinary = (metadata, payload, requestPath, headers = {}) => (metadata?.re
   && !Object.entries(headers).some(([key, value]) => key.toLowerCase() === "x-codex-internal-memory-connection"
     || key.toLowerCase() === "x-openai-subagent" && value === "memory_consolidation");
 const failure = code => Object.assign(new Error(code), { code });
+const rootStructureRejectionCodes = new Set([
+  "invalid_request_error",
+  "invalid_request",
+  "invalid_argument",
+  "unsupported_parameter",
+  "unsupported_value",
+  "previous_response_not_found",
+]);
+const isPermanentStructureTerminal = event => {
+  if (!event || !["error", "response.failed"].includes(event.type)) return false;
+  const err = event.response?.error ?? event.error;
+  if (!err || typeof err !== "object") return false;
+  const errCode = String(err.code ?? "").toLowerCase();
+  if (errCode === "context_length_exceeded") return false;
+  const statuses = [
+    event.status, event.status_code, event.statusCode, event.httpStatus, event.http_status,
+    err.status, err.status_code, err.statusCode, err.httpStatus, err.http_status,
+    event.response?.status, event.response?.status_code, event.response?.statusCode, event.response?.httpStatus, event.response?.http_status,
+  ].map(value => typeof value === "string" && /^\d{3}$/u.test(value) ? Number(value) : value);
+  return statuses.includes(400) || statuses.includes(422)
+    || err.type === "invalid_request_error"
+    || rootStructureRejectionCodes.has(errCode)
+    || err.param === "input" || err.param === "previous_response_id";
+};
 const isExplicitNotSent = (terminalEvent, recovery) => {
   const entries = [terminalEvent, terminalEvent?.error, terminalEvent?.response?.error].filter(Boolean);
   const delivery = recovery?.clientDelivery?.();
@@ -152,7 +176,8 @@ export function createRootAdmissionState({ getThread, getNativeIdentity, isNativ
     const input = payloadInput(job, payload);
     const output = [...response.output, ...[...(job.deliveredItems?.values() ?? [])]];
     const bytes = rootInputBytes(input, output);
-    const anchored = bytes <= maxAnchorBytes - anchorBytes - externalAnchorBytes();
+    const anchored = !isPermanentStructureTerminal(terminalEvent)
+      && bytes <= maxAnchorBytes - anchorBytes - externalAnchorBytes();
     if (anchored) {
       anchors.set(response.id, { threadId: job.metadata.thread_id, turnId: job.metadata.turn_id, nativeIdentity: record.pin,
         nativeGeneration: record.pin.generation, references: new Set(), consumedTurns: new Set(), consumedCompleted: false,
@@ -170,6 +195,7 @@ export function createRootAdmissionState({ getThread, getNativeIdentity, isNativ
   };
   return {
     sourcePayloadVersion: 1,
+    anchorFixVersion: 1,
     observeStart(state, start, origin = "native_notification", suppliedIdentity) {
       const previous = records.get(state.threadId);
       if (previous?.start === start) {
@@ -193,7 +219,8 @@ export function createRootAdmissionState({ getThread, getNativeIdentity, isNativ
     observeTerminal(state, event) {
       if (event.status !== "completed" || getThread(event.threadId) !== state || state.completion !== event) return;
       for (const anchor of anchors.values()) {
-        if (anchor.threadId === event.threadId && anchor.turnId !== event.turnId && anchor.consumedTurns.has(event.turnId)) {
+        if (anchor.threadId === event.threadId && anchor.consumedTurns.has(event.turnId)
+          && (anchor.turnId !== event.turnId || anchor.references.size === 0)) {
           anchor.consumedCompleted = true;
         }
       }
@@ -335,7 +362,7 @@ export function createRootAdmissionState({ getThread, getNativeIdentity, isNativ
       jobs.clear();
       records.clear();
     },
-    status() { return { protocolVersion: 1, records: records.size, jobs: jobs.size, anchors: anchors.size, anchorBytes }; },
+    status() { return { protocolVersion: 1, anchorFixVersion: 1, records: records.size, jobs: jobs.size, anchors: anchors.size, anchorBytes }; },
   };
 }
 

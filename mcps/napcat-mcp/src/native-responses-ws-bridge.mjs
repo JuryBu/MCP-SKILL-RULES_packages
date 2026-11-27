@@ -190,6 +190,35 @@ function nativePendingDisposition(operation) {
   return { requiresReconciliation: true, reconciliationAcceptance: accepted ? "accepted" : "unknown" };
 }
 
+const structureRejectionCodes = new Set([
+  "invalid_request_error",
+  "invalid_request",
+  "invalid_argument",
+  "unsupported_parameter",
+  "unsupported_value",
+  "previous_response_not_found",
+]);
+function isPermanentStructureRejection(diagnostics) {
+  if (!diagnostics) return false;
+  const reasonCode = String(diagnostics.failureReasonCode ?? "").toLowerCase();
+  const rawCode = String(diagnostics.rawCode ?? "").toLowerCase();
+  const rawUpstreamCode = String(diagnostics.rawUpstreamCode ?? "").toLowerCase();
+  if (reasonCode === "context_length_exceeded" || rawUpstreamCode === "context_length_exceeded") return false;
+  if (rawUpstreamCode === "previous_response_not_found" || reasonCode === "previous_response_not_found") return true;
+  if (diagnostics.rawUpstreamParam === "previous_response_id"
+    && (diagnostics.httpStatus === 400 || diagnostics.rawUpstreamType === "invalid_request_error")) return true;
+  if (diagnostics.httpStatus === 400 && diagnostics.rawUpstreamType === "invalid_request_error") return true;
+  if (diagnostics.failureCategory !== "permanent") return false;
+  return diagnostics.httpStatus === 400
+    || diagnostics.httpStatus === 422
+    || diagnostics.rawUpstreamType === "invalid_request_error"
+    || diagnostics.rawUpstreamParam === "input"
+    || diagnostics.rawUpstreamParam === "previous_response_id"
+    || structureRejectionCodes.has(reasonCode)
+    || structureRejectionCodes.has(rawCode)
+    || structureRejectionCodes.has(rawUpstreamCode);
+}
+
 const temporaryNativeWsCodes = new Set(["ECONNREFUSED", "ECONNRESET", "ECONNABORTED", "ETIMEDOUT", "ENOTFOUND", "EAI_AGAIN",
   "ENETUNREACH", "EHOSTUNREACH", "EPIPE", "ERR_NETWORK", "ERR_SOCKET_CLOSED", "ERR_STREAM_PREMATURE_CLOSE",
   "ERR_TLS_HANDSHAKE_TIMEOUT", "UND_ERR_CONNECT_TIMEOUT", "UND_ERR_HEADERS_TIMEOUT", "UND_ERR_BODY_TIMEOUT", "UND_ERR_SOCKET",
@@ -626,6 +655,15 @@ export function attachNativeResponsesBridge({ server, createRequestClient, relea
       };
       let peerClosed = false;
       const terminalResponseIds = new Set();
+      const invalidatedResponseIds = new Set();
+      const invalidateResponseIds = (...ids) => {
+        for (const id of ids) {
+          if (typeof id !== "string" || !id) continue;
+          invalidatedResponseIds.add(id);
+          if (invalidatedResponseIds.size > 64) invalidatedResponseIds.delete(invalidatedResponseIds.values().next().value);
+        }
+        try { releaseSession(sessionKey); } catch {}
+      };
       const emit = (type, fields = {}) => { try { onEvent({ type, connectionId, ...fields }); } catch {} };
       const recoveryState = (job, phase, fields = {}) => {
         job.recoveryPhase = phase;
@@ -1040,13 +1078,24 @@ export function attachNativeResponsesBridge({ server, createRequestClient, relea
           }
         }
         const completed = outgoingEvents.find(outgoing => outgoing.type === "response.completed");
-        const deliveredNonMessages = [...job.deliveredItems.values()].filter(item => item.type !== "message"
-          && (!(job.interruptResponseId || verifiedStop || pending || persistenceError) || item.type === "reasoning"));
+        const deliveredAllNonMessages = [...job.deliveredItems.values()].filter(item => item.type !== "message");
+        const deliveredNonMessages = deliveredAllNonMessages.filter(item =>
+          !(job.interruptResponseId || verifiedStop || pending || persistenceError) || item.type === "reasoning");
+        const droppedDeliveredNonMessages = deliveredNonMessages.length < deliveredAllNonMessages.length;
         completed.response.output = [...completed.response.output, ...deliveredNonMessages].sort((left, right) =>
           (job.itemIndices.get(left.id) ?? Number.MAX_SAFE_INTEGER) - (job.itemIndices.get(right.id) ?? Number.MAX_SAFE_INTEGER));
-        setAnchor(fullInput ? { id: completed.response.id, input: fullInput, output: completed.response.output, local: true } : null);
+        const invalidateAnchor = droppedDeliveredNonMessages
+          || Boolean(job.deliveredExecutableToolDone && (pending || persistenceError || job.interruptResponseId || verifiedStop))
+          || job.pendingLocalToolItems.size > 0
+          || job.localAnchorUsed === true
+          || job.startCallbackFailed === true
+          || job.settlementFailed === true
+          || Boolean(persistenceError)
+          || isPermanentStructureRejection(diagnostics);
+        if (invalidateAnchor) invalidateResponseIds(completed?.response?.id, job.publicResponseId, job.upstreamResponseId);
+        setAnchor(!invalidateAnchor && fullInput ? { id: completed.response.id, input: fullInput, output: completed.response.output, local: true } : null);
         if (!job.settlementFailed) retryGate.clear(job.metadata);
-        emit(type, { operationId: job.operationId, ...diagnostics, ...fields });
+        emit(type, { operationId: job.operationId, ...diagnostics, ...(invalidateAnchor ? { anchorInvalidated: true } : {}), ...fields });
         for (const outgoing of outgoingEvents) if (peer.readyState === webSocketOpen) { clientKeepalive.note(); peer.send(JSON.stringify(outgoing)); }
       };
       const receive = async (data, binary, prepared) => {
@@ -1091,13 +1140,15 @@ export function attachNativeResponsesBridge({ server, createRequestClient, relea
               job.request?.destroy();
               return;
             }
-            const output = [...job.deliveredItems].filter(([, item]) => item?.type === "message"
+            const deliveredAll = [...job.deliveredItems];
+            const output = deliveredAll.filter(([, item]) => item?.type === "message"
               || item?.type === "reasoning" && item.status === "completed")
               .sort(([left], [right]) => left - right).map(([, item]) => {
                 const copy = structuredClone(item);
                 if (copy.type === "message" && copy.status !== "completed") copy.status = "incomplete";
                 return copy;
               });
+            const droppedWaitingItems = output.length < deliveredAll.length || job.deliveredExecutableToolDone;
             const event = { type: "response.incomplete", sequence_number: ++job.clientSequence,
               response: { id: job.publicResponseId, status: "incomplete", incomplete_details: { reason: "interrupted" }, output } };
             job.terminal = true;
@@ -1107,8 +1158,9 @@ export function attachNativeResponsesBridge({ server, createRequestClient, relea
             job.request = null;
             emit("native_ws_interrupt", { operationId: job.operationId, accepted: !settlementError,
               reason: settlementError ? "settlement_failed" : "waiting_interrupted", targetResponseId });
-            if (settlementError) { closeFailedPeer(peer, settlementError); return; }
-            setAnchor(job.fullInput ? { id: job.publicResponseId, input: job.fullInput, output, local: true } : null);
+            if (settlementError) { invalidateResponseIds(job.publicResponseId, job.upstreamResponseId); setAnchor(null); closeFailedPeer(peer, settlementError); return; }
+            if (droppedWaitingItems) invalidateResponseIds(job.publicResponseId, job.upstreamResponseId);
+            setAnchor(!droppedWaitingItems && job.fullInput ? { id: job.publicResponseId, input: job.fullInput, output, local: true } : null);
             if (peer.readyState === webSocketOpen) {
               peer.send(JSON.stringify(event), sendFailure => { if (sendFailure) peer.terminate(); });
             }
@@ -1172,6 +1224,8 @@ export function attachNativeResponsesBridge({ server, createRequestClient, relea
             || metadata.thread_source === "memory_consolidation" || metadata.turn_trigger === "memory_consolidation"
             || payload.client_metadata?.["x-openai-subagent"] === "memory_consolidation";
           if (sourceDocument && !rootSourcePayload(payload)) await registerRootSourcePayload(payload, sourceDocument);
+          const localAnchor = anchor?.local === true && anchor.id === payload.previous_response_id;
+          job.localAnchorUsed = localAnchor;
           const sourceAnchor = Boolean(anchor && typeof payload.previous_response_id === "string"
             && anchor.id === payload.previous_response_id && isRootInputProjection(anchor.input));
           if (sourceAnchor || sourceDocument && payload.previous_response_id && anchor?.id === payload.previous_response_id) {
@@ -1227,7 +1281,6 @@ export function attachNativeResponsesBridge({ server, createRequestClient, relea
             && (!threadId || threadId === metadata.thread_id);
           const replayPayload = sourceDocument ? payload : fullInput ? { ...payload, input: fullInput } : null;
           if (replayPayload) delete replayPayload.previous_response_id;
-          const localAnchor = anchor?.local === true && anchor.id === payload.previous_response_id;
           job.admissionAttempt = admitRequest(job, () => onRequestStart({ sessionKey, operationId: job.operationId, metadata,
               payload: localAnchor && replayPayload ? replayPayload : payload, headers, bytes: data.byteLength,
                connectionToken, connectionId, requestPath: handshake.url, admissionLease: job.admissionLease, prepared }));
@@ -1241,6 +1294,15 @@ export function attachNativeResponsesBridge({ server, createRequestClient, relea
           }
           if (!job.context?.internalMemoryPrewarm) threadId = binding;
           if (job.released) { settle(job); return; }
+          if (typeof payload.previous_response_id === "string" && invalidatedResponseIds.has(payload.previous_response_id)) {
+            const error = Object.assign(new Error("Previous response anchor was invalidated on this connection"), {
+              code: "WS_NATIVE_PREVIOUS_RESPONSE_MISMATCH", httpStatus: 400,
+              requestAccepted: false, operationAcceptance: "not_sent", requestTransmissionState: "not_sent",
+            });
+            release(job, { kind: "failed", error });
+            closeFailedPeer(peer, error, 1008);
+            return;
+          }
           const startRequest = () => {
           job.waiting = false;
           if (job.released || peerClosed || peer.readyState !== webSocketOpen || job.abort.signal.aborted || isClosing?.()) { job.cancel(); return; }
@@ -1270,12 +1332,16 @@ export function attachNativeResponsesBridge({ server, createRequestClient, relea
                 const event = { type: "response.incomplete", sequence_number: ++job.clientSequence,
                   response: { id: job.publicResponseId, status: "incomplete", incomplete_details: { reason: "interrupted" }, output } };
                 job.terminal = true;
-                setAnchor({ id: job.publicResponseId, input: job.fullInput, output, local: true });
                 const error = release(job, { kind: "interrupted", event, userRequested: true });
                 job.request?.destroy();
+                const invalidateHttpInterruptAnchor = Boolean(error || job.outcome?.requiresReconciliation
+                  || job.deliveredExecutableToolDone || job.localAnchorUsed);
                 emit("native_http_interrupted", { operationId: job.operationId, responseId: job.publicResponseId,
-                  reason: "user_interrupt", userRequested: true, settlementState: error ? "unknown" : "settled" });
-                if (error) { closeFailedPeer(peer, error); return; }
+                  reason: "user_interrupt", userRequested: true, settlementState: error ? "unknown" : "settled",
+                  ...(invalidateHttpInterruptAnchor ? { anchorInvalidated: true } : {}) });
+                if (error) { invalidateResponseIds(job.publicResponseId, job.upstreamResponseId); setAnchor(null); closeFailedPeer(peer, error); return; }
+                if (invalidateHttpInterruptAnchor) invalidateResponseIds(job.publicResponseId, job.upstreamResponseId);
+                setAnchor(!invalidateHttpInterruptAnchor && job.fullInput ? { id: job.publicResponseId, input: job.fullInput, output, local: true } : null);
                 if (peer.readyState === webSocketOpen) { clientKeepalive.note(); peer.send(JSON.stringify(event)); }
               });
               return { ok: true, code: "interrupt_queued" };
@@ -1477,7 +1543,12 @@ export function attachNativeResponsesBridge({ server, createRequestClient, relea
                   job.terminal = true;
                   if ((event.type === "response.completed" || acknowledgedInterrupt) && fullInput
                     && typeof event.response?.id === "string" && Array.isArray(event.response.output)) {
-                    setAnchor({ id: event.response.id, upstreamId: job.upstreamResponseId, input: fullInput, output: event.response.output,
+                    const outputCallIds = new Set(event.response.output.map(item => item?.call_id).filter(Boolean));
+                    const missingDeliveredTool = acknowledgedInterrupt && [...job.deliveredItems.values()].some(
+                      item => ["function_call", "custom_tool_call", "local_shell_call", "computer_call", "mcp_call", "tool_search_call"].includes(item?.type)
+                        && typeof item.call_id === "string" && !outputCallIds.has(item.call_id));
+                    if (missingDeliveredTool) invalidateResponseIds(event.response.id, job.publicResponseId, job.upstreamResponseId);
+                    setAnchor(missingDeliveredTool ? null : { id: event.response.id, upstreamId: job.upstreamResponseId, input: fullInput, output: event.response.output,
                       ...(job.preparationInterrupted || job.httpFallback ? { local: true } : {}) });
                   }
                   if (!acknowledgedInterrupt && event.type !== "response.completed" && !recordedCapacity) {
@@ -1645,6 +1716,7 @@ export function attachNativeResponsesRelay({ server, acquire, isClosing, onEvent
       let active = null;
       let closed = false;
       let failed = false;
+      let terminalErrorForwarded = false;
       let resumeTimer = null;
       let lastLease = null;
       let idleTerminal = false;
@@ -1737,11 +1809,33 @@ export function attachNativeResponsesRelay({ server, acquire, isClosing, onEvent
         const { WebSocket } = require("ws");
         upstream = new WebSocket(lease.url, { headers: cleanHeaders(lease.headers ?? handshake.headers, true),
           perMessageDeflate: false, followRedirects: false, handshakeTimeout: 10000, maxPayload: maxPayload ?? 192 * 1024 * 1024 });
+        const closeAfterForwardedError = code => {
+          failed = true;
+          clientKeepalive.stop();
+          clearInterval(resumeTimer);
+          resumeTimer = null;
+          reclaimAbort?.abort();
+          try { onEvent({ type: "native_ws_relay_failed", connectionId, code }); } catch {}
+          nativeConnectionCloseReasons.set(peer, "failed");
+          const closeTimer = setTimeout(() => { if (peer.readyState !== 3) peer.terminate(); }, 1000);
+          closeTimer.unref?.();
+          peer.once("close", () => clearTimeout(closeTimer));
+          try { peer.close(1011, "model connection must reconnect"); } catch { clearTimeout(closeTimer); if (peer.readyState !== 3) peer.terminate(); }
+          upstream?.terminate();
+        };
         upstream.once("open", () => resolve(upstream));
         upstream.once("error", reject);
-        upstream.on("error", error => fail(error));
+        upstream.on("error", error => {
+          if (closed || failed) return;
+          if (!active && terminalErrorForwarded) { closeAfterForwardedError(error?.code ?? "NATIVE_WS_WORKER_CLOSED"); return; }
+          fail(error);
+        });
         upstream.on("unexpected-response", (_request, response) => { response.resume(); reject(Object.assign(new Error("Worker rejected WebSocket"), { code: "NATIVE_WS_WORKER_UNAVAILABLE" })); });
-        upstream.on("close", () => { if (!closed) fail({ code: "NATIVE_WS_WORKER_CLOSED" }); });
+        upstream.on("close", () => {
+          if (closed || failed) return;
+          if (!active && terminalErrorForwarded) { closeAfterForwardedError("NATIVE_WS_WORKER_CLOSED"); return; }
+          fail({ code: "NATIVE_WS_WORKER_CLOSED" });
+        });
         upstream.on("message", (data, binary) => {
           if (closed || failed) return;
           activityRevision += 1;
@@ -1774,6 +1868,8 @@ export function attachNativeResponsesRelay({ server, acquire, isClosing, onEvent
           }
           if (peer.readyState === webSocketOpen) {
             clientKeepalive.note();
+            if (event.type === "error") terminalErrorForwarded = true;
+            else if (event.type === "response.created" || event.type === "response.completed") terminalErrorForwarded = false;
             peer.send(data, { binary }, error => { if (error) peer.terminate(); });
             if (active) { active.recovery.markDelivered(event); active.lease?.markDelivered?.(event); }
           }
@@ -1819,6 +1915,7 @@ export function attachNativeResponsesRelay({ server, acquire, isClosing, onEvent
           job.sourceDocument = sourceState.document;
         }
         active = job;
+        terminalErrorForwarded = false;
         clientKeepalive.start();
         idleTerminal = false;
         try {
@@ -1944,5 +2041,7 @@ export function attachNativeResponsesRelay({ server, acquire, isClosing, onEvent
       };
     },
   });
-  return { ...endpoint, async close() { await endpoint.close(); while (sourceCleanups.size) await Promise.allSettled([...sourceCleanups]); } };
+  return { ...endpoint, anchorFixVersion: 1,
+    status: () => ({ ...endpoint.status(), anchorFixVersion: 1 }),
+    async close() { await endpoint.close(); while (sourceCleanups.size) await Promise.allSettled([...sourceCleanups]); } };
 }
