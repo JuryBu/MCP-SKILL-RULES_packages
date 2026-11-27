@@ -9,6 +9,9 @@ import { OwnerReplyEventsError } from "./owner-reply-events.mjs";
 import { OwnerWindowEventsError } from "./owner-window-events.mjs";
 import { createControlPlane } from "./control-plane.mjs";
 import { withOutgoingDeliveryTracking } from "./delivery-result.mjs";
+import { RelayError, loadAndValidateRelayConfig } from "./relay-groups.mjs";
+import { createNapCatRelayService } from "./relay-service.mjs";
+import { createFileBundleRelayHost } from "./relay-file-bundle-bridge.mjs";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -725,6 +728,85 @@ const tools = [
   },
 ];
 
+const relayTools = [
+  {
+    name: "napcat_relay_status",
+    description: "局部重读并校验独立外置 relay-groups.json 配置及硬互斥边界，返回脱敏后的多机中继路由视图、对端小号映射、限流上限与事件队列保留态（不含任何 token 或凭据）。",
+    inputSchema: {
+      type: "object",
+      properties: {
+        include_live_check: { type: "boolean", description: "是否向本机 OneBot 实测账号在线与启用中继群身份。" },
+      },
+      additionalProperties: false,
+    },
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+  },
+  {
+    name: "napcat_relay_send",
+    description: "按目标机器与渠道选择唯一 active_write 中继群（原路回执允许显式指定 reply_relay_key 走 draining_read 原群），幂等发送明文版本化帧 [COMM_RELAY_V1] 并核验 get_msg 与群真实序号推进；不触碰旧双机任务与人类 QQ 窗口。",
+    inputSchema: {
+      type: "object",
+      properties: {
+        dedupe_key: { type: "string", description: "稳定发送去重键；同键不同载荷将报 RELAY_DEDUPE_CONFLICT。" },
+        target_machine: { type: "string", description: "目标逻辑机器标识。" },
+        channel: { type: "string", description: "中继渠道，默认 qq。" },
+        reply_relay_key: { type: "string", description: "原路回执绑定的原始 relay_key（允许走 draining_read 原群）。" },
+        reply_group_id: { type: "string", description: "原路回执绑定的原始群号校验值。" },
+        reply_route_generation: { type: "integer", minimum: 1, description: "原路回执绑定的原始路由代次。" },
+        op: {
+          type: "string",
+          enum: [
+            "message", "delivery_ack", "processing_ack",
+            "status_query", "status_reply",
+            "list_query", "list_reply",
+            "snapshot_query", "snapshot_reply",
+            "board_delta", "board_dissolved", "board_state_sync", "board_ack",
+            "file_notice", "file_ack",
+          ],
+          description: "受控版本化中继操作类型。",
+        },
+        source: { type: "string", description: "发送方对话规范地址（<host>/<surface>/<conversation_id>，兼容 2 段）。" },
+        recipients: { type: "array", items: { type: "string" }, minItems: 1, description: "本目标机收件对话规范地址数组。" },
+        body: { type: "string", description: "明文正文（编码时逐行前置 '| ' 隔离旧解析器并计算 body_sha256）。" },
+        in_reply_to: { type: "string", description: "可选回复的原 relay_id。" },
+        meta: { type: "object", description: "可选交流核心透传元数据（request_id/all_recipients/recipient_deliveries/observed_at/truncated 等）。" },
+        allow_disclose_recipients: { type: "boolean", description: "可选显式控制是否允许在群发路线公开完整同批收件人名单。" },
+      },
+      required: ["dedupe_key", "target_machine", "op", "source", "recipients", "body"],
+      additionalProperties: false,
+    },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+  },
+  {
+    name: "napcat_relay_poll",
+    description: "多页扫描已启用的 active_write 与 draining_read 中继群，按 OneBot 真实 sender_id 反查授权 peers 校验并入独立有界事件队列，显式上报翻页断档。",
+    inputSchema: {
+      type: "object",
+      properties: {
+        relay_keys: { type: "array", items: { type: "string" }, description: "可选限定扫描的 relay_key 列表。" },
+        max_pages: { type: "integer", minimum: 1, maximum: 50, description: "可选单群最大向后翻页数。" },
+      },
+      additionalProperties: false,
+    },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+  },
+  {
+    name: "napcat_relay_events_read",
+    description: "按作用域游标只读分页拉取已验收的多机中继入站帧事件（供交流核心消费并分发给本机多宿主对话），过期或断档按路由隔离明确报错。",
+    inputSchema: {
+      type: "object",
+      properties: {
+        cursor: { anyOf: [{ type: "string" }, { type: "null" }], description: "上次返回的作用域游标。" },
+        limit: { type: "integer", minimum: 1, maximum: 50, description: "每页最大返回条数，默认 50。" },
+        relay_key: { type: "string", description: "可选限定单个中继路由读取。" },
+        resume_from_retained: { type: "boolean", description: "可选在调用方确认历史断档后显式从当前保留起点恢复读取，默认 false。" },
+      },
+      additionalProperties: false,
+    },
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+  },
+];
+
 function textResult(value, isError = false) {
   return {
     content: [{ type: "text", text: JSON.stringify(value, null, 2) }],
@@ -733,14 +815,16 @@ function textResult(value, isError = false) {
 }
 
 function errorResult(error) {
+  const isRelayBundleError = typeof error?.code === "string" && /^RELAY_[A-Z0-9_]+$/.test(error.code);
   const knownError = error instanceof NapCatNotifierError || error instanceof TaskRegistryError
-    || error instanceof ControlStateError || error instanceof OwnerReplyEventsError || error instanceof OwnerWindowEventsError;
+    || error instanceof ControlStateError || error instanceof OwnerReplyEventsError || error instanceof OwnerWindowEventsError
+    || error instanceof RelayError || isRelayBundleError;
   const safe = {
     ok: false,
     code: knownError ? error.code : "UNEXPECTED_ERROR",
     message: error?.message || String(error),
     outcomeUnknown: Boolean(error?.outcomeUnknown),
-    details: knownError ? error.details : null,
+    details: knownError ? (error.details ?? null) : null,
   };
   console.error(`[napcat-mcp] ${safe.code}: ${safe.message}`);
   return textResult(safe, true);
@@ -797,6 +881,128 @@ const controlPlane = createControlPlane({
   state: controlState,
   bridge: { wake: async () => { throw new Error("入站唤醒只由 task router 执行"); } },
 });
+const relayTrustedCoreEnabled = process.env.NAPCAT_RELAY_TRUSTED_CORE_ENTRYPOINT === "1";
+const relayStatePath = process.env.NAPCAT_RELAY_STATE_PATH
+  || path.join(path.dirname(notifier.bindingPath), "state", "comm-relay-state.json");
+const relayService = relayTrustedCoreEnabled
+  ? createNapCatRelayService({ notifier, statePath: relayStatePath })
+  : null;
+
+const fileBundleTrustedCoreEnabled = relayTrustedCoreEnabled
+  && process.env.NAPCAT_RELAY_FILE_BUNDLE_TRUSTED_CORE_ENABLED === "1";
+const fileBundleTrustedToken = Symbol("napcat-trusted-core-stdio");
+const fileBundleToolNames = new Set([
+  "napcat_file_bundle_send",
+  "napcat_file_bundle_poll",
+  "napcat_file_bundle_events_read",
+  "napcat_file_bundle_events_ack",
+]);
+let fileBundleIntegration = null;
+
+function parseAllowedAttachmentRoots(raw) {
+  if (typeof raw !== "string" || !raw.trim()) return [];
+  return raw
+    .split(path.delimiter)
+    .map((entry) => entry.trim())
+    .filter(Boolean)
+    .map((entry) => path.resolve(entry));
+}
+
+function createAllowedAttachmentResolver(allowedRoots) {
+  return async (attachments, scope) => {
+    scope?.signal?.throwIfAborted?.();
+    if (!allowedRoots.length) {
+      throw Object.assign(
+        new Error("未配置获准本机附件根目录 NAPCAT_RELAY_FILE_BUNDLE_ALLOWED_ATTACHMENT_ROOTS"),
+        { code: "RELAY_FILE_CALLER_DENIED" },
+      );
+    }
+    const resolvedRoots = await Promise.all(
+      allowedRoots.map(async (rootDir) => {
+        try { return await fs.promises.realpath(rootDir); } catch { return null; }
+      }),
+    );
+    const validRoots = resolvedRoots.filter(Boolean);
+    const out = [];
+    for (const item of attachments) {
+      scope?.signal?.throwIfAborted?.();
+      if (!item?.filePath || !path.isAbsolute(item.filePath)) {
+        throw Object.assign(new Error("附件路径必须是绝对路径"), { code: "RELAY_FILE_REQUEST_INVALID" });
+      }
+      const realFile = await fs.promises.realpath(item.filePath);
+      const stat = await fs.promises.lstat(realFile);
+      if (!stat.isFile()) {
+        throw Object.assign(new Error("附件必须是普通文件"), { code: "RELAY_FILE_REQUEST_INVALID" });
+      }
+      const allowed = validRoots.some((rootDir) => {
+        const rel = path.relative(rootDir, realFile);
+        return rel && !rel.startsWith("..") && !path.isAbsolute(rel);
+      });
+      if (!allowed) {
+        throw Object.assign(new Error("附件路径不在交流核心获准目录内"), { code: "RELAY_FILE_CALLER_DENIED" });
+      }
+      out.push({ name: item.name, filePath: realFile });
+    }
+    return out;
+  };
+}
+
+if (fileBundleTrustedCoreEnabled && relayService) {
+  const integrationModulePath = path.join(__dirname, "file-bundle-integration.mjs");
+  if (fs.existsSync(integrationModulePath)) {
+    const { openFileBundleIntegration } = await import(pathToFileURL(integrationModulePath).href);
+    let localMachineForBundle = process.env.NAPCAT_LOCAL_MACHINE || "";
+    try {
+      const relayCfg = loadAndValidateRelayConfig({ bindingPath: notifier.bindingPath, env: process.env });
+      if (relayCfg?.local_machine_id) localMachineForBundle = relayCfg.local_machine_id;
+    } catch {
+      try {
+        const rawBinding = JSON.parse(fs.readFileSync(notifier.bindingPath, "utf8"));
+        if (rawBinding?.controlPlane?.localMachine) localMachineForBundle = String(rawBinding.controlPlane.localMachine);
+      } catch {}
+    }
+    if (!localMachineForBundle) {
+      console.error("[napcat-mcp] 未检测到有效的 local_machine_id（relay-groups.json / binding.json / NAPCAT_LOCAL_MACHINE 均缺失），已安全跳过挂载文件包入口");
+    }
+    if (localMachineForBundle) {
+    const bundleRoot = process.env.NAPCAT_RELAY_FILE_BUNDLE_ROOT
+      || path.join(path.dirname(notifier.bindingPath), "state", "comm-file-bundle");
+    fs.mkdirSync(bundleRoot, { recursive: true, mode: 0o700 });
+    const downloadOrigins = (process.env.NAPCAT_RELAY_FILE_BUNDLE_DOWNLOAD_ORIGINS || "")
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean);
+    const relayHost = createFileBundleRelayHost({ notifier, relayService, env: process.env });
+    fileBundleIntegration = await openFileBundleIntegration({
+      enabled: true,
+      authorizeInvocation: async (_tool, ctx) => ctx?.trusted === fileBundleTrustedToken,
+      resolveAttachments: createAllowedAttachmentResolver(
+        parseAllowedAttachmentRoots(process.env.NAPCAT_RELAY_FILE_BUNDLE_ALLOWED_ATTACHMENT_ROOTS),
+      ),
+      relay: relayHost,
+      runtimeOptions: {
+        localMachine: localMachineForBundle,
+        privateRoot: bundleRoot,
+        oneBot: {
+          callOneBot: (action, params, opts) => relayHost.callOneBot(action, params, opts),
+          downloadOrigins,
+        },
+      },
+    });
+    let bundleClosed = false;
+    const closeBundleOnExit = () => {
+      if (bundleClosed) return;
+      bundleClosed = true;
+      try { fileBundleIntegration?.close?.(); } catch {}
+    };
+    process.once("SIGINT", closeBundleOnExit);
+    process.once("SIGTERM", closeBundleOnExit);
+    process.stdin.once("end", closeBundleOnExit);
+    process.stdin.once("close", closeBundleOnExit);
+    }
+  }
+}
+
 const server = new Server(
   { name: "codex-napcat-training-notifier", version: "0.3.18" },
   {
@@ -807,7 +1013,15 @@ const server = new Server(
   },
 );
 
-server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools }));
+server.setRequestHandler(ListToolsRequestSchema, async () => {
+  if (!relayTrustedCoreEnabled) return { tools };
+  const extraTools = [...relayTools];
+  if (fileBundleIntegration) {
+    const bundleVisible = await fileBundleIntegration.listTools({ trusted: fileBundleTrustedToken });
+    extraTools.push(...bundleVisible);
+  }
+  return { tools: [...tools, ...extraTools] };
+});
 
 server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
   const name = request.params.name;
@@ -1001,6 +1215,26 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
     }
     if (name === "napcat_send_configured_chat_file") {
       return textResult({ ok: true, ...(await notifier.sendConfiguredChatFile(args)) });
+    }
+    if (relayTrustedCoreEnabled && relayService) {
+      if (name === "napcat_relay_status") {
+        return textResult({ ok: true, ...(await relayService.relayStatus(args, { signal: extra?.signal })) });
+      }
+      if (name === "napcat_relay_send") {
+        return textResult({ ok: true, ...(await relayService.relaySend(args, { signal: extra?.signal })) });
+      }
+      if (name === "napcat_relay_poll") {
+        return textResult({ ok: true, ...(await relayService.relayPoll(args, { signal: extra?.signal })) });
+      }
+      if (name === "napcat_relay_events_read") {
+        return textResult({ ok: true, ...(await relayService.relayEventsRead(args)) });
+      }
+      if (fileBundleIntegration && fileBundleToolNames.has(name)) {
+        return textResult(await fileBundleIntegration.invoke(name, args, {
+          trusted: fileBundleTrustedToken,
+          signal: extra?.signal,
+        }));
+      }
     }
     throw new NapCatNotifierError("UNKNOWN_TOOL", `未知工具：${name}`);
   } catch (error) {

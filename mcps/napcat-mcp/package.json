@@ -1,16 +1,16 @@
 {
-  "name": "codex-napcat-training-notifier",
-  "version": "0.3.18",
-  "private": true,
-  "type": "module",
-  "scripts": {
-    "check": "node --check src/atomic-file.mjs && node --check src/bounded-jsonl-log.mjs && node --check src/observability-utils.mjs && node --check src/turn-observability.mjs && node --check src/core.mjs && node --check src/index.mjs && node --check src/heartbeat.mjs && node --check src/heartbeat-runner.mjs && node --check src/task-registry.mjs && node --check src/control-state.mjs && node --check src/machine-role.mjs && node --check src/control-plane.mjs && node --check src/task-router.mjs && node --check src/task-router-controller.mjs && node --check src/task-router-runner.mjs && node --check src/codex-thread-bridge.mjs && node --check src/codex-app-server-proxy.mjs && node --check src/codex-app-server-proxy-runner.mjs && node --check src/codex-app-tools-compat-launcher.mjs && node --check src/codex-model-stream-proxy.mjs && node --check src/codex-stream-recovery.mjs && node --check src/codex-model-stream-proxy-runner.mjs && node --check src/supervisor-runner.mjs && node --check src/napcat-offline-recovery.mjs && node --check src/stale-sent-wake-rearm.mjs && node --check ops/rearm-stale-sent-wake.mjs && node --check src/adaptive-delivery.mjs && node --check src/tool-preparation-deadline.mjs && node --check src/partial-response-progress.mjs && node --check src/tool-delivery-profile.mjs && node --check src/reasoning-progress.mjs",
-    "test": "node --test --test-concurrency=2 test/*.test.mjs"
-  },
-  "dependencies": {
-    "ws": "^8.20.0"
-  },
-  "engines": {
-    "node": ">=18"
-  }
+    "name":  "codex-napcat-training-notifier",
+    "version":  "0.3.18",
+    "private":  true,
+    "type":  "module",
+    "scripts":  {
+                    "check":  "node --check src/atomic-file.mjs \u0026\u0026 node --check src/bounded-jsonl-log.mjs \u0026\u0026 node --check src/observability-utils.mjs \u0026\u0026 node --check src/turn-observability.mjs \u0026\u0026 node --check src/core.mjs \u0026\u0026 node --check src/index.mjs \u0026\u0026 node --check src/heartbeat.mjs \u0026\u0026 node --check src/heartbeat-runner.mjs \u0026\u0026 node --check src/task-registry.mjs \u0026\u0026 node --check src/control-state.mjs \u0026\u0026 node --check src/machine-role.mjs \u0026\u0026 node --check src/control-plane.mjs \u0026\u0026 node --check src/task-router.mjs \u0026\u0026 node --check src/task-router-controller.mjs \u0026\u0026 node --check src/task-router-runner.mjs \u0026\u0026 node --check src/codex-thread-bridge.mjs \u0026\u0026 node --check src/codex-app-server-proxy.mjs \u0026\u0026 node --check src/codex-app-server-proxy-runner.mjs \u0026\u0026 node --check src/codex-app-tools-compat-launcher.mjs \u0026\u0026 node --check src/codex-model-stream-proxy.mjs \u0026\u0026 node --check src/codex-stream-recovery.mjs \u0026\u0026 node --check src/codex-model-stream-proxy-runner.mjs \u0026\u0026 node --check src/supervisor-runner.mjs \u0026\u0026 node --check src/napcat-offline-recovery.mjs \u0026\u0026 node --check src/stale-sent-wake-rearm.mjs \u0026\u0026 node --check ops/rearm-stale-sent-wake.mjs \u0026\u0026 node --check src/adaptive-delivery.mjs \u0026\u0026 node --check src/tool-preparation-deadline.mjs \u0026\u0026 node --check src/partial-response-progress.mjs \u0026\u0026 node --check src/tool-delivery-profile.mjs \u0026\u0026 node --check src/reasoning-progress.mjs \u0026\u0026 node --check src/relay-groups.mjs \u0026\u0026 node --check src/relay-frame.mjs \u0026\u0026 node --check src/relay-state.mjs \u0026\u0026 node --check src/relay-service.mjs \u0026\u0026 node --check src/relay-file-bundle-bridge.mjs \u0026\u0026 node --check src/file-bundle-capacity.mjs \u0026\u0026 node --check src/file-bundle-codec.mjs \u0026\u0026 node --check src/file-bundle-consumer.mjs \u0026\u0026 node --check src/file-bundle-endpoint.mjs \u0026\u0026 node --check src/file-bundle-integration.mjs \u0026\u0026 node --check src/file-bundle-journal.mjs \u0026\u0026 node --check src/file-bundle-onebot.mjs \u0026\u0026 node --check src/file-bundle-quota.mjs \u0026\u0026 node --check src/file-bundle-relay-binding.mjs \u0026\u0026 node --check src/file-bundle-runtime.mjs \u0026\u0026 node --check src/file-bundle-transfer.mjs",
+                    "test":  "node --test --test-concurrency=2 test/*.test.mjs"
+                },
+    "dependencies":  {
+                         "ws":  "^8.20.0"
+                     },
+    "engines":  {
+                    "node":  "\u003e=18"
+                }
 }

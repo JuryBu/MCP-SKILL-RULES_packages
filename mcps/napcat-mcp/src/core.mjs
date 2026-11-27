@@ -1250,6 +1250,7 @@ export function createNapCatNotifier(options = {}) {
         },
         body: JSON.stringify(params),
         signal: controller.signal,
+        ...(context?.rejectRedirect === true ? { redirect: "error" } : {}),
       }));
       const responseText = await wait(() => response.text());
       let envelope;
@@ -3655,6 +3656,261 @@ export function createNapCatNotifier(options = {}) {
     ErrorClass: NapCatNotifierError,
   });
 
+  function oneBotRelayFullText(message) {
+    const MAX_RELAY_RAW_CHARS = 65536;
+    if (Array.isArray(message?.message)) {
+      const joined = message.message.map((segment) => {
+        if (typeof segment === "string") return segment;
+        if (segment?.type === "text") return String(segment?.data?.text ?? "");
+        return "";
+      }).join("");
+      if (joined) return joined.slice(0, MAX_RELAY_RAW_CHARS);
+    }
+    if (typeof message?.raw_message === "string" && message.raw_message) {
+      return decodeCqValue(message.raw_message).slice(0, MAX_RELAY_RAW_CHARS);
+    }
+    if (typeof message?.message === "string" && message.message) {
+      return decodeCqValue(message.message).slice(0, MAX_RELAY_RAW_CHARS);
+    }
+    return "";
+  }
+
+  function summarizeRelayHistoryMessage(message, expectedSelfId) {
+    const timestamp = Number(message?.time ?? 0);
+    const senderId = String(message?.sender?.user_id ?? message?.user_id ?? "");
+    const postType = String(message?.post_type ?? "").trim();
+    const messageSentType = String(message?.message_sent_type ?? "").trim();
+    const explicitSelf = postType === "message_sent" || messageSentType === "self";
+    return {
+      messageId: String(message?.message_id ?? ""),
+      messageSeq: String(message?.message_seq ?? message?.message_id ?? ""),
+      realSeq: String(message?.real_seq ?? "").trim(),
+      time: Number.isFinite(timestamp) && timestamp > 0 ? new Date(timestamp * 1000).toISOString() : null,
+      senderId,
+      isSelf: Boolean((expectedSelfId && senderId === String(expectedSelfId)) || explicitSelf),
+      postType,
+      messageSentType,
+      text: oneBotRelayFullText(message),
+    };
+  }
+
+  async function callOneBotRelay(action, params = {}, optionsOrTimeout = {}) {
+    if (typeof optionsOrTimeout === "number") {
+      return callOneBot(action, params, optionsOrTimeout, { rejectRedirect: true });
+    }
+    const opts = optionsOrTimeout && typeof optionsOrTimeout === "object" ? optionsOrTimeout : {};
+    const reqTimeout = Number.isSafeInteger(opts.timeoutMs) && opts.timeoutMs > 0 ? opts.timeoutMs : timeoutMs;
+    return callOneBot(action, params, reqTimeout, {
+      ...(opts.signal ? { signal: opts.signal } : {}),
+      rejectRedirect: opts.rejectRedirect !== false,
+    });
+  }
+
+  async function relayVerifyAccountOnline(expectedSelfId, options = {}) {
+    const normalizedExpected = String(expectedSelfId ?? "").trim();
+    if (!normalizedExpected) {
+      throw new NapCatNotifierError("SELF_ID_MISSING", "中继账号核验必须提供有效的 expectedSelfId");
+    }
+    const runtimeStatus = await callOneBotRelay("get_status", {}, options);
+    if (runtimeStatus?.online !== true || runtimeStatus?.good !== true) {
+      throw new NapCatNotifierError("NAPCAT_NOT_READY", "NapCat 当前不在线或状态异常");
+    }
+    const loginInfo = await callOneBotRelay("get_login_info", {}, options);
+    const actualSelfId = String(loginInfo?.user_id ?? loginInfo?.self_id ?? "");
+    const actualNickname = String(loginInfo?.nickname ?? "");
+    if (actualSelfId !== normalizedExpected) {
+      throw new NapCatNotifierError("SELF_ID_MISMATCH", "当前 NapCat 登录账号与期望账号不一致", {
+        details: { expectedSelfId: normalizedExpected, actualSelfId },
+      });
+    }
+    return { runtimeStatus, actualSelfId, actualNickname };
+  }
+
+  async function relayVerifyGroupIdentity({
+    groupId,
+    expectedGroupName = "",
+    expectedMemberCount = null,
+    verifyMemberCount = false,
+  }, options = {}) {
+    if (verifyMemberCount === true && (!Number.isSafeInteger(expectedMemberCount) || expectedMemberCount < 1)) {
+      throw new NapCatNotifierError("GROUP_MEMBER_COUNT_MISSING", "启用 verifyMemberCount 时必须提供正整数 expectedMemberCount", {
+        details: { groupId: String(groupId) },
+      });
+    }
+    const groupInfo = await callOneBotRelay("get_group_info", { group_id: String(groupId), no_cache: true }, options);
+    const actualGroupId = String(groupInfo?.group_id ?? "");
+    const actualGroupName = String(groupInfo?.group_name ?? "");
+    const actualMemberCount = Number(groupInfo?.member_count ?? 0);
+    if (actualGroupId !== String(groupId)) {
+      throw new NapCatNotifierError("GROUP_ID_MISMATCH", "OneBot 返回的群号与中继配置不一致", {
+        details: { expected: String(groupId), actual: actualGroupId },
+      });
+    }
+    if (expectedGroupName && actualGroupName !== expectedGroupName) {
+      throw new NapCatNotifierError("GROUP_NAME_MISMATCH", "目标中继群名与配置不一致", {
+        details: { expected: expectedGroupName, actual: actualGroupName },
+      });
+    }
+    if (verifyMemberCount === true && actualMemberCount !== expectedMemberCount) {
+      throw new NapCatNotifierError("GROUP_MEMBER_COUNT_MISMATCH", "目标中继群成员数与配置不一致", {
+        details: { expected: expectedMemberCount, actual: actualMemberCount },
+      });
+    }
+    return { actualGroupId, actualGroupName, actualMemberCount };
+  }
+
+  async function relayReadGroupHistoryMultiPage(groupId, maxPages = 10, expectedSelfId = "", options = {}) {
+    const PAGE_SIZE = 50;
+    const effectiveMaxPages = Math.max(1, Math.min(50, Number(maxPages) || 10));
+    const shouldStopAfterPage = typeof options?.shouldStopAfterPage === "function" ? options.shouldStopAfterPage : null;
+    const messagesByKey = new Map();
+    const seenCursors = new Set();
+    let cursor = "";
+    let pagesScanned = 0;
+    let stopReason = "page_limit_reached";
+    while (pagesScanned < effectiveMaxPages) {
+      options?.signal?.throwIfAborted?.();
+      const history = await callOneBotRelay("get_group_msg_history", {
+        group_id: String(groupId),
+        ...(cursor ? { message_seq: cursor } : {}),
+        count: PAGE_SIZE,
+        reverse_order: false,
+        disable_get_url: true,
+        parse_mult_msg: false,
+        quick_reply: false,
+      }, options);
+      const rawMessages = Array.isArray(history?.messages) ? history.messages : [];
+      const page = rawMessages.map((msg) => summarizeRelayHistoryMessage(msg, expectedSelfId));
+      pagesScanned += 1;
+      let added = 0;
+      for (const message of page) {
+        const key = `${message.messageId}\0${message.messageSeq}\0${message.realSeq}\0${message.time}`;
+        if (messagesByKey.has(key)) continue;
+        messagesByKey.set(key, message);
+        added += 1;
+      }
+      if (!page.length || added === 0 || rawMessages.length < PAGE_SIZE) {
+        stopReason = "history_exhausted";
+        break;
+      }
+      if (shouldStopAfterPage && shouldStopAfterPage(page) === true) {
+        stopReason = "anchor_or_bootstrap_reached";
+        break;
+      }
+      const numericMessageSeqs = page
+        .map((message) => numericRealSeq(message.messageSeq))
+        .filter((value) => value !== null);
+      const nextCursor = numericMessageSeqs.length ? String(Math.min(...numericMessageSeqs)) : "";
+      const currentCursor = numericRealSeq(cursor);
+      if (
+        !nextCursor
+        || seenCursors.has(nextCursor)
+        || (currentCursor !== null && Number(nextCursor) >= currentCursor)
+      ) {
+        stopReason = "missing_or_repeated_cursor";
+        break;
+      }
+      seenCursors.add(nextCursor);
+      cursor = nextCursor;
+    }
+    return {
+      messages: [...messagesByKey.values()],
+      pagesScanned,
+      stopReason,
+    };
+  }
+
+  async function relayCaptureGroupHistoryCheckpoint(groupId, expectedSelfId = "", options = {}) {
+    const history = await callOneBotRelay("get_group_msg_history", {
+      group_id: String(groupId),
+      count: 50,
+      reverse_order: false,
+      disable_get_url: true,
+      parse_mult_msg: false,
+      quick_reply: false,
+    }, options);
+    const rawMessages = Array.isArray(history?.messages) ? history.messages : [];
+    const messages = rawMessages.map((msg) => summarizeRelayHistoryMessage(msg, expectedSelfId));
+    const realSeqValues = messages
+      .map((message) => numericRealSeq(message.realSeq))
+      .filter((value) => value !== null);
+    return {
+      maxRealSeq: realSeqValues.length ? Math.max(...realSeqValues) : null,
+      messageCount: messages.length,
+    };
+  }
+
+  async function relayVerifyGroupHistoryDelivery(
+    groupId,
+    expectedMessage,
+    expectedMessageId,
+    checkpoint,
+    expectedSelfId,
+    options = {},
+  ) {
+    const history = await callOneBotRelay("get_group_msg_history", {
+      group_id: String(groupId),
+      count: 50,
+      reverse_order: false,
+      disable_get_url: true,
+      parse_mult_msg: false,
+      quick_reply: false,
+    }, options);
+    const rawMessages = Array.isArray(history?.messages) ? history.messages : [];
+    const messages = rawMessages.map((msg) => summarizeRelayHistoryMessage(msg, expectedSelfId));
+    const normalizeLineEndings = (v) => String(v ?? "").replace(/\r\n?/g, "\n");
+    const expectedNorm = normalizeLineEndings(expectedMessage);
+    const candidate = messages.find((message) =>
+      message.messageId === String(expectedMessageId)
+      && normalizeLineEndings(message.text) === expectedNorm
+    );
+    if (!candidate) {
+      throw new NapCatNotifierError("MESSAGE_VERIFY_HISTORY_MISSING", "中继群历史没有找到本次消息的完整独立记录");
+    }
+    if (candidate.senderId && expectedSelfId && candidate.senderId !== String(expectedSelfId)) {
+      throw new NapCatNotifierError("MESSAGE_VERIFY_HISTORY_SENDER_MISMATCH", "中继群历史中的匹配消息属于另一个发送账号");
+    }
+    if (!candidate.isSelf) {
+      throw new NapCatNotifierError("MESSAGE_VERIFY_HISTORY_NOT_SELF", "中继群历史中的匹配消息不是当前 OneBot 账号的发送记录");
+    }
+    const beforeRealSeq = numericRealSeq(checkpoint?.maxRealSeq);
+    const deliveredRealSeq = numericRealSeq(candidate.realSeq);
+    const emptyHistoryCheckpoint = Number(checkpoint?.messageCount) === 0;
+    const realSeqAdvanced = deliveredRealSeq !== null
+      && (beforeRealSeq === null ? emptyHistoryCheckpoint : deliveredRealSeq > beforeRealSeq);
+    if (!realSeqAdvanced) {
+      throw new NapCatNotifierError("MESSAGE_VERIFY_HISTORY_NOT_VISIBLE", "中继群历史仅见本地回显且真实序号未前进", {
+        details: {
+          realSeqBefore: beforeRealSeq,
+          deliveredRealSeq,
+          postType: candidate.postType,
+          messageSentType: candidate.messageSentType,
+        },
+      });
+    }
+    return {
+      evidence: beforeRealSeq === null
+        ? "onebot_action_and_first_self_history_record"
+        : "onebot_action_and_self_history_sequence_advanced",
+      realSeqAdvanced,
+      realSeqBefore: beforeRealSeq,
+      deliveredRealSeq,
+      messageSeq: candidate.messageSeq,
+      postType: candidate.postType,
+      messageSentType: candidate.messageSentType,
+    };
+  }
+
+  const relayTransport = {
+    callOneBot: callOneBotRelay,
+    verifyAccountOnline: relayVerifyAccountOnline,
+    verifyGroupIdentity: relayVerifyGroupIdentity,
+    captureGroupHistoryCheckpoint: relayCaptureGroupHistoryCheckpoint,
+    getGroupLatestRealSeq: relayCaptureGroupHistoryCheckpoint,
+    verifyGroupHistoryDelivery: relayVerifyGroupHistoryDelivery,
+    readGroupHistoryMultiPage: relayReadGroupHistoryMultiPage,
+  };
+
   return {
     bindingPath,
     statePath,
@@ -3682,5 +3938,18 @@ export function createNapCatNotifier(options = {}) {
     sendConfiguredFile,
     sendChatFile,
     sendConfiguredChatFile,
+    _relayTransport: relayTransport,
+  };
+}
+
+export function inspectLegacyTaskMetadata(text) {
+  return structuredTaskMetadata(text);
+}
+
+export function inspectLegacyParsers(text, rawOneBotMessage = null) {
+  return {
+    taskMetadata: structuredTaskMetadata(text),
+    fileIndex: taskFileIndexMetadata(text),
+    controlSegments: oneBotControlSegments(rawOneBotMessage ?? { raw_message: text, message: [{ type: "text", data: { text } }] }),
   };
 }
