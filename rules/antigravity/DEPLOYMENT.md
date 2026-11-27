@@ -22,7 +22,7 @@ Antigravity 2.0（`oneharness` 架构）对规则文件有两道硬性限制：
 | `guidance/design-writing.template.md` | `%USERPROFILE%\.gemini\guidance\design-writing.md` | 前端、3D、海报、PPT、正式文书创作前按需读取（中性底稿） |
 | `guidance/web-visual.template.md` | `%USERPROFILE%\.gemini\guidance\web-visual.md` | 多模态原生直读（图/视频/音频/大 PDF 切页）、浏览器交互、登录墙与 `file://` 预览前按需读取 |
 | `guidance/maintenance-upgrades.template.md` | `%USERPROFILE%\.gemini\guidance\maintenance-upgrades.md` | 改配置、写回退脚本、本地 Git 提交与共享仓脱敏同步前按需读取 |
-| `skills/tools-reference/SKILL.template.md` | `%USERPROFILE%\.gemini\antigravity\skills\tools-reference\SKILL.md` | 调 Lazy MCP、`read_file` 多模态/`update_steps`、跨端读原文、`10 KiB` 落盘与 `512k/5m0s` 压缩前按需读取（`< 24,000 bytes`） |
+| `skills/tools-reference/SKILL.template.md` | `%USERPROFILE%\.gemini\antigravity\skills\tools-reference\SKILL.md` | 调 Lazy MCP、`sandbox_launch`、`10 KiB` 落盘、跨端读原文、`swarm` 覆盖与 `512k/5m0s` 压缩前按需读取（`< 24,000 bytes`） |
 | `local-care.example.md` | `%USERPROFILE%\.gemini\guidance\personal-care.local.md`（可选） | **仅在仓库外自建**；存放个人偏好、通知路由、作息与私有素材库路径，严禁入 Git（构建/安装脚本拒收直接传入示例原件） |
 | *(仓库外可选自建，无公开模板)* | `%USERPROFILE%\.gemini\guidance\account-status.local.md`（可选） | 若本机装有本地只读账号/步数监控 CLI，可在仓库外自建私有专题供 `GEMINI.md` 入口按需引用，严禁入 Git |
 
@@ -45,7 +45,7 @@ Antigravity 2.0（`oneharness` 架构）对规则文件有两道硬性限制：
 # 4. 仅离线构建到指定目录审阅差异（可选 -KeepTemplatePlaceholders 保留 C:/Users/<USER> 占位符）
 .\install\Build-AntigravityRulesProfile.ps1 -Profile neutral -OutputDirectory "$env:TEMP\agy-neutral-preview"
 
-# 5. 运行双版本自动化门禁测试（实测双版本构建/隔离安装、20 字符长用户名膨胀 < 24,000 B、人格隔离、逐字一致与严格脱敏）
+# 5. 运行双版本自动化门禁测试（实测双版本构建/隔离安装/回退、20/30 字符含空格用户名膨胀与呼吸余量 <= 18,000 B、人格隔离、逐字一致、反旧毒句复辟与三层解码脱敏）
 .\install\Test-AntigravityRulesProfiles.ps1
 ```
 
@@ -76,4 +76,4 @@ Get-ChildItem -LiteralPath $PreviewDir -Recurse -File | Select-Object FullName, 
    - **双机角色标记（多机用户必配）**：若同时维护开发机（`development`）与训练机（`training`），安装后请在各自机器的 `%USERPROFILE%\.gemini\GEMINI.md` 第七节及仓库外的 `%USERPROFILE%\.gemini\guidance\personal-care.local.md` 中明确标出本机 `local_role`（使助手清楚自己是「开发机的反重力」还是「训练机的反重力」，并在 Git 提交时分别使用 `[Antigravity/dev]` 与 `[Antigravity/training]` 正交双标，不混用署名）。后续若训练机需增加条件式训练监督规则，建议独立存为 `guidance\training-machine.md` 并配对应变体清单按需读取，不覆盖跨机共享的核心组件。
    - **风格切换与模型/MCP 列表**：随时可通过重跑 `Install-AntigravityRulesProfile.ps1 -Profile catgirl|neutral` 无损切换猫娘版与中性版（旧版自动备份，私有 `.local.md` 原样保留）；并按实际订阅与 `templates/config.antigravity.example.json` 调整可用模型档位与 MCP 服务（未配 `exa` 时自动降级 `search_web`；启用 `communication-core` 时在私有门面配置登记宿主统一连接或会话绑定）。
 2. **生效验证**：
-   - 保存后在 Antigravity 2.0 新开一条对话（无需重启宿主），用一个纯只读小问题验证：让助手确认已注入 `GEMINI.md`（2.0 双版本模块化版），复述本机机器角色（若已配置 `development` / `training`）及对应 Git 双标格式、单文件 `24,000 bytes` 预算线、`call_mcp_tool` `10 KiB` 落盘位置、`communication-core` 十一工具调用红线、`update_steps` 多步实时更新与收尾全标 `done`/`skipped` 规范、`schedule` 双模式与真·完全并行先完先检铁律、单端主攻 `plans_agy/` 隔离与进度表去内部代号要求、Gemini `read_file` 原生多模态直读与超大 PDF `PyMuPDF` 切页/`150 DPI` 瘦身规范，以及压缩/中断恢复找回已撤前置与原生日志 `USER_INPUT` 代理封套甄别红线。
+   - 保存后在 Antigravity 2.0 新开一条对话（无需重启宿主），用一个纯只读小问题验证：让助手确认已注入 `GEMINI.md`（2.0 双版本模块化版），复述第〇节人味/常识与真解决问题元原则、本机机器角色（若已配置 `development` / `training`）与「已授权仓库职责 × 动作效果」Git 分层规则、真实验收反形式主义红线、单文件 `24,000 bytes` 预算线与呼吸余量、`call_mcp_tool` `10 KiB` 落盘与 `communication-core` 十一工具硬契约、`update_steps` 与 `schedule` 防断收口、Gemini `read_file` 原生多模态直读与超大 PDF `PyMuPDF`/`150 DPI` 规范，以及压缩双锚点原文回读与 `USER_INPUT` 代理封套甄别。
