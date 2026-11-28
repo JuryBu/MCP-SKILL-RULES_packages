@@ -632,44 +632,52 @@ function structuredTaskMetadata(text) {
     nextCheckAt: "",
   };
   const normalizedText = normalizeComparableText(text);
-  const firstLine = normalizedText.split("\n").find((line) => line.trim())?.trim() ?? "";
+  const lines = normalizedText.split("\n");
+  const firstLine = lines.find((line) => line.trim())?.trim() ?? "";
   if (firstLine === "[COMM_RELAY_V1]") return metadata;
   if (firstLine === "[Codex][CONNECTION_REQUEST]") metadata.messageType = "connection_request";
   else if (firstLine === "[Codex][DELIVERY_RECEIPT]") metadata.messageType = "delivery_receipt";
   else if (firstLine === "[Codex][OWNER_REPLY]") metadata.messageType = "owner_reply";
-  for (const line of normalizedText.split("\n")) {
+  let replyRequiredSeen = false;
+  for (const line of lines) {
+    if (/^(?:正文|摘要)\s*[：:]/.test(line)) break;
+    if (metadata.messageType === "connection_request" && /^说明\s*[：:]/.test(line)) break;
+    if (metadata.messageType === "delivery_receipt" && /^兼容提醒\s*[：:]/.test(line)) break;
     const taskMatch = line.match(/^(?:任务|task_id)\s*[：:]\s*(.+)$/i);
-    if (taskMatch) metadata.taskId = taskMatch[1].trim().slice(0, 128);
+    if (taskMatch && !metadata.taskId) metadata.taskId = taskMatch[1].trim().slice(0, 128);
     const sourceMatch = line.match(/^(?:来源机器|source_machine)\s*[：:]\s*(.+)$/i);
-    if (sourceMatch) metadata.sourceMachine = sourceMatch[1].trim().slice(0, 64);
+    if (sourceMatch && !metadata.sourceMachine) metadata.sourceMachine = sourceMatch[1].trim().slice(0, 64);
     const targetMatch = line.match(/^(?:目标机器|target_machine)\s*[：:]\s*(.+)$/i);
-    if (targetMatch) metadata.targetMachine = targetMatch[1].trim().slice(0, 64);
+    if (targetMatch && !metadata.targetMachine) metadata.targetMachine = targetMatch[1].trim().slice(0, 64);
     const deliveryMatch = line.match(/^delivery_id\s*[：:]\s*(.+)$/i);
-    if (deliveryMatch) metadata.deliveryId = deliveryMatch[1].trim().slice(0, 128);
+    if (deliveryMatch && !metadata.deliveryId) metadata.deliveryId = deliveryMatch[1].trim().slice(0, 128);
     const requestMatch = line.match(/^request_id\s*[：:]\s*(.+)$/i);
-    if (requestMatch) metadata.requestId = requestMatch[1].trim().slice(0, 128);
+    if (requestMatch && !metadata.requestId) metadata.requestId = requestMatch[1].trim().slice(0, 128);
     const sourceConversationMatch = line.match(/^source_conversation_id\s*[：:]\s*(.+)$/i);
-    if (sourceConversationMatch) metadata.sourceConversationId = sourceConversationMatch[1].trim().slice(0, 256);
+    if (sourceConversationMatch && !metadata.sourceConversationId) metadata.sourceConversationId = sourceConversationMatch[1].trim().slice(0, 256);
     const conversationMatch = line.match(/^target_conversation_id\s*[：:]\s*(.+)$/i);
-    if (conversationMatch) metadata.targetConversationId = conversationMatch[1].trim().slice(0, 256);
+    if (conversationMatch && !metadata.targetConversationId) metadata.targetConversationId = conversationMatch[1].trim().slice(0, 256);
     const receiptMatch = line.match(/^receipt_stage\s*[：:]\s*(.+)$/i);
-    if (receiptMatch) metadata.receiptStage = receiptMatch[1].trim().slice(0, 64);
+    if (receiptMatch && !metadata.receiptStage) metadata.receiptStage = receiptMatch[1].trim().slice(0, 64);
     const deliverySequenceMatch = line.match(/^delivery_message_seq\s*[：:]\s*(.+)$/i);
-    if (deliverySequenceMatch) metadata.deliveryMessageSeq = deliverySequenceMatch[1].trim().slice(0, 64);
+    if (deliverySequenceMatch && !metadata.deliveryMessageSeq) metadata.deliveryMessageSeq = deliverySequenceMatch[1].trim().slice(0, 64);
     const proposedTaskMatch = line.match(/^proposed_task_id\s*[：:]\s*(.+)$/i);
-    if (proposedTaskMatch) metadata.proposedTaskId = proposedTaskMatch[1].trim().slice(0, 128);
+    if (proposedTaskMatch && !metadata.proposedTaskId) metadata.proposedTaskId = proposedTaskMatch[1].trim().slice(0, 128);
     const previousTaskMatch = line.match(/^previous_task_id\s*[：:]\s*(.+)$/i);
-    if (previousTaskMatch) metadata.previousTaskId = previousTaskMatch[1].trim().slice(0, 128);
+    if (previousTaskMatch && !metadata.previousTaskId) metadata.previousTaskId = previousTaskMatch[1].trim().slice(0, 128);
     const routeMatch = line.match(/^(?:route_key|路由)\s*[：:]\s*(.+)$/i);
-    if (routeMatch) metadata.routeKey = routeMatch[1].trim().slice(0, 256);
+    if (routeMatch && !metadata.routeKey) metadata.routeKey = routeMatch[1].trim().slice(0, 256);
     const replyRequiredMatch = line.match(/^reply_required\s*[：:]\s*(true|false)$/i);
-    if (replyRequiredMatch) metadata.replyRequired = replyRequiredMatch[1].toLowerCase() === "true";
+    if (replyRequiredMatch && !replyRequiredSeen) {
+      replyRequiredSeen = true;
+      metadata.replyRequired = replyRequiredMatch[1].toLowerCase() === "true";
+    }
     const expectedReplyMatch = line.match(/^expected_reply\s*[：:]\s*(.+)$/i);
-    if (expectedReplyMatch) metadata.expectedReply = expectedReplyMatch[1].trim().slice(0, 240);
+    if (expectedReplyMatch && !metadata.expectedReply) metadata.expectedReply = expectedReplyMatch[1].trim().slice(0, 240);
     const replyDeadlineMatch = line.match(/^reply_deadline_at\s*[：:]\s*(.+)$/i);
-    if (replyDeadlineMatch) metadata.replyDeadlineAt = replyDeadlineMatch[1].trim().slice(0, 64);
+    if (replyDeadlineMatch && !metadata.replyDeadlineAt) metadata.replyDeadlineAt = replyDeadlineMatch[1].trim().slice(0, 64);
     const nextCheckMatch = line.match(/^next_check_at\s*[：:]\s*(.+)$/i);
-    if (nextCheckMatch) metadata.nextCheckAt = nextCheckMatch[1].trim().slice(0, 64);
+    if (nextCheckMatch && !metadata.nextCheckAt) metadata.nextCheckAt = nextCheckMatch[1].trim().slice(0, 64);
   }
   return metadata;
 }

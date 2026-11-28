@@ -674,6 +674,7 @@ export async function runTaskRouterService(options = {}) {
   let failureCount = 0;
   let scanCount = 0;
   let lastMaintenanceFingerprint = null;
+  let lastMalformedFingerprint = null;
 
   const persist = (patch) => {
     status = { ...status, ...patch, updatedAt: nowIso(now) };
@@ -806,6 +807,32 @@ export async function runTaskRouterService(options = {}) {
           keepAlive,
           wakeCount: Number(scanResult?.wakeCount ?? 0),
         }, fsImpl);
+        const skippedMalformed = Array.isArray(scanResult?.results)
+          ? scanResult.results.flatMap((result) => (Array.isArray(result?.skippedMalformedMessages)
+            ? result.skippedMalformedMessages.map((item) => ({
+                taskId: result.taskId ?? null,
+                messageSeq: item.messageSeq ?? null,
+                messageAt: item.messageAt ?? null,
+                code: item.code ?? "INVALID_ARGUMENT",
+                reason: item.reason ?? "malformed_message",
+              }))
+            : []))
+          : [];
+        if (skippedMalformed.length > 0) {
+          const malformedFingerprint = JSON.stringify(skippedMalformed);
+          if (malformedFingerprint !== lastMalformedFingerprint) {
+            appendLog(logPath, {
+              at: scanAt,
+              type: "malformed_messages_skipped",
+              pid,
+              count: skippedMalformed.length,
+              items: skippedMalformed.slice(0, 20),
+            }, fsImpl);
+            lastMalformedFingerprint = malformedFingerprint;
+          }
+        } else {
+          lastMalformedFingerprint = null;
+        }
         if (openTaskCount === 0 && !keepAlive) {
           stopReason = "no_open_tasks";
           break;

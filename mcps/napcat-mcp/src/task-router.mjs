@@ -92,6 +92,90 @@ function publicError(error) {
   };
 }
 
+function buildObservedMessageInput(message) {
+  const expectedReply = message.expectedReply === undefined || message.expectedReply === null
+    ? null
+    : String(message.expectedReply).trim() || null;
+  const replyDeadlineAt = message.replyDeadlineAt === undefined || message.replyDeadlineAt === null
+    ? null
+    : String(message.replyDeadlineAt).trim() || null;
+  const nextCheckAt = message.nextCheckAt === undefined || message.nextCheckAt === null
+    ? null
+    : String(message.nextCheckAt).trim() || null;
+  return {
+    messageSeq: messageSequence(message),
+    messageAt: message.time,
+    replyRequired: message.replyRequired === true,
+    expectedReply,
+    replyDeadlineAt,
+    nextCheckAt,
+  };
+}
+
+function validateObservedMessageInput(entry) {
+  if (typeof entry.replyRequired !== "boolean") return "replyRequired 必须是布尔值";
+  if (entry.expectedReply !== null && entry.expectedReply.length > 240) {
+    return "expectedReply 不能超过 240 个字符";
+  }
+  if (entry.replyDeadlineAt !== null && !Number.isFinite(Date.parse(entry.replyDeadlineAt))) {
+    return "replyDeadlineAt 必须是有效时间";
+  }
+  if (entry.nextCheckAt !== null && !Number.isFinite(Date.parse(entry.nextCheckAt))) {
+    return "nextCheckAt 必须是有效时间";
+  }
+  if (entry.replyRequired && entry.expectedReply === null) {
+    return "replyRequired=true 时 expectedReply 不能为空";
+  }
+  if (!entry.replyRequired && (entry.expectedReply !== null || entry.replyDeadlineAt !== null || entry.nextCheckAt !== null)) {
+    return "无回复任务不能携带 expectedReply、replyDeadlineAt 或 nextCheckAt";
+  }
+  return null;
+}
+
+function isIsolatedMessageError(error) {
+  return error?.code === "INVALID_ARGUMENT" || error?.code === "MESSAGE_SEQ_CONFLICT";
+}
+
+function observeMessagesWithIsolation(registry, task, validMessages, validInputs, skippedMalformedMessages) {
+  try {
+    const seenTask = registry.observeMessages({
+      taskId: task.taskId,
+      expectedGeneration: task.generation,
+      messages: validInputs,
+    });
+    return { seenTask, acceptedMessages: validMessages };
+  } catch (error) {
+    if (!isIsolatedMessageError(error)) throw error;
+    let seenTask = null;
+    const acceptedMessages = [];
+    for (let index = 0; index < validInputs.length; index += 1) {
+      const entry = validInputs[index];
+      try {
+        seenTask = registry.observeMessages({
+          taskId: task.taskId,
+          expectedGeneration: task.generation,
+          messages: [entry],
+        });
+        acceptedMessages.push(validMessages[index]);
+      } catch (singleError) {
+        if (!isIsolatedMessageError(singleError)) throw singleError;
+        skippedMalformedMessages.push({
+          messageSeq: entry.messageSeq,
+          messageAt: entry.messageAt,
+          code: singleError.code,
+          reason: singleError.message ?? String(singleError),
+        });
+      }
+    }
+    return { seenTask, acceptedMessages };
+  }
+}
+
+function withSkippedMalformed(result, skippedMalformedMessages) {
+  if (!skippedMalformedMessages.length) return result;
+  return { ...result, skippedMalformedMessages };
+}
+
 export function createTaskRouter(options = {}) {
   const registry = options.registry;
   const notifier = options.notifier;
@@ -202,23 +286,54 @@ export function createTaskRouter(options = {}) {
       if (!messagesToObserve.length) {
         return { taskId: task.taskId, outcome: "no_new_message", scannedCount: history.scannedCount };
       }
-      const seenTask = registry.observeMessages({
-        taskId: task.taskId,
-        expectedGeneration: task.generation,
-        messages: messagesToObserve.map((message) => ({
-          messageSeq: messageSequence(message),
-          messageAt: message.time,
-          replyRequired: message.replyRequired === true,
-          expectedReply: message.expectedReply || null,
-          replyDeadlineAt: message.replyDeadlineAt || null,
-          nextCheckAt: message.nextCheckAt || null,
-        })),
-      });
+      const validMessages = [];
+      const validInputs = [];
+      const skippedMalformedMessages = [];
+      for (const message of messagesToObserve) {
+        const entry = buildObservedMessageInput(message);
+        const malformedReason = validateObservedMessageInput(entry);
+        if (malformedReason) {
+          skippedMalformedMessages.push({
+            messageSeq: entry.messageSeq,
+            messageAt: entry.messageAt,
+            code: "INVALID_ARGUMENT",
+            reason: malformedReason,
+          });
+          continue;
+        }
+        validMessages.push(message);
+        validInputs.push(entry);
+      }
+      if (!validMessages.length) {
+        return {
+          taskId: task.taskId,
+          outcome: "malformed_messages_skipped",
+          scannedCount: history.scannedCount,
+          skippedMalformedMessages,
+        };
+      }
+      const observed = observeMessagesWithIsolation(
+        registry,
+        task,
+        validMessages,
+        validInputs,
+        skippedMalformedMessages,
+      );
+      const acceptedMessages = observed.acceptedMessages;
+      const seenTask = observed.seenTask;
+      if (!acceptedMessages.length || !seenTask) {
+        return {
+          taskId: task.taskId,
+          outcome: "malformed_messages_skipped",
+          scannedCount: history.scannedCount,
+          skippedMalformedMessages,
+        };
+      }
       const machineReceipts = controlPlane
-        ? await controlPlane.acknowledgeBusinessMessages(messagesToObserve, "machine_received")
+        ? await controlPlane.acknowledgeBusinessMessages(acceptedMessages, "machine_received")
         : [];
       const conversationReceipts = controlPlane
-        ? await controlPlane.acknowledgeBusinessMessages(messagesToObserve, "conversation_received")
+        ? await controlPlane.acknowledgeBusinessMessages(acceptedMessages, "conversation_received")
         : [];
       const pendingMessages = seenTask.pendingMessages
         .sort((left, right) => Date.parse(left.messageAt) - Date.parse(right.messageAt));
@@ -234,14 +349,14 @@ export function createTaskRouter(options = {}) {
         .filter((message, index, source) => source.findIndex((candidate) => candidate.messageSeq === message.messageSeq) === index)
         .sort((left, right) => Date.parse(left.messageAt) - Date.parse(right.messageAt));
       if (!wakeMessages.length) {
-        return {
+        return withSkippedMalformed({
           taskId: task.taskId,
           outcome: pendingMessages.length ? "awaiting_ack" : "no_new_message",
           pendingCount: pendingMessages.length,
           scannedCount: history.scannedCount,
           machineReceipts,
           conversationReceipts,
-        };
+        }, skippedMalformedMessages);
       }
       const pendingThroughMessage = wakeMessages.at(-1);
       const wakeBoundarySequence = pendingThroughMessage.messageSeq;
@@ -275,7 +390,7 @@ export function createTaskRouter(options = {}) {
         threadIdleVerified,
       });
       if (!lease.acquired) {
-        return {
+        return withSkippedMalformed({
           taskId: task.taskId,
           outcome: lease.reason,
           pendingCount: pendingMessages.length,
@@ -286,7 +401,7 @@ export function createTaskRouter(options = {}) {
           wakeId,
           machineReceipts,
           conversationReceipts,
-        };
+        }, skippedMalformedMessages);
       }
       if (await isMaintenanceActive()) {
         registry.releaseWakeLease({
@@ -295,7 +410,7 @@ export function createTaskRouter(options = {}) {
           expectedWakeSentAt: lease.wakeSentAt,
           expectedWakeId: wakeId,
         });
-        return {
+        return withSkippedMalformed({
           taskId: task.taskId,
           outcome: "automation_paused",
           pendingCount: pendingMessages.length,
@@ -306,7 +421,7 @@ export function createTaskRouter(options = {}) {
           wakeId,
           machineReceipts,
           conversationReceipts,
-        };
+        }, skippedMalformedMessages);
       }
       let wake;
       try {
@@ -334,7 +449,7 @@ export function createTaskRouter(options = {}) {
           expectedWakeSentAt: lease.wakeSentAt,
           expectedWakeId: wakeId,
         });
-        return { taskId: task.taskId, outcome: "wake_failed", error: publicError(error), pendingMessageSeqs: wakeMessages.map((message) => message.messageSeq), newMessageSeqs: newMessages.map((message) => message.messageSeq), reminderMessageSeqs: reminderMessages.map((message) => message.messageSeq), pendingThroughSequence: wakeBoundarySequence, wakeId, machineReceipts, conversationReceipts };
+        return withSkippedMalformed({ taskId: task.taskId, outcome: "wake_failed", error: publicError(error), pendingMessageSeqs: wakeMessages.map((message) => message.messageSeq), newMessageSeqs: newMessages.map((message) => message.messageSeq), reminderMessageSeqs: reminderMessages.map((message) => message.messageSeq), pendingThroughSequence: wakeBoundarySequence, wakeId, machineReceipts, conversationReceipts }, skippedMalformedMessages);
       }
       if (wake.outcome === "accepted" || wake.outcome === "completed") {
         registry.confirmWakeSent({
@@ -343,7 +458,7 @@ export function createTaskRouter(options = {}) {
           expectedWakeSentAt: lease.wakeSentAt,
           expectedWakeId: wakeId,
         });
-        return {
+        return withSkippedMalformed({
           taskId: task.taskId,
           outcome: wake.outcome,
           pendingCount: pendingMessages.length,
@@ -355,7 +470,7 @@ export function createTaskRouter(options = {}) {
           turnId: wake.turn?.id ?? wake.turn?.turnId ?? null,
           machineReceipts,
           conversationReceipts,
-        };
+        }, skippedMalformedMessages);
       }
       if (wake.outcome === "unknown" && wake.error?.outcomeUnknown) {
         registry.confirmWakeSent({
@@ -364,7 +479,7 @@ export function createTaskRouter(options = {}) {
           expectedWakeSentAt: lease.wakeSentAt,
           expectedWakeId: wakeId,
         });
-        return {
+        return withSkippedMalformed({
           taskId: task.taskId,
           outcome: "wake_unknown",
           pendingCount: pendingMessages.length,
@@ -376,7 +491,7 @@ export function createTaskRouter(options = {}) {
           error: wake.error,
           machineReceipts,
           conversationReceipts,
-        };
+        }, skippedMalformedMessages);
       }
       registry.releaseWakeLease({
         taskId: task.taskId,
@@ -384,7 +499,7 @@ export function createTaskRouter(options = {}) {
         expectedWakeSentAt: lease.wakeSentAt,
         expectedWakeId: wakeId,
       });
-      return {
+      return withSkippedMalformed({
         taskId: task.taskId,
         outcome: wake.outcome === "busy" ? "thread_busy" : "thread_unavailable",
         pendingCount: pendingMessages.length,
@@ -395,7 +510,7 @@ export function createTaskRouter(options = {}) {
         threadStatus: wake.status,
         machineReceipts,
         conversationReceipts,
-      };
+      }, skippedMalformedMessages);
     } catch (error) {
       return { taskId: task.taskId, outcome: "scan_error", error: publicError(error) };
     }
