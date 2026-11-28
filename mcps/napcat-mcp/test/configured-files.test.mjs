@@ -52,7 +52,8 @@ function message(overrides = {}) {
     message: [
       { type: "text", data: { text: "普通消息" } },
       { type: "file", data: { file_id: "original-file-501", file: "原附件.txt", file_size: payload.length, busid: 102 } },
-      { type: "image", data: { file: "image-501", url: "https://media.example.invalid/image" } },
+      { type: "image", data: { file: "image-501.jpg", url: "https://media.example.invalid/image" } },
+      { type: "record", data: { file: "voice-501.amr" } },
     ],
     ...overrides,
   };
@@ -146,7 +147,10 @@ test("configured recent keeps ordinary messages, original identity, full text, o
   assert.equal(actual.replyMessageId, "");
   assert.match(actual.attachments[0].attachment_ref, /^ncf1:[a-f0-9]{64}$/);
   assert.equal(actual.attachments[1].type, "image");
-  assert.equal(actual.attachments[1].downloadable, false);
+  assert.equal(actual.attachments[1].downloadable, true);
+  assert.match(actual.attachments[1].attachment_ref, /^ncf1:[a-f0-9]{64}$/);
+  assert.equal(actual.attachments[2].type, "record");
+  assert.equal(actual.attachments[2].downloadable, false);
   assert.equal(recent.pagination.status, "unknown");
   assert.equal(recent.pagination.nextBeforeMessageId, null);
   assert.equal(recent.pagination.hasMore, null);
@@ -515,7 +519,8 @@ test("real isolated stdio MCP advertises exact tools, reads, downloads and hides
   delete setup.original.group_id;
   const privateRead = await request("tools/call", { name: readDefinition.name, arguments: { target_key: "owner" } });
   const privateRecent = JSON.parse(privateRead.result.content[0].text);
-  assert.equal(privateRecent.messages[0].attachments[1].downloadable, false);
+  assert.equal(privateRecent.messages[0].attachments[1].downloadable, true);
+  assert.equal(privateRecent.messages[0].attachments[2].downloadable, false);
   const privateInput = {
     target_key: "owner", message_id: "501", attachment_ref: privateRecent.messages[0].attachments[0].attachment_ref,
     destination_dir: path.join(setup.root, "mcp-private-download"),

@@ -127,7 +127,8 @@ export function createConfiguredFileAccess(options) {
       text: fullText(message),
       sender: message?.sender ?? { user_id: result.senderId },
       attachments: attachments.map((attachment) => {
-        const downloadable = attachment.type === "file" && Boolean(attachment.fileId) && Boolean(result.messageId);
+        const supportedType = attachment.type === "file" || attachment.type === "image";
+        const downloadable = supportedType && Boolean(attachment.fileId) && Boolean(result.messageId);
         return {
           ...attachment,
           downloadable,
@@ -226,18 +227,28 @@ export function createConfiguredFileAccess(options) {
     const attachment = source.attachments.find((item) => item.attachment_ref === reference && item.downloadable);
     if (!attachment) fail("ATTACHMENT_REF_MISMATCH", "附件引用与原消息的可下载附件不匹配");
     if (attachment.fileBytes > maximumFileBytes) fail("FILE_TOO_LARGE", "附件大小超过下载上限");
-    const urlData = await operation.wait(() => callOneBot(checked.target.type === "private" ? "get_private_file_url" : "get_group_file_url", {
-      ...(checked.target.type === "group" ? { group_id: checked.target.id } : {}),
-      file_id: attachment.fileId,
-      ...(checked.target.type === "group" && attachment.busId !== null ? { busid: attachment.busId } : {}),
-    }, undefined, { signal: operation.signal }));
+    const urlData = attachment.type === "image"
+      ? await operation.wait(() => callOneBot("get_image", {
+        file: attachment.fileId,
+      }, undefined, { signal: operation.signal }))
+      : await operation.wait(() => callOneBot(checked.target.type === "private" ? "get_private_file_url" : "get_group_file_url", {
+        ...(checked.target.type === "group" ? { group_id: checked.target.id } : {}),
+        file_id: attachment.fileId,
+        ...(checked.target.type === "group" && attachment.busId !== null ? { busid: attachment.busId } : {}),
+      }, undefined, { signal: operation.signal }));
     let downloadUrl;
     try { downloadUrl = new URL(String(urlData?.url ?? "")); } catch { fail("FILE_URL_INVALID", "文件接口未返回有效下载地址"); }
     if (!["http:", "https:"].includes(downloadUrl.protocol) || downloadUrl.username || downloadUrl.password) {
       fail("FILE_URL_INVALID", "文件接口返回的下载地址无效");
     }
-    const fallbackName = `napcat-file-${reference.slice(5, 17)}`;
-    const fileName = input.name ?? (validFileName(attachment.fileName) ? attachment.fileName : fallbackName);
+    const fallbackPrefix = attachment.type === "image" ? "napcat-image" : "napcat-file";
+    const fallbackName = `${fallbackPrefix}-${reference.slice(5, 17)}`;
+    const resolvedRemoteName = typeof urlData?.file_name === "string" ? urlData.file_name.trim() : "";
+    const fileName = input.name ?? (
+      validFileName(attachment.fileName)
+        ? attachment.fileName
+        : (attachment.type === "image" && validFileName(resolvedRemoteName) ? resolvedRemoteName : fallbackName)
+    );
     const destinationPath = path.join(path.resolve(destinationDirectory), fileName);
     const temporaryPath = `${destinationPath}.part-${randomUUID()}`;
     let response;

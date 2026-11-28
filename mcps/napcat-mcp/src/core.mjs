@@ -487,6 +487,22 @@ function summarizeFileAttachment(data = {}) {
   };
 }
 
+function summarizeImageAttachment(data = {}) {
+  const rawId = decodeCqValue(data.file ?? data.file_id ?? data.fileId ?? data.file_uuid ?? data.fileUuid ?? "").trim().slice(0, 1000);
+  const fileId = rawId && rawId !== "*" && !/[\u0000-\u001f\u007f]/.test(rawId) ? rawId : "";
+  const rawName = decodeCqValue(data.file_name ?? data.name ?? data.file ?? "").trim().slice(0, 1000);
+  const fileName = !/[\u0000-\u001f\u007f]/.test(rawName) ? rawName : "";
+  const rawSize = Number(data.file_size ?? data.size ?? 0);
+  return {
+    type: "image",
+    fileId,
+    fileName,
+    fileBytes: Number.isFinite(rawSize) && rawSize > 0 ? rawSize : null,
+    busId: null,
+    downloadable: Boolean(fileId),
+  };
+}
+
 const DEFERRED_ATTACHMENT_TYPES = new Set([
   "file",
   "image",
@@ -517,6 +533,7 @@ const DEFERRED_ATTACHMENT_FIELDS = [
 
 function summarizeDeferredAttachment(type, data = {}) {
   if (type === "file") return summarizeFileAttachment(data);
+  if (type === "image") return summarizeImageAttachment(data);
   const attachment = { type };
   for (const field of DEFERRED_ATTACHMENT_FIELDS) {
     const value = data?.[field];
