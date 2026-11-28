@@ -131,15 +131,49 @@ function checkpointAccepts(checkpoint, payload) {
     && includesToolResults(checkpoint.tools.slice(checkpoint.compaction.toolCount), payload);
 }
 
-export function createModelOperationLedger({ state, onStateChange, maxEntries = 2048, now = Date.now } = {}) {
+export function createModelOperationLedger({ state, onStateChange, onExpired, maxEntries = 2048,
+  unresolvedTtlMs = 24 * 60 * 60 * 1000, unresolvedToolTtlMs = 7 * 24 * 60 * 60 * 1000, now = Date.now } = {}) {
   if (!Number.isSafeInteger(maxEntries) || maxEntries < 1 || maxEntries > 10000) {
     throw new RangeError("Invalid operation ledger capacity");
   }
+  const effectiveUnresolvedTtlMs = Number.isFinite(unresolvedTtlMs) && unresolvedTtlMs > 0 ? unresolvedTtlMs : Infinity;
+  const effectiveUnresolvedToolTtlMs = Number.isFinite(unresolvedToolTtlMs) && unresolvedToolTtlMs > 0 ? unresolvedToolTtlMs : Infinity;
+  const realEpochFloorMs = 1_577_836_800_000;
+  const customClock = now !== Date.now;
+  const isClockComparable = (updatedAt, currentNow) => customClock || currentNow < realEpochFloorMs || updatedAt >= realEpochFloorMs;
+  const entryExpired = (entry, currentNow) => {
+    if (!entry || entry.phase !== "unresolved" || !Number.isSafeInteger(entry.updatedAt)) return false;
+    if (!isClockComparable(entry.updatedAt, currentNow)) return false;
+    const hasTools = Boolean(entry.continuation?.tools?.length || entry.reconciliationProof?.tools?.length);
+    const ttl = hasTools ? effectiveUnresolvedToolTtlMs : effectiveUnresolvedTtlMs;
+    return Number.isFinite(ttl) && currentNow - entry.updatedAt > ttl;
+  };
   const entries = new Map();
   const completed = new Map();
+  let dirtyFromReadPrune = false;
   const compactionTickets = new WeakMap();
   const requestGeneration = Symbol("model-operation-request-generation");
   const snapshot = () => ({ schemaVersion: 1, entries: [...entries].map(([key, entry]) => [key, clone(entry)]) });
+  const pruneExpired = (persist = false) => {
+    const currentNow = now();
+    const removed = [];
+    for (const [key, entry] of entries) {
+      if (entryExpired(entry, currentNow)) {
+        removed.push([key, entry]);
+        entries.delete(key);
+      }
+    }
+    if (!removed.length) return 0;
+    if (persist) {
+      try { save(); } catch (error) {
+        for (const [key, entry] of removed) entries.set(key, entry);
+        throw error;
+      }
+    }
+    try { onExpired?.(removed.map(([key, entry]) => ({ key, reason: "ttl_expired", updatedAt: entry.updatedAt,
+      threadHash: entry.threadHash ?? null, requiresReconciliation: entry.requiresReconciliation === true }))); } catch {}
+    return removed.length;
+  };
   const readState = value => {
     if (!value || typeof value !== "object" || Array.isArray(value)
       || value.schemaVersion !== 1 || !Array.isArray(value.entries) || value.entries.length > maxEntries
@@ -161,14 +195,25 @@ export function createModelOperationLedger({ state, onStateChange, maxEntries = 
           && (entry.requiresReconciliation !== true || !validContinuation(entry.reconciliationProof))) {
         throw new Error("INVALID_MODEL_OPERATION_STATE");
       }
-      restored.set(key, { phase: "unresolved", acceptance: entry.acceptance,
+      const normalized = { phase: "unresolved", acceptance: entry.acceptance,
         reason: "previous_proxy_interrupted", updatedAt: entry.updatedAt,
         ...(entry.threadHash ? { threadHash: entry.threadHash } : {}),
         ...(entry.requiresReconciliation === true ? { requiresReconciliation: true,
           ...(entry.reconciliationProof || entry.continuation
             ? { reconciliationProof: clone(entry.reconciliationProof ?? entry.continuation) } : {}) }
-          : entry.continuation ? { continuation: clone(entry.continuation) } : {}) });
+          : entry.continuation ? { continuation: clone(entry.continuation) } : {}) };
+      restored.set(key, normalized);
     }
+    const currentNow = now();
+    const expired = [];
+    for (const [key, entry] of restored) {
+      if (entryExpired(entry, currentNow)) {
+        expired.push({ key, reason: "ttl_expired_on_read", updatedAt: entry.updatedAt,
+          threadHash: entry.threadHash ?? null, requiresReconciliation: entry.requiresReconciliation === true });
+        restored.delete(key);
+      }
+    }
+    if (expired.length) { dirtyFromReadPrune = true; try { onExpired?.(expired); } catch {} }
     return restored;
   };
   if (state !== undefined) {
@@ -178,6 +223,7 @@ export function createModelOperationLedger({ state, onStateChange, maxEntries = 
     try {
       const result = onStateChange?.(snapshot());
       if (result && typeof result.then === "function") throw new Error("Synchronous persistence is required");
+      dirtyFromReadPrune = false;
     } catch (cause) {
       throw Object.assign(new Error("MODEL_OPERATION_STATE_PERSISTENCE_FAILED"), {
         code: "MODEL_OPERATION_STATE_PERSISTENCE_FAILED", cause,
@@ -186,10 +232,14 @@ export function createModelOperationLedger({ state, onStateChange, maxEntries = 
   };
   return {
     get(key) {
+      pruneExpired(false);
       const entry = entries.get(operationHash(key));
       return entry ? clone(entry) : null;
     },
-    canContinue(key, payload) { return canContinue(entries.get(operationHash(key)), payload); },
+    canContinue(key, payload) {
+      pruneExpired(false);
+      return canContinue(entries.get(operationHash(key)), payload);
+    },
     async prepareSource(key, payload, turnKey = null) {
       const source = sourceInputProof(payload);
       if (!source) return;
@@ -199,28 +249,49 @@ export function createModelOperationLedger({ state, onStateChange, maxEntries = 
       if (turnKey && turnKey !== key) await source.prepare({ checkpoint: completed.get(operationHash(turnKey)) });
     },
     begin(key, payload) {
+      const currentNow = now();
       const hash = operationHash(key);
-      const previous = entries.get(hash);
-      if (previous && !canContinue(previous, payload)) throw Object.assign(new Error("MODEL_OPERATION_REPLAY_BLOCKED"), { code: "MODEL_OPERATION_REPLAY_BLOCKED" });
-      const checkpoint = completed.get(hash);
-      if (!previous && checkpoint && !checkpointAccepts(checkpoint, payload)) {
-        throw Object.assign(new Error("MODEL_OPERATION_REPLAY_BLOCKED"), { code: "MODEL_OPERATION_REPLAY_BLOCKED" });
-      }
-      if (!previous && entries.size >= maxEntries) throw Object.assign(new Error("MODEL_OPERATION_LEDGER_FULL"), { code: "MODEL_OPERATION_LEDGER_FULL" });
-      const continuation = continuationState(payload);
-      if (continuation && previous?.continuation) {
-        continuation.completedTools = [...previous.continuation.completedTools, ...previous.continuation.tools];
-        if (previous.continuation.compaction) continuation.compaction = clone(previous.continuation.compaction);
-        if (continuation.completedTools.length > maxContinuationTools) {
-          throw Object.assign(new Error("MODEL_OPERATION_LEDGER_FULL"), { code: "MODEL_OPERATION_LEDGER_FULL" });
+      const expiredRemoved = [];
+      for (const [k, entry] of entries) {
+        if (entryExpired(entry, currentNow)) {
+          expiredRemoved.push([k, entry]);
+          entries.delete(k);
         }
-      } else if (continuation && checkpoint) {
-        continuation.completedTools = clone(checkpoint.tools);
-        if (checkpoint.compaction) continuation.compaction = clone(checkpoint.compaction);
       }
-      entries.set(hash, { [requestGeneration]: {}, phase: "submitting", acceptance: "unknown", reason: "request_submitting", updatedAt: now(),
-        threadHash: operationHash(key.split("\u0000")[0]), ...(continuation ? { continuation } : {}) });
-      try { save(); } catch (error) { if (previous) entries.set(hash, previous); else entries.delete(hash); throw error; }
+      const rollbackExpired = () => {
+        for (const [k, entry] of expiredRemoved) entries.set(k, entry);
+      };
+      const previous = entries.get(hash);
+      try {
+        if (previous && !canContinue(previous, payload)) throw Object.assign(new Error("MODEL_OPERATION_REPLAY_BLOCKED"), { code: "MODEL_OPERATION_REPLAY_BLOCKED" });
+        const checkpoint = completed.get(hash);
+        if (!previous && checkpoint && !checkpointAccepts(checkpoint, payload)) {
+          throw Object.assign(new Error("MODEL_OPERATION_REPLAY_BLOCKED"), { code: "MODEL_OPERATION_REPLAY_BLOCKED" });
+        }
+        if (!previous && entries.size >= maxEntries) throw Object.assign(new Error("MODEL_OPERATION_LEDGER_FULL"), { code: "MODEL_OPERATION_LEDGER_FULL" });
+        const continuation = continuationState(payload);
+        if (continuation && previous?.continuation) {
+          continuation.completedTools = [...previous.continuation.completedTools, ...previous.continuation.tools];
+          if (previous.continuation.compaction) continuation.compaction = clone(previous.continuation.compaction);
+          if (continuation.completedTools.length > maxContinuationTools) {
+            throw Object.assign(new Error("MODEL_OPERATION_LEDGER_FULL"), { code: "MODEL_OPERATION_LEDGER_FULL" });
+          }
+        } else if (continuation && checkpoint) {
+          continuation.completedTools = clone(checkpoint.tools);
+          if (checkpoint.compaction) continuation.compaction = clone(checkpoint.compaction);
+        }
+        entries.set(hash, { [requestGeneration]: {}, phase: "submitting", acceptance: "unknown", reason: "request_submitting", updatedAt: currentNow,
+          threadHash: operationHash(key.split("\u0000")[0]), ...(continuation ? { continuation } : {}) });
+        save();
+      } catch (error) {
+        if (previous) entries.set(hash, previous); else entries.delete(hash);
+        rollbackExpired();
+        throw error;
+      }
+      if (expiredRemoved.length) {
+        try { onExpired?.(expiredRemoved.map(([k, entry]) => ({ key: k, reason: "ttl_expired", updatedAt: entry.updatedAt,
+          threadHash: entry.threadHash ?? null, requiresReconciliation: entry.requiresReconciliation === true }))); } catch {}
+      }
     },
     captureCompaction(turnKey, requestKey, payload) {
       if (typeof turnKey !== "string" || typeof requestKey !== "string"
@@ -291,8 +362,27 @@ export function createModelOperationLedger({ state, onStateChange, maxEntries = 
       if (!requiresReconciliation && (outcome.localRejection || outcome.kind === "completed" || ["rejected", "not_sent"].includes(acceptance)
         || outcome.policy?.terminalOutcome === "failed_no_output" || replayableWithoutTool)) {
         const previous = entries.get(hash);
+        const purged = [];
+        const currentNow = now();
         entries.delete(hash);
-        try { save(); } catch (error) { entries.set(hash, previous); error.requestAccepted = acceptance; throw error; }
+        for (const [otherKey, other] of entries) {
+          if (entryExpired(other, currentNow)) {
+            purged.push([otherKey, other]);
+            entries.delete(otherKey);
+          } else if (outcome.kind === "completed" && previous.threadHash && other.threadHash === previous.threadHash
+            && other.phase === "unresolved" && other.requiresReconciliation !== true
+            && isClockComparable(other.updatedAt, currentNow)
+            && !other.continuation?.tools?.length && !other.reconciliationProof?.tools?.length
+            && currentNow - other.updatedAt > 60 * 60 * 1000) {
+            purged.push([otherKey, other]);
+            entries.delete(otherKey);
+          }
+        }
+        try { save(); } catch (error) {
+          entries.set(hash, previous);
+          for (const [otherKey, other] of purged) entries.set(otherKey, other);
+          error.requestAccepted = acceptance; throw error;
+        }
         const tools = previous.continuation?.compaction
           ? [...previous.continuation.completedTools, ...previous.continuation.tools] : previous.continuation?.completedTools;
         if (outcome.kind === "completed" && tools?.length) {
@@ -351,7 +441,20 @@ export function createModelOperationLedger({ state, onStateChange, maxEntries = 
       save();
       return incoming.size;
     },
-    snapshot() { return clone(snapshot()); },
-    status() { return { protectedOperations: entries.size, maxEntries, persistent: typeof onStateChange === "function" }; },
+    pruneExpired(persist = false) { return pruneExpired(persist); },
+    persistIfPruned() {
+      if (!dirtyFromReadPrune || typeof onStateChange !== "function") return false;
+      save();
+      return true;
+    },
+    hasProtectedThread(threadId) {
+      pruneExpired(false);
+      if (typeof threadId !== "string" || !threadId) return false;
+      const targetHash = operationHash(threadId);
+      for (const entry of entries.values()) if (entry.threadHash === targetHash) return true;
+      return false;
+    },
+    snapshot() { pruneExpired(false); return clone(snapshot()); },
+    status() { pruneExpired(false); return { protectedOperations: entries.size, maxEntries, persistent: typeof onStateChange === "function" }; },
   };
 }

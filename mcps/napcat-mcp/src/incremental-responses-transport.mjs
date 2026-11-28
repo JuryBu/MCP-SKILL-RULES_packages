@@ -249,10 +249,42 @@ function eventHasOutput(event) {
   return output !== undefined && (!Array.isArray(output) || output.some(itemHasOutput));
 }
 
+const retryableAtomicDisconnectCodes = new Set([
+  "WS_CONNECTION_CLOSED",
+  "WS_CONNECTION_ERROR",
+  "WS_SEND_ERROR",
+  "WS_TERMINAL_TIMEOUT",
+  "WS_CONNECT_TIMEOUT",
+  "WS_PREWARM_TIMEOUT",
+]);
+const nonRetryableWsCloseCodes = new Set([1002, 1003, 1007, 1008, 1009]);
+const nonRetryableWsErrorCodes = new Set([
+  "WS_ERR_INVALID_UTF8", "WS_ERR_UNEXPECTED_RSV_1", "WS_ERR_UNEXPECTED_RSV_2_3",
+  "WS_ERR_INVALID_OPCODE", "WS_ERR_UNEXPECTED_MASK", "WS_ERR_EXPECTED_MASK",
+  "WS_ERR_INVALID_CLOSE_CODE", "WS_ERR_INVALID_CONTROL_PAYLOAD_LENGTH",
+  "WS_ERR_UNEXPECTED_CONTINUATION_FRAME", "WS_ERR_UNSUPPORTED_MESSAGE_LENGTH",
+]);
+const safeLocalItemTypes = new Set(["reasoning", "message", "function_call", "custom_tool_call"]);
+const safeLocalResponseEvents = new Set([
+  "response.created", "response.in_progress", "response.queued",
+  "response.completed", "response.failed", "response.incomplete",
+  "response.output_item.added", "response.output_item.done",
+  "response.content_part.added", "response.content_part.done",
+  "response.output_text.delta", "response.output_text.done",
+  "response.refusal.delta", "response.refusal.done",
+  "response.reasoning_text.delta", "response.reasoning_text.done",
+  "response.reasoning_summary_part.added", "response.reasoning_summary_part.done",
+  "response.reasoning_summary_text.delta", "response.reasoning_summary_text.done",
+  "response.function_call_arguments.delta", "response.function_call_arguments.done",
+  "response.custom_tool_call_input.delta", "response.custom_tool_call_input.done",
+  "response.interrupt.accepted", "response.output_item.interrupted",
+]);
+
 function operationRequiresReconciliation(record) {
   return Boolean(record && record.state !== "completed" && (record.recoveryReconciliationRequired === true
     || !record.safeToEvict && record.acceptance !== false
-      && record.terminalOutcome !== "failed_no_output"));
+      && record.terminalOutcome !== "failed_no_output"
+      && record.retryableWithoutDelivery !== true));
 }
 
 function canRetryOperation(record, retryWithoutOutput = false) {
@@ -380,6 +412,7 @@ export function createIncrementalResponsesTransport(options = {}) {
         || record.retryableWithoutDelivery === true)
         && ["failed", "cancelled"].includes(record.state),
       requiresReconciliation: operationRequiresReconciliation(record),
+      recoveryReconciliationRequired: record.recoveryReconciliationRequired === true,
       ...(record.terminalOutcome ? { terminalOutcome: record.terminalOutcome } : {}),
       ...(record.fallbackCompletion ? { fallbackCompletion: { ...record.fallbackCompletion } } : {}),
     };
@@ -548,17 +581,43 @@ export function createIncrementalResponsesTransport(options = {}) {
       source: "transport", statusCode: httpStatus, code, requestAccepted: job.record.acceptance,
       message: job.record.upstreamFailureSignals ?? job.record.upstreamError,
       requestTransmissionState: job.record.requestTransmissionState,
+      wsCloseCode: job.record.closeCode,
       progressObserved: job.outputObserved === true, terminalEvidence: job.record.terminalEvidence, cancelled,
     }) : null;
-    job.record.retryableWithoutOutput = Boolean(code && !job.record.localRejection && !job.outputObserved && !job.visibleOutputCommitted
+    const upstreamFailureCode = String(job.record.upstreamError?.code ?? job.record.upstreamFailureSignals?.error?.code ?? "").toLowerCase();
+    const permanentStructureRejection = upstreamFailureCode !== "websocket_connection_limit_reached"
+      && (httpStatus === 400 || httpStatus === 422
+        || upstreamFailureCode === "previous_response_not_found");
+    const protocolCloseRejected = nonRetryableWsCloseCodes.has(job.record.closeCode)
+      || nonRetryableWsErrorCodes.has(job.record.wsErrorCode);
+    const hardProtocolFrameError = [1002, 1003, 1007, 1008].includes(job.record.closeCode)
+      || (nonRetryableWsErrorCodes.has(job.record.wsErrorCode) && job.record.wsErrorCode !== "WS_ERR_UNSUPPORTED_MESSAGE_LENGTH");
+    const hardNonPrnfStructureRejection = permanentStructureRejection && upstreamFailureCode !== "previous_response_not_found";
+    if (!job.record.prewarmCompatibilityFallback && (hardNonPrnfStructureRejection || hardProtocolFrameError)) {
+      job.record.permanentRejection = true;
+    }
+    job.record.retryableWithoutOutput = Boolean(code && !job.record.localRejection && !job.record.permanentRejection
+      && !job.outputObserved && !job.visibleOutputCommitted
       && (job.record.acceptance === false || job.record.terminalOutcome === "failed_no_output")
       && (cancelled && code === "ABORT_ERR" || failurePolicy?.retryable));
+    const atomicSafeDisconnect = retryableAtomicDisconnectCodes.has(code)
+      && !protocolCloseRejected
+      && job.payload?.store !== true
+      && job.record.responseIdentityConflict === undefined;
+    const atomicSafeTemporaryTerminal = (code === "WS_UPSTREAM_ERROR" || code === "WS_HTTP_503")
+      && !permanentStructureRejection
+      && job.payload?.store !== true
+      && job.record.responseIdentityConflict === undefined;
     job.record.retryableWithoutDelivery = Boolean(code && !cancelled && !job.record.localRejection
+      && !job.record.permanentRejection && !permanentStructureRejection && !protocolCloseRejected
+      && !job.record.recoveryReconciliationRequired
       && job.atomicUntilVisibleOutput && !job.visibleOutputCommitted
-      && (job.record.safeToEvict || job.record.acceptance === false || job.record.terminalOutcome === "failed_no_output")
+      && (job.record.safeToEvict || job.record.acceptance === false || job.record.terminalOutcome === "failed_no_output"
+        || job.nativeWebSocket && (atomicSafeDisconnect || atomicSafeTemporaryTerminal))
       && classifyModelFailure({ source: "transport", statusCode: httpStatus, code,
         requestAccepted: job.record.acceptance, message: job.record.upstreamFailureSignals ?? job.record.upstreamError,
         requestTransmissionState: job.record.requestTransmissionState, progressObserved: false,
+        wsCloseCode: job.record.closeCode,
         terminalEvidence: job.record.terminalEvidence }).retryable);
     if (job.record.retryableWithoutDelivery) {
       job.record.discardedOutputBytes = job.deferredOutputBytes;
@@ -1134,16 +1193,18 @@ export function createIncrementalResponsesTransport(options = {}) {
     const nestedId = event?.response?.id;
     const topLevelId = event?.response_id;
     const responseId = nestedId ?? topLevelId;
+    const completedRecord = typeof responseId === "string" ? session.completedIds.get(responseId) : undefined;
+    const completedDigest = typeof completedRecord === "string" ? completedRecord : completedRecord?.digest ?? null;
     const identityConflict = reason => {
       const tag = value => typeof value === "string" ? digest(value).slice(0, 16) : value === undefined ? null : `invalid:${typeof value}`;
       const responseIdentityConflict = { reason, eventType: typeof event?.type === "string" ? event.type.slice(0, 96) : null,
         nestedIdTag: tag(nestedId), topLevelIdTag: tag(topLevelId), packetResponseIdTag: tag(packet.responseId),
         previousResponseIdTag: tag(session.previousId), completedResponse: Boolean(responseId && session.completedIds.has(responseId)),
-        eventFingerprint: digest(event).slice(0, 16), completedFingerprint: typeof responseId === "string"
-          ? session.completedIds.get(responseId)?.slice(0, 16) ?? null : null,
+        eventFingerprint: digest(event).slice(0, 16), completedFingerprint: completedDigest?.slice(0, 16) ?? null,
         packetSequence: job.sentPackets, warm: packet.warm === true, nativeWebSocket: job.nativeWebSocket === true,
         outputObserved: job.outputObserved === true, packetOutputObserved: packet.outputObserved === true };
       job.outputObserved = true;
+      job.record.recoveryReconciliationRequired = true;
       return failConnection(session, "WS_RESPONSE_ID_CONFLICT", undefined, { responseIdentityConflict });
     };
     if (nestedId !== undefined && topLevelId !== undefined && nestedId !== topLevelId
@@ -1151,14 +1212,49 @@ export function createIncrementalResponsesTransport(options = {}) {
       return identityConflict("invalid_or_inconsistent_event_id");
     }
     if (responseId && session.completedIds.has(responseId)) {
-      if (["response.completed", "response.incomplete"].includes(event.type) && session.completedIds.get(responseId) === digest(event)) return;
-      if (job.nativeWebSocket && !packet.warm
-        && packet.establishedResponseId && packet.establishedResponseId !== responseId
-        && event.type === "response.in_progress" && event.response?.status === "in_progress"
-        && Object.keys(event).every(key => ["type", "response", "response_id", "sequence_number"].includes(key))
-        && (event.sequence_number === undefined || Number.isSafeInteger(event.sequence_number) && event.sequence_number >= 0)
-        && Object.keys(event.response).every(key => ["id", "status", "output"].includes(key))
-        && (event.response.output === undefined || Array.isArray(event.response.output) && event.response.output.length === 0)) return;
+      if (["response.completed", "response.incomplete"].includes(event.type) && completedDigest === digest(event)) return;
+      const staleOutputNonTool = event.response?.output === undefined || Array.isArray(event.response.output)
+        && event.response.output.every(item => ["reasoning", "message"].includes(item?.type));
+      const staleInterruptedIncomplete = completedRecord?.interrupted === true
+        && event.type === "response.incomplete"
+        && event.response?.status === "incomplete"
+        && event.response?.incomplete_details?.reason === "interrupted"
+        && !event.error && !event.response.error && staleOutputNonTool;
+      const staleItemNonTool = event.item === undefined || ["reasoning", "message"].includes(event.item?.type);
+      const staleInterruptedPreEstablish = completedRecord?.interrupted === true
+        && !packet.establishedResponseId
+        && staleOutputNonTool && staleItemNonTool
+        && (["error", "response.failed", "response.incomplete", "response.completed",
+          "response.in_progress", "response.queued", "response.output_item.added", "response.output_item.done",
+          "response.interrupt.accepted", "response.output_item.interrupted"].includes(event.type)
+          || /^response\.(?:reasoning_|output_text\.|content_part\.)/u.test(event.type));
+      const staleCompletedEvent = job.nativeWebSocket && !packet.warm
+        && (packet.staleIgnoredCount ?? 0) < 16
+        && (!packet.establishedResponseId || packet.establishedResponseId !== responseId)
+        && (
+          event.type === "response.in_progress"
+            && event.response?.status === "in_progress"
+            && !event.error && !event.response.error
+            && !eventHasOutput(event)
+            && (event.response.output === undefined || Array.isArray(event.response.output) && event.response.output.length === 0)
+          || event.type === "response.queued"
+            && !event.error && !event.response?.error
+            && !eventHasOutput(event)
+            && (event.response?.output === undefined || Array.isArray(event.response.output) && event.response.output.length === 0)
+          || completedRecord?.interrupted === true
+            && ["response.interrupt.accepted", "response.output_item.interrupted"].includes(event.type)
+            && !event.error && !event.response?.error && !eventHasOutput(event)
+          || staleInterruptedIncomplete
+          || staleInterruptedPreEstablish
+          || protocolControlEvent(event) && !event.error && !event.response?.error
+        );
+      if (staleCompletedEvent) {
+        packet.staleIgnoredCount = (packet.staleIgnoredCount ?? 0) + 1;
+        try { options.onEvent?.({ type: "stale_completed_response_event_ignored", sessionKey: session.key,
+          operationId: job.operationId, eventType: event.type, establishedResponsePresent: Boolean(packet.establishedResponseId),
+          priorInterrupted: completedRecord?.interrupted === true, ignoredCount: packet.staleIgnoredCount }); } catch {}
+        return;
+      }
       return identityConflict("event_for_completed_response");
     }
     if (responseId && packet.responseId && responseId !== packet.responseId) {
@@ -1179,13 +1275,20 @@ export function createIncrementalResponsesTransport(options = {}) {
       job.outputObserved = true;
       if (packet.warm) return failConnection(session, "WS_INVALID_PREWARM_OUTPUT");
     }
+    const nonLocalItem = Boolean(event.item && typeof event.item === "object" && !safeLocalItemTypes.has(event.item.type));
+    const nonLocalResponseEvent = typeof event.type === "string" && event.type.startsWith("response.") && !safeLocalResponseEvents.has(event.type) && !protocolControlEvent(event);
+    if (nonLocalItem || nonLocalResponseEvent) {
+      job.record.recoveryReconciliationRequired = true;
+    }
     const responseOutput = event.response?.output;
     const terminalResponseEvent = ["response.completed", "response.failed", "response.incomplete", "error"].includes(event.type);
     if (responseOutput !== undefined && responseOutput !== null
       && (!Array.isArray(responseOutput)
         || responseOutput.some(item => !["reasoning", "message"].includes(item?.type)
           && (!["function_call", "custom_tool_call"].includes(item?.type)
-            || !["in_progress", "incomplete"].includes(item?.status) || job.visibleOutputCommitted || terminalResponseEvent)))) {
+            || !["in_progress", "incomplete"].includes(item?.status) || job.visibleOutputCommitted))
+        || terminalResponseEvent && event.type !== "response.completed" && !job.atomicUntilVisibleOutput
+          && responseOutput.some(item => item?.type === "message" && itemHasOutput(item)))) {
       job.record.recoveryReconciliationRequired = true;
     }
     if (event.type.startsWith("response.")) {
@@ -1383,7 +1486,7 @@ export function createIncrementalResponsesTransport(options = {}) {
     } : null;
     session.cacheBytes = byteLength(committed) + Buffer.byteLength(response.id)
       + (session.cancelledReasoningAnchor ? byteLength(session.cancelledReasoningAnchor) : 0);
-    session.completedIds.set(response.id, digest(event));
+    session.completedIds.set(response.id, { digest: digest(event), interrupted: Boolean(packet.interruptSent) });
     if (session.completedIds.size > 128) session.completedIds.delete(session.completedIds.keys().next().value);
     if (packet.internalPrewarm) {
       session.wireBytes = 0;

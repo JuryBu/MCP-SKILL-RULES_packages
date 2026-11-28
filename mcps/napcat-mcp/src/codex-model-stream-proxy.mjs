@@ -1477,8 +1477,19 @@ export function createCodexModelStreamProxy(options = {}) {
   const bodyPreparations = new Set();
   const bodyCleanups = new Set();
   const nativeActive = new Map();
+  const recentNativeActive = new Map();
+  const rememberRecentNativeActive = (operationId, identity) => {
+    if (!operationId || !identity) return;
+    const cutoff = Date.now() - 60_000;
+    for (const [id, entry] of recentNativeActive) {
+      if (entry.recordedAt < cutoff) recentNativeActive.delete(id);
+    }
+    recentNativeActive.delete(operationId);
+    recentNativeActive.set(operationId, { identity, recordedAt: Date.now() });
+    if (recentNativeActive.size > 128) recentNativeActive.delete(recentNativeActive.keys().next().value);
+  };
   const nativeEvent = event => {
-    const identity = nativeActive.get(event.operationId);
+    const identity = nativeActive.get(event.operationId) ?? recentNativeActive.get(event.operationId)?.identity;
     if (!identity) return onEvent(event);
     const threadHash = hashIdentity(identity.threadId);
     const turnHash = hashIdentity(identity.turnId);
@@ -1507,6 +1518,7 @@ export function createCodexModelStreamProxy(options = {}) {
   };
   const operationLedger = managedRecovery || incrementalTransport ? createModelOperationLedger({
     state: options.operationState, onStateChange: options.onOperationStateChange,
+    onExpired: expired => onEvent({ type: "operation_ledger_expired_pruned", count: expired.length }),
     maxEntries: options.maxUnresolvedOperations,
   }) : null;
   const recoveryHandoff = createThreadRecoveryHandoff({
@@ -1573,8 +1585,10 @@ export function createCodexModelStreamProxy(options = {}) {
     for (const [key, state] of attempts) if (state.updatedAt < cutoff) attempts.delete(key);
     for (const [key, state] of emptyIdleTurns) if (state.updatedAt < cutoff) emptyIdleTurns.delete(key);
     for (const [key, state] of businessProgress) if (state.updatedAt < cutoff) businessProgress.delete(key);
+    const unresolvedWaitCutoff = Date.now() - Math.max(attemptStateTtlMs, 24 * 60 * 60_000);
     for (const [key, state] of waitTerminals) {
       if (state.updatedAt < cutoff && !["unknown", "accepted"].includes(state.acceptance)) waitTerminals.delete(key);
+      else if (state.updatedAt >= 1_577_836_800_000 && state.updatedAt < unresolvedWaitCutoff) waitTerminals.delete(key);
     }
   };
   const recordBusinessProgress = (identity) => {
@@ -3078,7 +3092,11 @@ export function createCodexModelStreamProxy(options = {}) {
           } else if (outcome.kind === "completed") settleCompletedRecovery(context.key, () => operationLedger?.settle(context.key, outcome));
           else operationLedger?.settle(context.key, outcome);
         }
-        } finally { nativeActive.delete(context.operationId); context.lease.release(); }
+        } finally {
+          rememberRecentNativeActive(context.operationId, nativeActive.get(context.operationId));
+          nativeActive.delete(context.operationId);
+          context.lease.release();
+        }
       },
     }) : null;
   server.requestTimeout = 0;
@@ -3131,6 +3149,11 @@ export function createCodexModelStreamProxy(options = {}) {
     acceptThreadHandoff(snapshot) { return recoveryHandoff.accept(snapshot); },
     async start() {
       if (server.listening) return this.status();
+      try {
+        if (operationLedger?.persistIfPruned?.()) {
+          onEvent({ type: "operation_ledger_startup_pruned_persisted", remaining: operationLedger.status().protectedOperations });
+        }
+      } catch {}
       await new Promise((resolve, reject) => {
         server.once("error", reject);
         server.listen(port, host, () => {
@@ -3183,7 +3206,7 @@ export function createCodexModelStreamProxy(options = {}) {
         managedRecovery,
         recoveryWaitingRequests: [...active.values()].filter(state => state.recoveryWait?.phase === "waiting").length
           + (nativeWebSockets?.recoveryStates().filter(state => state.phase === "waiting").length ?? 0),
-        unresolvedOperations: [...waitTerminals.values()].filter(state => ["unknown", "accepted"].includes(state.acceptance)).length,
+        unresolvedOperations: [...waitTerminals.values()].filter(state => ["unknown", "accepted"].includes(state.acceptance) && !(state.updatedAt >= 1_577_836_800_000 && state.updatedAt < Date.now() - Math.max(attemptStateTtlMs, 24 * 60 * 60_000))).length,
         incrementalTransport: incrementalTransport?.status?.() ?? null,
         nativeWebSockets: nativeWebSockets?.status() ?? null,
         attemptChains: attempts.size,

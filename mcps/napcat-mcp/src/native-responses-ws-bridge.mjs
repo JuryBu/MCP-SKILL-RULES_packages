@@ -157,6 +157,35 @@ function nativeFailureNotice(error) {
 
 const unresolvedNativeNotice = "上游是否完成仍待核实，已保留已有信息和操作记录，未自动重发。";
 const executableNativeTools = new Set(["function_call", "custom_tool_call"]);
+const safeLocalBridgeItemTypes = new Set(["reasoning", "message", "function_call", "custom_tool_call"]);
+const safeLocalBridgeResponseEvents = new Set([
+  "response.created", "response.in_progress", "response.queued",
+  "response.completed", "response.failed", "response.incomplete",
+  "response.output_item.added", "response.output_item.done",
+  "response.content_part.added", "response.content_part.done",
+  "response.output_text.delta", "response.output_text.done",
+  "response.refusal.delta", "response.refusal.done",
+  "response.reasoning_text.delta", "response.reasoning_text.done",
+  "response.reasoning_summary_part.added", "response.reasoning_summary_part.done",
+  "response.reasoning_summary_text.delta", "response.reasoning_summary_text.done",
+  "response.function_call_arguments.delta", "response.function_call_arguments.done",
+  "response.custom_tool_call_input.delta", "response.custom_tool_call_input.done",
+  "response.interrupt.accepted", "response.output_item.interrupted",
+]);
+function isNonLocalSideEffectEvent(event) {
+  if (!event || typeof event !== "object") return false;
+  if (event.item && typeof event.item === "object" && !safeLocalBridgeItemTypes.has(event.item.type)) return true;
+  if (typeof event.type === "string" && event.type.startsWith("response.") && !safeLocalBridgeResponseEvents.has(event.type) && !/(?:^|\.)(?:metadata|rate_limits?)$/u.test(event.type)) return true;
+  if (Array.isArray(event.response?.output) && event.response.output.some(item => item && !safeLocalBridgeItemTypes.has(item.type))) return true;
+  return false;
+}
+function safeForClientTextContinuation(job, operation) {
+  return Boolean(job && operation?.recoveryReconciliationRequired !== true
+    && !job.deliveredExecutableToolDone && !job.unrecordedExecutableTool
+    && !job.pendingLocalToolItems?.size && (job.protocolProgress?.toolParameterBytes ?? 0) === 0
+    && !job.sawNonLocalSideEffect && job.storeRequested !== true
+    && job.protocolProgress?.deliveredText === true);
+}
 
 function recordedNativeToolFingerprint(item) {
   if (!executableNativeTools.has(item?.type) || typeof item.id !== "string" || !item.id
@@ -182,8 +211,11 @@ function confirmedNativeToolContinuation(job, event) {
   return job.recordedNativeTools.size > 0 && [...job.deliveredItems.values()].every(hasProof) && event.response.output.every(hasProof);
 }
 
-function nativePendingDisposition(operation) {
+function nativePendingDisposition(operation, job = null) {
   if (operation?.requiresReconciliation !== true) return null;
+  if (safeForClientTextContinuation(job, operation)) {
+    return null;
+  }
   const accepted = [true, "accepted"].includes(operation.acceptance);
   const canHaveSent = ["prewarm_sent", "generation_sent", "response_received", "started", "finished"].includes(operation.requestTransmissionState);
   if (!accepted && !(operation.acceptance === "unknown" && canHaveSent)) return null;
@@ -203,11 +235,13 @@ function isPermanentStructureRejection(diagnostics) {
   const reasonCode = String(diagnostics.failureReasonCode ?? "").toLowerCase();
   const rawCode = String(diagnostics.rawCode ?? "").toLowerCase();
   const rawUpstreamCode = String(diagnostics.rawUpstreamCode ?? "").toLowerCase();
-  if (reasonCode === "context_length_exceeded" || rawUpstreamCode === "context_length_exceeded") return false;
+  if (reasonCode === "context_length_exceeded" || rawUpstreamCode === "context_length_exceeded" || reasonCode === "websocket_connection_limit_reached" || rawUpstreamCode === "websocket_connection_limit_reached") return false;
   if (rawUpstreamCode === "previous_response_not_found" || reasonCode === "previous_response_not_found") return true;
   if (diagnostics.rawUpstreamParam === "previous_response_id"
     && (diagnostics.httpStatus === 400 || diagnostics.rawUpstreamType === "invalid_request_error")) return true;
-  if (diagnostics.httpStatus === 400 && diagnostics.rawUpstreamType === "invalid_request_error") return true;
+  if (diagnostics.httpStatus === 400 || diagnostics.httpStatus === 422) return true;
+  if ([1002, 1003, 1007, 1008].includes(diagnostics.closeCode)) return true;
+  if (typeof diagnostics.rawWsErrorCode === "string" && /^WS_ERR_(?:INVALID_|UNEXPECTED_|EXPECTED_)/u.test(diagnostics.rawWsErrorCode)) return true;
   if (diagnostics.failureCategory !== "permanent") return false;
   return diagnostics.httpStatus === 400
     || diagnostics.httpStatus === 422
@@ -282,6 +316,7 @@ function nativeWsFailureDiagnostics(job, error, operation) {
     requiresReconciliation: typeof operation?.requiresReconciliation === "boolean" ? operation.requiresReconciliation : null,
     retryableWithoutDelivery: operation?.retryableWithoutDelivery === true,
     ...(operation?.nativePreviousResponseMismatch ? { nativePreviousResponseMismatch: { ...operation.nativePreviousResponseMismatch } } : {}),
+    ...(error?.responseIdentityConflict ? { responseIdentityConflict: { ...error.responseIdentityConflict } } : {}),
     rawWsErrorCode: code(error?.wsErrorCode),
     closeCode: Number.isInteger(error?.closeCode) && error.closeCode >= 1000 && error.closeCode <= 4999 ? error.closeCode : null,
     direction: ["send", "receive", "connect", "unknown"].includes(error?.direction) ? error.direction
@@ -619,7 +654,8 @@ export function attachNativeResponsesBridge({ server, createRequestClient, relea
   isClosing, onEvent = noop, maxPayload, maxConnections, admissionWaitingByteLimit, reserveAdmissionBytes, maxEventBytes = 32 * 1024 * 1024,
   onPacketSending, onPreparationProgress, onUploadProgress, onRequestStart = noop, onRequestEnd = noop, onToolDone = noop,
   onConnectionClosed = noop, nativeWsRetryOptions, getOperation = () => null, onRecoveryState = noop,
-  managedRecovery = false, managedRetryBaseMs = 5000, recoveryWaitLimitMs = 300000, executeHttpAttempt, prepareBodySource }) {
+  managedRecovery = false, managedRetryBaseMs = 5000, recoveryWaitLimitMs = 300000, maxNetworkRetries = 16, executeHttpAttempt, prepareBodySource }) {
+  const effectiveMaxNetworkRetries = Number.isSafeInteger(maxNetworkRetries) && maxNetworkRetries >= 1 ? maxNetworkRetries : 16;
   const jobs = new Set();
   const sourceCleanups = new Set();
   const ownedPreparations = new WeakSet();
@@ -832,6 +868,8 @@ export function attachNativeResponsesBridge({ server, createRequestClient, relea
           && !outcome.sawHostedTool && (!outcome.sawCompaction || sourceCompactionReplay);
         return { canRetry, sourceCompactionReplay: canRetry && sourceCompactionReplay,
           requiresReconciliation: unresolvedHttpOutput || !canRetry && outcome.policy?.acceptance === "unknown",
+          recoveryReconciliationRequired: Boolean(outcome.transportReconciliationRequired || outcome.sawHostedTool
+            || outcome.sawTool || outcome.sawExecutableToolDone || outcome.holdingToolDone || outcome.sawCompaction),
           acceptance: outcome.policy?.acceptance === "rejected" || outcome.policy?.acceptance === "not_sent" ? false
             : outcome.policy?.acceptance === "accepted" ? true : "unknown",
           requestTransmissionState: outcome.requestTransmissionState, terminalOutcome: outcome.kind === "completed" ? "completed" : undefined };
@@ -839,10 +877,10 @@ export function attachNativeResponsesBridge({ server, createRequestClient, relea
       const pendingReconciliation = (job, userRequested = false) => {
         if (!job.started || !job.context?.key) return null;
         try {
-          const observed = nativePendingDisposition(operationFor(job)) ?? job.nativeReconciliationEvidence ?? null;
+          const observed = nativePendingDisposition(operationFor(job), job) ?? job.nativeReconciliationEvidence ?? null;
           if (observed || userRequested === true || !job.httpFallback || job.httpOutcome) return observed;
-          return nativePendingDisposition({ requiresReconciliation: true, acceptance: "unknown",
-            requestTransmissionState: job.readHttpTransmissionState?.() });
+          return nativePendingDisposition({ requiresReconciliation: true, recoveryReconciliationRequired: true, acceptance: "unknown",
+            requestTransmissionState: job.readHttpTransmissionState?.() }, job);
         } catch { return job.nativeReconciliationEvidence ?? null; }
       };
       const fail = (job, error, capacity) => {
@@ -854,9 +892,10 @@ export function attachNativeResponsesBridge({ server, createRequestClient, relea
           failureOperation = capacity?.operation
             ?? (!job.httpFallback && attempt?.operationId === job.operationId ? attempt : operationFor(job));
         } catch {}
-        job.nativeReconciliationEvidence ??= nativePendingDisposition(failureOperation);
+        job.nativeReconciliationEvidence ??= nativePendingDisposition(failureOperation, job);
+        const failureDiagnostics = nativeWsFailureDiagnostics(job, error, failureOperation);
         emit("native_ws_failure_diagnostic", { operationId: job.operationId,
-          ...nativeWsFailureDiagnostics(job, error, failureOperation) });
+          ...failureDiagnostics });
         if (job.progressBudgetExceeded) {
           finishNotice(job, null, "推理进度已达到本次请求的内存预算，请保留已显示内容后重新发起请求。", job.fullInput,
             "native_ws_progress_budget_exceeded", {}, error);
@@ -888,10 +927,17 @@ export function attachNativeResponsesBridge({ server, createRequestClient, relea
           return;
         }
         if (recoveryAction === "continue_in_client" && !job.deliveredExecutableToolDone
-          && failureOperation?.terminalOutcome === "failed" && failureOperation.requiresReconciliation === false) {
+          && !job.unrecordedExecutableTool && !job.pendingLocalToolItems.size
+          && (job.protocolProgress?.toolParameterBytes ?? 0) === 0
+          && !job.sawNonLocalSideEffect && job.storeRequested !== true
+          && failureOperation?.recoveryReconciliationRequired !== true
+          && !isPermanentStructureRejection(failureDiagnostics)
+          && (job.protocolProgress?.deliveredText === true
+            || failureOperation?.terminalOutcome === "failed" && failureOperation.requiresReconciliation === false)) {
           job.terminal = true;
           const persistenceError = release(job, { kind: "failed", error });
-          if (persistenceError) { closeFailedPeer(peer, persistenceError); return; }
+          if (persistenceError) { invalidateResponseIds(job.publicResponseId, job.upstreamResponseId); setAnchor(null); closeFailedPeer(peer, persistenceError); return; }
+          invalidateResponseIds(job.publicResponseId, job.upstreamResponseId);
           setAnchor(null);
           for (const [outputIndex, item] of job.deliveredItems) {
             if (item?.type !== "message" || item.status === "completed"
@@ -943,12 +989,13 @@ export function attachNativeResponsesBridge({ server, createRequestClient, relea
           job.managedWaiting = true;
           job.waiting = true;
           job.recoveryReason = error?.code ?? "NATIVE_WS_UPSTREAM_ERROR";
-          const retryable = replayAllowed(operation, job);
+          const retryable = replayAllowed(operation, job) && !isPermanentStructureRejection(failureDiagnostics);
           if (!retryable) {
             job.managedWaiting = false;
             job.waiting = false;
             finishNotice(job, error?.upstreamFailureSignals ?? null, nativeFailureNotice(error), job.fullInput,
-              "native_ws_terminal_notice", {}, error);
+              "native_ws_terminal_notice", { code: error?.code ?? "NATIVE_WS_UPSTREAM_ERROR",
+                ...(error?.responseIdentityConflict ? { responseIdentityConflict: error.responseIdentityConflict } : {}) }, error);
             job.request?.destroy();
             return;
           }
@@ -962,6 +1009,14 @@ export function attachNativeResponsesBridge({ server, createRequestClient, relea
             job.response = null;
             job.capacityRetry = true;
             waitForManagedCapacity(job, capacity).catch(nextError => fail(job, nextError));
+            return;
+          }
+          if (!managedCapacity && job.networkRetryNumber >= effectiveMaxNetworkRetries) {
+            job.managedWaiting = false;
+            job.waiting = false;
+            finishNotice(job, null, "上游连接多次中断，已自动重连仍未恢复，已有信息已保留，请稍后继续。", job.fullInput,
+              "native_ws_terminal_notice", { code: error?.code ?? "NATIVE_WS_UPSTREAM_ERROR", retryExhausted: true,
+                retryNumber: job.networkRetryNumber, recoveryElapsedMs: Date.now() - job.recoveryStartedAt }, error);
             return;
           }
           const retryNumber = ++job.networkRetryNumber;
@@ -1086,6 +1141,7 @@ export function attachNativeResponsesBridge({ server, createRequestClient, relea
           (job.itemIndices.get(left.id) ?? Number.MAX_SAFE_INTEGER) - (job.itemIndices.get(right.id) ?? Number.MAX_SAFE_INTEGER));
         const invalidateAnchor = droppedDeliveredNonMessages
           || Boolean(job.deliveredExecutableToolDone && (pending || persistenceError || job.interruptResponseId || verifiedStop))
+          || Boolean((job.networkRetry || job.capacityRetry) && (job.protocolProgress?.completedReasoningItems ?? 0) > 0)
           || job.pendingLocalToolItems.size > 0
           || job.localAnchorUsed === true
           || job.startCallbackFailed === true
@@ -1274,6 +1330,8 @@ export function attachNativeResponsesBridge({ server, createRequestClient, relea
           const fullInput = sourceDocument ? rootSourcePayload(payload).input : !payload.previous_response_id ? payload.input : anchor?.id === payload.previous_response_id
             ? [...anchor.input, ...anchor.output, ...payload.input] : null;
           job.fullInput = fullInput;
+          job.storeRequested = payload.store === true;
+          job.sawNonLocalSideEffect = false;
           job.ordinaryTurn = job.generating && !job.compacting && !job.internalRequest
             && (metadata.request_kind === undefined || metadata.request_kind === "turn")
             && typeof metadata.thread_id === "string" && metadata.thread_id.length > 0
@@ -1305,6 +1363,8 @@ export function attachNativeResponsesBridge({ server, createRequestClient, relea
           }
           const startRequest = () => {
           job.waiting = false;
+          job.nativeReconciliationEvidence = null;
+          job.sawNonLocalSideEffect = false;
           if (job.released || peerClosed || peer.readyState !== webSocketOpen || job.abort.signal.aborted || isClosing?.()) { job.cancel(); return; }
           job.attemptStarted = performance.now();
           job.reasoningProgress.beginAttempt();
@@ -1422,9 +1482,11 @@ export function attachNativeResponsesBridge({ server, createRequestClient, relea
                 try { event = job.reasoningProgress.forward(event); }
                 catch (error) { fail(job, error); return; }
                 if (!event) continue;
-                const observedIncomplete = !job.httpFallback && isKnownIncompleteResponse(event, job.upstreamResponseId);
+                const rawResponseId = event.response?.id ?? event.response_id;
+                const observedUpstreamId = typeof rawResponseId === "string" && rawResponseId ? rawResponseId : job.upstreamResponseId;
+                const observedIncomplete = !job.httpFallback && isKnownIncompleteResponse(event, observedUpstreamId);
                 const observedFailed = !job.httpFallback && event.type === "response.failed"
-                  && typeof job.upstreamResponseId === "string" && event.response?.id === job.upstreamResponseId
+                  && typeof observedUpstreamId === "string" && event.response?.id === observedUpstreamId
                   && event.response.status === "failed" && Array.isArray(event.response.output);
                 event = mapClientResponse(job, event);
                 const executableDone = event.type === "response.output_item.done" && executableNativeTools.has(event.item?.type);
@@ -1453,6 +1515,13 @@ export function attachNativeResponsesBridge({ server, createRequestClient, relea
                   job.protocolProgress.toolParameterBytes = Math.min(Number.MAX_SAFE_INTEGER,
                     job.protocolProgress.toolParameterBytes + Buffer.byteLength(event.delta));
                 }
+                if (event.type === "response.function_call_arguments.done" && typeof event.arguments === "string" && event.arguments.length
+                  || event.type === "response.custom_tool_call_input.done" && typeof event.input === "string" && event.input.length) {
+                  const doneParam = event.type === "response.function_call_arguments.done" ? event.arguments : event.input;
+                  job.protocolProgress.toolParameterBytes = Math.min(Number.MAX_SAFE_INTEGER,
+                    job.protocolProgress.toolParameterBytes + Buffer.byteLength(doneParam));
+                }
+                if (isNonLocalSideEffectEvent(event)) job.sawNonLocalSideEffect = true;
                 if (event.type === "response.output_text.delta" && typeof event.delta === "string" && event.delta.length) {
                   job.protocolProgress.deliveredText = true;
                 }
