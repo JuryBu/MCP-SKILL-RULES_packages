@@ -152,7 +152,7 @@ export function normalizeSendInput(input, principal, target, { preserveLegacyVis
     target: { ...normalizeIdentity(target), binding_id: target.binding_id, binding_generation: target.binding_generation },
     dedupe_key: requireText(input.dedupe_key, "dedupe_key", 128),
     text: requireText(input.text, "text"),
-    attachment_refs: attachments.map(reference => requireText(reference, "attachment_ref", 512)),
+    attachment_refs: attachments.map(reference => requireText(reference, "attachment_ref", 1024)),
     delivery_policy: policy,
     ...(visibility === undefined ? {} : { message_visibility: visibility }),
     reply_required: input.reply_required === true,

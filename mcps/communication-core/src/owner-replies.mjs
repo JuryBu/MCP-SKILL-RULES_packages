@@ -69,12 +69,19 @@ function originalScope(input, binding) {
       || message.message_id !== binding.message_id || delivery.message_id !== binding.message_id
       || delivery.delivery_id !== binding.delivery_id || message.target_key !== targetKey || delivery.target_key !== targetKey
       || message.source_key !== identityKey(envelope.caller)
-      || target.conversation_id !== binding.route.target_key
-      || delivery.status !== "accepted" || (delivery.outcome !== undefined && delivery.outcome !== "accepted")) return null;
+      || target.conversation_id !== binding.route.target_key) return null;
     const accepted = delivery.evidence;
     const evidence = accepted?.evidence;
     const receipt = evidence?.native_receipt;
-    if (accepted?.outcome !== "accepted" || accepted.delivery_id !== delivery.delivery_id || accepted.target_key !== targetKey
+    const partialUnknown = delivery.status === "unknown"
+      && (delivery.outcome === undefined || delivery.outcome === "unknown")
+      && accepted?.outcome === "unknown"
+      && evidence?.partial_delivery === true
+      && Array.isArray(envelope?.attachment_refs) && envelope.attachment_refs.length > 0;
+    const fullyAccepted = delivery.status === "accepted"
+      && (delivery.outcome === undefined || delivery.outcome === "accepted")
+      && accepted?.outcome === "accepted";
+    if ((!fullyAccepted && !partialUnknown) || accepted.delivery_id !== delivery.delivery_id || accepted.target_key !== targetKey
       || evidence?.kind !== "receipt" || receipt?.provider !== "napcat_owner" || receipt.verified !== true
       || receipt.state_persisted !== true || !messageId(receipt.message_id)) return null;
     if (!sameRoute(receipt.reply_route, binding.route)) return null;

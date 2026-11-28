@@ -119,6 +119,16 @@ function runContentQuerySync(request) {
       return { state: "ready", rows };
     }
 
+    if (request.kind === "title") {
+      if (!SLUG.test(request.slug ?? "")) return { state: "unavailable" };
+      const session = prepareIndexed(
+        "SELECT id, title FROM sessions WHERE id = ?",
+        [request.slug],
+      ).get(request.slug);
+      if (!session) return { state: "ready", found: false };
+      return { state: "ready", found: true, title: session.title };
+    }
+
     if (request.kind === "tail") {
       if (!SLUG.test(request.slug ?? "")) return { state: "unavailable" };
       const session = prepareIndexed(
@@ -386,6 +396,14 @@ export function createWindsurfConversationContent({
         partial: false,
         coverage_source: "desktop_catalog",
       };
+    },
+
+    async readTitle(target, { signal } = {}) {
+      if (!SLUG.test(target?.conversation_id ?? "")) return null;
+      const res = await queryDb({ kind: "title", slug: target.conversation_id }, signal);
+      if (!res.found || !boundedString(res.title, 256)) return null;
+      const trimmed = res.title.trim();
+      return trimmed && trimmed !== target.conversation_id ? trimmed : null;
     },
 
     async readRecent(target, { lastRounds, signal }) {

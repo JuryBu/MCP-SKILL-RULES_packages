@@ -59,17 +59,43 @@ async function fileHash(filename) {
   return hash.digest("hex");
 }
 
-async function readPage({ filePath, copyDirectory, after, limit, exact }) {
-  const files = fileSet(filePath);
-  const free = statfsSync(copyDirectory);
-  const required = files.reduce((sum, file) => sum + file.byteSize, 0);
-  if (free.bavail * free.bsize < required + 16 * 1024 * 1024) throw unavailable();
-  const copied = join(copyDirectory, DATABASE_NAME);
-  for (const file of files) copyFileSync(filePath + file.suffix, copied + file.suffix, constants.COPYFILE_EXCL);
-  for (const file of files) {
-    if (await fileHash(filePath + file.suffix) !== await fileHash(copied + file.suffix)) throw unavailable();
+async function clearCopiedFiles(copyDirectory) {
+  for (const name of await readdir(copyDirectory)) {
+    if (![DATABASE_NAME, DATABASE_NAME + "-wal", DATABASE_NAME + "-shm", DATABASE_NAME + "-journal"].includes(name)) continue;
+    await unlink(join(copyDirectory, name)).catch(() => {});
   }
-  if (JSON.stringify(fileSet(filePath)) !== JSON.stringify(files)) throw unavailable();
+}
+
+async function copyStableSnapshot(filePath, copyDirectory) {
+  const delays = [20, 50];
+  for (let attempt = 0; ; attempt += 1) {
+    const files = fileSet(filePath);
+    const free = statfsSync(copyDirectory);
+    const required = files.reduce((sum, file) => sum + file.byteSize, 0);
+    if (free.bavail * free.bsize < required + 16 * 1024 * 1024) throw unavailable();
+    const copied = join(copyDirectory, DATABASE_NAME);
+    let stable = true;
+    try {
+      for (const file of files) copyFileSync(filePath + file.suffix, copied + file.suffix, constants.COPYFILE_EXCL);
+      for (const file of files) {
+        if (await fileHash(filePath + file.suffix) !== await fileHash(copied + file.suffix)) {
+          stable = false;
+          break;
+        }
+      }
+      if (stable && JSON.stringify(fileSet(filePath)) !== JSON.stringify(files)) stable = false;
+    } catch {
+      stable = false;
+    }
+    if (stable) return { files, copied };
+    await clearCopiedFiles(copyDirectory);
+    if (attempt >= delays.length) throw unavailable();
+    await new Promise(resolve => setTimeout(resolve, delays[attempt]));
+  }
+}
+
+async function readPage({ filePath, copyDirectory, after, limit, exact }) {
+  const { files, copied } = await copyStableSnapshot(filePath, copyDirectory);
   const database = new DatabaseSync(copied, { readOnly: true, allowExtension: false, timeout: 80 });
   try {
     database.exec("PRAGMA query_only=ON; PRAGMA trusted_schema=OFF");

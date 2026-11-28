@@ -174,7 +174,7 @@ async function readConfiguration(configPath) {
     const adapterIds = new Set();
     const adapters = boundedList(configuration.adapters).map(entry => {
       const allowed = entry.kind === "codex_proxy" ? ["id", "kind", "connection_file"]
-        : entry.kind === "napcat_owner" ? ["id", "kind", "base_url", "route_key", "conversation_id", "reply_hint", "reply_events"]
+        : entry.kind === "napcat_owner" ? ["id", "kind", "base_url", "route_key", "conversation_id", "reply_hint", "reply_events", "allowed_attachment_roots", "max_attachment_bytes", "max_attachments_per_message"]
         : entry.kind === "windsurf_acp" ? ["id", "kind", "max_active_clients", "idle_ttl_ms"]
         : ["id", "kind", "conversation_index_file"];
       assertExactKeys(entry, allowed, "接入模块");
@@ -191,14 +191,33 @@ async function readConfiguration(configPath) {
         const idleTtl = entry.idle_ttl_ms === undefined ? 180000 : requireInteger(entry.idle_ttl_ms, "idle_ttl_ms", 15000, 3600000);
         return { id, kind: entry.kind, max_active_clients: maxActive, idle_ttl_ms: idleTtl };
       }
-      if (entry.kind === "napcat_owner") return {
-        id, kind: entry.kind,
-        base_url: requireText(entry.base_url, "base_url", 2048),
-        route_key: requireText(entry.route_key, "route_key", 256),
-        conversation_id: requireText(entry.conversation_id, "conversation_id", 256),
-        ...(entry.reply_hint === undefined ? {} : { reply_hint: requireText(entry.reply_hint, "reply_hint", 512) }),
-        ...(entry.reply_events === undefined ? {} : { reply_events: ownerReplyConfiguration(entry.reply_events) }),
-      };
+      if (entry.kind === "napcat_owner") {
+        let allowedAttachmentRoots;
+        if (entry.allowed_attachment_roots !== undefined) {
+          allowedAttachmentRoots = boundedList(entry.allowed_attachment_roots, 32, 0).map(root => {
+            const text = requireText(root, "allowed_attachment_root", 1024);
+            if (!isAbsolute(text) || text.startsWith("\\\\") || text.startsWith("//")) throw invalidConfiguration();
+            return text;
+          });
+        }
+        const maxAttachmentBytes = entry.max_attachment_bytes === undefined
+          ? undefined
+          : requireInteger(entry.max_attachment_bytes, "max_attachment_bytes", 1, 2147483648);
+        const maxAttachmentsPerMessage = entry.max_attachments_per_message === undefined
+          ? undefined
+          : requireInteger(entry.max_attachments_per_message, "max_attachments_per_message", 1, 32);
+        return {
+          id, kind: entry.kind,
+          base_url: requireText(entry.base_url, "base_url", 2048),
+          route_key: requireText(entry.route_key, "route_key", 256),
+          conversation_id: requireText(entry.conversation_id, "conversation_id", 256),
+          ...(entry.reply_hint === undefined ? {} : { reply_hint: requireText(entry.reply_hint, "reply_hint", 512) }),
+          ...(entry.reply_events === undefined ? {} : { reply_events: ownerReplyConfiguration(entry.reply_events) }),
+          ...(allowedAttachmentRoots === undefined ? {} : { allowed_attachment_roots: allowedAttachmentRoots }),
+          ...(maxAttachmentBytes === undefined ? {} : { max_attachment_bytes: maxAttachmentBytes }),
+          ...(maxAttachmentsPerMessage === undefined ? {} : { max_attachments_per_message: maxAttachmentsPerMessage }),
+        };
+      }
       if (entry.conversation_index_file === undefined) return { id, kind: entry.kind };
       const indexFile = requireText(entry.conversation_index_file, "conversation_index_file", 32768);
       if (!isAbsolute(indexFile) || basename(indexFile) !== "conversation_summaries.db") throw invalidConfiguration();
@@ -462,15 +481,28 @@ export async function startLiveFromConfig({ configPath, stateDir, endpointFile, 
         statusProvider.providers.set("antigravity", createAntigravityStatusReader(transport, { configured_delivery_modes: { next_model_boundary: true, when_idle: true } }));
         const summaryIndex = entry.conversation_index_file ? createAntigravitySummaryIndex({ filePath: entry.conversation_index_file }) : undefined;
         if (summaryIndex) transports.add(summaryIndex);
+        let cachedAgList = { expiresAt: 0, conversations: null };
         ownerTitleProviders.set("antigravity", async (source, { signal, canList }) => {
-          if (canList) {
-            const liveIndex = await transport.listContentIndex({ signal }).catch(() => null);
-            const named = liveIndex?.conversations.find(row => row.cascade_id === source.conversation_id)?.title;
-            if (typeof named === "string" && named.trim()) return named;
+          if (summaryIndex && !signal?.aborted) {
+            const subTimeout = AbortSignal.timeout(1200);
+            const subSignal = signal ? AbortSignal.any([signal, subTimeout]) : subTimeout;
+            const result = await summaryIndex.find({ conversationId: source.conversation_id, signal: subSignal }).catch(() => null);
+            if (result?.cascade_id === source.conversation_id && typeof result.title === "string" && result.title.trim()) {
+              return result.title;
+            }
           }
-          if (!summaryIndex || signal?.aborted) return null;
-          const result = await summaryIndex.find({ conversationId: source.conversation_id, signal });
-          return result?.cascade_id === source.conversation_id ? result.title : null;
+          if (!canList || signal?.aborted) return null;
+          const nowMs = Date.now();
+          let conversations = cachedAgList.expiresAt > nowMs ? cachedAgList.conversations : null;
+          if (!conversations) {
+            const liveIndex = await transport.listContentIndex({ signal }).catch(() => null);
+            if (Array.isArray(liveIndex?.conversations)) {
+              conversations = liveIndex.conversations;
+              cachedAgList = { expiresAt: Date.now() + 15000, conversations };
+            }
+          }
+          const named = conversations?.find(row => row.cascade_id === source.conversation_id)?.title;
+          return typeof named === "string" && named.trim() ? named : null;
         });
         hostContentProviders.antigravity = createAntigravityConversationContent(transport, { summaryIndex, getMessageForDelivery: id => {
           const delivery = store?.getDelivery(id);
@@ -491,11 +523,25 @@ export async function startLiveFromConfig({ configPath, stateDir, endpointFile, 
         }));
         if (connection.content_read_token !== undefined) {
           hostContentProviders.codex = createCodexConversationContent(transport, { inspectThread: codexStatus?.inspectThread });
+          let cachedCodexList = { expiresAt: 0, threads: null };
           ownerTitleProviders.set("codex", async (source, { signal, canList }) => {
-            if (!canList) return null;
-            const list = await transport.readHostContent("list", { limit: 50 }, { signal });
-            if (!Array.isArray(list?.threads) || list.threads.length > 50) return null;
-            const matches = list.threads.filter(row => row?.thread_id === source.conversation_id);
+            if (typeof codexStatus?.inspectThread === "function" && !signal?.aborted) {
+              const inspected = await codexStatus.inspectThread(source.conversation_id, { signal }).catch(() => null);
+              const directTitle = inspected?.title ?? inspected?.thread?.title;
+              if (typeof directTitle === "string" && directTitle.trim()) return directTitle;
+            }
+            if (!canList || signal?.aborted) return null;
+            const nowMs = Date.now();
+            let threads = cachedCodexList.expiresAt > nowMs ? cachedCodexList.threads : null;
+            if (!threads) {
+              const list = await transport.readHostContent("list", { limit: 50 }, { signal }).catch(() => null);
+              if (Array.isArray(list?.threads) && list.threads.length <= 50) {
+                threads = list.threads;
+                cachedCodexList = { expiresAt: Date.now() + 15000, threads };
+              }
+            }
+            if (!threads) return null;
+            const matches = threads.filter(row => row?.thread_id === source.conversation_id);
             return matches.length === 1 ? matches[0].title : null;
           });
         }
@@ -524,12 +570,19 @@ export async function startLiveFromConfig({ configPath, stateDir, endpointFile, 
             return delivery ? store.getMessage(delivery.message_id) : null;
           },
         });
+        ownerTitleProviders.set("windsurf", async (source, { signal }) => {
+          if (signal?.aborted) return null;
+          return hostContentProviders.windsurf.readTitle?.(source, { signal }).catch(() => null) ?? null;
+        });
       } else {
         const transport = new NapcatMcpTransport({ baseUrl: entry.base_url, conversationId: entry.conversation_id });
         transports.add(transport);
         windowTransport = transport;
         created = new NapcatOwnerAdapter({ transport, routeKey: entry.route_key, replyHint: entry.reply_hint, conversationId: entry.conversation_id,
           readSourceTitle: readOwnerSourceTitle,
+          ...(entry.allowed_attachment_roots === undefined ? {} : { allowedAttachmentRoots: entry.allowed_attachment_roots }),
+          ...(entry.max_attachment_bytes === undefined ? {} : { maxAttachmentBytes: entry.max_attachment_bytes }),
+          ...(entry.max_attachments_per_message === undefined ? {} : { maxAttachmentsPerMessage: entry.max_attachments_per_message }),
           ...(entry.reply_events === undefined ? {} : { replyEvents: { ...entry.reply_events, callerConversationId: entry.conversation_id } }),
         });
       }

@@ -1,10 +1,17 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import { setImmediate as nextTurn } from "node:timers/promises";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { CoreError, identityKey } from "../src/contracts.mjs";
+import { CommunicationCore } from "../src/core.mjs";
+import { MessageStore } from "../src/store.mjs";
 import { NapcatMcpTransport } from "../src/transports/napcat-mcp.mjs";
 import { createOwnerSourceTitleReader, NapcatOwnerAdapter } from "../src/adapters/napcat-owner.mjs";
+import { createWindsurfConversationContent } from "../src/windsurf-conversation-content.mjs";
+import { DatabaseSync } from "node:sqlite";
 
 const endpoint = "http://127.0.0.1:14588/napcat/mcp";
 const secret = "Bearer fixture-credential-not-for-output";
@@ -214,7 +221,7 @@ test("an unavailable optional title falls back, but cancellation never submits a
   const slow = adapterFixture({}, { readSourceTitle: () => new Promise(() => {}) });
   const pending = slow.adapter.deliver(input());
   await nextTurn();
-  context.mock.timers.tick(1000);
+  context.mock.timers.tick(2600);
   assert.equal((await pending).outcome, "accepted");
   assert.match(slow.calls.send[0].request.summary, /来源Antigravity对话：/u);
 
@@ -607,4 +614,644 @@ test("adapter plus SDK injection distinguishes pre-call failure from post-call u
     assert.equal(result.outcome, phase === "connect" ? "busy" : "unknown");
     assert.equal(JSON.stringify(result).includes(secret), false);
   }
+});
+
+test("private QQ target strips group-only @ mention hint while group target keeps it intact", async () => {
+  const { adapter, calls } = adapterFixture({
+    async sendOwnerAlert(request, options) {
+      calls.send.push({ request, options });
+      const targetKey = calls.send.length === 1 ? "owner-private" : "configured-test-target";
+      return sent({ target: { targetKey } });
+    },
+  }, { replyHint: "有事引用这条并@我即可～" });
+  const priv = input();
+  priv.target.surface = "private";
+  priv.target.conversation_id = "owner-private";
+  const privRes = await adapter.deliver(priv);
+  assert.equal(privRes.outcome, "accepted");
+  assert.equal(calls.send[0].request.reply_hint, "有事引用这条即可～");
+
+  const grp = input();
+  grp.target.surface = "group";
+  grp.delivery.delivery_id = "test-delivery-group";
+  const grpRes = await adapter.deliver(grp);
+  assert.equal(grpRes.outcome, "accepted");
+  assert.equal(calls.send[1].request.reply_hint, "有事引用这条并@我即可～");
+});
+
+test("authorized QQ private and group targets send text plus ordered file/image/video attachments with per-file receipts", async context => {
+  const root = mkdtempSync(path.join(tmpdir(), "cc-qq-att-ok-"));
+  context.after(() => rmSync(root, { recursive: true, force: true }));
+  const docFile = path.join(root, "report.txt");
+  const imgFile = path.join(root, "render.png");
+  const vidFile = path.join(root, "demo.mp4");
+  writeFileSync(docFile, "hello report\n", "utf8");
+  writeFileSync(imgFile, Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x01, 0x02]));
+  writeFileSync(vidFile, Buffer.alloc(64, 0x42));
+
+  for (const [surface, targetId] of [["private", "owner-private"], ["group", "configured-test-target"]]) {
+    const fileCalls = [];
+    const { adapter, calls } = adapterFixture({
+      async sendOwnerAlert(request, options) {
+        calls.send.push({ request, options });
+        return sent({ target: { targetKey: targetId }, messageId: "5001" });
+      },
+      async sendConfiguredChatFile(request, options) {
+        fileCalls.push({ request, options });
+        const idx = fileCalls.length - 1;
+        return {
+          ok: true,
+          sent: true,
+          verified: true,
+          chatFileStatePersisted: true,
+          target: { targetKey: targetId },
+          messageId: String(6001 + idx),
+          fileMessageId: String(6001 + idx),
+          fileId: `fid-${idx}`,
+          fileName: request.name,
+          fileBytes: idx === 0 ? 13 : idx === 1 ? 10 : 64,
+          sha256: String(idx + 1).repeat(64),
+        };
+      },
+    }, {
+      replyHint: "有事引用这条并@我即可～",
+      allowedAttachmentRoots: [root],
+      readSourceTitle: async () => "猫猫云梯核心开发对话",
+    });
+
+    const original = input();
+    original.target.surface = surface;
+    original.target.conversation_id = targetId;
+    original.delivery.delivery_id = `del-${surface}-multi`;
+    original.message.envelope.attachment_refs = [docFile, imgFile, vidFile];
+    const result = await adapter.deliver(original);
+    assert.equal(result.outcome, "accepted");
+    assert.equal(calls.send.length, 1);
+    assert.match(calls.send[0].request.summary, /^交流核心转送 \/ 来源「猫猫云梯核心开发对话」：/u);
+    assert.equal(calls.send[0].request.reply_hint, surface === "private" ? "有事引用这条即可～" : "有事引用这条并@我即可～");
+    assert.deepEqual(fileCalls.map(c => c.request.name), ["report.txt", "render.png", "demo.mp4"]);
+    assert.deepEqual(fileCalls.map(c => c.request.target_key), [targetId, targetId, targetId]);
+    assert.deepEqual(fileCalls.map(c => c.request.dedupe_key), [
+      `communication-core:del-${surface}-multi:att:0`,
+      `communication-core:del-${surface}-multi:att:1`,
+      `communication-core:del-${surface}-multi:att:2`,
+    ]);
+    assert.equal(result.evidence.native_receipt.message_id, "5001");
+    assert.equal(result.evidence.native_receipt.attachments.length, 3);
+    assert.deepEqual(result.evidence.native_receipt.attachments.map(a => ({
+      index: a.index,
+      file_name: a.file_name,
+      message_id: a.message_id,
+      file_id: a.file_id,
+      verified: a.verified,
+      deduped: a.deduped,
+    })), [
+      { index: 0, file_name: "report.txt", message_id: "6001", file_id: "fid-0", verified: true, deduped: false },
+      { index: 1, file_name: "render.png", message_id: "6002", file_id: "fid-1", verified: true, deduped: false },
+      { index: 2, file_name: "demo.mp4", message_id: "6003", file_id: "fid-2", verified: true, deduped: false },
+    ]);
+  }
+});
+
+test("partial attachment failure preserves unknown outcome and retries never resend text or already sent files", async context => {
+  const root = mkdtempSync(path.join(tmpdir(), "cc-qq-att-retry-"));
+  context.after(() => rmSync(root, { recursive: true, force: true }));
+  const f1 = path.join(root, "first.png");
+  const f2 = path.join(root, "second.mp4");
+  writeFileSync(f1, Buffer.from([1, 2, 3, 4]));
+  writeFileSync(f2, Buffer.from([5, 6, 7, 8, 9]));
+
+  let failSecondOnce = true;
+  const sentFiles = [];
+  const { adapter, calls } = adapterFixture({
+    async sendConfiguredChatFile(request) {
+      sentFiles.push(request.name);
+      if (request.name === "second.mp4" && failSecondOnce) {
+        failSecondOnce = false;
+        throw new CoreError("napcat_mcp_unconfirmed", "timeout", { request_sent: true });
+      }
+      return {
+        ok: true, sent: true, verified: true, chatFileStatePersisted: true,
+        target: { targetKey: input().target.conversation_id },
+        messageId: request.name === "first.png" ? "7001" : "7002",
+        fileId: `id-${request.name}`,
+        fileName: request.name,
+        fileBytes: request.name === "first.png" ? 4 : 5,
+        sha256: "a".repeat(64),
+      };
+    },
+  }, { allowedAttachmentRoots: [root] });
+
+  const original = input();
+  original.message.envelope.attachment_refs = [f1, f2];
+  const firstAttempt = await adapter.deliver(original);
+  assert.equal(firstAttempt.outcome, "unknown");
+  assert.equal(firstAttempt.reason, "owner_attachment_submission_unconfirmed");
+  assert.equal(firstAttempt.evidence.native_receipt.message_id, "123456");
+  assert.equal(firstAttempt.evidence.native_receipt.attachments.length, 1);
+  assert.equal(firstAttempt.evidence.native_receipt.attachments[0].file_name, "first.png");
+  assert.equal(calls.send.length, 1);
+  assert.deepEqual(sentFiles, ["first.png", "second.mp4"]);
+
+  const secondAttempt = await adapter.deliver(original);
+  assert.equal(secondAttempt.outcome, "accepted");
+  assert.equal(calls.send.length, 1);
+  assert.deepEqual(sentFiles, ["first.png", "second.mp4", "second.mp4"]);
+  assert.equal(secondAttempt.evidence.native_receipt.attachments.length, 2);
+  assert.equal(secondAttempt.evidence.native_receipt.attachments[1].message_id, "7002");
+
+  // Cross-restart persisted dedupe path (new adapter instance)
+  const fresh = adapterFixture({
+    async sendOwnerAlert() { return sent({ sent: false, deduped: true }); },
+    async sendConfiguredChatFile(request) {
+      if (request.name === "first.png") {
+        return {
+          ok: true, sent: false, duplicateSuppressed: true, reason: "already_sent",
+          existing: { verified: true, fileMessageId: "7001", fileId: "id-first.png", fileName: "first.png", fileBytes: 4, sha256: "a".repeat(64) },
+        };
+      }
+      return {
+        ok: true, sent: true, verified: true, chatFileStatePersisted: true,
+        target: { targetKey: input().target.conversation_id },
+        messageId: "7002", fileId: "id-second.mp4", fileName: "second.mp4", fileBytes: 5, sha256: "b".repeat(64),
+      };
+    },
+  }, { allowedAttachmentRoots: [root] });
+  const dedupedRes = await fresh.adapter.deliver(original);
+  assert.equal(dedupedRes.outcome, "accepted");
+  assert.equal(dedupedRes.evidence.native_receipt.attachments[0].deduped, true);
+  assert.equal(dedupedRes.evidence.native_receipt.attachments[1].deduped, false);
+});
+
+test("attachment preflight blocks unapproved roots, URLs, ncf1 refs, sensitive files, empty and oversized files before any send", async context => {
+  const base = mkdtempSync(path.join(tmpdir(), "cc-qq-att-sec-"));
+  context.after(() => rmSync(base, { recursive: true, force: true }));
+  const allowed = path.join(base, "allowed");
+  const sibling = path.join(base, "allowed2");
+  const sshDir = path.join(allowed, ".ssh");
+  mkdirSync(allowed, { recursive: true });
+  mkdirSync(sibling, { recursive: true });
+  mkdirSync(sshDir, { recursive: true });
+
+  const outsideFile = path.join(sibling, "escape.txt");
+  const envFile = path.join(allowed, ".env");
+  const privFile = path.join(allowed, "secret.private.json");
+  const localMd = path.join(allowed, "personal-care.local.md");
+  const sqliteFile = path.join(allowed, "core.sqlite");
+  const sshFile = path.join(sshDir, "note.txt");
+  const emptyFile = path.join(allowed, "empty.txt");
+  const bigFile = path.join(allowed, "big.bin");
+  for (const f of [outsideFile, envFile, privFile, localMd, sqliteFile, sshFile]) writeFileSync(f, "x", "utf8");
+  writeFileSync(emptyFile, "");
+  writeFileSync(bigFile, Buffer.alloc(200, 1));
+
+  const cases = [
+    ["inbound ncf1 ref", [`ncf1:${"a".repeat(64)}`], "attachment_path_not_allowed"],
+    ["http url", ["https://example.com/a.png"], "attachment_path_not_allowed"],
+    ["file url", ["file:///C:/a.png"], "attachment_path_not_allowed"],
+    ["unc path", ["\\\\server\\share\\a.png"], "attachment_path_not_allowed"],
+    ["relative path", ["relative/a.png"], "attachment_path_not_allowed"],
+    ["sibling prefix escape", [outsideFile], "attachment_path_not_allowed"],
+    ["missing file", [path.join(allowed, "nope.png")], "attachment_not_found"],
+    ["directory", [allowed], "attachment_not_regular_file"],
+    ["empty file", [emptyFile], "attachment_empty"],
+    ["oversized file", [bigFile], "attachment_too_large"],
+    ["dotenv blocked", [envFile], "attachment_sensitive_path_blocked"],
+    ["private json blocked", [privFile], "attachment_sensitive_path_blocked"],
+    ["local md blocked", [localMd], "attachment_sensitive_path_blocked"],
+    ["sqlite blocked", [sqliteFile], "attachment_sensitive_path_blocked"],
+    ["ssh dir blocked", [sshFile], "attachment_sensitive_path_blocked"],
+    ["too many attachments", [outsideFile, outsideFile, outsideFile], "too_many_attachments"],
+  ];
+
+  for (const [label, refs, expectedReason] of cases) {
+    const { adapter, calls } = adapterFixture({
+      async sendConfiguredChatFile() { throw new Error("should not send"); },
+    }, { allowedAttachmentRoots: [allowed], maxAttachmentBytes: 100, maxAttachmentsPerMessage: 2 });
+    const original = input();
+    original.message.envelope.attachment_refs = refs;
+    const res = await adapter.deliver(original);
+    assert.equal(res.outcome, "failed_before_send", label);
+    assert.equal(res.reason, expectedReason, label);
+    assert.equal(calls.status.length, 0, label);
+    assert.equal(calls.send.length, 0, label);
+  }
+});
+
+test("NapcatMcpTransport.sendConfiguredChatFile uses dedicated upload lane, 45s timeout and submission tracking", async context => {
+  let started = 0;
+  const { transport, calls } = sdkFixture(context, {
+    async callTool(params) {
+      assert.equal(params.name, "napcat_send_configured_chat_file");
+      assert.equal(started, 1);
+      return { structuredContent: { ok: true, sent: true, verified: true, messageId: "9001", fileName: "a.png", fileBytes: 12 } };
+    },
+  });
+  const res = await transport.sendConfiguredChatFile({
+    target_key: "owner-private",
+    file_path: "C:/tmp/a.png",
+    name: "a.png",
+    dedupe_key: "cc:d1:att:0",
+  }, { onRequestStarted() { started += 1; } });
+  assert.equal(res.messageId, "9001");
+  assert.equal(calls.tools.length, 1);
+  assert.equal(calls.tools[0].options.timeout, 45000);
+  await assert.rejects(transport.sendConfiguredChatFile({ target_key: "owner-private", file_path: "a\nb", dedupe_key: "k" }), error => {
+    assert.equal(error.code, "napcat_mcp_unconfirmed");
+    assert.equal(error.details.request_sent, false);
+    return true;
+  });
+});
+
+test("CommunicationCore preserves sanitized per-file QQ attachment receipts without leaking external secrets", async context => {
+  const root = mkdtempSync(path.join(tmpdir(), "cc-core-qq-att-"));
+  const img = path.join(root, "shot.png");
+  writeFileSync(img, Buffer.from([1, 2, 3, 4, 5]));
+  const caller = { machine_id: "test-machine", host: "antigravity", surface: "desktop", conversation_id: "src-1" };
+  const target = { machine_id: "test-machine", host: "qq", surface: "private", conversation_id: "owner-private", binding_id: "qq-priv", binding_generation: 1, adapter_id: "qq-priv-adapter", capabilities: { next_model_boundary: true, when_idle: false }, evidence: "fixture" };
+  const { adapter } = adapterFixture({
+    async sendOwnerAlert() { return sent({ target: { targetKey: "owner-private" }, messageId: "8100", secretLeak: secret }); },
+    async sendConfiguredChatFile() {
+      return {
+        ok: true, sent: true, verified: true, chatFileStatePersisted: true,
+        target: { targetKey: "owner-private", id: secret },
+        messageId: "8101", fileId: "fid-shot", fileName: "shot.png", fileBytes: 5, sha256: "c".repeat(64), raw: secret,
+      };
+    },
+  }, { allowedAttachmentRoots: [root] });
+  const store = new MessageStore({ filePath: path.join(root, "core.sqlite") });
+  const core = new CommunicationCore({
+    store,
+    targets: [target],
+    principals: [{ id: "p1", identity: caller, allowed_targets: ["qq-priv"], origin_kinds: ["agent_message"] }],
+    adapters: new Map([["qq-priv-adapter", adapter]]),
+  });
+  context.after(async () => {
+    await core.close().catch(() => {});
+    store.close();
+    rmSync(root, { recursive: true, force: true });
+  });
+  await core.start();
+  const authCtx = { principal_id: "p1" };
+  const created = await core.sendMessage(authCtx, {
+    caller,
+    origin: { kind: "agent_message", channel: "antigravity", source_ref: "src-1" },
+    target: { machine_id: target.machine_id, host: target.host, surface: target.surface, conversation_id: target.conversation_id, binding_id: target.binding_id, binding_generation: target.binding_generation },
+    dedupe_key: "core-qq-att-test-1",
+    text: "请看截图",
+    attachment_refs: [img],
+    expires_at: new Date(Date.now() + 3600000).toISOString(),
+  });
+  await core.drain();
+  const detail = await core.getMessage(authCtx, { caller, message_id: created.message.message_id });
+  assert.equal(detail.delivery.status, "accepted");
+  assert.equal(JSON.stringify(detail).includes(secret), false);
+  assert.deepEqual(detail.delivery.evidence.evidence.native_receipt.attachments, [{
+    index: 0, file_name: "shot.png", file_bytes: 5, sha256: "c".repeat(64), message_id: "8101", file_id: "fid-shot", verified: true, deduped: false,
+  }]);
+});
+
+test("Windsurf conversation content readTitle reads session title via lightweight indexed query", async context => {
+  const cliDir = mkdtempSync(path.join(tmpdir(), "cc-wsf-title-"));
+  context.after(() => rmSync(cliDir, { recursive: true, force: true }));
+  const dbPath = path.join(cliDir, "sessions.db");
+  const db = new DatabaseSync(dbPath);
+  db.exec(`CREATE TABLE sessions (
+    id TEXT PRIMARY KEY,
+    working_directory TEXT,
+    model TEXT,
+    agent_mode TEXT,
+    created_at INTEGER,
+    last_activity_at INTEGER,
+    title TEXT,
+    main_chain_id INTEGER,
+    hidden INTEGER DEFAULT 0
+  );
+  CREATE TABLE message_nodes (
+    session_id TEXT,
+    node_id INTEGER,
+    parent_node_id INTEGER,
+    chat_message TEXT,
+    created_at INTEGER,
+    PRIMARY KEY (session_id, node_id)
+  );`);
+  db.prepare(`INSERT INTO sessions VALUES (?, ?, ?, ?, 1, 2, ?, 0, 0)`)
+    .run("bright-falcon", "C:/work", "swe-2", "code", "训练机联调对话");
+  db.close();
+
+  const reader = createWindsurfConversationContent({ cliDataDir: cliDir });
+  assert.equal(await reader.readTitle({ conversation_id: "bright-falcon" }), "训练机联调对话");
+  assert.equal(await reader.readTitle({ conversation_id: "missing-slug" }), null);
+  assert.equal(await reader.readTitle({ conversation_id: "INVALID SLUG" }), null);
+});
+
+test("default attachment limit rejects 5 files before status or send", async context => {
+  const root = mkdtempSync(path.join(tmpdir(), "cc-qq-att-max4-"));
+  context.after(() => rmSync(root, { recursive: true, force: true }));
+  const files = [];
+  for (let i = 0; i < 5; i += 1) {
+    const p = path.join(root, `item-${i}.txt`);
+    writeFileSync(p, `part-${i}`, "utf8");
+    files.push(p);
+  }
+  const { adapter, calls } = adapterFixture({
+    async sendConfiguredChatFile() { throw new Error("should not send"); },
+  }, { allowedAttachmentRoots: [root] });
+  const original = input();
+  original.message.envelope.attachment_refs = files;
+  const res = await adapter.deliver(original);
+  assert.equal(res.outcome, "failed_before_send");
+  assert.equal(res.reason, "too_many_attachments");
+  assert.equal(calls.status.length, 0);
+  assert.equal(calls.send.length, 0);
+});
+
+test("real Core + SQLite partial attachment unknown persists text receipt, reply_route and confirmed files across reopen and observes owner reply without resending", async context => {
+  const root = mkdtempSync(path.join(tmpdir(), "cc-core-partial-reopen-"));
+  const f1 = path.join(root, "confirmed.png");
+  const f2 = path.join(root, "unconfirmed.mp4");
+  writeFileSync(f1, Buffer.from([1, 2, 3, 4]));
+  writeFileSync(f2, Buffer.from([5, 6, 7, 8, 9]));
+  const dbPath = path.join(root, "core.sqlite");
+  const caller = { machine_id: "test-machine", host: "antigravity", surface: "desktop", conversation_id: "src-partial" };
+  const target = {
+    machine_id: "test-machine", host: "qq", surface: "private", conversation_id: "owner-private",
+    binding_id: "qq-priv", binding_generation: 1, adapter_id: "qq-priv-adapter",
+    capabilities: { next_model_boundary: true, when_idle: false }, evidence: "fixture",
+  };
+  const authCtx = { principal_id: "p-partial" };
+  const routeKey = "test-private-route";
+  const maintCid = "maint-cid";
+  const counters = { alertSends: 0, fileSends: [], replyReads: 0 };
+  let emitOwnerReply = false;
+
+  const makeAdapter = () => new NapcatOwnerAdapter({
+    routeKey,
+    conversationId: maintCid,
+    allowedAttachmentRoots: [root],
+    replyEvents: { enabled: true, callerConversationId: maintCid, targetKey: "owner-private", routeGeneration: 3, ownerSenderAllowlist: ["90001"] },
+    transport: {
+      submissionTracking: true,
+      async status() { return { ok: true, ready: true }; },
+      async sendOwnerAlert() {
+        counters.alertSends += 1;
+        return {
+          ok: true, sent: true, verified: true, statePersisted: true,
+          target: { targetKey: "owner-private" }, messageId: "92001",
+          replyRoute: { routeKey, conversationId: maintCid, targetKey: "owner-private", messageId: "92001", ownerEventGeneration: 3 },
+          rawSecret: secret,
+        };
+      },
+      async sendConfiguredChatFile(req) {
+        counters.fileSends.push(req.name);
+        if (req.name === "confirmed.png") {
+          return {
+            ok: true, sent: true, verified: true, chatFileStatePersisted: true,
+            target: { targetKey: "owner-private" }, messageId: "92002", fileMessageId: "92002",
+            fileId: "fid-confirmed", fileName: "confirmed.png", fileBytes: 4, sha256: "d".repeat(64),
+          };
+        }
+        throw new CoreError("napcat_mcp_unconfirmed", "lost response", { request_sent: true });
+      },
+      async readOwnerEvents(params) {
+        counters.replyReads += 1;
+        return {
+          ok: true,
+          route: { route_key: routeKey, conversation_id: maintCid, target_key: "owner-private", generation: 3 },
+          original_qq_message_id: params.original_qq_message_id,
+          events: emitOwnerReply ? [{
+            event_id: "ev-partial-reply-1",
+            message_id: "92099",
+            message_seq: 99,
+            quoted_message_id: "92001",
+            sender_id: "90001",
+            text: "收到正文和第一张图啦",
+          }] : [],
+          partial: false,
+          next_cursor: null,
+        };
+      },
+    },
+  });
+
+  const openRuntime = async () => {
+    const store = new MessageStore({ filePath: dbPath });
+    const core = new CommunicationCore({
+      store,
+      targets: [target],
+      principals: [{ id: "p-partial", identity: caller, allowed_targets: ["qq-priv"], origin_kinds: ["agent_message"] }],
+      adapters: new Map([["qq-priv-adapter", makeAdapter()]]),
+    });
+    await core.start();
+    return { core, store };
+  };
+
+  let rt;
+  context.after(async () => {
+    await rt?.core.close().catch(() => {});
+    rt?.store.close();
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  // 1. Send with 2 attachments -> text + file1 confirmed, file2 unknown
+  rt = await openRuntime();
+  const created = await rt.core.sendMessage(authCtx, {
+    caller,
+    origin: { kind: "agent_message", channel: "antigravity", source_ref: "src-partial" },
+    target: {
+      machine_id: target.machine_id, host: target.host, surface: target.surface, conversation_id: target.conversation_id,
+      binding_id: target.binding_id, binding_generation: target.binding_generation,
+    },
+    dedupe_key: "core-partial-unknown-reopen-1",
+    text: "半途失联持久化验证",
+    attachment_refs: [f1, f2],
+    expires_at: new Date(Date.now() + 3600000).toISOString(),
+  });
+  await rt.core.drain();
+  assert.equal(counters.alertSends, 1);
+  assert.deepEqual(counters.fileSends, ["confirmed.png", "unconfirmed.mp4"]);
+
+  // 2. Verify unknown preserved + confirmed text, reply_route and file1 persisted, and dispatchPending never wipes or resends
+  const snap1 = rt.core.getMessage(authCtx, { caller, message_id: created.message.message_id });
+  assert.equal(snap1.delivery.status, "unknown");
+  assert.equal(JSON.stringify(snap1).includes(secret), false);
+  assert.equal(snap1.delivery.evidence.evidence.partial_delivery, true);
+  assert.equal(snap1.delivery.evidence.evidence.native_receipt.message_id, "92001");
+  assert.deepEqual(snap1.delivery.evidence.evidence.native_receipt.reply_route, {
+    route_key: routeKey, conversation_id: maintCid, target_key: "owner-private", generation: 3,
+  });
+  assert.deepEqual(snap1.delivery.evidence.evidence.native_receipt.attachments, [{
+    index: 0, file_name: "confirmed.png", file_bytes: 4, sha256: "d".repeat(64),
+    message_id: "92002", file_id: "fid-confirmed", verified: true, deduped: false,
+  }]);
+
+  await rt.core.dispatchPending();
+  await rt.core.drain();
+  assert.equal(counters.alertSends, 1);
+  assert.deepEqual(counters.fileSends, ["confirmed.png", "unconfirmed.mp4"]);
+  const snapAfterQuery = rt.core.getMessage(authCtx, { caller, message_id: created.message.message_id });
+  assert.equal(snapAfterQuery.delivery.evidence.evidence.native_receipt.message_id, "92001");
+  assert.equal(snapAfterQuery.delivery.evidence.evidence.native_receipt.attachments.length, 1);
+
+  // 3. Close and reopen SQLite -> partial receipt & reply_route survive, no automatic resend, and pollReplies observes owner reply
+  await rt.core.close();
+  rt.store.close();
+  rt = await openRuntime();
+  await rt.core.dispatchPending();
+  await rt.core.drain();
+  assert.equal(counters.alertSends, 1);
+  assert.deepEqual(counters.fileSends, ["confirmed.png", "unconfirmed.mp4"]);
+
+  const snapReopen = rt.core.getMessage(authCtx, { caller, message_id: created.message.message_id });
+  assert.equal(snapReopen.delivery.status, "unknown");
+  assert.equal(snapReopen.delivery.evidence.evidence.native_receipt.message_id, "92001");
+  assert.equal(snapReopen.delivery.evidence.evidence.native_receipt.reply_route.generation, 3);
+  assert.equal(snapReopen.delivery.evidence.evidence.native_receipt.attachments.length, 1);
+  assert.equal(snapReopen.delivery.evidence.evidence.native_receipt.attachments[0].file_name, "confirmed.png");
+
+  emitOwnerReply = true;
+  const polled = await rt.core.pollReplies();
+  assert.ok(counters.replyReads >= 1, "expected pollReplies to invoke readOwnerEvents on confirmed partial text");
+  assert.equal(polled.replies, 1);
+  const events = rt.store.eventsAfter(created.message.message_id, 0, 50);
+  const replyEv = events.find(ev => ev.kind === "reply");
+  assert.ok(replyEv, "expected persisted reply event on reopened partial unknown QQ message");
+  assert.equal(replyEv.data.text, "收到正文和第一张图啦");
+
+  // Observing a reply on the confirmed text must NOT promote the partial unknown delivery to accepted
+  const snapAfterReply = rt.core.getMessage(authCtx, { caller, message_id: created.message.message_id });
+  assert.equal(snapAfterReply.delivery.status, "unknown");
+  assert.equal(snapAfterReply.delivery.evidence.evidence.partial_delivery, true);
+  assert.equal(snapAfterReply.delivery.evidence.evidence.native_receipt.attachments.length, 1);
+});
+
+test("graceful core.close() while awaiting second attachment preserves confirmed text, reply_route and first file across reopen", async context => {
+  const root = mkdtempSync(path.join(tmpdir(), "cc-core-partial-close-"));
+  const f1 = path.join(root, "part-a.txt");
+  const f2 = path.join(root, "part-b.txt");
+  writeFileSync(f1, "part-a", "utf8");
+  writeFileSync(f2, "part-b", "utf8");
+  const dbPath = path.join(root, "core.sqlite");
+  const caller = { machine_id: "test-machine", host: "antigravity", surface: "desktop", conversation_id: "src-close" };
+  const target = {
+    machine_id: "test-machine", host: "qq", surface: "private", conversation_id: "owner-private",
+    binding_id: "qq-priv", binding_generation: 1, adapter_id: "qq-priv-adapter",
+    capabilities: { next_model_boundary: true, when_idle: false }, evidence: "fixture",
+  };
+  const authCtx = { principal_id: "p-close" };
+  const routeKey = "close-private-route";
+  const maintCid = "maint-close-cid";
+  let alertSends = 0;
+  const fileSends = [];
+  let releaseSecond;
+  const enteredSecond = new Promise(resolve => { releaseSecond = resolve; });
+
+  const makeAdapter = () => new NapcatOwnerAdapter({
+    routeKey,
+    conversationId: maintCid,
+    allowedAttachmentRoots: [root],
+    replyEvents: { enabled: true, callerConversationId: maintCid, targetKey: "owner-private", routeGeneration: 5, ownerSenderAllowlist: ["90001"] },
+    transport: {
+      submissionTracking: true,
+      async status() { return { ok: true, ready: true }; },
+      async sendOwnerAlert(req, { onRequestStarted }) {
+        onRequestStarted?.();
+        alertSends += 1;
+        return {
+          ok: true, sent: true, verified: true, statePersisted: true,
+          target: { targetKey: "owner-private" }, messageId: "93001",
+          replyRoute: { routeKey, conversationId: maintCid, targetKey: "owner-private", messageId: "93001", ownerEventGeneration: 5 },
+        };
+      },
+      async sendConfiguredChatFile(req, { signal, onRequestStarted }) {
+        onRequestStarted?.();
+        fileSends.push(req.name);
+        if (req.name === "part-a.txt") {
+          return {
+            ok: true, sent: true, verified: true, chatFileStatePersisted: true,
+            target: { targetKey: "owner-private" }, messageId: "93002", fileMessageId: "93002",
+            fileId: "fid-a", fileName: "part-a.txt", fileBytes: 6, sha256: "e".repeat(64),
+          };
+        }
+        releaseSecond();
+        if (!signal.aborted) await new Promise(resolve => signal.addEventListener("abort", resolve, { once: true }));
+        throw new Error("aborted while awaiting second file");
+      },
+      async readOwnerEvents(params) {
+        return {
+          ok: true,
+          route: { route_key: routeKey, conversation_id: maintCid, target_key: "owner-private", generation: 5 },
+          original_qq_message_id: params.original_qq_message_id,
+          events: [{
+            event_id: "ev-close-reply-1",
+            message_id: "93099",
+            message_seq: 99,
+            quoted_message_id: "93001",
+            sender_id: "90001",
+            text: "停机前发的正文我也收到了",
+          }],
+          partial: false,
+          next_cursor: null,
+        };
+      },
+    },
+  });
+
+  const openRuntime = async () => {
+    const store = new MessageStore({ filePath: dbPath });
+    const core = new CommunicationCore({
+      store,
+      targets: [target],
+      principals: [{ id: "p-close", identity: caller, allowed_targets: ["qq-priv"], origin_kinds: ["agent_message"] }],
+      adapters: new Map([["qq-priv-adapter", makeAdapter()]]),
+    });
+    await core.start();
+    return { core, store };
+  };
+
+  let rt;
+  context.after(async () => {
+    await rt?.core.close().catch(() => {});
+    rt?.store.close();
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  rt = await openRuntime();
+  const created = await rt.core.sendMessage(authCtx, {
+    caller,
+    origin: { kind: "agent_message", channel: "antigravity", source_ref: "src-close" },
+    target: {
+      machine_id: target.machine_id, host: target.host, surface: target.surface, conversation_id: target.conversation_id,
+      binding_id: target.binding_id, binding_generation: target.binding_generation,
+    },
+    dedupe_key: "core-partial-close-in-flight-1",
+    text: "第二件在途时正常关停",
+    attachment_refs: [f1, f2],
+    expires_at: new Date(Date.now() + 3600000).toISOString(),
+  });
+  await enteredSecond;
+  await rt.core.close();
+  rt.store.close();
+
+  // Reopen SQLite directly and verify persisted partial receipt, reply_route and attachment 0
+  rt = await openRuntime();
+  await rt.core.dispatchPending();
+  await rt.core.drain();
+  assert.equal(alertSends, 1);
+  assert.deepEqual(fileSends, ["part-a.txt", "part-b.txt"]);
+
+  const snap = rt.core.getMessage(authCtx, { caller, message_id: created.message.message_id });
+  assert.equal(snap.delivery.status, "unknown");
+  assert.equal(snap.delivery.evidence.evidence.partial_delivery, true);
+  assert.equal(snap.delivery.evidence.evidence.native_receipt.message_id, "93001");
+  assert.deepEqual(snap.delivery.evidence.evidence.native_receipt.reply_route, {
+    route_key: routeKey, conversation_id: maintCid, target_key: "owner-private", generation: 5,
+  });
+  assert.equal(snap.delivery.evidence.evidence.native_receipt.attachments.length, 1);
+  assert.equal(snap.delivery.evidence.evidence.native_receipt.attachments[0].file_name, "part-a.txt");
+
+  const polled = await rt.core.pollReplies();
+  assert.equal(polled.replies, 1);
+  const snapAfter = rt.core.getMessage(authCtx, { caller, message_id: created.message.message_id });
+  assert.equal(snapAfter.delivery.status, "unknown");
 });

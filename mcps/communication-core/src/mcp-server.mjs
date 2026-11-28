@@ -190,7 +190,7 @@ const sendMessageFields = {
     target: targetField,
     dedupe_key: optional(textField(128, "可选；省略时按来源、目标、回复对象、正文与当前分钟桶自动生成去重键，显式传入须非空。")),
     text: textField(262144),
-    attachment_refs: optional(arrayField(textField(512), 32)),
+    attachment_refs: optional(arrayField(textField(1024), 32)),
     delivery_policy: optional({ schema: { type: "string", enum: ["next_model_boundary", "when_idle"], default: "next_model_boundary", description: "默认能中途插入就插入，原工具继续；仅明确要求延后或宿主确实只支持空闲时用when_idle" }, validator: z.enum(["next_model_boundary", "when_idle"]) }),
     message_visibility: optional({ schema: { type: "string", enum: ["hidden", "visible"], description: "仅用于Codex注入，省略时新消息默认hidden；visible保留全部消息气泡" }, validator: z.enum(["hidden", "visible"]) }),
     reply_required: optional(booleanField),

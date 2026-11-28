@@ -91,7 +91,21 @@ function safeOwnerRoute(value, targetKey) {
   }
 }
 
-function safeAdapterOutcome(result, delivery, method) {
+function hasObservablePartialQqReceipt(delivery) {
+  return delivery?.target_snapshot?.host === "qq"
+    && delivery.status === "unknown"
+    && delivery.evidence?.evidence?.partial_delivery === true
+    && delivery.evidence?.evidence?.native_receipt?.provider === "napcat_owner"
+    && delivery.evidence?.evidence?.native_receipt?.verified === true
+    && delivery.evidence?.evidence?.native_receipt?.state_persisted === true
+    && Boolean(delivery.evidence?.evidence?.native_receipt?.reply_route);
+}
+
+function isReplyObservableDelivery(delivery) {
+  return Boolean(delivery && (delivery.status === "accepted" || hasObservablePartialQqReceipt(delivery)));
+}
+
+function safeAdapterOutcome(result, delivery, method, message) {
   if (!result || typeof result !== "object" || Array.isArray(result)) return unknownOutcome(delivery, "invalid_adapter_result");
   const outcome = result.outcome;
   if (!DELIVERY_RESULTS.has(outcome) || result.delivery_id !== delivery.delivery_id || result.target_key !== delivery.target_key) {
@@ -116,12 +130,42 @@ function safeAdapterOutcome(result, delivery, method) {
   const retryAfterMs = suppliedEvidence?.retry_after_ms;
   if (Number.isSafeInteger(retryAfterMs) && retryAfterMs >= 0 && retryAfterMs <= 45000) evidence.retry_after_ms = retryAfterMs;
   const nativeReceipt = suppliedEvidence?.native_receipt;
-  if (outcome === "accepted" && delivery.target_snapshot?.host === "qq" && kind === "receipt"
+  const isConfirmedPartialAttachmentUnknown = outcome === "unknown"
+    && method === "deliver"
+    && suppliedEvidence?.partial_delivery === true
+    && Array.isArray(message?.envelope?.attachment_refs)
+    && message.envelope.attachment_refs.length > 0;
+  if ((outcome === "accepted" || isConfirmedPartialAttachmentUnknown) && delivery.target_snapshot?.host === "qq" && kind === "receipt"
     && nativeReceipt?.provider === "napcat_owner" && nativeReceipt.verified === true && nativeReceipt.state_persisted === true
     && typeof nativeReceipt.message_id === "string" && /^-?[1-9]\d{0,19}$/.test(nativeReceipt.message_id)) {
+    if (isConfirmedPartialAttachmentUnknown) evidence.partial_delivery = true;
     evidence.native_receipt = { provider: "napcat_owner", message_id: nativeReceipt.message_id, verified: true, state_persisted: true };
     const route = safeOwnerRoute(nativeReceipt.reply_route, delivery.target_snapshot.conversation_id);
     if (route) evidence.native_receipt.reply_route = route;
+    if (Array.isArray(nativeReceipt.attachments) && nativeReceipt.attachments.length <= 32) {
+      const cleaned = [];
+      for (const item of nativeReceipt.attachments) {
+        if (!item || typeof item !== "object" || Array.isArray(item)) continue;
+        if (!Number.isSafeInteger(item.index) || item.index < 0 || item.index >= 32
+          || typeof item.file_name !== "string" || !item.file_name.trim() || item.file_name.length > 255
+          || !Number.isSafeInteger(item.file_bytes) || item.file_bytes < 1
+          || typeof item.message_id !== "string" || !/^-?[1-9]\d{0,19}$/.test(item.message_id)
+          || item.verified !== true || typeof item.deduped !== "boolean") continue;
+        cleaned.push({
+          index: item.index,
+          file_name: item.file_name,
+          file_bytes: item.file_bytes,
+          ...(typeof item.sha256 === "string" && /^[a-f0-9]{64}$/iu.test(item.sha256) ? { sha256: item.sha256.toLowerCase() } : {}),
+          message_id: item.message_id,
+          ...(typeof item.file_id === "string" && item.file_id.trim() && item.file_id.length <= 512 ? { file_id: item.file_id } : {}),
+          verified: true,
+          deduped: item.deduped,
+        });
+      }
+      if (cleaned.length || isConfirmedPartialAttachmentUnknown) evidence.native_receipt.attachments = cleaned;
+    } else if (isConfirmedPartialAttachmentUnknown) {
+      evidence.native_receipt.attachments = [];
+    }
   }
   const normalized = { outcome, delivery_id: delivery.delivery_id, target_key: delivery.target_key, evidence };
   const suppliedError = result.error;
@@ -535,7 +579,7 @@ export class CommunicationCore {
     const updated = { ...persistedPatch, status, updated_at: this.timestamp() };
     this.store.updateDelivery(deliveryId, updated);
     this.store.updateMessage(delivery.message_id, { delivery_status: status });
-    if (status === "accepted" && delivery.target_snapshot?.host === "qq") {
+    if (delivery.target_snapshot?.host === "qq" && isReplyObservableDelivery({ ...delivery, ...updated })) {
       if (this.activeTxRecentQq) this.activeTxRecentQq.push(deliveryId);
       else this.rememberRecentQqDelivery(deliveryId);
     }
@@ -955,7 +999,7 @@ export class CommunicationCore {
           const origDel = this.store.getDeliveryForMessage(envelope.in_reply_to);
           if (origMsg && origDel && (origDel.status === "accepted" || origDel.status === "unknown")) {
             const origGeneration = origDel.target_snapshot?.binding_generation ?? origMsg.envelope.target.binding_generation;
-            if (origDel.status === "unknown") {
+            if (origDel.status === "unknown" && origDel.evidence?.evidence?.partial_delivery !== true) {
               this.changeDelivery(origDel.delivery_id, "accepted", {
                 outcome: "accepted",
                 error: null,
@@ -1332,7 +1376,7 @@ export class CommunicationCore {
           if (!currentDelivery || !["accepted", "dispatching", "unknown"].includes(currentDelivery.status)) {
             throw new CoreError("invalid_state", "该投递尚无接收依据");
           }
-          if (currentDelivery.status !== "accepted") {
+          if (currentDelivery.status !== "accepted" && currentDelivery.evidence?.evidence?.partial_delivery !== true) {
             this.changeDelivery(deliveryId, "accepted", { outcome: "accepted", error: null, evidence: { source: "processing_ack", binding_generation: bindingGeneration } }, append);
           }
           this.store.updateMessage(message.message_id, {
@@ -1347,7 +1391,7 @@ export class CommunicationCore {
       if (PROCESSING_TERMINALS.has(current.processing)) throw new CoreError("processing_conflict", "原消息已经取得终态处理回执");
       const currentDelivery = this.store.getDelivery(deliveryId);
       if (!currentDelivery || !["accepted", "dispatching", "unknown"].includes(currentDelivery.status)) throw new CoreError("invalid_state", "该投递尚无接收依据");
-      if (currentDelivery.status !== "accepted") {
+      if (currentDelivery.status !== "accepted" && currentDelivery.evidence?.evidence?.partial_delivery !== true) {
         this.changeDelivery(deliveryId, "accepted", { outcome: "accepted", error: null, evidence: { source: "processing_ack", binding_generation: bindingGeneration } }, append);
       }
       this.store.updateMessage(message.message_id, {
@@ -1482,11 +1526,32 @@ export class CommunicationCore {
     const controller = new AbortController();
     this.controllers.add(controller);
     let requestStarted = false;
+    let latestPartialOutcome = null;
     const onRequestStarted = () => {
       if (controller.signal.aborted) throw new CoreError("closed", "投递已取消");
       requestStarted = true;
     };
+    const onPartialReceipt = partialEvidence => {
+      if (method !== "deliver") return;
+      try {
+        const sanitized = safeAdapterOutcome({
+          outcome: "unknown",
+          delivery_id: delivery.delivery_id,
+          target_key: delivery.target_key,
+          evidence: partialEvidence,
+        }, delivery, method, message);
+        if (sanitized.evidence?.partial_delivery !== true || sanitized.evidence?.native_receipt?.provider !== "napcat_owner") return;
+        latestPartialOutcome = sanitized;
+        if (!this.closed) {
+          const current = this.store.getDelivery(delivery.delivery_id);
+          if (current && current.status === "dispatching" && current.target_key === delivery.target_key) {
+            this.store.updateDelivery(delivery.delivery_id, { evidence: copy(sanitized), updated_at: this.timestamp() });
+          }
+        }
+      } catch {}
+    };
     const interruptedOutcome = code => {
+      if (latestPartialOutcome) return { ...copy(latestPartialOutcome), error: adapterError(code) };
       if (method !== "deliver" || adapter.submissionTracking !== true || requestStarted) return unknownOutcome(delivery, code);
       const retryAfterMs = Math.min(45000, 1000 * (2 ** Math.min(6, Math.max(0, (delivery.attempt_count ?? 1) - 1))));
       return { outcome: "busy", delivery_id: delivery.delivery_id, target_key: delivery.target_key, error: adapterError("unavailable"), evidence: { operation: method, kind: "query", retry_after_ms: retryAfterMs } };
@@ -1496,12 +1561,20 @@ export class CommunicationCore {
       onAbort = () => resolve({ error: adapterError(controller.signal.reason?.code ?? "closed") });
       controller.signal.addEventListener("abort", onAbort, { once: true });
     });
-    const timer = setTimeout(() => controller.abort({ code: "delivery_timeout" }), this.deliveryTimeoutMs);
+    const attachmentCount = method === "deliver" && Array.isArray(message?.envelope?.attachment_refs) ? message.envelope.attachment_refs.length : 0;
+    const effectiveTimeoutMs = attachmentCount > 0
+      ? Math.max(this.deliveryTimeoutMs, Math.min(1600000, this.deliveryTimeoutMs + attachmentCount * 48000))
+      : this.deliveryTimeoutMs;
+    const timer = setTimeout(() => controller.abort({ code: "delivery_timeout" }), effectiveTimeoutMs);
     try {
       let returned;
       try {
         if (controller.signal.aborted) throw new CoreError("closed", "投递已取消");
-        returned = adapter[method]({ message: copy(message), delivery: copy(delivery), target: copy(target), signal: controller.signal, onRequestStarted });
+        returned = adapter[method]({
+          message: copy(message), delivery: copy(delivery), target: copy(target),
+          signal: controller.signal, onRequestStarted,
+          ...(method === "deliver" ? { onPartialReceipt } : {}),
+        });
       } catch {
         return interruptedOutcome("adapter_error");
       }
@@ -1509,7 +1582,7 @@ export class CommunicationCore {
       const response = await Promise.race([invocation, interrupted]);
       if (response.error) return interruptedOutcome(response.error.code);
       try {
-        return safeAdapterOutcome(response.result, delivery, method);
+        return safeAdapterOutcome(response.result, delivery, method, message);
       } catch {
         return unknownOutcome(delivery, "invalid_adapter_result");
       }
@@ -1527,10 +1600,15 @@ export class CommunicationCore {
       const confirmedUnsentQuery = queried && current.status === "unknown" && ["codex", "windsurf"].includes(current.target_snapshot?.host)
         && outcome.evidence?.kind === "receipt" && outcome.evidence.operation === "query" && outcome.evidence.request_sent === false;
       const status = outcome.outcome === "busy" ? queried && !confirmedUnsentQuery ? "unknown" : "prepared" : outcome.outcome;
-      if (queried && current.status === "unknown" && status === "unknown"
-        && current.evidence?.outcome === outcome.outcome
-        && (current.error?.code ?? null) === (outcome.error?.code ?? null)) {
-        return;
+      if (queried && current.status === "unknown" && status === "unknown") {
+        const preservePartialReceipt = current.evidence?.evidence?.partial_delivery === true
+          && current.evidence?.evidence?.native_receipt?.provider === "napcat_owner"
+          && outcome.evidence?.native_receipt === undefined;
+        if (preservePartialReceipt) return;
+        if (current.evidence?.outcome === outcome.outcome
+          && (current.error?.code ?? null) === (outcome.error?.code ?? null)) {
+          return;
+        }
       }
       this.changeDelivery(deliveryId, status, { outcome: outcome.outcome, error: outcome.error ?? null, evidence: copy(outcome) }, append);
     });
@@ -1579,9 +1657,9 @@ export class CommunicationCore {
   bootstrapRecentQqDeliveries() {
     const nowMs = this.nowMs();
     const recent = [];
-    for (const page of this.deliveryPages(["accepted"])) {
+    for (const page of this.deliveryPages(["accepted", "unknown"])) {
       for (const delivery of page) {
-        if (delivery.target_snapshot?.host !== "qq") continue;
+        if (delivery.target_snapshot?.host !== "qq" || !isReplyObservableDelivery(delivery)) continue;
         const acceptedAtMs = Date.parse(delivery.updated_at ?? delivery.created_at);
         if (!Number.isFinite(acceptedAtMs) || nowMs - acceptedAtMs > QQ_REPLY_RECENT_MS) continue;
         if (this.hasReply(delivery.message_id)) continue;
@@ -1641,7 +1719,7 @@ export class CommunicationCore {
   }
 
   replyCandidate(delivery) {
-    if (!delivery || delivery.status !== "accepted") return null;
+    if (!isReplyObservableDelivery(delivery)) return null;
     const message = this.store.getMessage(delivery.message_id);
     if (!message || this.hasReply(message.message_id)) return null;
     let target;
@@ -1736,7 +1814,7 @@ export class CommunicationCore {
         const appended = this.transaction(append => {
           const currentDelivery = this.store.getDelivery(delivery.delivery_id);
           const currentMessage = this.store.getMessage(message.message_id);
-          if (!currentDelivery || currentDelivery.status !== "accepted" || currentDelivery.message_id !== message.message_id
+          if (!isReplyObservableDelivery(currentDelivery) || currentDelivery.message_id !== message.message_id
             || !currentMessage || this.hasReply(message.message_id)) return false;
           let currentTarget;
           try {
@@ -1801,7 +1879,7 @@ export class CommunicationCore {
       // 先抢先检查近期 QQ 热池投递（按最新优先），避免被大量随机 UUID 的历史旧投递分页挤占
       await drainHotQq();
 
-      for (const deliveries of this.deliveryPages(["accepted"], REPLY_PAGE_SIZE)) {
+      for (const deliveries of this.deliveryPages(["accepted", "unknown"], REPLY_PAGE_SIZE)) {
         if (this.closed || this.replyInvocations.size >= this.maxConcurrent) { scanned = false; break; }
         let nextIndex = 0;
         const worker = async () => {

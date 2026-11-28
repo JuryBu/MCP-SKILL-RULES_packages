@@ -1257,3 +1257,193 @@ test("live CLI信号处理和stdin EOF释放句柄，直接入口启动失败不
   assert.ok(!/synthetic-private-token|SyntaxError|ENOENT/.test(result.stderr));
   assert.ok((await readFile(files.configPath, "utf8")).includes("synthetic-private-token"));
 });
+
+test("live napcat_owner config validates and forwards attachment roots and limits", async context => {
+  const allowedDir = await mkdtemp(join(tmpdir(), "cc-live-att-cfg-"));
+  context.after(() => rm(allowedDir, { recursive: true, force: true }));
+  const cfg = ownerConfiguration();
+  cfg.adapters[0].allowed_attachment_roots = [allowedDir];
+  cfg.adapters[0].max_attachment_bytes = 1048576;
+  cfg.adapters[0].max_attachments_per_message = 4;
+  const files = await fixture(context, cfg);
+  let captured;
+  const service = await startLiveFromConfig({
+    ...files,
+    factories: { napcat_owner: entry => { captured = entry; return new MockAdapter(); } },
+  });
+  files.cleanup(() => service.close());
+  assert.deepEqual(captured.allowed_attachment_roots, [allowedDir]);
+  assert.equal(captured.max_attachment_bytes, 1048576);
+  assert.equal(captured.max_attachments_per_message, 4);
+  await service.close();
+
+  for (const badAdapter of [
+    { allowed_attachment_roots: ["relative/dir"] },
+    { allowed_attachment_roots: ["\\\\server\\share\\dir"] },
+    { max_attachment_bytes: 0 },
+    { max_attachments_per_message: 33 },
+  ]) {
+    const badCfg = ownerConfiguration();
+    Object.assign(badCfg.adapters[0], badAdapter);
+    await writeFile(files.configPath, JSON.stringify(badCfg), "utf8");
+    await assert.rejects(startLiveFromConfig({
+      ...files,
+      factories: { napcat_owner: () => new MockAdapter() },
+    }), { code: "invalid_config" });
+  }
+});
+
+test("live QQ private send resolves local Antigravity summary title first, strips group @ hint, and sends ordered attachments over real HTTP NapCat transport", { timeout: 15000 }, async context => {
+  const workDir = await mkdtemp(join(tmpdir(), "cc-live-qq-e2e-"));
+  context.after(() => rm(workDir, { recursive: true, force: true }));
+
+  // 1. Create isolated Antigravity conversation_summaries.db
+  const summaryDbPath = join(workDir, "conversation_summaries.db");
+  const sdb = new DatabaseSync(summaryDbPath);
+  sdb.exec(`CREATE TABLE conversation_summaries (
+    conversation_id TEXT PRIMARY KEY,
+    title TEXT,
+    workspace_uris TEXT,
+    last_modified_time TEXT,
+    parent_conversation_id TEXT,
+    nesting_depth INTEGER,
+    source TEXT,
+    agent_name TEXT
+  )`);
+  sdb.prepare(`INSERT INTO conversation_summaries VALUES (?, ?, ?, ?, '', 0, '', '')`)
+    .run("catcloud-conv-1", "猫猫云梯核心开发对话", "[]", "2026-11-28T08:00:00Z");
+  sdb.close();
+
+  // 2. Prepare allowed local files (document, image, video)
+  const docPath = join(workDir, "summary.txt");
+  const imgPath = join(workDir, "preview.png");
+  const vidPath = join(workDir, "clip.mp4");
+  await writeFile(docPath, "hello owner\n", "utf8");
+  await writeFile(imgPath, Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]));
+  await writeFile(vidPath, Buffer.alloc(32, 0x7a));
+
+  // 3. Real isolated HTTP JSON-RPC NapCat MCP server
+  const receivedCalls = [];
+  const napcatServer = createHttpServer(async (req, res) => {
+    if (req.method !== "POST") {
+      res.writeHead(405).end();
+      return;
+    }
+    let body = "";
+    for await (const chunk of req) body += chunk.toString("utf8");
+    const rpc = JSON.parse(body);
+    if (rpc.method === "initialize") {
+      res.writeHead(200, { "content-type": "application/json", "mcp-session-id": "napcat-e2e-session" });
+      res.end(JSON.stringify({
+        jsonrpc: "2.0",
+        id: rpc.id,
+        result: { protocolVersion: "2025-03-26", capabilities: { tools: {} }, serverInfo: { name: "fake-napcat", version: "1.0.0" } },
+      }));
+      return;
+    }
+    if (rpc.method === "notifications/initialized") {
+      res.writeHead(202).end();
+      return;
+    }
+    if (rpc.method === "tools/call") {
+      const { name, arguments: args } = rpc.params;
+      receivedCalls.push({ name, args });
+      let structuredContent = { ok: true, ready: true };
+      if (name === "napcat_owner_alert") {
+        structuredContent = {
+          ok: true, sent: true, verified: true, statePersisted: true,
+          target: { targetKey: "owner-private" }, messageId: "44001",
+        };
+      } else if (name === "napcat_send_configured_chat_file") {
+        const idx = receivedCalls.filter(c => c.name === "napcat_send_configured_chat_file").length;
+        structuredContent = {
+          ok: true, sent: true, verified: true, chatFileStatePersisted: true,
+          target: { targetKey: args.target_key },
+          messageId: String(44100 + idx),
+          fileMessageId: String(44100 + idx),
+          fileId: `e2e-fid-${idx}`,
+          fileName: args.name,
+          fileBytes: idx === 1 ? 12 : idx === 2 ? 8 : 32,
+          sha256: String(idx).repeat(64),
+        };
+      }
+      res.writeHead(200, { "content-type": "application/json", "mcp-session-id": "napcat-e2e-session" });
+      res.end(JSON.stringify({ jsonrpc: "2.0", id: rpc.id, result: { structuredContent } }));
+      return;
+    }
+    res.writeHead(400).end();
+  });
+  await new Promise(resolveListen => napcatServer.listen(0, "127.0.0.1", resolveListen));
+  context.after(() => new Promise(resolveClose => napcatServer.close(() => resolveClose())));
+  const napcatPort = napcatServer.address().port;
+
+  // 4. Start real live runtime with Antigravity summary index + real NapcatOwnerAdapter
+  const cfg = ownerConfiguration();
+  cfg.allowed_conversation_ids = ["owner-private", "catcloud-conv-1"];
+  cfg.targets[0].surface = "private";
+  cfg.targets[0].conversation_id = "owner-private";
+  cfg.adapters[0] = {
+    id: cfg.adapters[0].id,
+    kind: "napcat_owner",
+    base_url: `http://127.0.0.1:${napcatPort}/napcat/mcp`,
+    route_key: "synthetic-private-route",
+    conversation_id: "synthetic-maintenance-route",
+    reply_hint: "有事引用这条并@我即可～",
+    allowed_attachment_roots: [workDir],
+  };
+  cfg.adapters.push({
+    id: "ag-local",
+    kind: "antigravity",
+    conversation_index_file: summaryDbPath,
+  });
+  const agScope = { machine_id: cfg.targets[0].machine_id, host: "antigravity", surface: "desktop" };
+  cfg.principals[0].identity = { ...agScope, conversation_id: "*" };
+  cfg.principals[0].caller_scope = agScope;
+  cfg.principals[0].allowed_host_lists = [agScope];
+
+  const files = await fixture(context, cfg);
+  const service = await startLiveFromConfig({ ...files });
+  files.cleanup(() => service.close());
+
+  const caller = { ...agScope, conversation_id: "catcloud-conv-1" };
+  const authCtx = { principal_id: cfg.principals[0].id };
+  const created = await service.core.sendMessage(authCtx, {
+    caller,
+    origin: { kind: "agent_message", channel: "antigravity", source_ref: "catcloud-conv-1" },
+    target: {
+      machine_id: cfg.targets[0].machine_id,
+      host: "qq",
+      surface: "private",
+      conversation_id: "owner-private",
+      binding_id: cfg.targets[0].binding_id,
+      binding_generation: cfg.targets[0].binding_generation,
+    },
+    dedupe_key: "live-qq-title-and-3-attachments",
+    text: "附件已发来，请查收",
+    attachment_refs: [docPath, imgPath, vidPath],
+    expires_at: new Date(Date.now() + 60000).toISOString(),
+  });
+
+  await service.core.drain();
+  const detail = await service.core.getMessage(authCtx, { caller, message_id: created.message.message_id });
+  assert.equal(detail.delivery.status, "accepted");
+
+  const alertCall = receivedCalls.find(c => c.name === "napcat_owner_alert");
+  assert.ok(alertCall, "expected napcat_owner_alert call");
+  assert.equal(alertCall.args.summary, "交流核心转送 / 来源「猫猫云梯核心开发对话」：\n附件已发来，请查收");
+  assert.equal(alertCall.args.reply_hint, "有事引用这条即可～");
+
+  const fileCalls = receivedCalls.filter(c => c.name === "napcat_send_configured_chat_file");
+  assert.deepEqual(fileCalls.map(c => c.args.name), ["summary.txt", "preview.png", "clip.mp4"]);
+  assert.deepEqual(fileCalls.map(c => c.args.target_key), ["owner-private", "owner-private", "owner-private"]);
+  assert.equal(detail.delivery.evidence.evidence.native_receipt.attachments.length, 3);
+  assert.deepEqual(
+    detail.delivery.evidence.evidence.native_receipt.attachments.map(a => [a.index, a.file_name, a.message_id, a.verified, a.deduped]),
+    [
+      [0, "summary.txt", "44101", true, false],
+      [1, "preview.png", "44102", true, false],
+      [2, "clip.mp4", "44103", true, false],
+    ],
+  );
+  await service.close();
+});

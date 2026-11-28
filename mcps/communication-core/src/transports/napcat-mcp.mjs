@@ -180,7 +180,7 @@ export class NapcatMcpTransport {
           connection = (lane ? this.#channelConnections.get(lane) : this.#connection) ?? this.#connect(options, lane);
           await Promise.race([connection.ready, interrupted]);
           if (requestSignal.aborted || connection.closed || this.#closed) throw unavailable();
-          if (["napcat_owner_alert", "napcat_owner_window_route_register", "napcat_owner_window_route_close"].includes(name)) onRequestStarted?.();
+          if (["napcat_owner_alert", "napcat_send_configured_chat_file", "napcat_owner_window_route_register", "napcat_owner_window_route_close"].includes(name)) onRequestStarted?.();
           if (requestSignal.aborted || connection.closed || this.#closed) throw unavailable();
           requestSent = true;
           const result = await Promise.race([
@@ -260,6 +260,22 @@ export class NapcatMcpTransport {
     if (!boundedText(route_key, 256) || !boundedText(dedupe_key, 200) || !boundedText(summary, 800)
       || (reply_hint !== undefined && !boundedText(reply_hint, 80))) throw unavailable();
     return this.#call("napcat_owner_alert", { route_key, dedupe_key, summary, ...(reply_hint === undefined ? {} : { reply_hint }) }, signal, onRequestStarted);
+  }
+
+  async sendConfiguredChatFile({ target_key, file_path, dedupe_key, name } = {}, { signal, onRequestStarted } = {}) {
+    if (!boundedText(target_key, 64) || target_key.trim() !== target_key || /[\u0000-\u001f\u007f]/.test(target_key)
+      || !boundedText(file_path, 4096) || /[\u0000-\u001f\u007f]/.test(file_path)
+      || !boundedText(dedupe_key, 200) || dedupe_key.trim() !== dedupe_key || /[\u0000-\u001f\u007f]/.test(dedupe_key)
+      || (name !== undefined && (!boundedText(name, 255) || /[\\/\u0000-\u001f\u007f]/.test(name)))) {
+      throw unavailable();
+    }
+    const args = {
+      target_key,
+      file_path,
+      dedupe_key,
+      ...(name === undefined ? {} : { name }),
+    };
+    return this.#call("napcat_send_configured_chat_file", args, signal, onRequestStarted, false, 45000, true, "channel_upload");
   }
 
   async readOwnerEvents(parameters, context = {}) {
