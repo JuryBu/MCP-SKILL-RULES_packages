@@ -207,6 +207,7 @@ export class MessageStore {
         ) STRICT;
         CREATE INDEX IF NOT EXISTS deliveries_status_id ON deliveries (status, delivery_id);
         CREATE INDEX IF NOT EXISTS deliveries_target ON deliveries (target_key);
+        CREATE INDEX IF NOT EXISTS deliveries_target_status_id ON deliveries (target_key, status, delivery_id);
         CREATE TABLE IF NOT EXISTS message_events (
           message_id TEXT NOT NULL REFERENCES messages (message_id),
           sequence INTEGER NOT NULL CHECK (sequence BETWEEN 1 AND 9007199254740991),
@@ -704,6 +705,37 @@ export class MessageStore {
     return this.#database.prepare(`
       SELECT record_json FROM deliveries WHERE delivery_id > ? ORDER BY delivery_id ASC LIMIT ?
     `).all(afterId, limit).map(decodeRecord);
+  }
+
+  listDeliveriesForTargets({ targetKeys, statuses, limit = 100, after_id } = {}) {
+    this.#assertOpen();
+    requireInteger(limit, "limit", 1, MAX_PAGE_SIZE);
+    const afterId = after_id === undefined ? "" : requireText(after_id, "after_id");
+    if (!Array.isArray(targetKeys) || targetKeys.length > MAX_PAGE_SIZE) {
+      throw new CoreError("invalid_input", "targetKeys必须是大小受限的数组");
+    }
+    if (targetKeys.length === 0) return [];
+    const normalizedTargets = [];
+    for (const key of targetKeys) normalizedTargets.push(requireText(key, "target_key", MAX_DIRECTORY_KEY_BYTES));
+    const targetPlaceholders = normalizedTargets.map(() => "?").join(", ");
+    if (statuses !== undefined) {
+      if (!Array.isArray(statuses) || statuses.length > MAX_PAGE_SIZE) {
+        throw new CoreError("invalid_input", "statuses必须是大小受限的数组");
+      }
+      for (const status of statuses) requireText(status, "status");
+      if (statuses.length === 0) return [];
+      const statusPlaceholders = statuses.map(() => "?").join(", ");
+      return this.#database.prepare(`
+        SELECT record_json FROM deliveries
+        WHERE target_key IN (${targetPlaceholders}) AND delivery_id > ? AND status IN (${statusPlaceholders})
+        ORDER BY delivery_id ASC LIMIT ?
+      `).all(...normalizedTargets, afterId, ...statuses, limit).map(decodeRecord);
+    }
+    return this.#database.prepare(`
+      SELECT record_json FROM deliveries
+      WHERE target_key IN (${targetPlaceholders}) AND delivery_id > ?
+      ORDER BY delivery_id ASC LIMIT ?
+    `).all(...normalizedTargets, afterId, limit).map(decodeRecord);
   }
 
   appendEvent(messageId, kind, data = {}) {

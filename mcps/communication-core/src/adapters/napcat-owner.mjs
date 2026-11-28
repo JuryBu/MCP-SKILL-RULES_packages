@@ -438,7 +438,7 @@ export class NapcatOwnerAdapter {
     return receipt(input, "unknown", "owner_alert_recovery_query_unsupported", { error: { code: "unsupported" } });
   }
 
-  async observeReply(input) {
+  #ownerReplyReader(input, { multiple = false } = {}) {
     if (this.closed || !this.replyEvents || input.signal?.aborted || input.target?.conversation_id !== this.replyEvents.targetKey) return null;
     const capturedRoute = input.delivery?.evidence?.evidence?.native_receipt?.reply_route;
     if (!capturedRoute
@@ -448,8 +448,9 @@ export class NapcatOwnerAdapter {
       || capturedRoute.generation !== this.replyEvents.routeGeneration) {
       return null;
     }
-    const reader = createOwnerReplyReader({
+    return createOwnerReplyReader({
       enabled: true,
+      multiple,
       callerConversationId: this.replyEvents.callerConversationId,
       ownerSenderAllowlist: this.replyEvents.ownerSenderAllowlist,
       binding: {
@@ -459,8 +460,20 @@ export class NapcatOwnerAdapter {
       },
       readPage: (parameters, context) => this.transport.readOwnerEvents(parameters, context),
     });
+  }
+
+  async observeReply(input) {
+    const reader = this.#ownerReplyReader(input, { multiple: false });
+    if (!reader) return null;
     const observed = await reader(input);
     return observed?.status === "unsupported" ? null : observed;
+  }
+
+  async observeReplies(input) {
+    const reader = this.#ownerReplyReader(input, { multiple: true });
+    if (!reader) return [];
+    const observed = await reader(input);
+    return observed?.status === "ok" && Array.isArray(observed.replies) ? observed.replies : [];
   }
 
   async close() {

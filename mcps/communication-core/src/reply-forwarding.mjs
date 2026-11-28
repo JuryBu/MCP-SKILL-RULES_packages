@@ -234,20 +234,28 @@ export function planOwnerReplyForward(options = {}) {
     const fromKey = identityKey(from);
     const toKey = identityKey(to);
     const envelope = message.envelope;
+    const accepted = delivery.evidence;
+    const evidence = accepted?.evidence;
+    const receipt = evidence?.native_receipt;
+    const partialUnknown = delivery.status === "unknown"
+      && (delivery.outcome === undefined || delivery.outcome === "unknown")
+      && accepted?.outcome === "unknown"
+      && evidence?.partial_delivery === true
+      && Array.isArray(envelope?.attachment_refs) && envelope.attachment_refs.length > 0;
+    const fullyAccepted = delivery.status === "accepted"
+      && (delivery.outcome === undefined || delivery.outcome === "accepted")
+      && accepted?.outcome === "accepted";
     if (message.principal_id !== captured.source_principal_id || message.source_key !== toKey || message.target_key !== fromKey
       || !record(envelope) || envelope.origin?.kind !== "agent_message" || identityKey(envelope.caller) !== toKey
       || !matchesTarget(envelope.target, from, false) || !matchesTarget(delivery.target_snapshot, from)
-      || delivery.message_id !== messageId || delivery.target_key !== fromKey || delivery.status !== "accepted"
-      || (delivery.outcome !== undefined && delivery.outcome !== "accepted")) return null;
+      || delivery.message_id !== messageId || delivery.target_key !== fromKey
+      || (!fullyAccepted && !partialUnknown)) return null;
     requireText(envelope.origin.channel, "origin.channel", 64);
     requireText(envelope.origin.source_ref, "origin.source_ref", 512);
     if (message.reply_forward_binding !== undefined && message.reply_forward_binding !== null
       && digest(normalizeBinding(message.reply_forward_binding)) !== digest(captured)) return null;
     if (reply.delivery_id !== undefined && reply.delivery_id !== deliveryId) return null;
-    const accepted = delivery.evidence;
-    const evidence = accepted?.evidence;
-    const receipt = evidence?.native_receipt;
-    if (accepted?.outcome !== "accepted" || accepted.delivery_id !== deliveryId || accepted.target_key !== fromKey
+    if (accepted.delivery_id !== deliveryId || accepted.target_key !== fromKey
       || evidence?.kind !== "receipt" || receipt?.provider !== "napcat_owner" || receipt.verified !== true
       || receipt.state_persisted !== true || !qqMessageId(receipt.message_id)) return null;
     const capturedRoute = ownerRoute(receipt.reply_route);

@@ -142,10 +142,12 @@ export function createOwnerReplyReader(options = {}) {
   let capturedBinding = null;
   let callerConversationId = null;
   let owners = null;
+  let multiple = false;
   let setupFailed = false;
   try {
     enabled = options?.enabled === true;
     if (enabled) {
+      multiple = options?.multiple === true;
       readPage = options.readPage;
       capturedBinding = captureBinding(options.binding);
       callerConversationId = options.callerConversationId;
@@ -185,6 +187,7 @@ export function createOwnerReplyReader(options = {}) {
       const sequences = new Set();
       let cursor;
       let selected = null;
+      const selectedList = [];
       let textBytes = 0;
       for (let pageIndex = 0; pageIndex < OWNER_REPLY_LIMITS.pages; pageIndex += 1) {
         if (signal?.aborted) return unsupported("cancelled");
@@ -221,8 +224,8 @@ export function createOwnerReplyReader(options = {}) {
           eventIds.add(event.event_id);
           messageIds.add(event.message_id);
           sequences.add(event.message_seq);
-          if (owners.has(event.sender_id) && event.text.trim() && !selected) {
-            selected = {
+          if (owners.has(event.sender_id) && event.text.trim()) {
+            const matched = {
               event_id: event.event_id,
               message_id: event.message_id,
               message_seq: event.message_seq,
@@ -230,11 +233,20 @@ export function createOwnerReplyReader(options = {}) {
               sender_id: event.sender_id,
               text: event.text,
             };
+            if (!selected) selected = matched;
+            if (multiple) selectedList.push(matched);
           }
         }
         if (signal?.aborted) return unsupported("cancelled");
         if (originalScope(input, capturedBinding)?.fingerprint !== original.fingerprint) return unsupported("original_scope_changed");
-        if (!page.partial) return selected ? nativeReply(selected, capturedBinding, original.originalId) : unsupported("no_reply");
+        if (!page.partial) {
+          if (multiple) {
+            return selectedList.length
+              ? { status: "ok", replies: selectedList.map(item => nativeReply(item, capturedBinding, original.originalId)) }
+              : unsupported("no_reply");
+          }
+          return selected ? nativeReply(selected, capturedBinding, original.originalId) : unsupported("no_reply");
+        }
         if (cursors.has(page.next_cursor)) return unsupported("cursor_cycle");
         cursor = page.next_cursor;
         cursors.add(cursor);

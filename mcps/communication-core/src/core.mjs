@@ -41,7 +41,8 @@ const QQ_REPLY_WAIT_GAP_MS = 1000;
 const AG_REPLY_RECENT_MS = 60 * 60 * 1000;
 const AG_REPLY_PASSIVE_GAP_MS = 10000;
 const AG_REPLY_WAIT_GAP_MS = 1000;
-const MAX_RECENT_QQ_DELIVERIES = 64;
+const MAX_RECENT_QQ_DELIVERIES = 128;
+const MAX_ACTIVE_QQ_PER_POLL = 16;
 const MAX_REPLIED_MESSAGES_CACHE = 8192;
 const ADAPTER_ERROR_MESSAGES = {
   adapter_error: "适配器调用失败，发送结果待核实",
@@ -246,10 +247,10 @@ class HostReplyPacer {
     return false;
   }
 
-  isOld(pass, message, delivery) {
-    const acceptedAt = Date.parse(delivery.updated_at ?? delivery.created_at);
-    return message.envelope.reply_required !== true && Number.isFinite(acceptedAt)
-      && pass.now - acceptedAt > this.recentMs;
+  isOld(pass, message, delivery, activityAtMs) {
+    const referenceAt = Number.isFinite(activityAtMs) ? activityAtMs : Date.parse(delivery.updated_at ?? delivery.created_at);
+    return message.envelope.reply_required !== true && Number.isFinite(referenceAt)
+      && pass.now - referenceAt > this.recentMs;
   }
 
   claim(pass, deliveryId) {
@@ -260,14 +261,15 @@ class HostReplyPacer {
     return pass.lane;
   }
 
-  reserve(pass, message, delivery, listeners = []) {
+  reserve(pass, message, delivery, listeners = [], activityAtMs) {
     const deliveryId = delivery.delivery_id;
     if (this.reading.has(deliveryId)) return null;
     let lane = null;
-    if (this.isOld(pass, message, delivery)) {
+    const referenceAt = Number.isFinite(activityAtMs) ? activityAtMs : Date.parse(delivery.updated_at ?? delivery.created_at);
+    if (this.isOld(pass, message, delivery, referenceAt)) {
       if (this.activelyWaiting(listeners)) lane = this.claim(pass.waiting, deliveryId);
       const cohort = this.passive.cohortBefore ?? pass.now - this.recentMs;
-      if (lane === null && Date.parse(delivery.updated_at ?? delivery.created_at) <= cohort) {
+      if (lane === null && referenceAt <= cohort) {
         lane = this.claim(pass.passive, deliveryId);
         if (lane !== null) lane.cohortBefore = cohort;
       }
@@ -295,7 +297,7 @@ class HostReplyPacer {
 export class CommunicationCore {
   #boardEntry;
 
-  constructor({ store, targets, principals, adapters, replyForwarding = [], conversationRoutes = [], channelWindows = [], ownerWindowSources = [], downloadLedger, channelDownloadFailure = false, statusProvider, hostContentProvider, automaticReplyForwarding = [], autoCompleteOnReply = false, now = () => Date.now(), deliveryTimeoutMs = 5000, maxConcurrent = 2 }) {
+  constructor({ store, targets, principals, adapters, replyForwarding = [], conversationRoutes = [], channelWindows = [], ownerWindowSources = [], downloadLedger, channelDownloadFailure = false, statusProvider, hostContentProvider, automaticReplyForwarding = [], autoCompleteOnReply = false, now = () => Date.now(), deliveryTimeoutMs = 5000, maxConcurrent = 2, qqReplyRecentMs = QQ_REPLY_RECENT_MS }) {
     this.store = store;
     this.targets = targets ?? [];
     this.principals = principals ?? [];
@@ -324,17 +326,27 @@ export class CommunicationCore {
       origin_kinds: ["human_message"],
     }));
     this.now = now;
+    this.qqReplyRecentMs = requireInteger(qqReplyRecentMs, "qqReplyRecentMs", 1, 2147483647);
     const replyWaiters = new WeakSet();
     this.replyWaiters = replyWaiters;
     this.replyPacers = new Map([
       ["codex", new HostReplyPacer(() => this.nowMs(), { recentMs: CODEX_REPLY_RECENT_MS, passiveGapMs: CODEX_REPLY_PASSIVE_GAP_MS, waitGapMs: CODEX_REPLY_WAIT_GAP_MS, waiters: replyWaiters })],
-      ["qq", new HostReplyPacer(() => this.nowMs(), { recentMs: QQ_REPLY_RECENT_MS, passiveGapMs: QQ_REPLY_PASSIVE_GAP_MS, waitGapMs: QQ_REPLY_WAIT_GAP_MS, waiters: replyWaiters })],
+      ["qq", new HostReplyPacer(() => this.nowMs(), { recentMs: this.qqReplyRecentMs, passiveGapMs: QQ_REPLY_PASSIVE_GAP_MS, waitGapMs: QQ_REPLY_WAIT_GAP_MS, waiters: replyWaiters })],
       ["antigravity", new HostReplyPacer(() => this.nowMs(), { recentMs: AG_REPLY_RECENT_MS, passiveGapMs: AG_REPLY_PASSIVE_GAP_MS, waitGapMs: AG_REPLY_WAIT_GAP_MS, waiters: replyWaiters })],
     ]);
     this.codexReplies = this.replyPacers.get("codex");
     this.recentQqDeliveries = new Map();
+    this.recentQqEnqueuedSeq = new Map();
+    this.recentQqSeq = 0;
+    this.qqCheckTick = 0;
+    this.qqLastCheckedTick = new Map();
+    this.agedQqCursor = null;
+    this.agedQqCohortBefore = null;
+    this.agedQqPreempted = new Set();
+    this.agedQqLastWasPreempt = false;
     this.activeTxRecentQq = null;
     this.repliedMessages = new Set();
+    this.repliedOwnerEventIds = new Map();
     this.deliveryTimeoutMs = requireInteger(deliveryTimeoutMs, "deliveryTimeoutMs", 1, 2147483647);
     this.maxConcurrent = requireInteger(maxConcurrent, "maxConcurrent", 1);
     this.closed = false;
@@ -557,7 +569,7 @@ export class CommunicationCore {
       this.activeTxRecentQq = prevTxRecentQq;
     }
     if (!prevTxRecentQq && pendingRecentQq.length) {
-      for (const deliveryId of pendingRecentQq) this.rememberRecentQqDelivery(deliveryId);
+      for (const entry of pendingRecentQq) this.rememberRecentQqDelivery(entry.deliveryId, entry.acceptedAtMs);
     }
     if (relayAckStaged && this.relayAcknowledgementReady && !this.relayAcknowledgementSignalPending) {
       this.relayAcknowledgementSignalPending = true;
@@ -580,8 +592,9 @@ export class CommunicationCore {
     this.store.updateDelivery(deliveryId, updated);
     this.store.updateMessage(delivery.message_id, { delivery_status: status });
     if (delivery.target_snapshot?.host === "qq" && isReplyObservableDelivery({ ...delivery, ...updated })) {
-      if (this.activeTxRecentQq) this.activeTxRecentQq.push(deliveryId);
-      else this.rememberRecentQqDelivery(deliveryId);
+      const acceptedAtMs = Date.parse(updated.updated_at);
+      if (this.activeTxRecentQq) this.activeTxRecentQq.push({ deliveryId, acceptedAtMs });
+      else this.rememberRecentQqDelivery(deliveryId, acceptedAtMs);
     }
     append(delivery.message_id, "delivery", {
       delivery_id: deliveryId,
@@ -887,7 +900,8 @@ export class CommunicationCore {
         if (!finished || matches.length !== 1) throw new CoreError("invalid_forward_recovery", "精确回信恢复没有唯一原事件");
         const event = matches[0];
         const reply = safeObservedReply(event.data, delivery.target_snapshot, delivery);
-        if (!reply || !this.transaction(append => this.persistOwnerReplyForward(message, delivery, reply, binding, event.created_at, append))) {
+        const observedAt = event.data?.evidence?.observed_at ?? event.created_at;
+        if (!reply || !this.transaction(append => this.persistOwnerReplyForward(message, delivery, reply, binding, observedAt, append))) {
           throw new CoreError("invalid_forward_recovery", "原引用回信没有通过来源核查");
         }
       }
@@ -1638,6 +1652,128 @@ export class CommunicationCore {
     }
   }
 
+  qqTargetKeys() {
+    const keys = new Set();
+    for (const target of registryValues(this.targets)) {
+      if (target?.host === "qq") {
+        try {
+          keys.add(identityKey(target));
+        } catch {}
+      }
+    }
+    return [...keys];
+  }
+
+  *qqDeliveryPages(statuses, pageSize = DELIVERY_PAGE_SIZE) {
+    const targetKeys = this.qqTargetKeys();
+    if (!targetKeys.length) return;
+    if (typeof this.store.listDeliveriesForTargets === "function") {
+      let afterId;
+      while (true) {
+        const page = this.store.listDeliveriesForTargets({ targetKeys, statuses, limit: pageSize, ...(afterId ? { after_id: afterId } : {}) });
+        if (!page.length) return;
+        let previousId = afterId;
+        for (const delivery of page) {
+          if (previousId && delivery.delivery_id <= previousId) throw new CoreError("store_pagination_error", "投递分页没有按原游标继续递增");
+          previousId = delivery.delivery_id;
+        }
+        afterId = previousId;
+        yield page;
+        if (page.length < pageSize) return;
+      }
+    }
+    for (const page of this.deliveryPages(statuses, pageSize)) {
+      const filtered = page.filter(delivery => delivery.target_snapshot?.host === "qq");
+      if (filtered.length) yield filtered;
+    }
+  }
+
+  isMultiReplyQqMessage(message, delivery, adapter) {
+    if (message?.envelope?.target?.host !== "qq" || !message.reply_forward_binding) return false;
+    const resolvedAdapter = adapter ?? lookupAdapter(this.adapters, delivery?.target_snapshot?.adapter_id);
+    return typeof resolvedAdapter?.observeReplies === "function";
+  }
+
+  isAllowedOwnerReplySender(message, senderId) {
+    const binding = message?.reply_forward_binding;
+    if (!binding) return true;
+    if (!Array.isArray(binding.owner_sender_allowlist) || !binding.owner_sender_allowlist.includes(senderId)) return false;
+    const explicitRules = this.replyForwarding.filter(rule => rule.principal_id === binding.principal_id);
+    if (explicitRules.length > 0) {
+      return explicitRules.length === 1 && explicitRules[0].owner_sender_allowlist.includes(senderId);
+    }
+    const autoRules = this.automaticReplyForwarding.filter(rule => rule.binding_id === binding.from_target?.binding_id);
+    if (autoRules.length > 0) {
+      return autoRules.some(rule => rule.owner_sender_allowlist.includes(senderId));
+    }
+    return true;
+  }
+
+  observedOwnerReplyEvents(messageId, { refresh = false } = {}) {
+    if (!refresh && this.repliedOwnerEventIds.has(messageId)) {
+      return this.repliedOwnerEventIds.get(messageId);
+    }
+    const ids = new Set();
+    let lastObservedAtMs = NaN;
+    let sequence = 0;
+    while (true) {
+      const events = this.store.eventsAfter(messageId, sequence, REPLY_EVENT_PAGE_SIZE);
+      if (!events.length) break;
+      for (const event of events) {
+        if (event.message_id !== messageId || !Number.isSafeInteger(event.sequence) || event.sequence <= sequence) {
+          throw new CoreError("store_pagination_error", "回复事件分页没有按原消息游标继续递增");
+        }
+        sequence = event.sequence;
+        if (event.kind === "reply") {
+          const eventId = event.data?.native_source?.event?.event_id;
+          if (typeof eventId === "string" && eventId) ids.add(eventId);
+          const observedMs = Date.parse(event.data?.evidence?.observed_at ?? event.created_at);
+          if (Number.isFinite(observedMs) && (!Number.isFinite(lastObservedAtMs) || observedMs > lastObservedAtMs)) {
+            lastObservedAtMs = observedMs;
+          }
+        }
+      }
+      if (events.length < REPLY_EVENT_PAGE_SIZE) break;
+    }
+    const entry = { ids, lastObservedAtMs };
+    this.repliedOwnerEventIds.delete(messageId);
+    if (this.repliedOwnerEventIds.size >= MAX_REPLIED_MESSAGES_CACHE) {
+      this.repliedOwnerEventIds.delete(this.repliedOwnerEventIds.keys().next().value);
+    }
+    this.repliedOwnerEventIds.set(messageId, entry);
+    return entry;
+  }
+
+  qqActivityAtMs(message, delivery, adapter) {
+    const acceptedAtMs = Date.parse(delivery?.updated_at ?? delivery?.created_at);
+    if (!this.isMultiReplyQqMessage(message, delivery, adapter)) return acceptedAtMs;
+    const observed = this.observedOwnerReplyEvents(message.message_id);
+    return Number.isFinite(observed.lastObservedAtMs)
+      && (!Number.isFinite(acceptedAtMs) || observed.lastObservedAtMs > acceptedAtMs)
+      ? observed.lastObservedAtMs
+      : acceptedAtMs;
+  }
+
+  rememberOwnerReplyEvent(messageId, eventId, observedAtMs) {
+    const entry = this.observedOwnerReplyEvents(messageId);
+    if (typeof eventId === "string" && eventId) entry.ids.add(eventId);
+    if (Number.isFinite(observedAtMs) && (!Number.isFinite(entry.lastObservedAtMs) || observedAtMs > entry.lastObservedAtMs)) {
+      entry.lastObservedAtMs = observedAtMs;
+    }
+    this.repliedOwnerEventIds.delete(messageId);
+    this.repliedOwnerEventIds.set(messageId, entry);
+  }
+
+  isReplyForwardActive(message, delivery, nowMs) {
+    const observed = this.observedOwnerReplyEvents(message.message_id);
+    if (observed.ids.size === 0) return true;
+    const ttlMs = Math.max(message.reply_forward_binding?.ttl_ms ?? 0, this.qqReplyRecentMs);
+    const acceptedAtMs = Date.parse(delivery.updated_at ?? delivery.created_at);
+    if (Number.isFinite(acceptedAtMs) && nowMs - acceptedAtMs <= ttlMs) return true;
+    if (Number.isFinite(observed.lastObservedAtMs) && nowMs - observed.lastObservedAtMs <= this.qqReplyRecentMs) return true;
+    return false;
+  }
+
   rememberRepliedMessage(messageId) {
     if (this.repliedMessages.has(messageId)) return;
     if (this.repliedMessages.size >= MAX_REPLIED_MESSAGES_CACHE) {
@@ -1649,19 +1785,45 @@ export class CommunicationCore {
   rememberRecentQqDelivery(deliveryId, acceptedAtMs = this.nowMs()) {
     this.recentQqDeliveries.delete(deliveryId);
     this.recentQqDeliveries.set(deliveryId, acceptedAtMs);
+    this.recentQqEnqueuedSeq.delete(deliveryId);
+    this.recentQqEnqueuedSeq.set(deliveryId, ++this.recentQqSeq);
     while (this.recentQqDeliveries.size > MAX_RECENT_QQ_DELIVERIES) {
-      this.recentQqDeliveries.delete(this.recentQqDeliveries.keys().next().value);
+      const evicted = this.recentQqDeliveries.keys().next().value;
+      this.recentQqDeliveries.delete(evicted);
+      this.recentQqEnqueuedSeq.delete(evicted);
     }
+  }
+
+  deleteRecentQqDelivery(deliveryId) {
+    this.recentQqDeliveries.delete(deliveryId);
+    this.recentQqEnqueuedSeq.delete(deliveryId);
+  }
+
+  markQqChecked(deliveryId) {
+    this.qqLastCheckedTick.delete(deliveryId);
+    if (this.qqLastCheckedTick.size >= MAX_REPLIED_MESSAGES_CACHE) {
+      this.qqLastCheckedTick.delete(this.qqLastCheckedTick.keys().next().value);
+    }
+    this.qqLastCheckedTick.set(deliveryId, ++this.qqCheckTick);
   }
 
   bootstrapRecentQqDeliveries() {
     const nowMs = this.nowMs();
     const recent = [];
-    for (const page of this.deliveryPages(["accepted", "unknown"])) {
+    for (const page of this.qqDeliveryPages(["accepted", "unknown"])) {
       for (const delivery of page) {
         if (delivery.target_snapshot?.host !== "qq" || !isReplyObservableDelivery(delivery)) continue;
+        const message = this.store.getMessage(delivery.message_id);
+        if (!message) continue;
+        if (this.isMultiReplyQqMessage(message, delivery)) {
+          if (!this.isReplyForwardActive(message, delivery, nowMs)) continue;
+          const activityMs = this.qqActivityAtMs(message, delivery);
+          if (!Number.isFinite(activityMs) || nowMs - activityMs > this.qqReplyRecentMs) continue;
+          recent.push({ deliveryId: delivery.delivery_id, acceptedAtMs: activityMs });
+          continue;
+        }
         const acceptedAtMs = Date.parse(delivery.updated_at ?? delivery.created_at);
-        if (!Number.isFinite(acceptedAtMs) || nowMs - acceptedAtMs > QQ_REPLY_RECENT_MS) continue;
+        if (!Number.isFinite(acceptedAtMs) || nowMs - acceptedAtMs > this.qqReplyRecentMs) continue;
         if (this.hasReply(delivery.message_id)) continue;
         recent.push({ deliveryId: delivery.delivery_id, acceptedAtMs });
       }
@@ -1718,10 +1880,49 @@ export class CommunicationCore {
     }
   }
 
+  async callReplyObservers(adapter, message, delivery, target, release) {
+    if (!this.isMultiReplyQqMessage(message, delivery, adapter)) {
+      const single = await this.callReplyObserver(adapter, message, delivery, target, release);
+      return single ? [single] : [];
+    }
+    const controller = new AbortController();
+    this.controllers.add(controller);
+    let onAbort;
+    const interrupted = new Promise(resolve => {
+      onAbort = () => resolve([]);
+      controller.signal.addEventListener("abort", onAbort, { once: true });
+    });
+    const timer = setTimeout(() => controller.abort({ code: "delivery_timeout" }), this.deliveryTimeoutMs);
+    const invocation = Promise.resolve().then(() => {
+      if (controller.signal.aborted) return [];
+      return adapter.observeReplies({ message: copy(message), delivery: copy(delivery), target: copy(target), signal: controller.signal });
+    }).then(results => {
+      if (controller.signal.aborted || !Array.isArray(results) || results.length > 100) return [];
+      const valid = [];
+      for (const item of results) {
+        const observed = safeObservedReply(item, target, delivery);
+        if (!observed) return [];
+        valid.push(observed);
+      }
+      return valid;
+    }, () => []).finally(() => {
+      this.controllers.delete(controller);
+      this.replyInvocations.delete(invocation);
+      release?.();
+    });
+    this.replyInvocations.add(invocation);
+    try {
+      return await Promise.race([invocation, interrupted]);
+    } finally {
+      clearTimeout(timer);
+      controller.signal.removeEventListener("abort", onAbort);
+    }
+  }
+
   replyCandidate(delivery) {
     if (!isReplyObservableDelivery(delivery)) return null;
     const message = this.store.getMessage(delivery.message_id);
-    if (!message || this.hasReply(message.message_id)) return null;
+    if (!message) return null;
     let target;
     try {
       target = this.currentDispatchTarget(message, delivery);
@@ -1730,7 +1931,13 @@ export class CommunicationCore {
       return null;
     }
     const adapter = lookupAdapter(this.adapters, target.adapter_id);
-    return typeof adapter?.observeReply === "function" ? { delivery, message, target, adapter } : null;
+    if (this.isMultiReplyQqMessage(message, delivery, adapter)) {
+      if (!this.isReplyForwardActive(message, delivery, this.nowMs())) return null;
+      return { delivery, message, target, adapter };
+    }
+    if (typeof adapter?.observeReply !== "function") return null;
+    if (this.hasReply(message.message_id)) return null;
+    return { delivery, message, target, adapter };
   }
 
   waitingHostReply(passes, prioritized) {
@@ -1744,7 +1951,8 @@ export class CommunicationCore {
         const delivery = this.store.getDeliveryForMessage(messageId);
         if (!delivery || prioritized.has(delivery.delivery_id) || pacer.reading.has(delivery.delivery_id)) continue;
         const candidate = this.replyCandidate(delivery);
-        if (!candidate || candidate.target.host !== host || !pacer.isOld(pass, candidate.message, delivery)) continue;
+        const activityAtMs = candidate && host === "qq" ? this.qqActivityAtMs(candidate.message, delivery, candidate.adapter) : undefined;
+        if (!candidate || candidate.target.host !== host || !pacer.isOld(pass, candidate.message, delivery, activityAtMs)) continue;
         if (!first || delivery.delivery_id < first.delivery.delivery_id) first = candidate;
         if ((pacer.waiting.cursor === null || delivery.delivery_id > pacer.waiting.cursor)
           && (!next || delivery.delivery_id < next.delivery.delivery_id)) next = candidate;
@@ -1755,40 +1963,129 @@ export class CommunicationCore {
     return null;
   }
 
-  hotQqDeliveryIds(nowMs, excluded = null) {
+  hotQqDeliveryIds(nowMs, excluded = null, { minSeq = 0 } = {}) {
     if (!this.recentQqDeliveries.size) return [];
     const ids = [];
     const entries = [...this.recentQqDeliveries.entries()];
     for (let index = entries.length - 1; index >= 0; index -= 1) {
       const [deliveryId, acceptedAtMs] = entries[index];
-      if (!Number.isFinite(acceptedAtMs) || nowMs - acceptedAtMs > QQ_REPLY_RECENT_MS) {
-        this.recentQqDeliveries.delete(deliveryId);
+      if (!Number.isFinite(acceptedAtMs) || nowMs - acceptedAtMs > this.qqReplyRecentMs) {
+        this.deleteRecentQqDelivery(deliveryId);
         continue;
       }
+      if (minSeq > 0 && (this.recentQqEnqueuedSeq.get(deliveryId) ?? 0) <= minSeq) continue;
       if (excluded?.has(deliveryId)) continue;
       ids.push(deliveryId);
     }
     return ids;
   }
 
-  takeNextHotQqCandidate(nowMs, prioritized) {
+  takeNextHotQqCandidate(nowMs, prioritized, { minSeq = 0 } = {}) {
     const entries = [...this.recentQqDeliveries.entries()];
     for (let index = entries.length - 1; index >= 0; index -= 1) {
       const [deliveryId, acceptedAtMs] = entries[index];
-      if (!Number.isFinite(acceptedAtMs) || nowMs - acceptedAtMs > QQ_REPLY_RECENT_MS) {
-        this.recentQqDeliveries.delete(deliveryId);
+      if (!Number.isFinite(acceptedAtMs) || nowMs - acceptedAtMs > this.qqReplyRecentMs) {
+        this.deleteRecentQqDelivery(deliveryId);
         continue;
       }
+      if (minSeq > 0 && (this.recentQqEnqueuedSeq.get(deliveryId) ?? 0) <= minSeq) continue;
       if (prioritized.has(deliveryId)) continue;
       prioritized.add(deliveryId);
       const candidate = this.replyCandidate(this.store.getDelivery(deliveryId));
       if (!candidate) {
-        this.recentQqDeliveries.delete(deliveryId);
+        this.deleteRecentQqDelivery(deliveryId);
         continue;
       }
       return candidate;
     }
     return null;
+  }
+
+  takeNextAgedQqCandidate(passes, prioritized, allowWrap = true) {
+    const pacer = this.replyPacers.get("qq");
+    const pass = passes.get("qq");
+    if (!pacer || !pass || !pacer.available(pass.passive)) return null;
+    const nowMs = this.nowMs();
+    const cohort = this.agedQqCohortBefore ?? (nowMs - this.qqReplyRecentMs);
+    const cohortAged = [];
+    const freshAged = [];
+    for (const page of this.qqDeliveryPages(["accepted", "unknown"])) {
+      for (const delivery of page) {
+        if (delivery.target_snapshot?.host !== "qq" || !isReplyObservableDelivery(delivery)) continue;
+        if (prioritized.has(delivery.delivery_id) || pacer.reading.has(delivery.delivery_id)) continue;
+        const candidate = this.replyCandidate(delivery);
+        if (!candidate || candidate.target.host !== "qq") continue;
+        const activityAtMs = this.qqActivityAtMs(candidate.message, delivery, candidate.adapter);
+        if (!Number.isFinite(activityAtMs)) continue;
+        if (!pacer.isOld({ now: nowMs }, candidate.message, delivery, activityAtMs)) continue;
+        const item = { acceptedAtMs: activityAtMs, deliveryId: delivery.delivery_id, candidate };
+        if (this.agedQqCohortBefore !== null && activityAtMs > this.agedQqCohortBefore) {
+          if (!this.agedQqPreempted.has(delivery.delivery_id)) freshAged.push(item);
+        } else if (activityAtMs <= cohort) {
+          cohortAged.push(item);
+        }
+      }
+    }
+    const byNewest = (left, right) => (right.acceptedAtMs - left.acceptedAtMs)
+      || (left.deliveryId < right.deliveryId ? -1 : left.deliveryId > right.deliveryId ? 1 : 0);
+    cohortAged.sort(byNewest);
+    freshAged.sort(byNewest);
+
+    let nextCohortItem = null;
+    if (cohortAged.length) {
+      if (this.agedQqCursor) {
+        nextCohortItem = cohortAged.find(item => item.acceptedAtMs < this.agedQqCursor.acceptedAtMs
+          || (item.acceptedAtMs === this.agedQqCursor.acceptedAtMs && item.deliveryId > this.agedQqCursor.deliveryId)) ?? null;
+      } else {
+        nextCohortItem = cohortAged[0];
+      }
+    }
+
+    let selected = null;
+    let usedPreempt = false;
+    // 刚跨过 4h 热池线的新老化 QQ 优先插队（避免等完旧批次全部古董），并与旧批次按 1:1 公平交替防饿死历史旧信
+    if (freshAged.length && (!this.agedQqLastWasPreempt || !nextCohortItem)) {
+      selected = freshAged[0];
+      usedPreempt = true;
+    } else if (nextCohortItem) {
+      selected = nextCohortItem;
+    }
+
+    if (!selected) {
+      const hadState = this.agedQqCohortBefore !== null || this.agedQqCursor !== null || this.agedQqPreempted.size > 0;
+      this.agedQqCursor = null;
+      this.agedQqCohortBefore = null;
+      this.agedQqPreempted.clear();
+      this.agedQqLastWasPreempt = false;
+      if (hadState && allowWrap) {
+        return this.takeNextAgedQqCandidate(passes, prioritized, false);
+      }
+      return null;
+    }
+
+    if (usedPreempt) {
+      if (this.agedQqPreempted.size >= MAX_REPLIED_MESSAGES_CACHE) {
+        this.agedQqPreempted.delete(this.agedQqPreempted.values().next().value);
+      }
+      this.agedQqPreempted.add(selected.deliveryId);
+      this.agedQqLastWasPreempt = true;
+    } else {
+      this.agedQqCohortBefore = cohort;
+      this.agedQqCursor = { acceptedAtMs: selected.acceptedAtMs, deliveryId: selected.deliveryId };
+      this.agedQqLastWasPreempt = false;
+    }
+    prioritized.add(selected.deliveryId);
+    pass.passive.used = true;
+    pacer.passive.reading = true;
+    pacer.reading.add(selected.deliveryId);
+    const listeners = this.waiters.get(selected.candidate.message.message_id) ?? [];
+    for (const listener of listeners) pacer.waiters.delete(listener);
+    const release = () => {
+      pacer.reading.delete(selected.deliveryId);
+      pacer.passive.reading = false;
+      pacer.passive.nextAt = this.nowMs() + pacer.passive.gap;
+    };
+    return { candidate: selected.candidate, release };
   }
 
   pollReplies() {
@@ -1801,96 +2098,265 @@ export class CommunicationCore {
       const prioritized = new Set();
       let scanned = true;
 
-      const observeCandidate = async candidate => {
+      const observeCandidate = async (candidate, preReservedRelease) => {
         const { delivery, message, target, adapter } = candidate;
         const pacer = this.replyPacers.get(target.host);
-        const release = pacer
-          ? pacer.reserve(passes.get(target.host), message, delivery, this.waiters.get(message.message_id))
+        const activityAtMs = target.host === "qq" ? this.qqActivityAtMs(message, delivery, adapter) : undefined;
+        const release = preReservedRelease !== undefined ? preReservedRelease
+          : pacer ? pacer.reserve(passes.get(target.host), message, delivery, this.waiters.get(message.message_id), activityAtMs)
           : undefined;
         if (release === null) return;
         checked += 1;
-        const reply = await this.callReplyObserver(adapter, message, delivery, target, release);
-        if (!reply || this.closed) return;
-        const appended = this.transaction(append => {
+        const observedList = await this.callReplyObservers(adapter, message, delivery, target, release);
+        if (!observedList.length || this.closed) return;
+        const multiQq = this.isMultiReplyQqMessage(message, delivery, adapter);
+        if (!multiQq) {
+          const reply = observedList[0];
+          const appended = this.transaction(append => {
+            const currentDelivery = this.store.getDelivery(delivery.delivery_id);
+            const currentMessage = this.store.getMessage(message.message_id);
+            if (!isReplyObservableDelivery(currentDelivery) || currentDelivery.message_id !== message.message_id
+              || !currentMessage || this.hasReply(message.message_id)) return false;
+            let currentTarget;
+            try {
+              currentTarget = this.currentDispatchTarget(currentMessage, currentDelivery);
+            } catch (error) {
+              if (!(error instanceof CoreError)) throw error;
+              return false;
+            }
+            if (identityKey(currentTarget) !== identityKey(target) || currentTarget.binding_id !== target.binding_id
+              || currentTarget.binding_generation !== target.binding_generation || currentTarget.adapter_id !== target.adapter_id
+              || lookupAdapter(this.adapters, target.adapter_id) !== adapter) return false;
+            if (currentTarget.host === "qq" && currentMessage.reply_forward_binding
+              && !this.isAllowedOwnerReplySender(currentMessage, reply.native_source?.event?.sender_id)) return false;
+            const observedAt = this.timestamp();
+            const event = append(message.message_id, "reply", {
+              delivery_id: delivery.delivery_id,
+              ...reply,
+              evidence: {
+                kind: "native_reply",
+                source: "adapter.observeReply",
+                ...normalizeIdentity(target),
+                adapter_id: target.adapter_id,
+                binding_id: target.binding_id,
+                binding_generation: target.binding_generation,
+                observed_at: observedAt,
+              },
+            });
+            const forward = this.persistOwnerReplyForward(currentMessage, currentDelivery, reply, currentMessage.reply_forward_binding, observedAt, append);
+            if (currentMessage.reply_forward_binding && !forward) append(message.message_id, "reply_forward_blocked", { code: "unverified_reply_forward" });
+            return { forward_delivery_id: forward?.delivery_id };
+          });
+          if (appended) {
+            replies += 1;
+            this.rememberRepliedMessage(message.message_id);
+            this.deleteRecentQqDelivery(delivery.delivery_id);
+            if (appended.forward_delivery_id) this.enqueue(appended.forward_delivery_id).catch(error => { this.backgroundError = error; });
+          }
+          return;
+        }
+        const preSeen = this.observedOwnerReplyEvents(message.message_id).ids;
+        const freshReplies = observedList.filter(item => {
+          const eventId = item?.native_source?.event?.event_id;
+          return typeof eventId === "string" && eventId && !preSeen.has(eventId);
+        });
+        if (!freshReplies.length) return;
+        const committed = this.transaction(append => {
           const currentDelivery = this.store.getDelivery(delivery.delivery_id);
           const currentMessage = this.store.getMessage(message.message_id);
           if (!isReplyObservableDelivery(currentDelivery) || currentDelivery.message_id !== message.message_id
-            || !currentMessage || this.hasReply(message.message_id)) return false;
+            || !currentMessage || !this.isMultiReplyQqMessage(currentMessage, currentDelivery, adapter)) return [];
           let currentTarget;
           try {
             currentTarget = this.currentDispatchTarget(currentMessage, currentDelivery);
           } catch (error) {
             if (!(error instanceof CoreError)) throw error;
-            return false;
+            return [];
           }
           if (identityKey(currentTarget) !== identityKey(target) || currentTarget.binding_id !== target.binding_id
             || currentTarget.binding_generation !== target.binding_generation || currentTarget.adapter_id !== target.adapter_id
-            || lookupAdapter(this.adapters, target.adapter_id) !== adapter) return false;
-          const ownerSenders = currentMessage.reply_forward_binding?.owner_sender_allowlist;
-          if (currentTarget.host === "qq" && currentMessage.reply_forward_binding
-            && (!Array.isArray(ownerSenders) || !ownerSenders.includes(reply.native_source?.event?.sender_id))) return false;
-          const event = append(message.message_id, "reply", {
-            delivery_id: delivery.delivery_id,
-            ...reply,
-            evidence: {
-              kind: "native_reply",
-              source: "adapter.observeReply",
-              ...normalizeIdentity(target),
-              adapter_id: target.adapter_id,
-              binding_id: target.binding_id,
-              binding_generation: target.binding_generation,
-              observed_at: this.timestamp(),
-            },
-          });
-          const forward = this.persistOwnerReplyForward(currentMessage, currentDelivery, reply, currentMessage.reply_forward_binding, event.created_at, append);
-          if (currentMessage.reply_forward_binding && !forward) append(message.message_id, "reply_forward_blocked", { code: "unverified_reply_forward" });
-          return { forward_delivery_id: forward?.delivery_id };
+            || lookupAdapter(this.adapters, target.adapter_id) !== adapter) return [];
+          const persistedSeen = new Set(this.observedOwnerReplyEvents(message.message_id, { refresh: true }).ids);
+          const added = [];
+          for (const reply of freshReplies) {
+            const eventId = reply?.native_source?.event?.event_id;
+            if (!eventId || persistedSeen.has(eventId)) continue;
+            if (!this.isAllowedOwnerReplySender(currentMessage, reply.native_source?.event?.sender_id)) continue;
+            const observedAt = this.timestamp();
+            const event = append(message.message_id, "reply", {
+              delivery_id: delivery.delivery_id,
+              ...reply,
+              evidence: {
+                kind: "native_reply",
+                source: "adapter.observeReply",
+                ...normalizeIdentity(target),
+                adapter_id: target.adapter_id,
+                binding_id: target.binding_id,
+                binding_generation: target.binding_generation,
+                observed_at: observedAt,
+              },
+            });
+            persistedSeen.add(eventId);
+            const forward = this.persistOwnerReplyForward(currentMessage, currentDelivery, reply, currentMessage.reply_forward_binding, observedAt, append);
+            if (!forward) append(message.message_id, "reply_forward_blocked", { code: "unverified_reply_forward" });
+            const observedAtMs = Date.parse(observedAt);
+            added.push({
+              eventId,
+              observedAtMs: Number.isFinite(observedAtMs) ? observedAtMs : this.nowMs(),
+              forward_delivery_id: forward?.duplicate ? null : (forward?.delivery_id ?? null),
+            });
+          }
+          return added;
         });
-        if (appended) {
-          replies += 1;
-          this.rememberRepliedMessage(message.message_id);
-          this.recentQqDeliveries.delete(delivery.delivery_id);
-          if (appended.forward_delivery_id) this.enqueue(appended.forward_delivery_id).catch(error => { this.backgroundError = error; });
+        if (Array.isArray(committed) && committed.length) {
+          replies += committed.length;
+          let maxObservedAtMs = NaN;
+          for (const item of committed) {
+            this.rememberOwnerReplyEvent(message.message_id, item.eventId, item.observedAtMs);
+            if (Number.isFinite(item.observedAtMs) && (!Number.isFinite(maxObservedAtMs) || item.observedAtMs > maxObservedAtMs)) {
+              maxObservedAtMs = item.observedAtMs;
+            }
+            if (item.forward_delivery_id) this.enqueue(item.forward_delivery_id).catch(error => { this.backgroundError = error; });
+          }
+          const renewAtMs = Number.isFinite(maxObservedAtMs) ? maxObservedAtMs : this.qqActivityAtMs(message, delivery, adapter);
+          this.rememberRecentQqDelivery(delivery.delivery_id, Number.isFinite(renewAtMs) ? renewAtMs : this.nowMs());
         }
       };
 
-      const drainHotQq = async () => {
-        const hotQqIds = this.hotQqDeliveryIds(this.nowMs(), prioritized);
-        if (!hotQqIds.length || this.closed || this.replyInvocations.size >= this.maxConcurrent) return;
-        let hotIndex = 0;
-        const hotWorker = async () => {
-          while (!this.closed && hotIndex < hotQqIds.length && this.replyInvocations.size < this.maxConcurrent) {
-            const deliveryId = hotQqIds[hotIndex++];
+      const qqPacer = this.replyPacers.get("qq");
+      const qqPass = passes.get("qq");
+      const pollStartSeq = this.recentQqSeq;
+      let agedQqExhausted = false;
+      let inFlightHotChecks = 0;
+
+      // 热池 + 溢出/reply_required 非老化 QQ 共用统一每轮上限（MAX_ACTIVE_QQ_PER_POLL）与公平轮转，避免满池 QQ 堵死非 QQ 扫描
+      const drainActiveQq = async () => {
+        if (this.closed || this.replyInvocations.size >= this.maxConcurrent || !qqPacer || !qqPass) return;
+        const nowMs = this.nowMs();
+        const activeById = new Map();
+        const consider = (delivery) => {
+          if (!delivery || delivery.target_snapshot?.host !== "qq" || !isReplyObservableDelivery(delivery)) return;
+          if (activeById.has(delivery.delivery_id) || prioritized.has(delivery.delivery_id) || qqPacer.reading.has(delivery.delivery_id)) return;
+          const candidate = this.replyCandidate(delivery);
+          if (!candidate || candidate.target.host !== "qq") {
+            this.deleteRecentQqDelivery(delivery.delivery_id);
+            return;
+          }
+          const activityAtMs = this.qqActivityAtMs(candidate.message, delivery, candidate.adapter);
+          if (qqPacer.isOld(qqPass, candidate.message, delivery, activityAtMs)) {
+            this.deleteRecentQqDelivery(delivery.delivery_id);
+            return;
+          }
+          const multiQq = this.isMultiReplyQqMessage(candidate.message, delivery, candidate.adapter);
+          const hasReplied = multiQq && this.observedOwnerReplyEvents(candidate.message.message_id).ids.size > 0;
+          const lastTick = this.qqLastCheckedTick.get(delivery.delivery_id) ?? 0;
+          const tier = (candidate.message.envelope.reply_required === true || (!hasReplied && lastTick === 0)) ? 0
+            : !hasReplied ? 1 : 2;
+          activeById.set(delivery.delivery_id, { candidate, tier, lastTick, activityAtMs: Number.isFinite(activityAtMs) ? activityAtMs : 0 });
+        };
+
+        for (const deliveryId of this.hotQqDeliveryIds(nowMs, prioritized)) {
+          consider(this.store.getDelivery(deliveryId));
+        }
+        for (const page of this.qqDeliveryPages(["accepted", "unknown"])) {
+          for (const delivery of page) consider(delivery);
+        }
+        if (!activeById.size) return;
+
+        const batch = [...activeById.values()]
+          .sort((left, right) => (left.tier - right.tier)
+            || (left.lastTick - right.lastTick)
+            || (right.activityAtMs - left.activityAtMs)
+            || (left.candidate.delivery.delivery_id < right.candidate.delivery.delivery_id ? -1 : 1))
+          .slice(0, MAX_ACTIVE_QQ_PER_POLL);
+
+        let idx = 0;
+        const activeWorker = async () => {
+          while (!this.closed && idx < batch.length && this.replyInvocations.size < this.maxConcurrent) {
+            const entry = batch[idx++];
+            const deliveryId = entry.candidate.delivery.delivery_id;
+            if (prioritized.has(deliveryId)) continue;
+            prioritized.add(deliveryId);
+            this.markQqChecked(deliveryId);
+            await observeCandidate(entry.candidate);
+          }
+        };
+        const results = await Promise.allSettled(Array.from({ length: Math.min(this.maxConcurrent, batch.length) }, activeWorker));
+        const failed = results.find(result => result.status === "rejected");
+        if (failed) throw failed.reason;
+      };
+
+      const drainNewlyEnqueuedHotQq = async () => {
+        if (this.closed || this.replyInvocations.size >= this.maxConcurrent || inFlightHotChecks >= MAX_ACTIVE_QQ_PER_POLL) return;
+        const remaining = MAX_ACTIVE_QQ_PER_POLL - inFlightHotChecks;
+        const freshIds = this.hotQqDeliveryIds(this.nowMs(), prioritized, { minSeq: pollStartSeq }).slice(0, remaining);
+        if (!freshIds.length) return;
+        let idx = 0;
+        const freshWorker = async () => {
+          while (!this.closed && idx < freshIds.length && this.replyInvocations.size < this.maxConcurrent && inFlightHotChecks < MAX_ACTIVE_QQ_PER_POLL) {
+            const deliveryId = freshIds[idx++];
             if (prioritized.has(deliveryId)) continue;
             prioritized.add(deliveryId);
             const candidate = this.replyCandidate(this.store.getDelivery(deliveryId));
             if (!candidate) {
-              this.recentQqDeliveries.delete(deliveryId);
+              this.deleteRecentQqDelivery(deliveryId);
               continue;
             }
+            inFlightHotChecks += 1;
+            this.markQqChecked(deliveryId);
             await observeCandidate(candidate);
           }
         };
-        const hotWorkers = await Promise.allSettled(Array.from({ length: Math.min(this.maxConcurrent, hotQqIds.length) }, hotWorker));
-        const hotFailed = hotWorkers.find(result => result.status === "rejected");
-        if (hotFailed) throw hotFailed.reason;
+        const results = await Promise.allSettled(Array.from({ length: Math.min(this.maxConcurrent, freshIds.length) }, freshWorker));
+        const failed = results.find(result => result.status === "rejected");
+        if (failed) throw failed.reason;
       };
 
-      // 先抢先检查近期 QQ 热池投递（按最新优先），避免被大量随机 UUID 的历史旧投递分页挤占
-      await drainHotQq();
+      const drainOneAgedQq = async () => {
+        if (this.closed || this.replyInvocations.size >= this.maxConcurrent || agedQqExhausted) return;
+        if (!qqPacer || !qqPass || !qqPacer.available(qqPass.passive)) return;
+        const picked = this.takeNextAgedQqCandidate(passes, prioritized);
+        if (!picked) {
+          agedQqExhausted = true;
+          return;
+        }
+        await observeCandidate(picked.candidate, picked.release);
+      };
 
-      for (const deliveries of this.deliveryPages(["accepted", "unknown"], REPLY_PAGE_SIZE)) {
+      // 1) 先按统一预算检查活跃非老化 QQ（未首回/新发优先 + 已回公平轮转），再按倒序/新过线 1:1 交替检查 1 条慢车道 QQ
+      await drainActiveQq();
+      await drainOneAgedQq();
+
+      for (const deliveries of this.deliveryPages(["accepted"], REPLY_PAGE_SIZE)) {
         if (this.closed || this.replyInvocations.size >= this.maxConcurrent) { scanned = false; break; }
         let nextIndex = 0;
         const worker = async () => {
           while (!this.closed && nextIndex < deliveries.length && this.replyInvocations.size < this.maxConcurrent) {
-            const hotCandidate = this.takeNextHotQqCandidate(this.nowMs(), prioritized);
+            const hotCandidate = inFlightHotChecks < MAX_ACTIVE_QQ_PER_POLL
+              ? this.takeNextHotQqCandidate(this.nowMs(), prioritized, { minSeq: pollStartSeq })
+              : null;
+            if (hotCandidate) {
+              inFlightHotChecks += 1;
+              this.markQqChecked(hotCandidate.delivery.delivery_id);
+            }
             const waiting = hotCandidate ? null : this.waitingHostReply(passes, prioritized);
             let candidate = hotCandidate ?? waiting;
             if (!candidate) {
+              // 漫长全库 AG/Codex 扫描期间，无论轮询启动时是否处于冷却期，只要 QQ 慢车道 5s 冷却已满即借空槽立即抢检 1 条慢车道 QQ
+              if (!agedQqExhausted && qqPacer && qqPass && !qqPacer.passive.reading && qqPacer.passive.nextAt <= this.nowMs()) {
+                qqPass.passive.used = false;
+                const agedPicked = this.takeNextAgedQqCandidate(passes, prioritized);
+                if (agedPicked) {
+                  await observeCandidate(agedPicked.candidate, agedPicked.release);
+                  continue;
+                }
+                agedQqExhausted = true;
+              }
               const deliveryId = deliveries[nextIndex++].delivery_id;
               if (prioritized.has(deliveryId)) continue;
-              candidate = this.replyCandidate(this.store.getDelivery(deliveryId));
+              const rawDelivery = this.store.getDelivery(deliveryId);
+              if (rawDelivery?.target_snapshot?.host === "qq") continue;
+              candidate = this.replyCandidate(rawDelivery);
             }
             if (!candidate) continue;
             if (waiting) prioritized.add(candidate.delivery.delivery_id);
@@ -1902,9 +2368,10 @@ export class CommunicationCore {
         if (failed) throw failed.reason;
         if (nextIndex < deliveries.length) scanned = false;
       }
-      // 尾部追检：若当前轮因慢 RPC 在途期间又新进了热池 QQ 投递，立刻借空槽补查一次不干等下轮
-      await drainHotQq();
+      // 尾部追检：仅追检本轮启动后新入池/新续热的 QQ 投递，绝不再重扫满池存量
+      await drainNewlyEnqueuedHotQq();
       for (const [host, pacer] of this.replyPacers.entries()) {
+        if (host === "qq") continue;
         pacer.finish(passes.get(host), scanned && !this.closed);
       }
       return { checked, replies };

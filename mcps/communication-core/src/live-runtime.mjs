@@ -612,7 +612,8 @@ export async function startLiveFromConfig({ configPath, stateDir, endpointFile, 
       channelWindows: configuration.channelWindows,
       ownerWindowSources: configuration.ownerWindowSources, downloadLedger, channelDownloadFailure, autoCompleteOnReply: true,
       statusProvider, hostContentProvider: new HostConversationContent({ providers: hostContentProviders, localMachineId, machineProviders }),
-      deliveryTimeoutMs: configuration.deliveryTimeoutMs });
+      deliveryTimeoutMs: configuration.deliveryTimeoutMs,
+      qqReplyRecentMs: 4 * 60 * 60 * 1000 });
     if (typeof core.pollReplies !== "function") throw new CoreError("startup_failed", "真实测试核心依赖尚未就绪");
     await mkdir(directory, { recursive: true, mode: 0o700 });
     store = new MessageStore({ filePath: join(directory, "core.sqlite") });
