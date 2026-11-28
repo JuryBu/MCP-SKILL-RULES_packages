@@ -143,7 +143,7 @@ test("the board tool is absent by default, and a running board tool is visible o
   await expectError(direct, "board", { ...input, caller: { ...short(first), conversation_id: "*" } }, "invalid_input");
   await expectError(direct, "board", { ...input, actorIdentity: second }, "invalid_input");
   assert.equal(requests.length, 0);
-  assert.deepEqual(await ok(direct, "board", input), { items: [] });
+  assert.deepEqual(await ok(direct, "board", input), { items: [], caller: input.caller });
   assert.equal(requests.length, 1);
   assert.deepEqual(requests[0].actorIdentity, first);
   assert.equal(requests[0].board, undefined);
@@ -172,13 +172,36 @@ test("the board tool resolves only the caller's alias and checks each action's a
   await expectError(owner, "board", { ...operation, action: "delete_archived" }, "invalid_input");
   await expectError(owner, "board", { ...operation, limit: 5 }, "invalid_input");
   assert.equal(requests.length, 0);
-  assert.deepEqual(await ok(owner, "board", operation), { accepted: true });
+  assert.deepEqual(await ok(owner, "board", operation), { accepted: true, caller: operation.caller });
   assert.deepEqual(await ok(owner, "board", { ...operation, action: "unsubscribe", board: { board_id: address.board_id } }),
-    { accepted: true });
+    { accepted: true, caller: operation.caller });
   assert.deepEqual(requests.map(({ action, board: target }) => ({ action, target })), [
     { action: "subscribe", target: address },
     { action: "unsubscribe", target: address },
   ]);
+});
+
+test("a conversation can rename an inherited contact without changing the shared default or a peer's book", async context => {
+  const open = await fixture(context);
+  const live = await open();
+  const owner = await live.connect(0);
+  const other = await live.connect(1);
+  const shared = await live.connect(2);
+  const input = { caller: short(first), action: "rename", contact: "共有", alias: "我的名字" };
+  await expectError(shared, "contacts", input, "caller_unverified");
+  await expectError(owner, "contacts", { ...input, caller: short(second) }, "caller_mismatch");
+  const result = await ok(owner, "contacts", input);
+  assert.deepEqual(result.caller, input.caller);
+  const renamed = await ok(owner, "contacts", { caller: short(first), action: "get", contact: input.alias });
+  assert.equal(renamed.alias, input.alias);
+  assert.deepEqual(renamed.target, second);
+  assert.equal(renamed.note, "公共备注");
+  for (const [client, caller] of [[other, short(second)], [shared, short(first)]]) {
+    await expectError(client, "contacts", { caller, action: "get", contact: input.alias }, "contact_not_found");
+    const entry = await ok(client, "contacts", { caller, action: "get", contact: "共有" });
+    assert.equal(entry.alias, "共有");
+    assert.deepEqual(entry.target, second);
+  }
 });
 
 test("group send through MCP commits per recipient, hides private labels, and uses only one reply event", async context => {

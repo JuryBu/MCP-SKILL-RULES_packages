@@ -340,6 +340,34 @@ test("CoreError保留具体code，普通异常和结果序列化异常不泄露�
   }
 });
 
+test("通讯录与交流板回传本次提交的对话，业务拒绝只回显对话字段", async context => {
+  const fixture = await harness(context, {
+    addressBook: {},
+    canUseBoardTool: () => true,
+    contacts(_context, input) {
+      if (input.action === "set_note") throw new CoreError("contact_not_found", "synthetic detail not returned");
+      return { entries: [] };
+    },
+    board: () => ({ boards: [] }),
+  });
+  const client = await fixture.client();
+  const submitted = { host: caller.host, conversation_id: caller.conversation_id };
+  const requested = { ...submitted, machine_id: caller.machine_id, surface: caller.surface };
+  for (const [name, identity] of [["communication_contacts", submitted], ["communication_board", requested]]) {
+    const result = await client.callTool({ name, arguments: { caller: identity, action: "list" } });
+    assert.notEqual(result.isError, true);
+    assert.deepEqual(result.structuredContent.caller, identity);
+    assert.deepEqual(JSON.parse(result.content[0].text.split("\n")[1]).caller, identity);
+  }
+  const denied = await client.callTool({ name: "communication_contacts", arguments: {
+    caller: submitted, action: "set_note", contact: "synthetic contact", note: "synthetic private note",
+  } });
+  assert.equal(denied.isError, true);
+  assert.equal(denied.structuredContent.error.code, "contact_not_found");
+  assert.deepEqual(denied.structuredContent.caller, submitted);
+  assert.ok(!JSON.stringify(denied).includes("synthetic private note"));
+});
+
 test("参数与未知工具错误同样返回structuredContent，不回显敏感输入", async context => {
   let invoked = false;
   const fixture = await harness(context, { wait() { invoked = true; return {}; } });

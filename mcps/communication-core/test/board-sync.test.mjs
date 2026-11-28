@@ -640,8 +640,8 @@ test("导出清单与常量规格精确匹配", () => {
   assert.equal(BOARD_SYNC_LIMITS.maxPayloadJsonBytes, 960 * 1024);
   assert.equal(BOARD_SYNC_LIMITS.maxBundleAttachments, 63);
   assert.equal(BOARD_SYNC_LIMITS.maxBundleTotalBytes, 16 * 1024 * 1024 - 256 * 1024);
-  assert.equal(BOARD_SYNC_LIMITS.defaultSyncIntervalMs, 90000);
-  assert.equal(BOARD_SYNC_LIMITS.defaultNotifyIntervalMs, 90000);
+  assert.equal(BOARD_SYNC_LIMITS.defaultSyncIntervalMs, 15000);
+  assert.equal(BOARD_SYNC_LIMITS.defaultNotifyIntervalMs, 15000);
 });
 
 test("绝对零空轮询：7 类待同步项全空时发 0 帧，空板邀远端成员首同步后 ACK 归零", async () => {
@@ -3467,4 +3467,190 @@ test("W2-3 R2-P1-1 + 归档/通知计时间隔解耦：同步层严禁发出残�
   } finally {
     cleanupTempDir(tmpDir);
   }
+});
+
+test("事件防抖端到端时间戳实测：双机默认周期下发帖自动同步与本机提醒均在 1.5s 内送达且关闭零句柄泄漏", async testContext => {
+  const tmpDir = createTempDir();
+  const beforeHandles = process.getActiveResourcesInfo();
+  let hostDb = null;
+  let clientDb = null;
+  let hostRt = null;
+  let clientRt = null;
+  let relayPump = null;
+  try {
+    const bus = new InMemoryRelayBus();
+    bus.registerMachine({ machine_id: HOST_ID, qq_id: "100001", bundle_enabled: true });
+    bus.registerMachine({ machine_id: CLIENT_ID, qq_id: "100002", bundle_enabled: true });
+    bus.registerRoute({
+      relay_key: "r_latency_pair",
+      group_id: "300099",
+      members: [HOST_ID, CLIENT_ID],
+      allow_file_bundle_write: true,
+    });
+
+    const hostDisp = new RemoteCoreDispatcher({
+      localMachineId: HOST_ID,
+      transport: bus.createTransportFor(HOST_ID),
+      policy: { peers: { [CLIENT_ID]: { trust_source_identity: true } } },
+    });
+    const clientDisp = new RemoteCoreDispatcher({
+      localMachineId: CLIENT_ID,
+      transport: bus.createTransportFor(CLIENT_ID),
+      policy: { peers: { [HOST_ID]: { trust_source_identity: true } } },
+    });
+
+    hostDb = new DatabaseSync(path.join(tmpDir, "host-latency.sqlite"));
+    clientDb = new DatabaseSync(path.join(tmpDir, "client-latency.sqlite"));
+
+    const hostNotifications = [];
+    const clientNotifications = [];
+    hostRt = openBoardRuntime({
+      localMachineId: HOST_ID,
+      privateRoot: path.join(tmpDir, "host-priv"),
+      allowedUploadRoots: [],
+      openStore: create => create({ database: hostDb }),
+      relayDispatcher: hostDisp,
+      peerMachines: [CLIENT_ID],
+      notifyLocalMember: async payload => {
+        hostNotifications.push({ at: performance.now(), payload });
+        return { ok: true, accepted: true, message_id: `host-noti-${hostNotifications.length}` };
+      },
+    });
+    clientRt = openBoardRuntime({
+      localMachineId: CLIENT_ID,
+      privateRoot: path.join(tmpDir, "client-priv"),
+      allowedUploadRoots: [],
+      openStore: create => create({ database: clientDb }),
+      relayDispatcher: clientDisp,
+      peerMachines: [HOST_ID],
+      notifyLocalMember: async payload => {
+        clientNotifications.push({ at: performance.now(), payload });
+        return { ok: true, accepted: true, message_id: `client-noti-${clientNotifications.length}` };
+      },
+    });
+
+    await hostRt.start();
+    await clientRt.start();
+
+    let pumping = false;
+    relayPump = setInterval(() => {
+      if (pumping) return;
+      pumping = true;
+      Promise.allSettled([hostDisp.pollOnce(), clientDisp.pollOnce()]).finally(() => {
+        pumping = false;
+      });
+    }, 30);
+
+    const waitFor = async (predicate, timeoutMs = 4500) => {
+      const deadline = performance.now() + timeoutMs;
+      while (performance.now() < deadline) {
+        if (predicate()) return true;
+        await new Promise(resolve => setTimeout(resolve, 20));
+      }
+      return predicate();
+    };
+
+    // 1. 建板并邀客机成员，验证无需手动 syncTick/localNotifyTick 即自动同步并提醒，远低于默认 15s/90s 周期
+    await hostRt.invoke({
+      action: "create",
+      actorIdentity: HOST_ALICE,
+      params: { board_id: "latency-board", title: "时延实测板" },
+    });
+    await hostRt.invoke({
+      action: "invite",
+      actorIdentity: HOST_ALICE,
+      board: { machine_id: HOST_ID, board_id: "latency-board" },
+      params: { members: [CLIENT_BOB] },
+    });
+    const hostPostAt = performance.now();
+    await hostRt.invoke({
+      action: "post",
+      actorIdentity: HOST_ALICE,
+      board: { machine_id: HOST_ID, board_id: "latency-board" },
+      params: { body: "建板机发帖测试端到端自动推送与提醒" },
+    });
+
+    assert.equal(
+      await waitFor(() => clientNotifications.length >= 1, 4500),
+      true,
+      `客机成员应在防抖窗口内收到本机提醒 (clientBoard=${JSON.stringify(clientRt.store.getBoard("latency-board"))})`,
+    );
+    const hostToClientNotifyMs = clientNotifications[0].at - hostPostAt;
+    assert.ok(hostToClientNotifyMs < 4000, `建板机发帖到客机提醒用时应 <4000ms，实测 ${Math.round(hostToClientNotifyMs)}ms`);
+
+    // 2. 客机发帖 -> 自动防抖推送建板机 -> 建板机成员自动防抖收到提醒
+    const clientPostAt = performance.now();
+    await clientRt.invoke({
+      action: "post",
+      actorIdentity: CLIENT_BOB,
+      board: { machine_id: HOST_ID, board_id: "latency-board" },
+      params: { body: "客机发帖回传测试自动提醒耗时" },
+    });
+
+    assert.equal(
+      await waitFor(() => hostNotifications.length >= 1, 4500),
+      true,
+      `建板机成员应在防抖窗口内收到客机新帖提醒 (hostBoard=${JSON.stringify(hostRt.store.getBoard("latency-board"))})`,
+    );
+    const clientToHostNotifyMs = hostNotifications[0].at - clientPostAt;
+    assert.ok(clientToHostNotifyMs < 4000, `客机发帖到建板机提醒用时应 <4000ms，实测 ${Math.round(clientToHostNotifyMs)}ms`);
+    testContext.diagnostic(`host->client notify=${Math.round(hostToClientNotifyMs)}ms, client->host notify=${Math.round(clientToHostNotifyMs)}ms`);
+  } finally {
+    if (relayPump !== null) clearInterval(relayPump);
+    if (clientRt) await clientRt.close();
+    if (hostRt) await hostRt.close();
+    if (clientDb) clientDb.close();
+    if (hostDb) hostDb.close();
+    cleanupTempDir(tmpDir);
+  }
+  await new Promise(resolve => setImmediate(resolve));
+  const afterHandles = process.getActiveResourcesInfo();
+  assert.equal(afterHandles.length - beforeHandles.length, 0, "双机防抖同步关闭后活跃句柄增量必须为 0");
+});
+
+test("周期通知与防抖通知交叠触发绝不并发重入，且关闭后句柄增量为 0", async () => {
+  const tmpDir = createTempDir();
+  const beforeHandles = process.getActiveResourcesInfo();
+  let db = null;
+  let rt = null;
+  try {
+    db = new DatabaseSync(path.join(tmpDir, "no-reenter.sqlite"));
+    let inFlight = 0;
+    let maxConcurrent = 0;
+    let calls = 0;
+    rt = openBoardRuntime({
+      localMachineId: HOST_ID,
+      privateRoot: path.join(tmpDir, "no-reenter-priv"),
+      allowedUploadRoots: [],
+      openStore: create => create({ database: db }),
+      relayDispatcher: null,
+      notifyIntervalMs: 40,
+      notifyLocalMember: async () => {
+        inFlight += 1;
+        calls += 1;
+        maxConcurrent = Math.max(maxConcurrent, inFlight);
+        await new Promise(resolve => setTimeout(resolve, 70));
+        inFlight -= 1;
+        return { ok: true, accepted: true, message_id: `m-${calls}` };
+      },
+    });
+    await rt.start();
+    await rt.invoke({ action: "create", actorIdentity: HOST_ALICE, params: { board_id: "reenter-board", title: "防重入板" } });
+    const hostPeer = { machine_id: HOST_ID, host: "codex", surface: "desktop", conversation_id: "conv-host-reenter-peer" };
+    await rt.invoke({ action: "invite", actorIdentity: HOST_ALICE, board: { machine_id: HOST_ID, board_id: "reenter-board" }, params: { members: [hostPeer] } });
+    for (let i = 0; i < 4; i += 1) {
+      await rt.invoke({ action: "post", actorIdentity: HOST_ALICE, board: { machine_id: HOST_ID, board_id: "reenter-board" }, params: { body: `并发压测帖 ${i}` } });
+      await new Promise(resolve => setTimeout(resolve, 25));
+    }
+    await new Promise(resolve => setTimeout(resolve, 400));
+    assert.equal(maxConcurrent, 1, `周期与防抖通知绝不可并发重入，实测 maxConcurrent=${maxConcurrent}`);
+    assert.ok(calls >= 1, "至少应完成一次通知送达");
+  } finally {
+    if (rt) await rt.close();
+    if (db) db.close();
+    cleanupTempDir(tmpDir);
+  }
+  await new Promise(resolve => setImmediate(resolve));
+  const afterHandles = process.getActiveResourcesInfo();
+  assert.equal(afterHandles.length - beforeHandles.length, 0, "防重入压测关闭后活跃句柄增量必须为 0");
 });

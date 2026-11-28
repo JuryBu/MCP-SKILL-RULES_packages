@@ -77,6 +77,7 @@ export class ConversationAddressBook {
   #database;
   #machineId;
   #shared = new Map();
+  #sharedById = new Map();
   #machineRoutes;
   #readInbound;
   #now;
@@ -99,9 +100,11 @@ export class ConversationAddressBook {
       if (entryKind === "contact") target = checkedAddress(entry.target, this.#machineId);
       else if (entryKind === "board") target = normalizeBoardAddress(entry.target, this.#machineId);
       else throw new CoreError("invalid_config", "共有条目类型无效");
-      this.#shared.set(key, Object.freeze({
-        id, alias, entry_kind: entryKind, target: Object.freeze(target), note: checkedNote(entry.note ?? ""),
-      }));
+      const frozen = Object.freeze({
+        id, alias, alias_key: key, entry_kind: entryKind, target: Object.freeze(target), note: checkedNote(entry.note ?? ""),
+      });
+      this.#shared.set(key, frozen);
+      this.#sharedById.set(id, frozen);
     }
     this.#machineRoutes = machineRoutes.map(checkedRoute);
     this.#database.exec(`
@@ -127,6 +130,15 @@ export class ConversationAddressBook {
         updated_at TEXT NOT NULL,
         PRIMARY KEY (owner_key, shared_id)
       ) STRICT;
+      CREATE TABLE IF NOT EXISTS caller_shared_aliases (
+        owner_key TEXT NOT NULL REFERENCES caller_books(owner_key),
+        shared_id TEXT NOT NULL,
+        alias_key TEXT NOT NULL,
+        alias TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY (owner_key, shared_id),
+        UNIQUE (owner_key, alias_key)
+      ) STRICT;
     `);
   }
 
@@ -139,19 +151,81 @@ export class ConversationAddressBook {
     return this.#database.prepare("SELECT alias, target_json, entry_kind, note, updated_at FROM caller_contacts WHERE owner_key = ? AND alias_key = ?").get(key, name);
   }
 
-  #sharedContact(key, shared, conflict = false) {
-    const saved = key === null ? null : this.#database.prepare("SELECT note, updated_at FROM caller_shared_notes WHERE owner_key = ? AND shared_id = ?").get(key, shared.id);
+  #sharedAliasById(key, sharedId) {
+    return key === null ? null : this.#database.prepare("SELECT alias_key, alias, updated_at FROM caller_shared_aliases WHERE owner_key = ? AND shared_id = ?").get(key, sharedId);
+  }
+
+  #sharedAliasByName(key, name) {
+    return key === null ? null : this.#database.prepare("SELECT shared_id, alias_key, alias, updated_at FROM caller_shared_aliases WHERE owner_key = ? AND alias_key = ?").get(key, name);
+  }
+
+  #effectiveSharedEntries(key) {
+    const aliasRows = key === null ? [] : this.#database.prepare("SELECT shared_id, alias_key, alias, updated_at FROM caller_shared_aliases WHERE owner_key = ?").all(key);
+    const byId = new Map(aliasRows.map(row => [row.shared_id, row]));
+    const byEffectiveKey = new Map();
+    const list = [];
+    for (const shared of this.#shared.values()) {
+      const override = byId.get(shared.id) ?? null;
+      const effectiveKey = override?.alias_key ?? shared.alias_key;
+      const effectiveAlias = override?.alias ?? shared.alias;
+      const item = { shared, override, effectiveKey, effectiveAlias };
+      list.push(item);
+      const bucket = byEffectiveKey.get(effectiveKey);
+      if (bucket) bucket.push(item);
+      else byEffectiveKey.set(effectiveKey, [item]);
+    }
+    return { list, byEffectiveKey, byId };
+  }
+
+  #sharedContact(key, shared, conflict = false, preloadedAlias = undefined) {
+    const savedNote = key === null ? null : this.#database.prepare("SELECT note, updated_at FROM caller_shared_notes WHERE owner_key = ? AND shared_id = ?").get(key, shared.id);
+    const savedAlias = preloadedAlias !== undefined ? preloadedAlias : this.#sharedAliasById(key, shared.id);
+    let updatedAt = savedNote?.updated_at ?? null;
+    if (savedAlias?.updated_at && (!updatedAt || savedAlias.updated_at > updatedAt)) updatedAt = savedAlias.updated_at;
     return {
-      alias: shared.alias, note: saved?.note ?? shared.note, target: { ...shared.target }, scope: "shared",
-      shared_id: shared.id, entry_kind: shared.entry_kind, updated_at: saved?.updated_at ?? null, ...(conflict ? { alias_conflict: true } : {}),
+      alias: savedAlias?.alias ?? shared.alias,
+      note: savedNote?.note ?? shared.note,
+      target: { ...shared.target },
+      scope: "shared",
+      shared_id: shared.id,
+      entry_kind: shared.entry_kind,
+      updated_at: updatedAt,
+      ...(savedAlias ? { default_alias: shared.alias } : {}),
+      ...(conflict ? { alias_conflict: true } : {}),
     };
   }
 
+  #pruneOrphanSharedAliases(key) {
+    const rows = this.#database.prepare("SELECT shared_id FROM caller_shared_aliases WHERE owner_key = ?").all(key);
+    for (const row of rows) {
+      if (!this.#sharedById.has(row.shared_id)) {
+        this.#database.prepare("DELETE FROM caller_shared_aliases WHERE owner_key = ? AND shared_id = ?").run(key, row.shared_id);
+      }
+    }
+  }
+
+  #resolveSharedEffective(key, name) {
+    const matches = [];
+    const custom = this.#sharedAliasByName(key, name);
+    if (custom) {
+      const shared = this.#sharedById.get(custom.shared_id);
+      if (shared) matches.push({ shared, override: custom });
+    }
+    const direct = this.#shared.get(name);
+    if (direct && !matches.some(item => item.shared.id === direct.id)) {
+      const override = this.#sharedAliasById(key, direct.id);
+      if (!override || override.alias_key === name) matches.push({ shared: direct, override });
+    }
+    return matches;
+  }
+
   #resolve(key, name) {
-    const shared = this.#shared.get(name);
+    const sharedMatches = this.#resolveSharedEffective(key, name);
     const personal = this.#get(key, name);
-    if (shared && personal) throw new CoreError("contact_alias_conflict", "共有与个人通讯录有同名联系人，请先调整别名或直接填写地址");
-    if (shared) return this.#sharedContact(key, shared);
+    if (sharedMatches.length > 1 || (sharedMatches.length === 1 && personal)) {
+      throw new CoreError("contact_alias_conflict", "共有与个人通讯录有同名联系人，请先调整别名或直接填写地址");
+    }
+    if (sharedMatches.length === 1) return this.#sharedContact(key, sharedMatches[0].shared, false, sharedMatches[0].override);
     if (personal) return projectPersonal(personal);
     throw new CoreError("contact_not_found", "这本通讯录里没有该联系人");
   }
@@ -159,7 +233,7 @@ export class ConversationAddressBook {
   #put(key, aliasValue, target, noteValue) {
     const alias = checkedText(aliasValue, "联系人别名", 256);
     const name = aliasKey(alias);
-    if (this.#shared.has(name)) throw new CoreError("shared_alias_reserved", "此别名已用于本机共有联系人");
+    if (this.#resolveSharedEffective(key, name).length > 0) throw new CoreError("shared_alias_reserved", "此别名已用于本机共有联系人");
     const note = noteValue === undefined ? null : checkedNote(noteValue);
     if (!this.#get(key, name) && this.#database.prepare("SELECT count(*) AS total FROM caller_contacts WHERE owner_key = ?").get(key).total >= MAX_CONTACTS) {
       throw new CoreError("contact_limit", "个人联系人已达到上限");
@@ -179,11 +253,17 @@ export class ConversationAddressBook {
     const receiver = checkedAddress(receiverIdentity);
     if (receiver.machine_id !== this.#machineId) throw new CoreError("forbidden", "只能用本机收件对话的通讯录译名");
     const peerKey = identityKey(checkedAddress(peerAddress));
-    const ownNames = this.#database.prepare("SELECT alias_key, alias, target_json FROM caller_contacts WHERE owner_key = ? AND entry_kind = 'contact' ORDER BY alias_key").all(ownerKey(receiver));
-    const personal = ownNames.find(row => !this.#shared.has(row.alias_key) && identityKey(JSON.parse(row.target_json)) === peerKey);
+    const key = ownerKey(receiver);
+    const { list: effectiveShared, byEffectiveKey } = this.#effectiveSharedEntries(key);
+    const ownRows = this.#database.prepare("SELECT alias_key, alias, target_json, entry_kind FROM caller_contacts WHERE owner_key = ? ORDER BY alias_key").all(key);
+    const personal = ownRows.find(row => row.entry_kind === "contact" && !byEffectiveKey.has(row.alias_key) && identityKey(JSON.parse(row.target_json)) === peerKey);
     if (personal) return personal.alias;
-    for (const entry of this.#shared.values()) {
-      if (entry.entry_kind === "contact" && identityKey(entry.target) === peerKey) return entry.alias;
+    const ownKeySet = new Set(ownRows.map(row => row.alias_key));
+    for (const item of effectiveShared) {
+      if (item.shared.entry_kind === "contact" && identityKey(item.shared.target) === peerKey) {
+        const conflicted = ownKeySet.has(item.effectiveKey) || (byEffectiveKey.get(item.effectiveKey)?.length ?? 0) > 1;
+        return conflicted ? item.shared.alias : item.effectiveAlias;
+      }
     }
     return null;
   }
@@ -192,10 +272,14 @@ export class ConversationAddressBook {
     const key = ownerKey(bookActor(principal, this.#machineId));
     this.#open(key);
     const personal = this.#database.prepare("SELECT alias_key, alias, target_json, entry_kind, note, updated_at FROM caller_contacts WHERE owner_key = ? ORDER BY alias_key").all(key);
-    const names = new Set(personal.map(row => row.alias_key));
-    const shared = [...this.#shared.entries()].map(([name, entry]) => this.#sharedContact(key, entry, names.has(name)));
+    const personalNames = new Set(personal.map(row => row.alias_key));
+    const { list: effectiveShared, byEffectiveKey } = this.#effectiveSharedEntries(key);
+    const shared = effectiveShared.map(item => {
+      const conflict = personalNames.has(item.effectiveKey) || (byEffectiveKey.get(item.effectiveKey)?.length ?? 0) > 1;
+      return this.#sharedContact(key, item.shared, conflict, item.override);
+    });
     return {
-      contacts: [...shared, ...personal.map(row => projectPersonal(row, this.#shared.has(row.alias_key)))],
+      contacts: [...shared, ...personal.map(row => projectPersonal(row, byEffectiveKey.has(row.alias_key)))],
       ...(include_machine_routes === true ? { machine_routes: this.#machineRoutes.map(route => ({ ...route })) } : {}),
     };
   }
@@ -212,7 +296,7 @@ export class ConversationAddressBook {
 
   listShared({ include_machine_routes = false } = {}) {
     return {
-      contacts: [...this.#shared.values()].map(entry => this.#sharedContact(null, entry)),
+      contacts: [...this.#shared.values()].map(entry => this.#sharedContact(null, entry, false, null)),
       ...(include_machine_routes === true ? { machine_routes: this.#machineRoutes.map(route => ({ ...route })) } : {}),
     };
   }
@@ -220,7 +304,7 @@ export class ConversationAddressBook {
   resolveShared(alias) {
     const entry = this.#shared.get(aliasKey(alias));
     if (!entry) throw new CoreError("contact_not_found", "共有通讯录里没有该联系人");
-    return this.#sharedContact(null, entry);
+    return this.#sharedContact(null, entry, false, null);
   }
 
   openForSend(principal) {
@@ -245,9 +329,10 @@ export class ConversationAddressBook {
 
   listBoardsForIdentity(memberIdentity) {
     const key = ownerKey(this.#localBoardMember(memberIdentity));
+    const { byEffectiveKey } = this.#effectiveSharedEntries(key);
     const rows = this.#database.prepare(
       "SELECT alias_key, alias, target_json FROM caller_contacts WHERE owner_key = ? AND entry_kind = 'board' ORDER BY alias_key, alias");
-    return rows.all(key).filter(row => !this.#shared.has(row.alias_key))
+    return rows.all(key).filter(row => !byEffectiveKey.has(row.alias_key))
       .map(row => ({ alias: row.alias, target: normalizeBoardAddress(JSON.parse(row.target_json)) }));
   }
 
@@ -273,11 +358,12 @@ export class ConversationAddressBook {
       RETURNING alias
     `);
     this.#open(key);
+    const { byEffectiveKey } = this.#effectiveSharedEntries(key);
     for (let attempt = 1; attempt <= MAX_CONTACTS + this.#shared.size + 1; attempt += 1) {
       const suffix = attempt === 1 ? "" : "#" + attempt;
       const alias = title.slice(0, 64 - suffix.length).join("").trimEnd() + suffix;
       const name = aliasKey(alias);
-      if (this.#shared.has(name) || this.#get(key, name)) continue;
+      if (byEffectiveKey.has(name) || this.#get(key, name)) continue;
       const saved = insert.get(key, name, alias, target, this.#now(), key, target, key, MAX_CONTACTS);
       const matched = saved ?? findTarget.get(key, target);
       if (matched) return { alias_allocated: true, alias: matched.alias };
@@ -306,6 +392,62 @@ export class ConversationAddressBook {
     return this.#put(ownerKey(actor), alias, sender, note);
   }
 
+  rename(principal, { contact, alias: nextAliasValue, note: noteValue }) {
+    const key = ownerKey(bookActor(principal, this.#machineId));
+    const currentName = aliasKey(contact);
+    const entry = this.#resolve(key, currentName);
+    const nextAlias = checkedText(nextAliasValue, "联系人别名", 256);
+    const nextName = aliasKey(nextAlias);
+    const note = noteValue === undefined ? undefined : checkedNote(noteValue);
+    const updatedAt = this.#now();
+
+    if (entry.scope === "shared") {
+      const shared = this.#sharedById.get(entry.shared_id);
+      const collidingShared = this.#resolveSharedEffective(key, nextName).filter(item => item.shared.id !== shared.id);
+      if (collidingShared.length > 0) throw new CoreError("shared_alias_reserved", "此别名已用于本机共有联系人");
+      if (this.#get(key, nextName)) throw new CoreError("contact_alias_conflict", "此别名已有其它地址，原地址保持不变");
+      const manageTx = !this.#database.isTransaction;
+      if (manageTx) this.#database.exec("BEGIN IMMEDIATE");
+      try {
+        this.#open(key);
+        this.#pruneOrphanSharedAliases(key);
+        if (nextAlias === shared.alias) {
+          this.#database.prepare("DELETE FROM caller_shared_aliases WHERE owner_key = ? AND shared_id = ?").run(key, shared.id);
+        } else {
+          this.#database.prepare(`
+            INSERT INTO caller_shared_aliases(owner_key, shared_id, alias_key, alias, updated_at) VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(owner_key, shared_id) DO UPDATE SET alias_key = excluded.alias_key, alias = excluded.alias, updated_at = excluded.updated_at
+          `).run(key, shared.id, nextName, nextAlias, updatedAt);
+        }
+        if (note !== undefined) {
+          this.#database.prepare(`
+            INSERT INTO caller_shared_notes(owner_key, shared_id, note, updated_at) VALUES (?, ?, ?, ?)
+            ON CONFLICT(owner_key, shared_id) DO UPDATE SET note = excluded.note, updated_at = excluded.updated_at
+          `).run(key, shared.id, note, updatedAt);
+        }
+        if (manageTx) this.#database.exec("COMMIT");
+      } catch (error) {
+        if (manageTx) {
+          try { this.#database.exec("ROLLBACK"); } catch {}
+        }
+        throw error;
+      }
+      return this.#sharedContact(key, shared);
+    }
+
+    if (this.#resolveSharedEffective(key, nextName).length > 0) {
+      throw new CoreError("shared_alias_reserved", "此别名已用于本机共有联系人");
+    }
+    if (nextName !== currentName && this.#get(key, nextName)) {
+      throw new CoreError("contact_alias_conflict", "此别名已有其它地址，原地址保持不变");
+    }
+    this.#database.prepare(`
+      UPDATE caller_contacts SET alias_key = ?, alias = ?, note = COALESCE(?, note), updated_at = ?
+      WHERE owner_key = ? AND alias_key = ?
+    `).run(nextName, nextAlias, note ?? null, updatedAt, key, currentName);
+    return projectPersonal(this.#get(key, nextName));
+  }
+
   setNote(principal, { contact, note }) {
     const key = ownerKey(bookActor(principal, this.#machineId));
     const name = aliasKey(contact);
@@ -314,14 +456,14 @@ export class ConversationAddressBook {
     const updatedAt = this.#now();
     if (entry.scope === "personal") {
       this.#database.prepare("UPDATE caller_contacts SET note = ?, updated_at = ? WHERE owner_key = ? AND alias_key = ?").run(text, updatedAt, key, name);
-    } else {
-      this.#open(key);
-      this.#database.prepare(`
-        INSERT INTO caller_shared_notes(owner_key, shared_id, note, updated_at) VALUES (?, ?, ?, ?)
-        ON CONFLICT(owner_key, shared_id) DO UPDATE SET note = excluded.note, updated_at = excluded.updated_at
-      `).run(key, this.#shared.get(name).id, text, updatedAt);
+      return { ...entry, note: text, updated_at: updatedAt };
     }
-    return { ...entry, note: text, updated_at: updatedAt };
+    this.#open(key);
+    this.#database.prepare(`
+      INSERT INTO caller_shared_notes(owner_key, shared_id, note, updated_at) VALUES (?, ?, ?, ?)
+      ON CONFLICT(owner_key, shared_id) DO UPDATE SET note = excluded.note, updated_at = excluded.updated_at
+    `).run(key, entry.shared_id, text, updatedAt);
+    return this.#sharedContact(key, this.#sharedById.get(entry.shared_id));
   }
 
   removePersonal(principal, alias) {
@@ -334,9 +476,29 @@ export class ConversationAddressBook {
     const key = ownerKey(bookActor(principal, this.#machineId));
     const name = aliasKey(alias);
     const result = this.removePersonal(principal, alias);
-    const shared = this.#shared.get(name);
-    if (result.removed || !shared) return result;
-    const removed = this.#database.prepare("DELETE FROM caller_shared_notes WHERE owner_key = ? AND shared_id = ?").run(key, shared.id);
-    return { removed: removed.changes === 1, scope: "shared" };
+    if (result.removed) return result;
+    const sharedMatches = this.#resolveSharedEffective(key, name);
+    if (sharedMatches.length !== 1) {
+      const orphan = this.#sharedAliasByName(key, name);
+      if (orphan && !this.#sharedById.has(orphan.shared_id)) {
+        const cleaned = this.#database.prepare("DELETE FROM caller_shared_aliases WHERE owner_key = ? AND shared_id = ?").run(key, orphan.shared_id);
+        return { removed: cleaned.changes === 1, scope: "shared" };
+      }
+      return result;
+    }
+    const { shared, override } = sharedMatches[0];
+    if (override) {
+      const defaultKey = shared.alias_key;
+      if (defaultKey !== name) {
+        const collidingShared = this.#resolveSharedEffective(key, defaultKey).filter(item => item.shared.id !== shared.id);
+        if (collidingShared.length > 0 || this.#get(key, defaultKey)) {
+          throw new CoreError("contact_alias_conflict", "恢复该共有联系人的默认名称会与现有联系人冲突，请先调整冲突联系人名称");
+        }
+      }
+    }
+    const sharedId = shared.id;
+    const removedNote = this.#database.prepare("DELETE FROM caller_shared_notes WHERE owner_key = ? AND shared_id = ?").run(key, sharedId);
+    const removedAlias = this.#database.prepare("DELETE FROM caller_shared_aliases WHERE owner_key = ? AND shared_id = ?").run(key, sharedId);
+    return { removed: removedNote.changes === 1 || removedAlias.changes === 1, scope: "shared" };
   }
 }

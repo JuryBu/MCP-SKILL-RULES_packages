@@ -16,7 +16,17 @@ const UUID_OR_ID = /^[A-Za-z0-9._:-]{1,256}$/u;
 const MAPPING_PREFIX = "windsurf.acp.messageStore.session.acp/devin-cli/";
 const QUERY_ARG = "--windsurf-acp-transport-sqlite-query";
 const MAX_FRAME_BYTES = 2097152;
+const MAX_STDERR_BYTES = 4096;
 const STALE_TURN_RECONCILE_MS = 15000;
+
+function isDaemonSubcommandRemovedError(err) {
+  const combined = `${err?.stderr ?? ""}\n${err?.stdout ?? ""}\n${err?.message ?? ""}`;
+  return /(?:unrecognized|unknown)\s+(?:subcommand|command)\s+['"`]?daemon['"`]?|no\s+such\s+(?:subcommand|command)\s+['"`]?daemon['"`]?|error:\s+unrecognized\s+subcommand\s+['"`]?daemon['"`]?/iu.test(combined);
+}
+
+function isProcessModelUnsupportedError(text) {
+  return /(?:unexpected|unrecognized|unknown)\s+(?:argument|option|flag)\s+['"`]?--process-model['"`]?|--process-model[^\n]{0,80}(?:unknown|unrecognized|unexpected|not\s+found|unsupported)/iu.test(text ?? "");
+}
 
 function record(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
@@ -332,7 +342,8 @@ export class WindsurfAcpTransport {
     this.closeController = new AbortController();
     this.retainedClosed = [];
     this.closed = false;
-    this.daemonCache = { at: 0, running: false, pid: null, sessionsLoaded: 0, promise: null };
+    this.daemonCache = { at: 0, running: false, pid: null, sessionsLoaded: 0, mode: "unknown", promise: null };
+    this.stdioAcpProbeCache = null;
     this.reaperTimer = setInterval(() => this.reapIdle(), 30000);
     this.reaperTimer.unref?.();
   }
@@ -395,42 +406,106 @@ export class WindsurfAcpTransport {
   }
 
   async checkDaemonStatus(signal, maxAgeMs = 1500) {
-    if (this.closed) return { running: false, pid: null };
+    if (this.closed) return { running: false, pid: null, sessionsLoaded: 0, mode: "unknown" };
     const now = Date.now();
-    if (now - this.daemonCache.at <= maxAgeMs && !this.daemonCache.promise) {
-      return { running: this.daemonCache.running, pid: this.daemonCache.pid, sessionsLoaded: this.daemonCache.sessionsLoaded };
+    if (maxAgeMs > 0 && now - this.daemonCache.at <= maxAgeMs && !this.daemonCache.promise) {
+      return {
+        running: this.daemonCache.running,
+        pid: this.daemonCache.pid,
+        sessionsLoaded: this.daemonCache.sessionsLoaded,
+        mode: this.daemonCache.mode,
+      };
     }
     if (!this.daemonCache.promise) {
-      this.daemonCache.promise = this.trackExec(async () => {
+      const probePromise = this.trackExec(async () => {
         let childClosed;
+        let acpChildClosed;
         try {
-          if (!this.devinBinaryPath) return { running: false, pid: null, sessionsLoaded: 0 };
+          if (!this.devinBinaryPath) {
+            const empty = { running: false, pid: null, sessionsLoaded: 0, mode: "unknown" };
+            this.daemonCache = { ...empty, at: Date.now(), promise: null };
+            return empty;
+          }
           const st = await files.stat(this.devinBinaryPath).catch(() => null);
-          if (!st?.isFile()) return { running: false, pid: null, sessionsLoaded: 0 };
-          const execPromise = this.execute(this.devinBinaryPath, ["daemon", "status"], {
-            signal: this.closeController.signal,
-            windowsHide: true,
-            timeout: 4000,
-            maxBuffer: 16384,
-            encoding: "utf8",
-          });
-          if (execPromise?.child) childClosed = new Promise(resolve => execPromise.child.once("close", resolve));
-          const { stdout } = await execPromise;
-          const text = stdout.trim();
-          const match = /running\s*\(pid\s+(\d+)\)(?:,\s*(\d+)\s+session\(s\)\s+loaded)?/iu.exec(text);
-          const next = match
-            ? { running: true, pid: Number(match[1]), sessionsLoaded: match[2] ? Number(match[2]) : 0 }
-            : { running: false, pid: null, sessionsLoaded: 0 };
-          this.daemonCache = { ...next, at: Date.now(), promise: null };
-          return next;
+          if (!st?.isFile()) {
+            const missing = { running: false, pid: null, sessionsLoaded: 0, mode: "unknown" };
+            this.daemonCache = { ...missing, at: Date.now(), promise: null };
+            return missing;
+          }
+          try {
+            const execPromise = this.execute(this.devinBinaryPath, ["daemon", "status"], {
+              signal: this.closeController.signal,
+              windowsHide: true,
+              timeout: 4000,
+              maxBuffer: 16384,
+              encoding: "utf8",
+            });
+            if (execPromise?.child) childClosed = new Promise(resolve => execPromise.child.once("close", resolve));
+            const { stdout } = await execPromise;
+            const text = stdout.trim();
+            const match = /running\s*\(pid\s+(\d+)\)(?:,\s*(\d+)\s+session\(s\)\s+loaded)?/iu.exec(text);
+            const next = match
+              ? { running: true, pid: Number(match[1]), sessionsLoaded: match[2] ? Number(match[2]) : 0, mode: "daemon" }
+              : { running: false, pid: null, sessionsLoaded: 0, mode: "daemon" };
+            this.daemonCache = { ...next, at: Date.now(), promise: null };
+            return next;
+          } catch (daemonErr) {
+            if (!this.closed && isDaemonSubcommandRemovedError(daemonErr)) {
+              const cachedProbe = this.stdioAcpProbeCache;
+              const cacheValid = Boolean(
+                cachedProbe
+                && cachedProbe.path === this.devinBinaryPath
+                && cachedProbe.mtimeMs === st.mtimeMs
+                && cachedProbe.size === st.size
+                && (cachedProbe.supported === true || Date.now() - cachedProbe.at < 5000),
+              );
+              let supported = false;
+              if (cacheValid) {
+                supported = cachedProbe.supported;
+              } else {
+                try {
+                  const acpExec = this.execute(this.devinBinaryPath, ["acp", "--help"], {
+                    signal: this.closeController.signal,
+                    windowsHide: true,
+                    timeout: 4000,
+                    maxBuffer: 16384,
+                    encoding: "utf8",
+                  });
+                  if (acpExec?.child) acpChildClosed = new Promise(resolve => acpExec.child.once("close", resolve));
+                  await acpExec;
+                  supported = true;
+                } catch {
+                  supported = false;
+                }
+                this.stdioAcpProbeCache = {
+                  path: this.devinBinaryPath,
+                  mtimeMs: st.mtimeMs,
+                  size: st.size,
+                  supported,
+                  at: Date.now(),
+                };
+              }
+              const next = supported
+                ? { running: true, pid: null, sessionsLoaded: 0, mode: "acp_stdio" }
+                : { running: false, pid: null, sessionsLoaded: 0, mode: "unknown" };
+              this.daemonCache = { ...next, at: Date.now(), promise: null };
+              return next;
+            }
+            const fallback = { running: false, pid: null, sessionsLoaded: 0, mode: "unknown" };
+            this.daemonCache = { ...fallback, at: Date.now(), promise: null };
+            return fallback;
+          }
         } catch {
-          const fallback = { running: false, pid: null, sessionsLoaded: 0 };
+          const fallback = { running: false, pid: null, sessionsLoaded: 0, mode: "unknown" };
           this.daemonCache = { ...fallback, at: Date.now(), promise: null };
           return fallback;
         } finally {
+          if (this.daemonCache.promise === probePromise) this.daemonCache.promise = null;
           await childClosed;
+          await acpChildClosed;
         }
       });
+      this.daemonCache.promise = probePromise;
     }
     const result = await this.daemonCache.promise;
     signal?.throwIfAborted?.();
@@ -621,168 +696,207 @@ export class WindsurfAcpTransport {
       if (this.connecting.has(resolved.slug)) return { pendingConnect: this.connecting.get(resolved.slug) };
 
       const connectPromise = (async () => {
-        let client = null;
-        let terminateChild = async () => {};
+        const connectOnce = async (spawnArgs, allowStdioAcp) => {
+          let client = null;
+          let terminateChild = async () => {};
+          let stderrText = "";
+          try {
+            const env = { ...process.env };
+            delete env.ACP_BACKEND;
+            const child = this.spawnProcess(this.devinBinaryPath, spawnArgs, {
+              cwd: resolved.cwd,
+              env,
+              stdio: ["pipe", "pipe", "pipe"],
+              windowsHide: true,
+              detached: false,
+            });
+
+            let exited = false;
+            const exitPromise = new Promise(resolveExit => {
+              child.once("exit", () => { exited = true; resolveExit(); });
+              child.once("error", () => { exited = true; resolveExit(); });
+            });
+            const stderrDrainedPromise = child.stderr
+              ? new Promise(resolveStderr => {
+                  child.stderr.once("end", resolveStderr);
+                  child.stderr.once("close", resolveStderr);
+                  child.once("close", resolveStderr);
+                  child.once("error", resolveStderr);
+                })
+              : Promise.resolve();
+
+            terminateChild = async () => {
+              try { child.stdin?.end(); } catch {}
+              if (!exited) {
+                try { child.kill("SIGTERM"); } catch {}
+                await Promise.race([exitPromise, unrefSleep(1500)]);
+                if (!exited) {
+                  try { child.kill("SIGKILL"); } catch {}
+                  await Promise.race([exitPromise, unrefSleep(1000)]);
+                }
+              }
+              await Promise.race([stderrDrainedPromise, unrefSleep(200)]);
+            };
+
+            client = createDevinSessionClient({
+              connectorId: "devin-cli",
+              sessionId: resolved.slug,
+              cwd: resolved.cwd,
+              requestTimeoutMs: 12000,
+              evictSettled: true,
+              allowStdioAcp,
+              sendLine: line => new Promise((resolveWrite, rejectWrite) => {
+                if (exited || !child.stdin?.writable) {
+                  rejectWrite(new Error("stdin_closed"));
+                  return;
+                }
+                child.stdin.write(line, "utf8", err => (err ? rejectWrite(err) : resolveWrite()));
+              }),
+              verifyPersisted: ({ messageId, deliveryId, signal: pollSignal }) => this.sqliteQuery({
+                path: resolved.sessionsDb,
+                kind: "verify_persisted",
+                slug: resolved.slug,
+                messageId,
+                deliveryId,
+              }, pollSignal),
+              checkSessionIdle: async ({ signal: idleSignal }) => {
+                const res = await this.sqliteQuery({ path: resolved.sessionsDb, kind: "check_idle", slug: resolved.slug }, idleSignal);
+                return res.state === "ready" && res.found ? { idle: res.idle === true, reason: res.reason } : { idle: false, reason: "sqlite_unavailable" };
+              },
+            });
+
+            let chunks = [];
+            let bufferedBytes = 0;
+            let droppingOversizedLine = false;
+            child.stdout?.on("data", chunk => {
+              let offset = 0;
+              while (offset < chunk.length) {
+                const nl = chunk.indexOf(0x0a, offset);
+                if (nl === -1) {
+                  const tail = chunk.subarray(offset);
+                  if (!droppingOversizedLine) {
+                    if (bufferedBytes + tail.length > MAX_FRAME_BYTES) {
+                      droppingOversizedLine = true;
+                      chunks = [];
+                      bufferedBytes = 0;
+                    } else {
+                      chunks.push(tail);
+                      bufferedBytes += tail.length;
+                    }
+                  }
+                  break;
+                }
+                const segment = chunk.subarray(offset, nl);
+                offset = nl + 1;
+                if (droppingOversizedLine) {
+                  droppingOversizedLine = false;
+                  chunks = [];
+                  bufferedBytes = 0;
+                  continue;
+                }
+                if (bufferedBytes + segment.length > MAX_FRAME_BYTES) {
+                  chunks = [];
+                  bufferedBytes = 0;
+                  continue;
+                }
+                const full = chunks.length === 0 ? segment : Buffer.concat([...chunks, segment], bufferedBytes + segment.length);
+                chunks = [];
+                bufferedBytes = 0;
+                const line = full.toString("utf8").replace(/\r$/u, "");
+                if (line) client.feedLine(line);
+              }
+            });
+            child.stderr?.on("data", chunk => {
+              if (stderrText.length < MAX_STDERR_BYTES) {
+                const piece = typeof chunk === "string" ? chunk : chunk.toString("utf8");
+                stderrText += piece.slice(0, MAX_STDERR_BYTES - stderrText.length);
+              }
+            });
+            child.stdout?.on("end", () => {
+              if (!this.closed) client.feedLine(null);
+            });
+            child.once("exit", () => {
+              if (this.active.get(resolved.slug)?.client === client) {
+                this.active.delete(resolved.slug);
+                client.close("process_exited");
+                this.retainClosedClient(resolved.slug, client);
+              }
+            });
+
+            const initRes = await client.initialize({ signal: effSignal });
+            if (initRes.outcome !== "accepted") {
+              client.close("initialize_failed");
+              await terminateChild();
+              return { client: null, stderrText, failedBeforeAuth: true };
+            }
+            const stateDb = await safeRegularFile(this.userDataDir, ["globalStorage", "state.vscdb"]);
+            const authInfo = stateDb ? await this.sqliteQuery({ path: stateDb, kind: "windsurf_auth" }, effSignal) : null;
+            if (!authInfo || authInfo.state !== "ready" || !authInfo.found || !authInfo.api_key) {
+              client.close("auth_unavailable");
+              await terminateChild();
+              return { client: null, stderrText, failedBeforeAuth: false };
+            }
+            const authRes = await client.authenticate({
+              apiKey: authInfo.api_key,
+              apiServerUrl: authInfo.api_server_url || "https://server.codeium.com",
+              signal: effSignal,
+            });
+            if (authRes.outcome !== "accepted") {
+              client.close("authenticate_failed");
+              await terminateChild();
+              return { client: null, stderrText, failedBeforeAuth: false };
+            }
+            const attachRes = await client.attach({ signal: effSignal });
+            if (attachRes.outcome !== "accepted") {
+              client.close("attach_failed");
+              await terminateChild();
+              return { client: null, stderrText, failedBeforeAuth: false };
+            }
+            if (this.settleDelayMs > 0) {
+              const ok = await unrefSleep(this.settleDelayMs, effSignal);
+              if (!ok || this.closed) {
+                client.close(this.closed ? "transport_closed" : "cancelled_before_ready");
+                await terminateChild();
+                return { client: null, stderrText, failedBeforeAuth: false };
+              }
+            }
+            if (this.closed || exited || !client.describe().ready) {
+              client.close(this.closed ? "transport_closed" : "process_exited_before_ready");
+              await terminateChild();
+              return { client: null, stderrText, failedBeforeAuth: false };
+            }
+            this.active.set(resolved.slug, { client, child, terminateChild, sessionsDb: resolved.sessionsDb });
+            return { client, stderrText, failedBeforeAuth: false };
+          } catch {
+            try { client?.close("connect_exception"); } catch {}
+            try { await terminateChild(); } catch {}
+            return { client: null, stderrText, failedBeforeAuth: true };
+          }
+        };
+
         try {
           const daemon = await this.checkDaemonStatus(effSignal, 500);
           if (!daemon.running || this.closed) return null;
 
-          const env = { ...process.env };
-          delete env.ACP_BACKEND;
-          const child = this.spawnProcess(this.devinBinaryPath, ["acp", "--process-model", "daemon"], {
-            cwd: resolved.cwd,
-            env,
-            stdio: ["pipe", "pipe", "pipe"],
-            windowsHide: true,
-            detached: false,
-          });
-
-          let exited = false;
-          const exitPromise = new Promise(resolveExit => {
-            child.once("exit", () => { exited = true; resolveExit(); });
-            child.once("error", () => { exited = true; resolveExit(); });
-          });
-
-          terminateChild = async () => {
-            try { child.stdin?.end(); } catch {}
-            if (!exited) {
-              try { child.kill("SIGTERM"); } catch {}
-              await Promise.race([exitPromise, unrefSleep(1500)]);
-              if (!exited) {
-                try { child.kill("SIGKILL"); } catch {}
-                await Promise.race([exitPromise, unrefSleep(1000)]);
-              }
-            }
-          };
-
-        client = createDevinSessionClient({
-          connectorId: "devin-cli",
-          sessionId: resolved.slug,
-          cwd: resolved.cwd,
-          requestTimeoutMs: 12000,
-          evictSettled: true,
-          sendLine: line => new Promise((resolveWrite, rejectWrite) => {
-            if (exited || !child.stdin?.writable) {
-              rejectWrite(new Error("stdin_closed"));
-              return;
-            }
-            child.stdin.write(line, "utf8", err => (err ? rejectWrite(err) : resolveWrite()));
-          }),
-          verifyPersisted: ({ messageId, deliveryId, signal: pollSignal }) => this.sqliteQuery({
-            path: resolved.sessionsDb,
-            kind: "verify_persisted",
-            slug: resolved.slug,
-            messageId,
-            deliveryId,
-          }, pollSignal),
-          checkSessionIdle: async ({ signal: idleSignal }) => {
-            const res = await this.sqliteQuery({ path: resolved.sessionsDb, kind: "check_idle", slug: resolved.slug }, idleSignal);
-            return res.state === "ready" && res.found ? { idle: res.idle === true, reason: res.reason } : { idle: false, reason: "sqlite_unavailable" };
-          },
-        });
-
-        let chunks = [];
-        let bufferedBytes = 0;
-        let droppingOversizedLine = false;
-        child.stdout?.on("data", chunk => {
-          let offset = 0;
-          while (offset < chunk.length) {
-            const nl = chunk.indexOf(0x0a, offset);
-            if (nl === -1) {
-              const tail = chunk.subarray(offset);
-              if (!droppingOversizedLine) {
-                if (bufferedBytes + tail.length > MAX_FRAME_BYTES) {
-                  droppingOversizedLine = true;
-                  chunks = [];
-                  bufferedBytes = 0;
-                } else {
-                  chunks.push(tail);
-                  bufferedBytes += tail.length;
-                }
-              }
-              break;
-            }
-            const segment = chunk.subarray(offset, nl);
-            offset = nl + 1;
-            if (droppingOversizedLine) {
-              droppingOversizedLine = false;
-              chunks = [];
-              bufferedBytes = 0;
-              continue;
-            }
-            if (bufferedBytes + segment.length > MAX_FRAME_BYTES) {
-              chunks = [];
-              bufferedBytes = 0;
-              continue;
-            }
-            const full = chunks.length === 0 ? segment : Buffer.concat([...chunks, segment], bufferedBytes + segment.length);
-            chunks = [];
-            bufferedBytes = 0;
-            const line = full.toString("utf8").replace(/\r$/u, "");
-            if (line) client.feedLine(line);
+          if (daemon.mode === "acp_stdio") {
+            const stdioRes = await connectOnce(["acp"], true);
+            return stdioRes.client;
           }
-        });
-        child.stderr?.on("data", () => {});
-        child.stdout?.on("end", () => {
-          if (!this.closed) client.feedLine(null);
-        });
-        child.once("exit", () => {
-          if (this.active.get(resolved.slug)?.client === client) {
-            this.active.delete(resolved.slug);
-            client.close("process_exited");
-            this.retainClosedClient(resolved.slug, client);
-          }
-        });
 
-        const initRes = await client.initialize({ signal: effSignal });
-        if (initRes.outcome !== "accepted") {
-          client.close("initialize_failed");
-          await terminateChild();
+          const daemonRes = await connectOnce(["acp", "--process-model", "daemon"], false);
+          if (daemonRes.client) return daemonRes.client;
+
+          if (!this.closed && !effSignal.aborted && daemonRes.failedBeforeAuth && isProcessModelUnsupportedError(daemonRes.stderrText)) {
+            const fallbackRes = await connectOnce(["acp"], true);
+            if (fallbackRes.client) {
+              this.daemonCache = { running: true, pid: null, sessionsLoaded: 0, mode: "acp_stdio", at: Date.now(), promise: null };
+            }
+            return fallbackRes.client;
+          }
+          return null;
+        } catch {
           return null;
         }
-        const stateDb = await safeRegularFile(this.userDataDir, ["globalStorage", "state.vscdb"]);
-        const authInfo = stateDb ? await this.sqliteQuery({ path: stateDb, kind: "windsurf_auth" }, effSignal) : null;
-        if (!authInfo || authInfo.state !== "ready" || !authInfo.found || !authInfo.api_key) {
-          client.close("auth_unavailable");
-          await terminateChild();
-          return null;
-        }
-        const authRes = await client.authenticate({
-          apiKey: authInfo.api_key,
-          apiServerUrl: authInfo.api_server_url || "https://server.codeium.com",
-          signal: effSignal,
-        });
-        if (authRes.outcome !== "accepted") {
-          client.close("authenticate_failed");
-          await terminateChild();
-          return null;
-        }
-        const attachRes = await client.attach({ signal: effSignal });
-        if (attachRes.outcome !== "accepted") {
-          client.close("attach_failed");
-          await terminateChild();
-          return null;
-        }
-        if (this.settleDelayMs > 0) {
-          const ok = await unrefSleep(this.settleDelayMs, effSignal);
-          if (!ok || this.closed) {
-            client.close(this.closed ? "transport_closed" : "cancelled_before_ready");
-            await terminateChild();
-            return null;
-          }
-        }
-          if (this.closed || exited || !client.describe().ready) {
-            client.close(this.closed ? "transport_closed" : "process_exited_before_ready");
-            await terminateChild();
-            return null;
-          }
-          this.active.set(resolved.slug, { client, child, terminateChild, sessionsDb: resolved.sessionsDb });
-        return client;
-      } catch {
-        try { client?.close("connect_exception"); } catch {}
-        try { await terminateChild(); } catch {}
-        return null;
-      }
       })().finally(() => {
         this.connecting.delete(resolved.slug);
       });

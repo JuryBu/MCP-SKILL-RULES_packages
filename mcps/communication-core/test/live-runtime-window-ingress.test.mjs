@@ -225,23 +225,34 @@ test("default false retains source specifications and model binding without open
   assert.equal(JSON.parse(await readFile(files.configPath, "utf8")).channel_windows.length, 1);
 });
 
-test("true wires actual Core ingest through the existing scheduler and preserves native ID", async context => {
+test("native window ingest preserves its ID and does not wait for an active reply scan", async context => {
   const files = await fixture(context);
   const service = await files.open();
   const bound = await bind(files, service);
   assert.equal(bound.capture.status, "ready");
   assert.notEqual(files.native.route.route_key, files.value.adapters[1].route_key);
-  const event = files.native.append();
-  await waitUntil(() => recordFor(service, event)?.delivery_status === "accepted");
-  await service.core.drain();
-  const message = recordFor(service, event);
-  assert.equal(message.native_window_source.event.event_id, event.event_id);
-  assert.equal(message.envelope.target.conversation_id, "synthetic-model-a");
-  assert.equal(message.envelope.origin.channel, "napcat_owner_window");
-  assert.equal(message.envelope.text, event.text);
-  assert.equal(files.modelAdapters[0].calls.length, 1);
-  assert.equal(service.windowIngress.getStatus(bound.window_key).cursor, "g1_s1");
-  assert.equal(files.native.maxReads, 1);
+  const pendingReply = Promise.withResolvers();
+  let replyStarted = false;
+  service.core.pollReplies = () => {
+    replyStarted = true;
+    return pendingReply.promise;
+  };
+  try {
+    const event = files.native.append();
+    await waitUntil(() => replyStarted);
+    await waitUntil(() => recordFor(service, event)?.delivery_status === "accepted");
+    await service.core.drain();
+    const message = recordFor(service, event);
+    assert.equal(message.native_window_source.event.event_id, event.event_id);
+    assert.equal(message.envelope.target.conversation_id, "synthetic-model-a");
+    assert.equal(message.envelope.origin.channel, "napcat_owner_window");
+    assert.equal(message.envelope.text, event.text);
+    assert.equal(files.modelAdapters[0].calls.length, 1);
+    assert.equal(service.windowIngress.getStatus(bound.window_key).cursor, "g1_s1");
+    assert.equal(files.native.maxReads, 1);
+  } finally {
+    pendingReply.resolve();
+  }
 });
 
 test("MCP bind synchronizes only after successful CAS, and get/list expose bounded capture summary", async context => {

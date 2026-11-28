@@ -746,3 +746,266 @@ test("WindsurfAcpTransport and live-runtime default max_active_clients to 8 and 
     );
   }
 });
+
+test("Devin CLI 3000.15.14 without daemon subcommand falls back to stdio acp, caches --help probe, preserves fail-closed on generic errors, and refuses detaching active stdio turns", async context => {
+  const fx = createWorkspaceFixture(context, {
+    sessions: [
+      { slug: "stdio-one", cliModel: "swe-2-max", uiModel: "swe-2-max", mainChainId: 1, nodes: [{ nodeId: 1, parentId: null, message: { role: "assistant", content: "ready", metadata: { finish_reason: "stop" } } }] },
+      { slug: "stdio-two", cliModel: "swe-2-max", uiModel: "swe-2-max", mainChainId: 1, nodes: [{ nodeId: 1, parentId: null, message: { role: "assistant", content: "ready", metadata: { finish_reason: "stop" } } }] },
+    ],
+  });
+
+  // 1. Generic daemon error or legacy exit-0 "no devin daemon is running" must still fail-closed!
+  for (const mode of ["legacy_stopped", "generic_error"]) {
+    const failClosed = new WindsurfAcpTransport({
+      appDataDir: fx.root,
+      devinBinaryPath: fx.binPath,
+      execute: (cmd, args, opts) => {
+        if (cmd === fx.binPath && args[0] === "daemon") {
+          if (mode === "legacy_stopped") return Promise.resolve({ stdout: "no devin daemon is running\n" });
+          const err = new Error("spawn EACCES");
+          err.stderr = "permission denied";
+          return Promise.reject(err);
+        }
+        return realExecFile(cmd, args, opts);
+      },
+    });
+    context.after(() => failClosed.close());
+    const status = await failClosed.checkDaemonStatus();
+    assert.equal(status.running, false, `${mode} must fail-closed`);
+    assert.equal(status.pid, null);
+  }
+
+  // 2. Devin 3000.15.14: `daemon status` exits with unrecognized subcommand -> verifies `acp --help` (cached), spawns `["acp"]`, never evicts active stdio turn
+  let helpProbeCount = 0;
+  const spawnedArgs = [];
+  const promptResponders = new Map();
+  let nextNodeId = 50;
+  const makeStdioSpawn = () => (_cmd, args) => {
+    spawnedArgs.push([...args]);
+    const child = new EventEmitter();
+    child.stdin = new PassThrough();
+    child.stdout = new PassThrough();
+    child.stderr = new PassThrough();
+    child.kill = () => { child.emit("exit", 0); };
+    child.stdin.on("data", chunk => {
+      for (const line of chunk.toString("utf8").split("\n").filter(Boolean)) {
+        const req = JSON.parse(line);
+        if (req.method === "initialize") {
+          // 3000.15.14 stdio ACP: protocolVersion=1 + loadSession + midTurnPrompts, NO cognition.ai/daemon!
+          child.stdout.write(JSON.stringify({
+            jsonrpc: "2.0",
+            id: req.id,
+            result: {
+              protocolVersion: 1,
+              agentCapabilities: { loadSession: true, _meta: { "cognition.ai/midTurnPrompts": true } },
+            },
+          }) + "\n");
+        } else if (req.method === "authenticate") {
+          child.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: req.id, result: {} }) + "\n");
+        } else if (req.method === "session/load") {
+          child.stdout.write(JSON.stringify({
+            jsonrpc: "2.0",
+            id: req.id,
+            result: { configOptions: [{ id: "model", currentValue: "swe-2-max" }] },
+          }) + "\n");
+        } else if (req.method === "session/prompt") {
+          const slug = req.params.sessionId;
+          const promptText = req.params.prompt[0].text;
+          setTimeout(() => {
+            if (!fx.cli.isOpen) return;
+            const nodeId = nextNodeId++;
+            fx.cli.prepare("INSERT INTO message_nodes(session_id, node_id, parent_node_id, chat_message, created_at) VALUES (?, ?, 1, ?, ?)")
+              .run(slug, nodeId, JSON.stringify({ role: "user", content: promptText, metadata: { is_user_input: 1 } }), 1795286100);
+            fx.cli.prepare("UPDATE sessions SET main_chain_id = ? WHERE id = ?").run(nodeId, slug);
+          }, 40);
+          promptResponders.set(slug, () => {
+            child.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: req.id, result: { stopReason: "end_turn" } }) + "\n");
+          });
+        }
+      }
+    });
+    return child;
+  };
+
+  const transport = new WindsurfAcpTransport({
+    appDataDir: fx.root,
+    devinBinaryPath: fx.binPath,
+    maxActiveClients: 1,
+    settleDelayMs: 10,
+    spawnProcess: makeStdioSpawn(),
+    execute: (cmd, args, opts) => {
+      if (cmd === fx.binPath && args[0] === "daemon") {
+        const err = new Error("Command failed");
+        err.stderr = "error: unrecognized subcommand 'daemon'\n";
+        return Promise.reject(err);
+      }
+      if (cmd === fx.binPath && args[0] === "acp" && args[1] === "--help") {
+        helpProbeCount += 1;
+        return Promise.resolve({ stdout: "Run ACP server\nUsage: devin acp\n" });
+      }
+      return realExecFile(cmd, args, opts);
+    },
+  });
+  context.after(() => transport.close());
+
+  const firstProbe = await transport.checkDaemonStatus(undefined, 0);
+  assert.equal(firstProbe.running, true);
+  assert.equal(firstProbe.pid, null);
+  assert.equal(firstProbe.mode, "acp_stdio");
+  assert.equal(helpProbeCount, 1);
+
+  // Expired daemonCache re-probes `daemon status`, but `acp --help` stays cached by binary stat!
+  const secondProbe = await transport.checkDaemonStatus(undefined, 0);
+  assert.equal(secondProbe.running, true);
+  assert.equal(secondProbe.mode, "acp_stdio");
+  assert.equal(helpProbeCount, 1);
+
+  const adapter = new WindsurfAcpDeliveryAdapter({
+    clientForTarget: (target, ctx) => transport.clientForTarget(target, ctx),
+    verifyPersistedDelivery: (target, ctx) => transport.verifyPersistedDelivery(target, ctx),
+  });
+  const makeInput = (slug, suffix) => {
+    const target = {
+      machine_id: "development", host: "windsurf", surface: "desktop", conversation_id: slug,
+      binding_id: `bind-${slug}`, binding_generation: 1, adapter_id: "wsf-acp",
+      capabilities: { next_model_boundary: true, when_idle: true },
+    };
+    return {
+      target,
+      message: {
+        message_id: `33333333-3333-4333-8333-33333333333${suffix}`,
+        envelope: {
+          caller: { machine_id: "development", host: "antigravity", surface: "desktop", conversation_id: "caller-main" },
+          origin: { kind: "agent_message", channel: "antigravity", source_ref: "caller-main" },
+          target,
+          text: `stdio acp message ${suffix}`,
+          delivery_policy: "next_model_boundary",
+          attachment_refs: [],
+        },
+      },
+      delivery: {
+        delivery_id: `44444444-4444-4444-8444-44444444444${suffix}`,
+        message_id: `33333333-3333-4333-8333-33333333333${suffix}`,
+        target_key: identityKey(target),
+        status: "prepared",
+        attempt_count: 1,
+      },
+    };
+  };
+
+  const res1 = await adapter.deliver(makeInput("stdio-one", "1"));
+  assert.equal(res1.outcome, "accepted");
+  assert.equal(res1.evidence.native.kind, "persisted_session_node");
+  assert.deepEqual(spawnedArgs, [["acp"]]);
+
+  // Active stdio turn MUST NOT be detachable or evicted while turn is still running!
+  const desc1 = transport.active.get("stdio-one").client.describe();
+  assert.equal(desc1.daemon_capabilities.daemon, false);
+  assert.equal(desc1.daemon_capabilities.local_idle_gate, true);
+  assert.equal(desc1.turn_active, true);
+  assert.equal(desc1.can_detach_safely, false);
+  const blockedWhileActive = await transport.clientForTarget({ host: "windsurf", surface: "desktop", conversation_id: "stdio-two" });
+  assert.equal(blockedWhileActive, null, "pool slot must not evict live stdio turn");
+  assert.equal(transport.active.has("stdio-one"), true);
+
+  // Once the turn finishes with stopReason, slot becomes safely reusable for stdio-two!
+  promptResponders.get("stdio-one")();
+  await new Promise(r => setImmediate(r));
+  assert.equal(transport.active.get("stdio-one").client.describe().turn_active, false);
+  assert.equal(transport.active.get("stdio-one").client.describe().can_detach_safely, true);
+  const res2 = await adapter.deliver(makeInput("stdio-two", "2"));
+  assert.equal(res2.outcome, "accepted");
+  assert.equal(transport.active.has("stdio-two"), true);
+});
+
+test("WindsurfAcpTransport falls back once from --process-model daemon to plain acp when stderr rejects --process-model", async context => {
+  const fx = createWorkspaceFixture(context, {
+    sessions: [
+      { slug: "fallback-one", cliModel: "swe-2-max", uiModel: "swe-2-max", mainChainId: 1, nodes: [{ nodeId: 1, parentId: null, message: { role: "assistant", content: "ready", metadata: { finish_reason: "stop" } } }] },
+    ],
+  });
+
+  const spawned = [];
+  const transport = new WindsurfAcpTransport({
+    appDataDir: fx.root,
+    devinBinaryPath: fx.binPath,
+    settleDelayMs: 10,
+    execute: (cmd, args, opts) => {
+      if (cmd === fx.binPath && args[0] === "daemon") {
+        return Promise.resolve({ stdout: "devin daemon running (pid 4444), 1 session(s) loaded\n" });
+      }
+      return realExecFile(cmd, args, opts);
+    },
+    spawnProcess: (_cmd, args) => {
+      spawned.push([...args]);
+      const child = new EventEmitter();
+      child.stdin = new PassThrough();
+      child.stdout = new PassThrough();
+      child.stderr = new PassThrough();
+      child.kill = () => { child.emit("exit", 0); };
+      if (args.includes("--process-model")) {
+        queueMicrotask(() => {
+          child.stderr.write("error: unexpected argument '--process-model' found\n");
+          child.stdout.end();
+          child.emit("exit", 2);
+        });
+      } else {
+        child.stdin.on("data", chunk => {
+          for (const line of chunk.toString("utf8").split("\n").filter(Boolean)) {
+            const req = JSON.parse(line);
+            if (req.method === "initialize") {
+              child.stdout.write(JSON.stringify({
+                jsonrpc: "2.0",
+                id: req.id,
+                result: {
+                  protocolVersion: 1,
+                  agentCapabilities: { loadSession: true, _meta: { "cognition.ai/midTurnPrompts": true } },
+                },
+              }) + "\n");
+            } else if (req.method === "authenticate") {
+              child.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: req.id, result: {} }) + "\n");
+            } else if (req.method === "session/load") {
+              child.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: req.id, result: {} }) + "\n");
+            }
+          }
+        });
+      }
+      return child;
+    },
+  });
+  context.after(() => transport.close());
+
+  const client = await transport.clientForTarget({ host: "windsurf", surface: "desktop", conversation_id: "fallback-one" });
+  assert.ok(client, "should succeed via single fallback to plain acp");
+  assert.equal(client.describe().ready, true);
+  assert.deepEqual(spawned, [["acp", "--process-model", "daemon"], ["acp"]]);
+});
+
+test("checkDaemonStatus recovers after transient missing devin.exe instead of pinning a resolved promise forever", async context => {
+  const dir = mkdtempSync(path.join(os.tmpdir(), "wsf-transient-bin-"));
+  context.after(() => rmSync(dir, { recursive: true, force: true }));
+  const binPath = path.join(dir, "devin.exe");
+
+  const transport = new WindsurfAcpTransport({
+    devinBinaryPath: binPath,
+    execute: (cmd, args) => {
+      if (cmd === binPath && args[0] === "daemon") {
+        return Promise.resolve({ stdout: "devin daemon running (pid 5555), 1 session(s) loaded\n" });
+      }
+      return Promise.reject(new Error("unexpected"));
+    },
+  });
+  context.after(() => transport.close());
+
+  // 1. Binary temporarily absent -> fail-closed AND clears daemonCache.promise
+  const first = await transport.checkDaemonStatus(undefined, 0);
+  assert.equal(first.running, false);
+
+  // 2. Binary restored -> next check recovers immediately!
+  writeFileSync(binPath, "stub", "utf8");
+  const second = await transport.checkDaemonStatus(undefined, 0);
+  assert.equal(second.running, true);
+  assert.equal(second.pid, 5555);
+  assert.equal(second.mode, "daemon");
+});

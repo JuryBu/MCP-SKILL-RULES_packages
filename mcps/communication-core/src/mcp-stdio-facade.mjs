@@ -6,7 +6,7 @@ import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { CallToolRequestSchema, CallToolResultSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
-import { communicationContactsTool, communicationToolEntries, listCommunicationToolDefinitions } from "./mcp-server.mjs";
+import { communicationContactsTool, communicationToolEntries, listCommunicationToolDefinitions, withSubmittedCaller } from "./mcp-server.mjs";
 
 export const FACADE_INSTRUCTIONS =
   "每次填写真实 caller 的 host 与稳定 conversation_id。唯一匹配登记时可省 machine_id、surface；有多个匹配须补齐。已登记的宿主统一入口无需逐个登记CID；broker未提供可信宿主CID，门面按登记选连接，未鉴别实际宿主来源。" +
@@ -214,19 +214,21 @@ export async function createMcpStdioFacade({ registryFile = process.env.COMMUNIC
     const definition = entries.find(entry => entry.definition.name === name);
     const parsed = definition?.validator.safeParse(args);
     if (!parsed?.success || parsed.data.caller.conversation_id === "*") return failure("invalid_input");
-    if (definition === communicationContactsTool && !["list", "get"].includes(parsed.data.action)) return failure("caller_unverified");
+    const submittedCaller = definition === communicationContactsTool ? parsed.data.caller : undefined;
+    const fail = code => withSubmittedCaller(failure(code), submittedCaller);
+    if (submittedCaller && !["list", "get"].includes(parsed.data.action)) return fail("caller_unverified");
     const signal = AbortSignal.any([lifetime.signal, ...(extra.signal ? [extra.signal] : [])]);
     let snapshot;
     try { snapshot = await readRegistry(registryFile); } catch {
       await Promise.all([...clients.values()].map(entry => retire(entry)));
-      return failure("facade_config_invalid");
+      return fail("facade_config_invalid");
     }
-    if (signal.aborted) return failure("request_cancelled");
+    if (signal.aborted) return fail("request_cancelled");
     const currentKeys = new Set(snapshot.map(connection => connection.key));
     await Promise.all([...clients.values()].filter(entry => !currentKeys.has(entry.key)).map(entry => retire(entry)));
     const caller = completeFacadeCaller(snapshot, parsed.data.caller);
     const connection = caller && selectConnection(snapshot, caller);
-    if (!connection) return failure("caller_unregistered");
+    if (!connection) return fail("caller_unregistered");
     let entry = clients.get(connection.key);
     if (!entry) {
       const controller = new AbortController();
@@ -243,22 +245,22 @@ export async function createMcpStdioFacade({ registryFile = process.env.COMMUNIC
       let current;
       try { current = await readRegistry(registryFile); } catch {
         await Promise.all([...clients.values()].map(candidate => retire(candidate)));
-        return failure("facade_config_invalid");
+        return fail("facade_config_invalid");
       }
       const currentCaller = completeFacadeCaller(current, parsed.data.caller);
       if (!currentCaller || identityKey(currentCaller) !== identityKey(caller) || selectConnection(current, currentCaller)?.key !== connection.key) {
         await retire(entry);
-        return failure("caller_unregistered");
+        return fail("caller_unregistered");
       }
-      if (signal.aborted) return failure("request_cancelled");
+      if (signal.aborted) return fail("request_cancelled");
       started = true;
       const result = await withSignal(() => client.callTool({ name, arguments: { ...parsed.data, caller } }, undefined, { signal, timeout: CALL_TIMEOUT_MS, maxTotalTimeout: CALL_TIMEOUT_MS, resetTimeoutOnProgress: false }), signal);
       const validated = CallToolResultSchema.safeParse(result);
       if (!validated.success) throw new Error("core_call_failed");
-      return validated.data;
+      return withSubmittedCaller(validated.data, submittedCaller);
     } catch {
       entry.retired = true;
-      return failure(signal.aborted ? "request_cancelled" : started ? "core_call_failed" : "core_connect_failed");
+      return fail(signal.aborted ? "request_cancelled" : started ? "core_call_failed" : "core_connect_failed");
     } finally {
       entry.active -= 1;
       if (entry.retired) await retire(entry);

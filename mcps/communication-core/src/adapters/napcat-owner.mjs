@@ -174,6 +174,14 @@ export class NapcatOwnerAdapter {
 
   async observeReply(input) {
     if (this.closed || !this.replyEvents || input.signal?.aborted || input.target?.conversation_id !== this.replyEvents.targetKey) return null;
+    const capturedRoute = input.delivery?.evidence?.evidence?.native_receipt?.reply_route;
+    if (!capturedRoute
+      || capturedRoute.route_key !== this.routeKey
+      || capturedRoute.conversation_id !== this.replyEvents.callerConversationId
+      || capturedRoute.target_key !== this.replyEvents.targetKey
+      || capturedRoute.generation !== this.replyEvents.routeGeneration) {
+      return null;
+    }
     const reader = createOwnerReplyReader({
       enabled: true,
       callerConversationId: this.replyEvents.callerConversationId,

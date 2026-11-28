@@ -275,13 +275,13 @@ const tools = [
 
 export { tools as communicationTools };
 
-const contactActions = ["list", "get", "save", "set_note", "save_sender", "remove"];
+const contactActions = ["list", "get", "save", "set_note", "rename", "save_sender", "remove"];
 const contactNoteField = {
   schema: { type: "string", maxLength: 256 },
   validator: z.string().refine(value => [...value].length <= 256 && Buffer.byteLength(value, "utf8") <= 1024),
 };
 
-export const communicationContactsTool = tool("contacts", "contacts", "查本机共有或个人联系人；确认对话身份的入口可保存地址、按原来信存发件人、改自己的备注或移除个人条目。联系人不会增加发送或读取目标的授权。", {
+export const communicationContactsTool = tool("contacts", "contacts", "查本机共有或个人联系人。个人通讯录可保存地址、按原来信存发件人，或用 rename（contact 原名字、alias 新名字）改自己看到的名字，原地址和其他对话不变。回执带本次传入的对话；联系人不变更授权。", {
   action: { schema: { type: "string", enum: contactActions }, validator: z.enum(contactActions) },
   contact: optional(contactField),
   alias: optional(contactField),
@@ -371,6 +371,28 @@ function stripUndefinedFields(data, omitKeys = []) {
   return cleaned;
 }
 
+const TOOL_RESULT_TEXT_PREFIX = "交流操作结果：\n";
+const BOARD_READ_RESPONSE_LIMIT_BYTES = 9 * 1024;
+
+function boardReadDataBudgetFor(caller) {
+  const callerBytes = Buffer.byteLength(JSON.stringify({ caller: stripUndefinedFields(caller) }), "utf8") - 1;
+  return BOARD_READ_RESPONSE_LIMIT_BYTES - 1 - Buffer.byteLength(TOOL_RESULT_TEXT_PREFIX, "utf8") - callerBytes;
+}
+
+export function withSubmittedCaller(result, caller) {
+  if (!caller) return result;
+  const submitted = stripUndefinedFields(caller);
+  const structuredContent = { ...result.structuredContent, caller: submitted };
+  const error = result.isError && result.structuredContent?.error;
+  const callerText = `本次传入的对话：${JSON.stringify(submitted)}`;
+  const content = error
+    ? [{ type: "text", text: `${error.message}（${error.code}）\n${callerText}` }]
+    : result.structuredContent
+      ? [{ type: "text", text: `${TOOL_RESULT_TEXT_PREFIX}${JSON.stringify(structuredContent)}` }]
+      : [...(result.content ?? []), { type: "text", text: callerText }];
+  return { ...result, structuredContent, content };
+}
+
 function projectSendMessageResult(result, verboseReceipt) {
   if (!result || typeof result !== "object" || !result.message || typeof result.message !== "object"
     || !result.delivery || typeof result.delivery !== "object") {
@@ -418,15 +440,21 @@ function makeServer(core, principalId, requestSignal, sharedFacade = false) {
   const entries = communicationToolEntries(features);
   server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: listCommunicationToolDefinitions(features) }));
   server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
+    let submittedCaller;
     try {
       const entry = entries.find(candidate => candidate.definition.name === request.params.name);
       if (!entry) throw new CoreError("invalid_input", "未知工具");
       const parsed = entry.validator.safeParse(request.params.arguments);
       if (!parsed.success) throw new CoreError("invalid_input", "工具参数无效");
+      if (entry === communicationContactsTool || entry === boardTool) submittedCaller = parsed.data.caller;
       const signal = AbortSignal.any([requestSignal, extra.signal]);
       const verboseReceipt = entry.method === "sendMessage" && parsed.data.verbose_receipt === true;
       const coreArgs = stripUndefinedFields(parsed.data, entry.method === "sendMessage" ? ["verbose_receipt"] : []);
-      const value = await abortable(() => core[entry.method]({ principal_id: principalId, signal, shared_facade: sharedFacade }, coreArgs), signal);
+      const context = { principal_id: principalId, signal, shared_facade: sharedFacade };
+      if (entry === boardTool && coreArgs.action === "read" && submittedCaller) {
+        context.boardReadDataBudgetBytes = boardReadDataBudgetFor(submittedCaller);
+      }
+      const value = await abortable(() => core[entry.method](context, coreArgs), signal);
       const rawResult = value === null && entry.method === "manageChannelBinding" && parsed.data.action === "get" ? { binding: null } : value;
       if (!rawResult || typeof rawResult !== "object" || Array.isArray(rawResult)) throw new Error("Invalid result");
       if (entry.method === "readRecentSnapshot") return formatRecentSnapshotMcp(rawResult);
@@ -434,10 +462,11 @@ function makeServer(core, principalId, requestSignal, sharedFacade = false) {
         return { structuredContent: rawResult, content: [{ type: "text", text: `本次共有 ${rawResult.recipient_count} 位收件人，逐人投递与处理状态、原消息 ID 见结构化回执。` }] };
       }
       const result = entry.method === "sendMessage" ? projectSendMessageResult(rawResult, verboseReceipt) : rawResult;
+      if (submittedCaller) return withSubmittedCaller({ structuredContent: result }, submittedCaller);
       const serialized = JSON.stringify(result);
-      return { structuredContent: result, content: [{ type: "text", text: `交流操作结果：\n${serialized}` }] };
+      return { structuredContent: result, content: [{ type: "text", text: `${TOOL_RESULT_TEXT_PREFIX}${serialized}` }] };
     } catch (error) {
-      return toolFailure(error);
+      return withSubmittedCaller(toolFailure(error), submittedCaller);
     }
   });
   return server;

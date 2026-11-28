@@ -35,6 +35,14 @@ const REPLY_EVENT_PAGE_SIZE = 100;
 const CODEX_REPLY_RECENT_MS = 60 * 60 * 1000;
 const CODEX_REPLY_PASSIVE_GAP_MS = 10000;
 const CODEX_REPLY_WAIT_GAP_MS = 1000;
+const QQ_REPLY_RECENT_MS = 15 * 60 * 1000;
+const QQ_REPLY_PASSIVE_GAP_MS = 5000;
+const QQ_REPLY_WAIT_GAP_MS = 1000;
+const AG_REPLY_RECENT_MS = 60 * 60 * 1000;
+const AG_REPLY_PASSIVE_GAP_MS = 10000;
+const AG_REPLY_WAIT_GAP_MS = 1000;
+const MAX_RECENT_QQ_DELIVERIES = 64;
+const MAX_REPLIED_MESSAGES_CACHE = 8192;
 const ADAPTER_ERROR_MESSAGES = {
   adapter_error: "适配器调用失败，发送结果待核实",
   delivery_timeout: "适配器调用超时，发送结果待核实",
@@ -170,13 +178,14 @@ function safeObservedReply(result, target, delivery) {
   }
 }
 
-class CodexReplyPacer {
-  constructor(now) {
+class HostReplyPacer {
+  constructor(now, { recentMs, passiveGapMs, waitGapMs, waiters } = {}) {
     this.now = now;
-    this.waiters = new WeakSet();
+    this.recentMs = recentMs;
+    this.waiters = waiters ?? new WeakSet();
     this.reading = new Set();
-    this.passive = { cursor: null, cohortBefore: null, reading: false, nextAt: 0, gap: CODEX_REPLY_PASSIVE_GAP_MS };
-    this.waiting = { cursor: null, reading: false, nextAt: 0, gap: CODEX_REPLY_WAIT_GAP_MS };
+    this.passive = { cursor: null, cohortBefore: null, reading: false, nextAt: 0, gap: passiveGapMs };
+    this.waiting = { cursor: null, reading: false, nextAt: 0, gap: waitGapMs };
   }
 
   begin() {
@@ -196,7 +205,7 @@ class CodexReplyPacer {
   isOld(pass, message, delivery) {
     const acceptedAt = Date.parse(delivery.updated_at ?? delivery.created_at);
     return message.envelope.reply_required !== true && Number.isFinite(acceptedAt)
-      && pass.now - acceptedAt > CODEX_REPLY_RECENT_MS;
+      && pass.now - acceptedAt > this.recentMs;
   }
 
   claim(pass, deliveryId) {
@@ -213,7 +222,7 @@ class CodexReplyPacer {
     let lane = null;
     if (this.isOld(pass, message, delivery)) {
       if (this.activelyWaiting(listeners)) lane = this.claim(pass.waiting, deliveryId);
-      const cohort = this.passive.cohortBefore ?? pass.now - CODEX_REPLY_RECENT_MS;
+      const cohort = this.passive.cohortBefore ?? pass.now - this.recentMs;
       if (lane === null && Date.parse(delivery.updated_at ?? delivery.created_at) <= cohort) {
         lane = this.claim(pass.passive, deliveryId);
         if (lane !== null) lane.cohortBefore = cohort;
@@ -271,7 +280,17 @@ export class CommunicationCore {
       origin_kinds: ["human_message"],
     }));
     this.now = now;
-    this.codexReplies = new CodexReplyPacer(() => this.nowMs());
+    const replyWaiters = new WeakSet();
+    this.replyWaiters = replyWaiters;
+    this.replyPacers = new Map([
+      ["codex", new HostReplyPacer(() => this.nowMs(), { recentMs: CODEX_REPLY_RECENT_MS, passiveGapMs: CODEX_REPLY_PASSIVE_GAP_MS, waitGapMs: CODEX_REPLY_WAIT_GAP_MS, waiters: replyWaiters })],
+      ["qq", new HostReplyPacer(() => this.nowMs(), { recentMs: QQ_REPLY_RECENT_MS, passiveGapMs: QQ_REPLY_PASSIVE_GAP_MS, waitGapMs: QQ_REPLY_WAIT_GAP_MS, waiters: replyWaiters })],
+      ["antigravity", new HostReplyPacer(() => this.nowMs(), { recentMs: AG_REPLY_RECENT_MS, passiveGapMs: AG_REPLY_PASSIVE_GAP_MS, waitGapMs: AG_REPLY_WAIT_GAP_MS, waiters: replyWaiters })],
+    ]);
+    this.codexReplies = this.replyPacers.get("codex");
+    this.recentQqDeliveries = new Map();
+    this.activeTxRecentQq = null;
+    this.repliedMessages = new Set();
     this.deliveryTimeoutMs = requireInteger(deliveryTimeoutMs, "deliveryTimeoutMs", 1, 2147483647);
     this.maxConcurrent = requireInteger(maxConcurrent, "maxConcurrent", 1);
     this.closed = false;
@@ -386,8 +405,12 @@ export class CommunicationCore {
     const signal = context?.signal ? AbortSignal.any([context.signal, entry.signal]) : entry.signal;
     if (signal.aborted) throw new CoreError("request_cancelled", "交流板请求已取消");
     const invocation = normalizeBoardInvocation(input, principal, this.addressBook, this.addressBookMachineId);
+    const boardReadDataBudgetBytes = context?.boardReadDataBudgetBytes;
     const pending = Promise.resolve().then(() => {
       if (signal.aborted) throw new CoreError("request_cancelled", "交流板请求已取消");
+      if (invocation.action === "read" && boardReadDataBudgetBytes !== undefined) {
+        return entry.invoke({ ...invocation, signal, boardReadDataBudgetBytes });
+      }
       return entry.invoke({ ...invocation, signal });
     });
     entry.pending.add(pending);
@@ -424,7 +447,8 @@ export class CommunicationCore {
   contacts(context, input) {
     const fields = new Map([
       ["list", ["include_machine_routes"]], ["get", ["contact"]], ["save", ["alias", "target", "note"]],
-      ["set_note", ["contact", "note"]], ["save_sender", ["message_id", "alias", "note"]], ["remove", ["contact"]],
+      ["set_note", ["contact", "note"]], ["rename", ["contact", "alias", "note"]],
+      ["save_sender", ["message_id", "alias", "note"]], ["remove", ["contact"]],
     ]).get(input?.action);
     if (!fields) throw new CoreError("invalid_input", "通讯录操作无效");
     assertExactKeys(input, ["caller", "action", ...fields], "通讯录");
@@ -436,6 +460,7 @@ export class CommunicationCore {
     if (input.action === "save") return this.addressBook.saveAddress(principal, input);
     if (input.action === "save_sender") return this.addressBook.saveSender(principal, input);
     if (input.action === "set_note") return this.addressBook.setNote(principal, input);
+    if (input.action === "rename") return this.addressBook.rename(principal, input);
     return this.addressBook.remove(principal, input.contact);
   }
 
@@ -473,12 +498,23 @@ export class CommunicationCore {
   transaction(callback) {
     const changed = new Set();
     let relayAckStaged = false;
-    const result = this.store.transaction(() => callback((messageId, kind, data = {}) => {
-      const event = this.store.appendEvent(messageId, kind, copy(data));
-      if (kind === "processing" && this.relayAcknowledgements?.stageProcessing(messageId, data.processing)) relayAckStaged = true;
-      changed.add(messageId);
-      return event;
-    }));
+    const prevTxRecentQq = this.activeTxRecentQq;
+    const pendingRecentQq = prevTxRecentQq ?? [];
+    this.activeTxRecentQq = pendingRecentQq;
+    let result;
+    try {
+      result = this.store.transaction(() => callback((messageId, kind, data = {}) => {
+        const event = this.store.appendEvent(messageId, kind, copy(data));
+        if (kind === "processing" && this.relayAcknowledgements?.stageProcessing(messageId, data.processing)) relayAckStaged = true;
+        changed.add(messageId);
+        return event;
+      }));
+    } finally {
+      this.activeTxRecentQq = prevTxRecentQq;
+    }
+    if (!prevTxRecentQq && pendingRecentQq.length) {
+      for (const deliveryId of pendingRecentQq) this.rememberRecentQqDelivery(deliveryId);
+    }
     if (relayAckStaged && this.relayAcknowledgementReady && !this.relayAcknowledgementSignalPending) {
       this.relayAcknowledgementSignalPending = true;
       queueMicrotask(() => {
@@ -499,6 +535,10 @@ export class CommunicationCore {
     const updated = { ...persistedPatch, status, updated_at: this.timestamp() };
     this.store.updateDelivery(deliveryId, updated);
     this.store.updateMessage(delivery.message_id, { delivery_status: status });
+    if (status === "accepted" && delivery.target_snapshot?.host === "qq") {
+      if (this.activeTxRecentQq) this.activeTxRecentQq.push(deliveryId);
+      else this.rememberRecentQqDelivery(deliveryId);
+    }
     append(delivery.message_id, "delivery", {
       delivery_id: deliveryId,
       status,
@@ -540,6 +580,7 @@ export class CommunicationCore {
         });
       }
       this.recoverReplyForwards();
+      this.bootstrapRecentQqDeliveries();
       this.started = true;
       this.dispatchPending().catch(() => {});
       return { started: true };
@@ -1234,7 +1275,7 @@ export class CommunicationCore {
         }
       };
       listeners.add(notify);
-      if (until === "reply" && waitMs > 0) this.codexReplies.waiters.add(notify);
+      if (until === "reply" && waitMs > 0) this.replyWaiters.add(notify);
       signal?.addEventListener("abort", onAbort, { once: true });
       if (signal?.aborted) onAbort();
       if (settled) return;
@@ -1519,7 +1560,42 @@ export class CommunicationCore {
     }
   }
 
+  rememberRepliedMessage(messageId) {
+    if (this.repliedMessages.has(messageId)) return;
+    if (this.repliedMessages.size >= MAX_REPLIED_MESSAGES_CACHE) {
+      this.repliedMessages.delete(this.repliedMessages.values().next().value);
+    }
+    this.repliedMessages.add(messageId);
+  }
+
+  rememberRecentQqDelivery(deliveryId, acceptedAtMs = this.nowMs()) {
+    this.recentQqDeliveries.delete(deliveryId);
+    this.recentQqDeliveries.set(deliveryId, acceptedAtMs);
+    while (this.recentQqDeliveries.size > MAX_RECENT_QQ_DELIVERIES) {
+      this.recentQqDeliveries.delete(this.recentQqDeliveries.keys().next().value);
+    }
+  }
+
+  bootstrapRecentQqDeliveries() {
+    const nowMs = this.nowMs();
+    const recent = [];
+    for (const page of this.deliveryPages(["accepted"])) {
+      for (const delivery of page) {
+        if (delivery.target_snapshot?.host !== "qq") continue;
+        const acceptedAtMs = Date.parse(delivery.updated_at ?? delivery.created_at);
+        if (!Number.isFinite(acceptedAtMs) || nowMs - acceptedAtMs > QQ_REPLY_RECENT_MS) continue;
+        if (this.hasReply(delivery.message_id)) continue;
+        recent.push({ deliveryId: delivery.delivery_id, acceptedAtMs });
+      }
+    }
+    recent.sort((left, right) => left.acceptedAtMs - right.acceptedAtMs);
+    for (const item of recent.slice(-MAX_RECENT_QQ_DELIVERIES)) {
+      this.rememberRecentQqDelivery(item.deliveryId, item.acceptedAtMs);
+    }
+  }
+
   hasReply(messageId) {
+    if (this.repliedMessages.has(messageId)) return true;
     let sequence = 0;
     while (true) {
       const events = this.store.eventsAfter(messageId, sequence, REPLY_EVENT_PAGE_SIZE);
@@ -1529,7 +1605,10 @@ export class CommunicationCore {
           throw new CoreError("store_pagination_error", "回复事件分页没有按原消息游标继续递增");
         }
         sequence = event.sequence;
-        if (event.kind === "reply") return true;
+        if (event.kind === "reply") {
+          this.rememberRepliedMessage(messageId);
+          return true;
+        }
       }
       if (events.length < REPLY_EVENT_PAGE_SIZE) return false;
     }
@@ -1576,22 +1655,62 @@ export class CommunicationCore {
     return typeof adapter?.observeReply === "function" ? { delivery, message, target, adapter } : null;
   }
 
-  waitingCodexReply(pass, prioritized) {
-    if (!this.codexReplies.available(pass.waiting)) return null;
-    let first = null;
-    let next = null;
-    for (const [messageId, listeners] of this.waiters.entries()) {
-      if (!this.codexReplies.activelyWaiting(listeners)) continue;
-      const delivery = this.store.getDeliveryForMessage(messageId);
-      if (!delivery || prioritized.has(delivery.delivery_id) || this.codexReplies.reading.has(delivery.delivery_id)) continue;
-      const candidate = this.replyCandidate(delivery);
-      if (!candidate || candidate.target.host !== "codex" || !this.codexReplies.isOld(pass, candidate.message, delivery)) continue;
-      if (!first || delivery.delivery_id < first.delivery.delivery_id) first = candidate;
-      if ((this.codexReplies.waiting.cursor === null || delivery.delivery_id > this.codexReplies.waiting.cursor)
-        && (!next || delivery.delivery_id < next.delivery.delivery_id)) next = candidate;
+  waitingHostReply(passes, prioritized) {
+    for (const [host, pacer] of this.replyPacers.entries()) {
+      const pass = passes.get(host);
+      if (!pacer.available(pass.waiting)) continue;
+      let first = null;
+      let next = null;
+      for (const [messageId, listeners] of this.waiters.entries()) {
+        if (!pacer.activelyWaiting(listeners)) continue;
+        const delivery = this.store.getDeliveryForMessage(messageId);
+        if (!delivery || prioritized.has(delivery.delivery_id) || pacer.reading.has(delivery.delivery_id)) continue;
+        const candidate = this.replyCandidate(delivery);
+        if (!candidate || candidate.target.host !== host || !pacer.isOld(pass, candidate.message, delivery)) continue;
+        if (!first || delivery.delivery_id < first.delivery.delivery_id) first = candidate;
+        if ((pacer.waiting.cursor === null || delivery.delivery_id > pacer.waiting.cursor)
+          && (!next || delivery.delivery_id < next.delivery.delivery_id)) next = candidate;
+      }
+      if (!next && first) pacer.waiting.cursor = null;
+      if (next ?? first) return next ?? first;
     }
-    if (!next && first) this.codexReplies.waiting.cursor = null;
-    return next ?? first;
+    return null;
+  }
+
+  hotQqDeliveryIds(nowMs, excluded = null) {
+    if (!this.recentQqDeliveries.size) return [];
+    const ids = [];
+    const entries = [...this.recentQqDeliveries.entries()];
+    for (let index = entries.length - 1; index >= 0; index -= 1) {
+      const [deliveryId, acceptedAtMs] = entries[index];
+      if (!Number.isFinite(acceptedAtMs) || nowMs - acceptedAtMs > QQ_REPLY_RECENT_MS) {
+        this.recentQqDeliveries.delete(deliveryId);
+        continue;
+      }
+      if (excluded?.has(deliveryId)) continue;
+      ids.push(deliveryId);
+    }
+    return ids;
+  }
+
+  takeNextHotQqCandidate(nowMs, prioritized) {
+    const entries = [...this.recentQqDeliveries.entries()];
+    for (let index = entries.length - 1; index >= 0; index -= 1) {
+      const [deliveryId, acceptedAtMs] = entries[index];
+      if (!Number.isFinite(acceptedAtMs) || nowMs - acceptedAtMs > QQ_REPLY_RECENT_MS) {
+        this.recentQqDeliveries.delete(deliveryId);
+        continue;
+      }
+      if (prioritized.has(deliveryId)) continue;
+      prioritized.add(deliveryId);
+      const candidate = this.replyCandidate(this.store.getDelivery(deliveryId));
+      if (!candidate) {
+        this.recentQqDeliveries.delete(deliveryId);
+        continue;
+      }
+      return candidate;
+    }
+    return null;
   }
 
   pollReplies() {
@@ -1600,70 +1719,104 @@ export class CommunicationCore {
     const poll = Promise.resolve().then(async () => {
       let checked = 0;
       let replies = 0;
-      const codexPass = this.codexReplies.begin();
+      const passes = new Map([...this.replyPacers.entries()].map(([host, pacer]) => [host, pacer.begin()]));
       const prioritized = new Set();
       let scanned = true;
+
+      const observeCandidate = async candidate => {
+        const { delivery, message, target, adapter } = candidate;
+        const pacer = this.replyPacers.get(target.host);
+        const release = pacer
+          ? pacer.reserve(passes.get(target.host), message, delivery, this.waiters.get(message.message_id))
+          : undefined;
+        if (release === null) return;
+        checked += 1;
+        const reply = await this.callReplyObserver(adapter, message, delivery, target, release);
+        if (!reply || this.closed) return;
+        const appended = this.transaction(append => {
+          const currentDelivery = this.store.getDelivery(delivery.delivery_id);
+          const currentMessage = this.store.getMessage(message.message_id);
+          if (!currentDelivery || currentDelivery.status !== "accepted" || currentDelivery.message_id !== message.message_id
+            || !currentMessage || this.hasReply(message.message_id)) return false;
+          let currentTarget;
+          try {
+            currentTarget = this.currentDispatchTarget(currentMessage, currentDelivery);
+          } catch (error) {
+            if (!(error instanceof CoreError)) throw error;
+            return false;
+          }
+          if (identityKey(currentTarget) !== identityKey(target) || currentTarget.binding_id !== target.binding_id
+            || currentTarget.binding_generation !== target.binding_generation || currentTarget.adapter_id !== target.adapter_id
+            || lookupAdapter(this.adapters, target.adapter_id) !== adapter) return false;
+          const ownerSenders = currentMessage.reply_forward_binding?.owner_sender_allowlist;
+          if (currentTarget.host === "qq" && currentMessage.reply_forward_binding
+            && (!Array.isArray(ownerSenders) || !ownerSenders.includes(reply.native_source?.event?.sender_id))) return false;
+          const event = append(message.message_id, "reply", {
+            delivery_id: delivery.delivery_id,
+            ...reply,
+            evidence: {
+              kind: "native_reply",
+              source: "adapter.observeReply",
+              ...normalizeIdentity(target),
+              adapter_id: target.adapter_id,
+              binding_id: target.binding_id,
+              binding_generation: target.binding_generation,
+              observed_at: this.timestamp(),
+            },
+          });
+          const forward = this.persistOwnerReplyForward(currentMessage, currentDelivery, reply, currentMessage.reply_forward_binding, event.created_at, append);
+          if (currentMessage.reply_forward_binding && !forward) append(message.message_id, "reply_forward_blocked", { code: "unverified_reply_forward" });
+          return { forward_delivery_id: forward?.delivery_id };
+        });
+        if (appended) {
+          replies += 1;
+          this.rememberRepliedMessage(message.message_id);
+          this.recentQqDeliveries.delete(delivery.delivery_id);
+          if (appended.forward_delivery_id) this.enqueue(appended.forward_delivery_id).catch(error => { this.backgroundError = error; });
+        }
+      };
+
+      const drainHotQq = async () => {
+        const hotQqIds = this.hotQqDeliveryIds(this.nowMs(), prioritized);
+        if (!hotQqIds.length || this.closed || this.replyInvocations.size >= this.maxConcurrent) return;
+        let hotIndex = 0;
+        const hotWorker = async () => {
+          while (!this.closed && hotIndex < hotQqIds.length && this.replyInvocations.size < this.maxConcurrent) {
+            const deliveryId = hotQqIds[hotIndex++];
+            if (prioritized.has(deliveryId)) continue;
+            prioritized.add(deliveryId);
+            const candidate = this.replyCandidate(this.store.getDelivery(deliveryId));
+            if (!candidate) {
+              this.recentQqDeliveries.delete(deliveryId);
+              continue;
+            }
+            await observeCandidate(candidate);
+          }
+        };
+        const hotWorkers = await Promise.allSettled(Array.from({ length: Math.min(this.maxConcurrent, hotQqIds.length) }, hotWorker));
+        const hotFailed = hotWorkers.find(result => result.status === "rejected");
+        if (hotFailed) throw hotFailed.reason;
+      };
+
+      // 先抢先检查近期 QQ 热池投递（按最新优先），避免被大量随机 UUID 的历史旧投递分页挤占
+      await drainHotQq();
+
       for (const deliveries of this.deliveryPages(["accepted"], REPLY_PAGE_SIZE)) {
         if (this.closed || this.replyInvocations.size >= this.maxConcurrent) { scanned = false; break; }
         let nextIndex = 0;
         const worker = async () => {
           while (!this.closed && nextIndex < deliveries.length && this.replyInvocations.size < this.maxConcurrent) {
-            const waiting = this.waitingCodexReply(codexPass, prioritized);
-            let candidate = waiting;
+            const hotCandidate = this.takeNextHotQqCandidate(this.nowMs(), prioritized);
+            const waiting = hotCandidate ? null : this.waitingHostReply(passes, prioritized);
+            let candidate = hotCandidate ?? waiting;
             if (!candidate) {
               const deliveryId = deliveries[nextIndex++].delivery_id;
               if (prioritized.has(deliveryId)) continue;
               candidate = this.replyCandidate(this.store.getDelivery(deliveryId));
             }
             if (!candidate) continue;
-            const { delivery, message, target, adapter } = candidate;
-            if (waiting) prioritized.add(delivery.delivery_id);
-            const release = target.host === "codex"
-              ? this.codexReplies.reserve(codexPass, message, delivery, this.waiters.get(message.message_id))
-              : undefined;
-            if (release === null) continue;
-            checked += 1;
-            const reply = await this.callReplyObserver(adapter, message, delivery, target, release);
-            if (!reply || this.closed) continue;
-            const appended = this.transaction(append => {
-              const currentDelivery = this.store.getDelivery(delivery.delivery_id);
-              const currentMessage = this.store.getMessage(message.message_id);
-              if (!currentDelivery || currentDelivery.status !== "accepted" || currentDelivery.message_id !== message.message_id
-                || !currentMessage || this.hasReply(message.message_id)) return false;
-              let currentTarget;
-              try {
-                currentTarget = this.currentDispatchTarget(currentMessage, currentDelivery);
-              } catch (error) {
-                if (!(error instanceof CoreError)) throw error;
-                return false;
-              }
-              if (identityKey(currentTarget) !== identityKey(target) || currentTarget.binding_id !== target.binding_id
-                || currentTarget.binding_generation !== target.binding_generation || currentTarget.adapter_id !== target.adapter_id
-                || lookupAdapter(this.adapters, target.adapter_id) !== adapter) return false;
-              const ownerSenders = currentMessage.reply_forward_binding?.owner_sender_allowlist;
-              if (currentTarget.host === "qq" && currentMessage.reply_forward_binding
-                && (!Array.isArray(ownerSenders) || !ownerSenders.includes(reply.native_source?.event?.sender_id))) return false;
-              const event = append(message.message_id, "reply", {
-                delivery_id: delivery.delivery_id,
-                ...reply,
-                evidence: {
-                  kind: "native_reply",
-                  source: "adapter.observeReply",
-                  ...normalizeIdentity(target),
-                  adapter_id: target.adapter_id,
-                  binding_id: target.binding_id,
-                  binding_generation: target.binding_generation,
-                  observed_at: this.timestamp(),
-                },
-              });
-              const forward = this.persistOwnerReplyForward(currentMessage, currentDelivery, reply, currentMessage.reply_forward_binding, event.created_at, append);
-              if (currentMessage.reply_forward_binding && !forward) append(message.message_id, "reply_forward_blocked", { code: "unverified_reply_forward" });
-              return { forward_delivery_id: forward?.delivery_id };
-            });
-            if (appended) {
-              replies += 1;
-              if (appended.forward_delivery_id) this.enqueue(appended.forward_delivery_id).catch(error => { this.backgroundError = error; });
-            }
+            if (waiting) prioritized.add(candidate.delivery.delivery_id);
+            await observeCandidate(candidate);
           }
         };
         const workers = await Promise.allSettled(Array.from({ length: Math.min(this.maxConcurrent, deliveries.length) }, worker));
@@ -1671,7 +1824,11 @@ export class CommunicationCore {
         if (failed) throw failed.reason;
         if (nextIndex < deliveries.length) scanned = false;
       }
-      this.codexReplies.finish(codexPass, scanned && !this.closed);
+      // 尾部追检：若当前轮因慢 RPC 在途期间又新进了热池 QQ 投递，立刻借空槽补查一次不干等下轮
+      await drainHotQq();
+      for (const [host, pacer] of this.replyPacers.entries()) {
+        pacer.finish(passes.get(host), scanned && !this.closed);
+      }
       return { checked, replies };
     });
     this.replyPollPromise = poll;

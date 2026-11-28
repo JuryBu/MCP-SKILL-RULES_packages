@@ -146,7 +146,7 @@ test("private board startup uses its own root, retains local identity, and close
     requestInit: { headers: { Authorization: "Bearer " + principal.token } },
   }));
   const listed = await direct.callTool({ name: "communication_board", arguments: { caller, action: "list" } });
-  assert.deepEqual(listed.structuredContent, { status: "ready" });
+  assert.deepEqual(listed.structuredContent, { status: "ready", caller });
   const profile = join(files.directory, "fixture-board-connection.json");
   const registry = join(files.directory, "fixture-board-registry.json");
   await writeFile(profile, JSON.stringify({ endpoint_file: endpointFile, identity, token: facadePrincipal.token }), "utf8");
@@ -931,39 +931,54 @@ test("可选字段沿用S1授权，localhost仅监听回环，投递期限接受
   }
 });
 
-test("250ms调度与约1秒回信检查串行，close等待在途工作且停止后续调度", { timeout: 10000 }, async context => {
+test("投递和回信检查不互等，单路不重入，关闭等待已开始的工作", { timeout: 10000 }, async context => {
   const files = await fixture(context);
   const service = await startLiveFromConfig({ ...files, factories: mockFactories });
   files.cleanup(() => service.close());
   await service.core.drain();
-  let active = 0;
-  let maximum = 0;
   let dispatches = 0;
-  const polls = [];
+  let polls = 0;
+  let dispatching = false;
+  let polling = false;
+  const dispatchGate = Promise.withResolvers();
+  const replyGate = Promise.withResolvers();
   service.core.dispatchPending = async () => {
+    assert.equal(dispatching, false);
     dispatches += 1;
-    active += 1;
-    maximum = Math.max(maximum, active);
-    await delay(300);
-    active -= 1;
+    dispatching = true;
+    await dispatchGate.promise;
+    dispatching = false;
   };
   service.core.pollReplies = async () => {
-    polls.push(Date.now());
-    active += 1;
-    maximum = Math.max(maximum, active);
-    await delay(80);
-    active -= 1;
+    assert.equal(polling, false);
+    polls += 1;
+    polling = true;
+    await replyGate.promise;
+    polling = false;
   };
-  await waitUntil(() => polls.length >= 2);
-  await service.close();
-  assert.equal(active, 0);
-  assert.equal(maximum, 1);
-  assert.ok(dispatches >= 3);
-  assert.ok(polls[1] - polls[0] >= 1000);
+  let closed = false;
+  try {
+    await waitUntil(() => dispatching && polling);
+    assert.equal(dispatches, 1);
+    dispatchGate.resolve();
+    await waitUntil(() => dispatches >= 2);
+    assert.equal(polls, 1);
+    const closing = service.close().then(() => { closed = true; });
+    await delay(50);
+    assert.equal(closed, false);
+    assert.equal(polling, true);
+    replyGate.resolve();
+    await closing;
+  } finally {
+    dispatchGate.resolve();
+    replyGate.resolve();
+  }
+  assert.equal(dispatching, false);
+  assert.equal(polling, false);
   const count = dispatches;
   await delay(350);
   assert.equal(dispatches, count);
-  assert.equal(polls.length, 2);
+  assert.equal(polls, 1);
 });
 
 test("调度异常只回报安全文本并关闭HTTP、adapter与store，onError抛错也完成清理", { timeout: 10000 }, async context => {

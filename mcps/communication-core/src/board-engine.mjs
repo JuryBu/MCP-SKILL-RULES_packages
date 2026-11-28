@@ -1080,7 +1080,7 @@ export class BoardEngine {
     return { outcome: "failed" };
   }
 
-  async invoke({ action, actorIdentity, board = null, params = {}, signal, remotePrincipal = null } = {}) {
+  async invoke({ action, actorIdentity, board = null, params = {}, signal, remotePrincipal = null, boardReadDataBudgetBytes } = {}) {
     this.#assertOpen(signal);
     if (typeof action !== "string" || !BOARD_ACTIONS.has(action)) {
       throw new CoreError("invalid_input", "交流板操作无效");
@@ -1097,7 +1097,7 @@ export class BoardEngine {
       case "unsubscribe": return this.unsubscribeBoard(actor, normalizedParams, context);
       case "invite": return this.inviteMembers(actor, normalizedParams, context);
       case "post": return this.postMessage(actor, normalizedParams, context);
-      case "read": return this.readBoard(actor, normalizedParams, context);
+      case "read": return this.readBoard(actor, normalizedParams, { ...context, boardReadDataBudgetBytes });
       case "set_subscription": return this.setSubscription(actor, normalizedParams, context);
       case "query_members": return this.queryMembers(actor, normalizedParams, context);
       case "update_settings": return this.updateSettings(actor, normalizedParams, context);
@@ -2196,7 +2196,7 @@ export class BoardEngine {
     });
   }
 
-  async readBoard(actorIdentity, params = {}, { board: boardInput = null, signal } = {}) {
+  async readBoard(actorIdentity, params = {}, { board: boardInput = null, signal, boardReadDataBudgetBytes } = {}) {
     this.#assertOpen(signal);
     const actor = normalizeConcreteIdentity(actorIdentity);
     const ref = this.#resolveBoardRef(actor, boardInput, params);
@@ -2253,7 +2253,9 @@ export class BoardEngine {
     const enforceResponseByteBudget = params?.max_total_chars === undefined
       || params?.max_total_chars === null
       || maxTotalChars <= this.#limits.defaultReadMaxTotalChars;
-    const maxResponseBytes = this.#limits.defaultReadMaxResponseBytes;
+    const maxResponseBytes = boardReadDataBudgetBytes === undefined
+      ? this.#limits.defaultReadMaxResponseBytes
+      : Math.min(this.#limits.defaultReadMaxResponseBytes, requireInteger(boardReadDataBudgetBytes, "boardReadDataBudgetBytes", 1));
 
     const buildResponse = (postsList, hasMoreFlag) => ({
       board_id: board.board_id,

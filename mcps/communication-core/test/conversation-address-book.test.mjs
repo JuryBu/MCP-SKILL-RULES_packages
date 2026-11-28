@@ -226,3 +226,129 @@ test("the optional machine route view returns only the agreed display fields", c
     "machine_id", "channel", "group_label", "group_id", "account_id", "enabled", "relay_mode",
   ]);
 });
+
+test("shared contacts act as per-caller defaults that each caller can rename without affecting others", context => {
+  const { open } = setup(context);
+  const first = open({ sharedContacts: [{ ...sharedContact, target: remote }] });
+  const actor = principal(recipient);
+  const peer = principal(sibling);
+
+  // Rename shared contact without changing its note: note still dynamically inherits shared default
+  const renamed = first.book.rename(actor, { contact: "协作窗口", alias: "主人专属群" });
+  assert.equal(renamed.scope, "shared");
+  assert.equal(renamed.alias, "主人专属群");
+  assert.equal(renamed.default_alias, "协作窗口");
+  assert.equal(renamed.note, "公共备注");
+  assert.deepEqual(renamed.target, remote);
+
+  // Other callers are completely unaffected; listShared also remains unaffected
+  assert.equal(first.book.list(peer).contacts[0].alias, "协作窗口");
+  assert.ok(!Object.hasOwn(first.book.list(peer).contacts[0], "default_alias"));
+  assert.equal(first.book.listShared().contacts[0].alias, "协作窗口");
+
+  // Renamed shared contact is resolvable by its personal name, supports setNote via new name, and updates display name
+  assert.equal(first.book.resolve(actor, "主人专属群").shared_id, "sample-common");
+  assert.throws(() => first.book.resolve(actor, "协作窗口"), { code: "contact_not_found" });
+  const noted = first.book.setNote(actor, { contact: "主人专属群", note: "改名后备注" });
+  assert.equal(noted.alias, "主人专属群");
+  assert.equal(noted.note, "改名后备注");
+  assert.equal(first.book.resolveDisplayName(recipient, remote), "主人专属群");
+  assert.equal(first.book.resolveDisplayName(sibling, remote), "协作窗口");
+
+  // Old default alias freed by caller's rename can be reused as a personal contact in that caller's own book
+  first.book.saveAddress(actor, { alias: "协作窗口", target: sibling, note: "个人另用旧名" });
+  assert.deepEqual(first.book.resolve(actor, "协作窗口").target, sibling);
+  assert.equal(first.book.resolve(actor, "主人专属群").shared_id, "sample-common");
+
+  // Board alias allocation respects caller's personal alias of shared contacts
+  const board = first.book.saveBoard(actor, { machine_id: peerMachine, board_id: "renamed-clash", baseTitle: "主人专属群" });
+  assert.deepEqual(board, { alias_allocated: true, alias: "主人专属群#2" });
+
+  // Persists across close and reopen
+  first.database.close();
+  const second = open({ sharedContacts: [{ ...sharedContact, target: remote }] });
+  assert.equal(second.book.resolve(actor, "主人专属群").note, "改名后备注");
+  assert.equal(second.book.resolveDisplayName(recipient, remote), "主人专属群");
+  assert.equal(second.book.resolveDisplayName(sibling, remote), "协作窗口");
+
+  // Remove personal entry occupying old name, then remove shared overrides to restore default name & note
+  assert.deepEqual(second.book.remove(actor, "协作窗口"), { removed: true });
+  assert.deepEqual(second.book.remove(actor, "主人专属群"), { removed: true, scope: "shared" });
+  assert.equal(second.book.resolve(actor, "协作窗口").note, "公共备注");
+  assert.ok(!Object.hasOwn(second.book.resolve(actor, "协作窗口"), "default_alias"));
+  assert.equal(second.book.resolveDisplayName(recipient, remote), "协作窗口");
+});
+
+test("rename supports personal contacts, prevents collisions, and keeps resolveDisplayName read-only", context => {
+  const { book, database } = setup(context).open({
+    sharedContacts: [
+      sharedContact,
+      { id: "sample-common-2", alias: "第二共有", note: "", target: remote },
+    ],
+  });
+  const actor = principal(recipient);
+  const outsider = { ...recipient, conversation_id: "sample-fresh-reader" };
+
+  // resolveDisplayName on unseen caller creates zero caller_books rows
+  assert.equal(book.resolveDisplayName(outsider, remote), "第二共有");
+  assert.equal(bookCount(database), 0);
+
+  // Personal rename & note update
+  book.saveAddress(actor, { alias: "旧搭档", target: remote, note: "初备注" });
+  const updated = book.rename(actor, { contact: "旧搭档", alias: "新搭档", note: "新备注" });
+  assert.equal(updated.scope, "personal");
+  assert.equal(updated.alias, "新搭档");
+  assert.equal(updated.note, "新备注");
+  assert.throws(() => book.resolve(actor, "旧搭档"), { code: "contact_not_found" });
+  assert.deepEqual(book.resolve(actor, "新搭档").target, remote);
+
+  // Collisions blocked for both shared and personal renames
+  assert.throws(() => book.rename(actor, { contact: "新搭档", alias: "协作窗口" }), { code: "shared_alias_reserved" });
+  assert.throws(() => book.rename(actor, { contact: "协作窗口", alias: "第二共有" }), { code: "shared_alias_reserved" });
+  assert.throws(() => book.rename(actor, { contact: "协作窗口", alias: "新搭档" }), { code: "contact_alias_conflict" });
+
+  // Renaming shared contact back to its exact default alias cleans the override cleanly
+  book.rename(actor, { contact: "协作窗口", alias: "临时别名" });
+  const restored = book.rename(actor, { contact: "临时别名", alias: "协作窗口" });
+  assert.equal(restored.alias, "协作窗口");
+  assert.ok(!Object.hasOwn(restored, "default_alias"));
+});
+
+test("remove refuses restoring a colliding shared default alias and rename prunes orphaned shared overrides", testContext => {
+  const { book, database } = setup(testContext).open({
+    machineId: "dev",
+    sharedContacts: [
+      { id: "s1", alias: "默认甲", target: { machine_id: "dev", host: "qq", surface: "group", conversation_id: "g1" } },
+      { id: "s2", alias: "默认乙", target: { machine_id: "dev", host: "qq", surface: "group", conversation_id: "g2" } },
+    ],
+  });
+  const actor = principal({ machine_id: "dev", host: "codex", surface: "desktop", conversation_id: "conv-deadlock-guard" });
+
+  // S1 renames "默认甲" -> "临时名", releasing "默认甲"; S2 then claims "默认甲"
+  book.rename(actor, { contact: "默认甲", alias: "临时名" });
+  book.rename(actor, { contact: "默认乙", alias: "默认甲" });
+
+  // Removing "临时名" would restore S1 back to "默认甲" and deadlock both shared entries -> must reject!
+  assert.throws(() => book.remove(actor, "临时名"), error => error.code === "contact_alias_conflict");
+  assert.equal(book.resolve(actor, "临时名").target.conversation_id, "g1");
+  assert.equal(book.resolve(actor, "默认甲").target.conversation_id, "g2");
+
+  // Once S2 moves off "默认甲", removing "临时名" restores S1 cleanly
+  book.rename(actor, { contact: "默认甲", alias: "默认乙" });
+  assert.deepEqual(book.remove(actor, "临时名"), { removed: true, scope: "shared" });
+  assert.equal(book.resolve(actor, "默认甲").target.conversation_id, "g1");
+
+  // Reopen with s2 removed from shared config while an orphaned alias row remains in SQLite
+  book.rename(actor, { contact: "默认乙", alias: "下线占名" });
+  const book2 = new ConversationAddressBook({
+    database,
+    machineId: "dev",
+    sharedContacts: [
+      { id: "s1", alias: "默认甲", target: { machine_id: "dev", host: "qq", surface: "group", conversation_id: "g1" } },
+    ],
+  });
+  // Renaming s1 to "下线占名" must prune the orphaned s2 override instead of throwing SQLITE_CONSTRAINT_UNIQUE
+  const renamed = book2.rename(actor, { contact: "默认甲", alias: "下线占名" });
+  assert.equal(renamed.alias, "下线占名");
+  assert.equal(book2.resolve(actor, "下线占名").target.conversation_id, "g1");
+});

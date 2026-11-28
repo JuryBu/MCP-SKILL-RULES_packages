@@ -32,6 +32,7 @@ export function createDevinSessionClient({
   requestTimeoutMs = 10000,
   limits = {},
   evictSettled = false,
+  allowStdioAcp = false,
   verifyPersisted,
   checkSessionIdle,
 } = {}) {
@@ -39,6 +40,7 @@ export function createDevinSessionClient({
     throw new TypeError('sendLine, connectorId, sessionId and cwd are required');
   }
   if (!Number.isSafeInteger(requestTimeoutMs) || requestTimeoutMs < 1 || requestTimeoutMs > 3600000) throw new TypeError('Invalid requestTimeoutMs');
+  if (typeof allowStdioAcp !== 'boolean') throw new TypeError('Invalid allowStdioAcp');
   if (verifyPersisted !== undefined && typeof verifyPersisted !== 'function') throw new TypeError('Invalid verifyPersisted');
   if (checkSessionIdle !== undefined && typeof checkSessionIdle !== 'function') throw new TypeError('Invalid checkSessionIdle');
   if (!object(limits) || Object.keys(limits).some(key => !(key in DEFAULT_LIMITS))) throw new TypeError('Invalid limits');
@@ -147,16 +149,46 @@ export function createDevinSessionClient({
   function armInFlightGuardIfNeeded(request) {
     if (!open || request.responseReceived || !request.awaitingReply || request.inFlightGuardTimer) return;
     const guardMs = Math.max(requestTimeoutMs, 180000);
-    const guard = setTimeout(() => {
-      pollTimers.delete(guard);
-      request.inFlightGuardTimer = null;
-      request.awaitingReply = false;
-      if (request.method === 'session/prompt') turnActive = false;
-      requests.delete(request.id);
-    }, guardMs);
-    guard.unref?.();
-    request.inFlightGuardTimer = guard;
-    pollTimers.add(guard);
+    const requiresLiveProcessForTurn = allowStdioAcp && !capabilities.daemon;
+    const scheduleGuard = (delayMs) => {
+      if (!open || request.responseReceived || !request.awaitingReply) return;
+      const guard = setTimeout(async () => {
+        pollTimers.delete(guard);
+        request.inFlightGuardTimer = null;
+        if (!open || request.responseReceived || !request.awaitingReply) return;
+        if (requiresLiveProcessForTurn) {
+          const idleElapsed = Date.now() - lastActivityAt;
+          if (idleElapsed < guardMs) {
+            scheduleGuard(Math.max(1000, guardMs - idleElapsed));
+            return;
+          }
+          if (typeof checkSessionIdle === 'function') {
+            try {
+              const status = await checkSessionIdle({ sessionId });
+              if (!open || request.responseReceived || !request.awaitingReply) return;
+              if (status?.idle !== true) {
+                scheduleGuard(guardMs);
+                return;
+              }
+            } catch {
+              if (!open || request.responseReceived || !request.awaitingReply) return;
+              scheduleGuard(guardMs);
+              return;
+            }
+          } else {
+            scheduleGuard(guardMs);
+            return;
+          }
+        }
+        request.awaitingReply = false;
+        if (request.method === 'session/prompt') turnActive = false;
+        requests.delete(request.id);
+      }, delayMs);
+      guard.unref?.();
+      request.inFlightGuardTimer = guard;
+      pollTimers.add(guard);
+    };
+    scheduleGuard(guardMs);
   }
 
   function settle(request, outcome, reason, evidence) {
@@ -361,23 +393,27 @@ export function createDevinSessionClient({
         && object(daemonInfo)
         && Number.isSafeInteger(daemonInfo.protocolVersion)
         && daemonInfo.protocolVersion >= 2;
-      if (result.protocolVersion !== 2 && !isDaemonV2) {
+      const hasResume = object(agent.sessionCapabilities?.resume);
+      const isStdioAcp = allowStdioAcp
+        && !isDaemonV2
+        && (result.protocolVersion === 1 || result.protocolVersion === 2)
+        && (agent.loadSession === true || hasResume);
+      if (result.protocolVersion !== 2 && !isDaemonV2 && !isStdioAcp) {
         settle(request, 'unknown', 'unsupported_initialize_protocol');
         return;
       }
       wireProtocolVersion = result.protocolVersion;
-      protocolVersion = result.protocolVersion === 2 ? 2 : daemonInfo.protocolVersion;
+      protocolVersion = result.protocolVersion === 2 ? 2 : (isDaemonV2 ? daemonInfo.protocolVersion : 2);
       daemonPid = isDaemonV2 && Number.isSafeInteger(daemonInfo.pid) && daemonInfo.pid > 0 ? daemonInfo.pid : null;
       initialized = true;
-      const hasResume = object(agent.sessionCapabilities?.resume);
-      const hasLoad = agent.loadSession === true && isDaemonV2;
+      const hasLoad = agent.loadSession === true && (isDaemonV2 || isStdioAcp);
       capabilities = {
         direct: agent._meta?.['cognition.ai/midTurnPrompts'] === true,
         queue: agent._meta?.['cognition.ai/queuedMessages'] === true,
         resume: hasResume,
         load: hasLoad,
         daemon: isDaemonV2 || agent._meta?.['cognition.ai/daemon'] === true,
-        local_idle_gate: isDaemonV2 && typeof checkSessionIdle === 'function',
+        local_idle_gate: (isDaemonV2 || isStdioAcp) && typeof checkSessionIdle === 'function',
       };
       settle(request, 'accepted', undefined, { kind: 'initialize_ack', rpc_id: request.id, wire_protocol_version: wireProtocolVersion, ...binding() });
     } });
@@ -608,7 +644,9 @@ export function createDevinSessionClient({
       retained_operations: operations.size,
       awaiting_responses: pendingCount(),
       queued_writes: writeQueue.length,
-      can_detach_safely: open && ready && !writerRunning && writeQueue.length === 0 && [...requests.values()].every(r => r.settled && r.outcome === 'accepted'),
+      can_detach_safely: open && ready && !writerRunning && writeQueue.length === 0
+        && (!(allowStdioAcp && !capabilities.daemon) || (!turnActive && pendingCount() === 0))
+        && [...requests.values()].every(r => r.settled && r.outcome === 'accepted'),
       counters: { ...counters },
     };
   }

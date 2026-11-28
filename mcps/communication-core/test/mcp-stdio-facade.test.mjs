@@ -139,12 +139,19 @@ test("the shared contacts facade refuses writes before making a Core connection"
   const files = await fixture(context);
   const mocks = mockClients();
   const facade = await files.facade({ includeContacts: true, ...mocks });
+  const submitted = { host: caller.host, conversation_id: caller.conversation_id };
   const denied = await facade.callTool("communication_contacts", {
-    caller: { host: caller.host, conversation_id: caller.conversation_id },
+    caller: submitted,
     action: "set_note", contact: "共有联系人", note: "共享入口只读",
   });
   assert.equal(errorCode(denied), "caller_unverified");
+  assert.deepEqual(denied.structuredContent.caller, submitted);
   assert.equal(mocks.created.length, 0);
+  const read = await facade.callTool("communication_contacts", { caller: submitted, action: "list" });
+  assert.notEqual(read.isError, true);
+  assert.deepEqual(read.structuredContent.caller, submitted);
+  assert.deepEqual(JSON.parse(read.content[0].text.split("\n")[1]).caller, submitted);
+  assert.equal(mocks.created.length, 1);
 });
 
 test("duplicate files, identities and tokens are rejected rather than selecting the first profile", async context => {

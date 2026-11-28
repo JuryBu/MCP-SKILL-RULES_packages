@@ -16,10 +16,13 @@ import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { CoreError, digest, identityKey, normalizeIdentity } from "../src/contracts.mjs";
 import { ConversationAddressBook } from "../src/conversation-address-book.mjs";
 import { normalizeBoardInvocation } from "../src/board-entry-contract.mjs";
 import { CommunicationCore } from "../src/core.mjs";
+import { createMcpHttpServer } from "../src/mcp-server.mjs";
 import { MessageStore } from "../src/store.mjs";
 import {
   allocateBoardAlias,
@@ -2709,6 +2712,57 @@ test("dissolveBoard enqueues dissolved notifications only for local active membe
   assert.equal(bobNotif.payload.dissolved_by_key, identityKey(ALICE));
   assert.equal(bobNotif.payload.dissolved_by_display, "解散人爱丽丝");
   assert.equal(bobNotif.payload.restorable, true);
+});
+
+test("MCP board read budgets the original submitted caller and preserves pagination and expanded reads", async t => {
+  const { engine, tempDir } = createHarness(t);
+  const caller = { ...ALICE, surface: "s".repeat(64), conversation_id: "bound-" + "\\".repeat(250) };
+  const registered = { id: "synthetic-long-board-reader", token: "synthetic-long-board-reader-token",
+    identity: caller, address_book_identity_bound: true, allowed_targets: [], origin_kinds: ["agent_message"] };
+  const board = { machine_id: DEV_MACHINE, board_id: "mcp-budget-fixture" };
+  const body = "汉🚲".repeat(2000);
+  await engine.invoke({ action: "create", actorIdentity: caller, params: { title: "回执预算测试", board_id: board.board_id } });
+  await engine.invoke({ action: "post", actorIdentity: caller, board, params: { body } });
+  await engine.invoke({ action: "post", actorIdentity: caller, board, params: { body: "后续一页" } });
+  const store = new MessageStore({ filePath: join(tempDir, "mcp-budget.sqlite") });
+  const core = new CommunicationCore({ store, targets: [], principals: [registered], adapters: {} });
+  core.attachAddressBook({ machineId: DEV_MACHINE });
+  core.attachBoardEntry({ invoke: invocation => engine.invoke(invocation), principalIds: [registered.id] });
+  const client = new Client({ name: "synthetic-board-budget-test", version: "1" });
+  let service;
+  try {
+    await core.start();
+    service = await createMcpHttpServer({ core, principals: [registered] });
+    await client.connect(new StreamableHTTPClientTransport(new URL(service.url), {
+      requestInit: { headers: { Authorization: `Bearer ${registered.token}` } },
+    }));
+    async function read(params = {}) {
+      const result = await client.callTool({ name: "communication_board", arguments: { caller, action: "read", board, ...params } });
+      assert.notEqual(result.isError, true, JSON.stringify(result.structuredContent));
+      assert.deepEqual(result.structuredContent.caller, caller);
+      return result;
+    }
+    const first = await read();
+    const serializedBytes = Buffer.byteLength(JSON.stringify(first.structuredContent), "utf8");
+    const textBytes = Buffer.byteLength(first.content[0].text, "utf8");
+    t.diagnostic(`Board read with caller: ${serializedBytes} structured bytes / ${textBytes} text bytes`);
+    assert.ok(serializedBytes < 9216, `board data with caller exceeded 9 KiB: ${serializedBytes}`);
+    assert.ok(textBytes < 9216);
+    assert.equal(first.structuredContent.posts[0].truncated, true);
+    assert.equal(first.structuredContent.posts[0].full_body_chars, [...body].length);
+    assert.equal(first.structuredContent.has_more, true);
+    assert.equal(first.structuredContent.next_after_seq, 1);
+    const second = await read({ after_seq: first.structuredContent.next_after_seq });
+    assert.deepEqual(second.structuredContent.posts.map(post => post.seq), [2]);
+    assert.equal(second.structuredContent.has_more, false);
+    const expanded = await read({ seq: 1, max_total_chars: 16000 });
+    assert.equal(expanded.structuredContent.posts[0].body, body);
+  } finally {
+    await client.close();
+    await service?.close();
+    await core.close();
+    store.close();
+  }
 });
 
 test("read enforces < 9 KiB UTF-8 serialized byte budget on 50 Chinese posts, single giant Chinese post, and multi-file posts", async t => {

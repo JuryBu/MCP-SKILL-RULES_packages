@@ -28,9 +28,22 @@ export const BOARD_SYNC_LIMITS = Object.freeze({
   maxPayloadJsonBytes: 960 * 1024,
   maxBundleAttachments: 63,
   maxBundleTotalBytes: 16 * 1024 * 1024 - 256 * 1024,
-  defaultSyncIntervalMs: 90000,
-  defaultNotifyIntervalMs: 90000,
+  defaultSyncIntervalMs: 15000,
+  defaultNotifyIntervalMs: 15000,
 });
+
+const DEBOUNCED_SYNC_EVENT_KINDS = new Set([
+  "board_created",
+  "post_created",
+  "outbox_enqueued",
+  "members_invited",
+  "member_subscribed",
+  "member_unsubscribed",
+  "settings_updated",
+  "board_settings_updated",
+  "board_restored",
+  "board_deleted",
+]);
 
 const SYSTEM_SYNC_ENDPOINT = "core/system/board_sync";
 const BOARD_ID_RE = /^[a-z0-9][a-z0-9_-]{0,127}$/u;
@@ -479,8 +492,14 @@ export class BoardSyncCoordinator {
   #loopRunning = false;
   #syncTimer = null;
   #notifyTimer = null;
+  #debouncedSyncTimer = null;
+  #debouncedNotifyTimer = null;
   #syncInFlight = null;
   #notifyInFlight = null;
+  #notifyEnabled = false;
+  #notifyPendingRerun = false;
+  #archiveSweepPending = false;
+  #syncPendingRerun = false;
 
   constructor({
     store,
@@ -1164,6 +1183,10 @@ export class BoardSyncCoordinator {
   async syncTick({ peerMachines, signal } = {}) {
     this.#assertOpen();
     if (this.#syncInFlight) return this.#syncInFlight;
+    if (this.#debouncedSyncTimer !== null) {
+      clearTimeout(this.#debouncedSyncTimer);
+      this.#debouncedSyncTimer = null;
+    }
 
     const effectiveSignal = signal
       ? AbortSignal.any([this.#lifecycleAbort.signal, signal])
@@ -1194,6 +1217,10 @@ export class BoardSyncCoordinator {
 
     const promise = run().finally(() => {
       if (this.#syncInFlight === promise) this.#syncInFlight = null;
+      if (this.#syncPendingRerun && !this.#closed && this.#loopRunning) {
+        this.#syncPendingRerun = false;
+        this.scheduleDebouncedSync(50);
+      }
     });
     this.#syncInFlight = promise;
     return promise;
@@ -2272,6 +2299,7 @@ export class BoardSyncCoordinator {
     }
 
     const ackBoards = [];
+    let totalAppliedNewPosts = 0;
 
     for (const incoming of incomingBoards) {
       if (!isPlainObject(incoming) || typeof incoming.board_id !== "string") continue;
@@ -2450,6 +2478,9 @@ export class BoardSyncCoordinator {
               postApplyErrorCode = normalizeErrorCode(applyRes.code ?? "post_not_applied");
               break;
             }
+            if (!applyRes || (applyRes.applied !== false && applyRes.deduplicated !== true)) {
+              totalAppliedNewPosts += 1;
+            }
             if (post.seq === expectedNextSeq) {
               contiguousAckedSeq = post.seq;
             }
@@ -2600,6 +2631,9 @@ export class BoardSyncCoordinator {
 
     const ackPayload = { kind: "board_ack", boards: ackBoards };
     await this.#sendBoardAck(ctx, ackPayload);
+    if (totalAppliedNewPosts > 0) {
+      this.scheduleDebouncedLocalNotify(300);
+    }
     return { ok: true, boards: ackBoards };
   }
 
@@ -3499,6 +3533,9 @@ export class BoardSyncCoordinator {
 
     if (this.#loopRunning) return;
     this.#loopRunning = true;
+    this.#notifyEnabled = effectiveNotifyMs > 0
+      && Boolean(this.#engine)
+      && typeof this.#engine.localNotifyTick === "function";
 
     const hasNotifyTimer = effectiveNotifyMs > 0
       && this.#engine
@@ -3530,33 +3567,103 @@ export class BoardSyncCoordinator {
         this.#notifyTimer = setTimeout(async () => {
           this.#notifyTimer = null;
           if (!this.#loopRunning || this.#closed) return;
-          const runNotify = async () => {
-            if (typeof this.#engine.runAutoArchiveSweep === "function") {
-              await this.#engine.runAutoArchiveSweep();
-            }
-            if (!this.#loopRunning || this.#closed) return;
-            if (typeof this.#engine.localNotifyTick === "function") {
-              await this.#engine.localNotifyTick({ signal: this.#lifecycleAbort.signal });
-            }
-          };
-          const promise = runNotify().catch(error => {
-            if (!this.#closed) this.#onError(error);
-          }).finally(() => {
-            if (this.#notifyInFlight === promise) this.#notifyInFlight = null;
-            scheduleNotify();
-          });
-          this.#notifyInFlight = promise;
-          await promise;
+          await this.#runNotifyCycle({ runArchiveSweep: true });
+          scheduleNotify();
         }, effectiveNotifyMs);
       };
       scheduleNotify();
     }
   }
 
+  #runNotifyCycle({ runArchiveSweep = false } = {}) {
+    if (this.#closed || !this.#loopRunning) return Promise.resolve();
+    if (this.#notifyInFlight) {
+      this.#notifyPendingRerun = true;
+      if (runArchiveSweep) this.#archiveSweepPending = true;
+      return this.#notifyInFlight;
+    }
+    const doSweep = runArchiveSweep || this.#archiveSweepPending;
+    this.#archiveSweepPending = false;
+    const runNotify = async () => {
+      if (doSweep && typeof this.#engine?.runAutoArchiveSweep === "function") {
+        await this.#engine.runAutoArchiveSweep();
+      }
+      if (!this.#loopRunning || this.#closed) return;
+      if (this.#notifyEnabled && typeof this.#engine?.localNotifyTick === "function") {
+        await this.#engine.localNotifyTick({ signal: this.#lifecycleAbort.signal });
+      }
+    };
+    const promise = runNotify().catch(error => {
+      if (!this.#closed) this.#onError(error);
+    }).finally(() => {
+      if (this.#notifyInFlight === promise) this.#notifyInFlight = null;
+      if ((this.#notifyPendingRerun || this.#archiveSweepPending) && !this.#closed && this.#loopRunning) {
+        const needsSweep = this.#archiveSweepPending;
+        this.#notifyPendingRerun = false;
+        if (needsSweep) {
+          void this.#runNotifyCycle({ runArchiveSweep: true });
+        } else if (this.#notifyEnabled) {
+          this.scheduleDebouncedLocalNotify(50);
+        }
+      }
+    });
+    this.#notifyInFlight = promise;
+    return promise;
+  }
+
+  scheduleDebouncedSync(delayMs = 200) {
+    if (this.#closed || !this.#loopRunning) return false;
+    if (this.#syncInFlight) {
+      this.#syncPendingRerun = true;
+      return true;
+    }
+    if (this.#debouncedSyncTimer !== null) return true;
+    const waitMs = Math.max(10, Math.min(5000, Number.isFinite(delayMs) ? Math.floor(delayMs) : 200));
+    this.#debouncedSyncTimer = setTimeout(() => {
+      this.#debouncedSyncTimer = null;
+      if (this.#closed || !this.#loopRunning) return;
+      if (this.#syncInFlight) {
+        this.#syncPendingRerun = true;
+        return;
+      }
+      this.syncTick({ signal: this.#lifecycleAbort.signal }).catch(error => {
+        if (!this.#closed) this.#onError(error);
+      });
+    }, waitMs);
+    return true;
+  }
+
+  scheduleDebouncedLocalNotify(delayMs = 300) {
+    if (
+      this.#closed
+      || !this.#loopRunning
+      || !this.#notifyEnabled
+      || typeof this.#engine?.localNotifyTick !== "function"
+    ) {
+      return false;
+    }
+    if (this.#notifyInFlight) {
+      this.#notifyPendingRerun = true;
+      return true;
+    }
+    if (this.#debouncedNotifyTimer !== null) return true;
+    const waitMs = Math.max(10, Math.min(5000, Number.isFinite(delayMs) ? Math.floor(delayMs) : 300));
+    this.#debouncedNotifyTimer = setTimeout(() => {
+      this.#debouncedNotifyTimer = null;
+      if (this.#closed || !this.#loopRunning || !this.#notifyEnabled) return;
+      void this.#runNotifyCycle({ runArchiveSweep: false });
+    }, waitMs);
+    return true;
+  }
+
   async close() {
     if (this.#closed) return;
     this.#closed = true;
     this.#loopRunning = false;
+    this.#notifyEnabled = false;
+    this.#notifyPendingRerun = false;
+    this.#archiveSweepPending = false;
+    this.#syncPendingRerun = false;
 
     if (this.#syncTimer !== null) {
       clearTimeout(this.#syncTimer);
@@ -3565,6 +3672,14 @@ export class BoardSyncCoordinator {
     if (this.#notifyTimer !== null) {
       clearTimeout(this.#notifyTimer);
       this.#notifyTimer = null;
+    }
+    if (this.#debouncedSyncTimer !== null) {
+      clearTimeout(this.#debouncedSyncTimer);
+      this.#debouncedSyncTimer = null;
+    }
+    if (this.#debouncedNotifyTimer !== null) {
+      clearTimeout(this.#debouncedNotifyTimer);
+      this.#debouncedNotifyTimer = null;
     }
 
     if (!this.#lifecycleAbort.signal.aborted) {
@@ -3728,6 +3843,69 @@ export function openBoardRuntime({
   let sync = null;
   let started = false;
   let closed = false;
+  let localTimer = null;
+  let localDebouncedNotifyTimer = null;
+  let localTickInFlight = null;
+  let localNotifyEnabled = false;
+  let localNotifyPendingRerun = false;
+  let localArchivePending = false;
+  const localAbort = new AbortController();
+
+  const runLocalCycle = ({ runArchive = false, runNotify = false } = {}) => {
+    if (closed || !started || localAbort.signal.aborted) return Promise.resolve();
+    if (localTickInFlight) {
+      if (runNotify && localNotifyEnabled) localNotifyPendingRerun = true;
+      if (runArchive) localArchivePending = true;
+      return localTickInFlight;
+    }
+    const doArchive = runArchive || localArchivePending;
+    const doNotify = (runNotify || localNotifyPendingRerun) && localNotifyEnabled;
+    localArchivePending = false;
+    localNotifyPendingRerun = false;
+    const p = (async () => {
+      if (doArchive && typeof engine?.runAutoArchiveSweep === "function") {
+        await engine.runAutoArchiveSweep();
+      }
+      if (doNotify && !closed && !localAbort.signal.aborted && typeof engine?.localNotifyTick === "function") {
+        await engine.localNotifyTick({ signal: localAbort.signal });
+      }
+    })().catch(err => {
+      if (!closed) onError(err);
+    }).finally(() => {
+      if (localTickInFlight === p) localTickInFlight = null;
+      if (!closed && started && !localAbort.signal.aborted && (localArchivePending || (localNotifyPendingRerun && localNotifyEnabled))) {
+        const nextArchive = localArchivePending;
+        const nextNotify = localNotifyPendingRerun && localNotifyEnabled;
+        localArchivePending = false;
+        localNotifyPendingRerun = false;
+        if (nextArchive) {
+          void runLocalCycle({ runArchive: true, runNotify: nextNotify });
+        } else if (nextNotify) {
+          scheduleLocalDebouncedNotify(50);
+        }
+      }
+    });
+    localTickInFlight = p;
+    return p;
+  };
+
+  const scheduleLocalDebouncedNotify = (delayMs = 300) => {
+    if (closed || !started || !localNotifyEnabled || localAbort.signal.aborted || typeof engine?.localNotifyTick !== "function") {
+      return false;
+    }
+    if (localTickInFlight) {
+      localNotifyPendingRerun = true;
+      return true;
+    }
+    if (localDebouncedNotifyTimer !== null) return true;
+    const waitMs = Math.max(10, Math.min(5000, Number.isFinite(delayMs) ? Math.floor(delayMs) : 300));
+    localDebouncedNotifyTimer = setTimeout(() => {
+      localDebouncedNotifyTimer = null;
+      if (closed || !started || !localNotifyEnabled || localAbort.signal.aborted) return;
+      void runLocalCycle({ runArchive: false, runNotify: true });
+    }, waitMs);
+    return true;
+  };
 
   const handleBoardChanged = event => {
     if (typeof onBoardChanged === "function") {
@@ -3737,8 +3915,9 @@ export function openBoardRuntime({
         onError(error);
       }
     }
-    // 高优手动解散即时触达同步，不干等 90s 周期
-    if (event?.kind === "board_dissolved" && sync && started && !closed && !sync.closed) {
+    if (!started || closed) return;
+    // 高优手动解散即时触达同步，不干等周期
+    if (event?.kind === "board_dissolved" && sync && !sync.closed) {
       Promise.resolve()
         .then(() => {
           if (!closed && sync && !sync.closed) {
@@ -3749,6 +3928,19 @@ export function openBoardRuntime({
         .catch(error => {
           if (!closed) onError(error);
         });
+      return;
+    }
+    // 发帖/客机出站/成员与设置变更等写事件通过短防抖快速推向对端，压低端到端同步耗时
+    if (DEBOUNCED_SYNC_EVENT_KINDS.has(event?.kind) && sync && !sync.closed) {
+      sync.scheduleDebouncedSync(200);
+    }
+    // 新帖落地后在启用通知周期时短防抖提醒本机成员（显式 notifyIntervalMs=0 仍严格禁发）
+    if (event?.kind === "post_created") {
+      if (sync && !sync.closed) {
+        sync.scheduleDebouncedLocalNotify(300);
+      } else if (localNotifyEnabled) {
+        scheduleLocalDebouncedNotify(300);
+      }
     }
   };
 
@@ -3782,10 +3974,6 @@ export function openBoardRuntime({
       })
     : null;
 
-  let localTimer = null;
-  let localTickInFlight = null;
-  const localAbort = new AbortController();
-
   async function start() {
     if (closed || started) return;
     started = true;
@@ -3815,9 +4003,9 @@ export function openBoardRuntime({
     const defaultLocalIntervalMs = Number.isSafeInteger(limits?.defaultNotifyIntervalMs) && limits.defaultNotifyIntervalMs >= 10
       ? limits.defaultNotifyIntervalMs
       : BOARD_SYNC_LIMITS.defaultNotifyIntervalMs;
-    const effectiveNotifyIntervalMs = notifyIntervalMs === undefined || notifyIntervalMs === null
+    const effectiveNotifyIntervalMs = notifyIntervalMs === undefined
       ? defaultLocalIntervalMs
-      : (notifyIntervalMs === 0
+      : (notifyIntervalMs === null || notifyIntervalMs === 0
           ? 0
           : requireInteger(notifyIntervalMs, "notifyIntervalMs", 10, 3600000));
     const effectiveArchiveSweepIntervalMs = archiveSweepIntervalMs === undefined || archiveSweepIntervalMs === null
@@ -3828,6 +4016,7 @@ export function openBoardRuntime({
     const positiveIntervals = [effectiveArchiveSweepIntervalMs, typeof notifyLocalMember === "function" ? effectiveNotifyIntervalMs : 0]
       .filter(v => v > 0);
     const effectiveIntervalMs = positiveIntervals.length > 0 ? Math.min(...positiveIntervals) : 0;
+    localNotifyEnabled = effectiveNotifyIntervalMs > 0 && typeof notifyLocalMember === "function";
 
     if (effectiveIntervalMs > 0) {
       let lastArchiveRunAt = effectiveNow();
@@ -3837,35 +4026,17 @@ export function openBoardRuntime({
         localTimer = setTimeout(async () => {
           localTimer = null;
           if (closed || localAbort.signal.aborted) return;
-          const runLocalTick = async () => {
-            const nowMs = effectiveNow();
-            if (
-              effectiveArchiveSweepIntervalMs > 0
-              && typeof engine.runAutoArchiveSweep === "function"
-              && (effectiveArchiveSweepIntervalMs === effectiveIntervalMs || nowMs - lastArchiveRunAt >= effectiveArchiveSweepIntervalMs)
-            ) {
-              lastArchiveRunAt = nowMs;
-              await engine.runAutoArchiveSweep();
-            }
-            if (
-              effectiveNotifyIntervalMs > 0
-              && typeof notifyLocalMember === "function"
-              && !closed
-              && !localAbort.signal.aborted
-              && (effectiveNotifyIntervalMs === effectiveIntervalMs || nowMs - lastNotifyRunAt >= effectiveNotifyIntervalMs)
-            ) {
-              lastNotifyRunAt = nowMs;
-              await engine.localNotifyTick({ signal: localAbort.signal });
-            }
-          };
-          const p = runLocalTick().catch(err => {
-            if (!closed) onError(err);
-          }).finally(() => {
-            if (localTickInFlight === p) localTickInFlight = null;
-            if (!closed && !localAbort.signal.aborted) scheduleLocalTick();
-          });
-          localTickInFlight = p;
-          await p;
+          const nowMs = effectiveNow();
+          const shouldArchive = effectiveArchiveSweepIntervalMs > 0
+            && typeof engine.runAutoArchiveSweep === "function"
+            && (effectiveArchiveSweepIntervalMs === effectiveIntervalMs || nowMs - lastArchiveRunAt >= effectiveArchiveSweepIntervalMs);
+          const shouldNotify = effectiveNotifyIntervalMs > 0
+            && typeof notifyLocalMember === "function"
+            && (effectiveNotifyIntervalMs === effectiveIntervalMs || nowMs - lastNotifyRunAt >= effectiveNotifyIntervalMs);
+          if (shouldArchive) lastArchiveRunAt = nowMs;
+          if (shouldNotify) lastNotifyRunAt = nowMs;
+          await runLocalCycle({ runArchive: shouldArchive, runNotify: shouldNotify });
+          if (!closed && !localAbort.signal.aborted) scheduleLocalTick();
         }, effectiveIntervalMs);
       };
       scheduleLocalTick();
@@ -3875,9 +4046,16 @@ export function openBoardRuntime({
   async function close() {
     if (closed) return;
     closed = true;
+    localNotifyEnabled = false;
+    localNotifyPendingRerun = false;
+    localArchivePending = false;
     if (localTimer !== null) {
       clearTimeout(localTimer);
       localTimer = null;
+    }
+    if (localDebouncedNotifyTimer !== null) {
+      clearTimeout(localDebouncedNotifyTimer);
+      localDebouncedNotifyTimer = null;
     }
     if (!localAbort.signal.aborted) {
       localAbort.abort(new CoreError("runtime_closed", "交流板运行时已关闭"));

@@ -404,16 +404,14 @@ export async function startLiveFromConfig({ configPath, stateDir, endpointFile, 
   let detachBoard;
   let windowIngress;
   let windowIngressNeedsSync = false;
-  let timer;
   let closing = false;
   let closePromise;
-  let scheduledWork = Promise.resolve();
-  let nextPollAt = Date.now() + 1000;
+  const scheduledLoops = [];
   const report = message => { try { onError(message); } catch {} };
   const close = () => {
     if (closePromise) return closePromise;
     closing = true;
-    clearTimeout(timer);
+    for (const loop of scheduledLoops) clearInterval(loop.timer);
     const boardDrain = detachBoard?.();
     closePromise = Promise.resolve().then(async () => {
       let failed = false;
@@ -428,7 +426,7 @@ export async function startLiveFromConfig({ configPath, stateDir, endpointFile, 
       try { await relayBridge?.close(); } catch { failed = true; }
       const stopped = await Promise.allSettled([Promise.resolve().then(() => statusProvider.close()), Promise.resolve().then(() => core?.close()), Promise.resolve().then(() => http?.close())]);
       if (stopped.some(result => result.status === "rejected")) failed = true;
-      for (const cleanup of [() => scheduledWork, ...[...ownedAdapters].map(adapter => () => adapter.close?.()), ...[...transports].map(transport => () => transport.close()), () => downloadLedger?.close(), () => store?.close()]) {
+      for (const cleanup of [() => Promise.all(scheduledLoops.map(loop => loop.work)), ...[...ownedAdapters].map(adapter => () => adapter.close?.()), ...[...transports].map(transport => () => transport.close()), () => downloadLedger?.close(), () => store?.close()]) {
         try { await cleanup(); } catch { failed = true; }
       }
       if (failed) throw new CoreError("shutdown_failed", "真实测试服务退出清理失败");
@@ -436,30 +434,20 @@ export async function startLiveFromConfig({ configPath, stateDir, endpointFile, 
     });
     return closePromise;
   };
-  const schedule = () => {
-    if (closing) return;
-    timer = setTimeout(() => {
-      if (closing) return;
-      scheduledWork = Promise.resolve().then(async () => {
-        await core.dispatchPending();
-        if (!closing && Date.now() >= nextPollAt) {
-          nextPollAt = Date.now() + 1000;
-          await core.pollReplies();
-          if (!closing && windowIngress) {
-            if (windowIngressNeedsSync) {
-              windowIngressNeedsSync = false;
-              await windowIngress.start();
-            }
-            if (!closing) await windowIngress.poll();
-          }
-        }
+  const schedule = (intervalMs, run) => {
+    const loop = { timer: null, work: null };
+    loop.timer = setInterval(() => {
+      if (closing || loop.work) return;
+      loop.work = Promise.resolve().then(() => {
+        if (!closing) return run();
       }).catch(() => {
         if (closing) return;
-        report("真实测试投递或回信调度异常，正在关闭服务\n");
+        report("真实测试投递、回信或窗口调度异常，正在关闭服务\n");
         void close().catch(() => report("真实测试服务退出清理失败\n"));
-      }).finally(schedule);
-    }, 250);
-    timer.unref();
+      }).finally(() => { loop.work = null; });
+    }, intervalMs);
+    loop.timer.unref();
+    scheduledLoops.push(loop);
   };
   try {
     for (const entry of configuration.adapters) {
@@ -621,7 +609,15 @@ export async function startLiveFromConfig({ configPath, stateDir, endpointFile, 
     http = await createMcpHttpServer({ core, principals: configuration.principals, host: configuration.host, port: configuration.port });
     await lease.setUrl(http.url);
     relayBridge?.start();
-    schedule();
+    schedule(250, () => core.dispatchPending());
+    schedule(1000, () => core.pollReplies());
+    if (windowIngress) schedule(1000, async () => {
+      if (windowIngressNeedsSync) {
+        windowIngressNeedsSync = false;
+        await windowIngress.start();
+      }
+      if (!closing) await windowIngress.poll();
+    });
     return { url: http.url, address: http.address, close, core, ...(windowIngress ? { windowIngress } : {}),
       ...(relayBridge ? { relayDispatcher: relayBridge.dispatcher } : {}) };
   } catch {
