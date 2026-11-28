@@ -421,7 +421,7 @@ test("omitted parameters preserve legacy media buffering and wake generation one
   assert.equal(subject.state.getOwnerRoute("event-route").ownerEventGeneration, undefined);
 });
 
-test("events_only retains target, quote, sender, baseline, self and group mention filtering", async (context) => {
+test("events_only retains target, quote, sender, baseline, self filtering while allowing exact group quotes without mention", async (context) => {
   const subject = fixture(context);
   subject.reply(1);
   await subject.openEvents();
@@ -437,11 +437,13 @@ test("events_only retains target, quote, sender, baseline, self and group mentio
   subject.reply(10, { replyMessageId: "600" }, "owner-group");
   subject.reply(11, { replyMessageId: "600", mentionedUserIds: ["1000000001"] }, "owner-group");
   subject.reply(12, { replyMessageId: "500", mentionedUserIds: ["1000000001"] }, "owner-group");
+  subject.reply(13, { replyMessageId: null, mentionedUserIds: ["1000000001"] }, "owner-group");
   await subject.control.scanOwnerReplies();
   assert.deepEqual(subject.read().events.map((event) => event.message_seq), [7]);
-  assert.deepEqual(subject.read({ route_key: "group-route", conversation_id: "group-chat", original_qq_message_id: "600" }).events.map((event) => event.message_seq), [11]);
+  assert.deepEqual(subject.read({ route_key: "group-route", conversation_id: "group-chat", original_qq_message_id: "600" }).events.map((event) => event.message_seq), [10, 11]);
   for (const sequence of [1, 2, 3, 4, 5]) assert.equal(subject.state.hasSeenControlMessage(`owner:owner-private:${sequence}`), false);
-  assert.equal(subject.state.hasSeenControlMessage("owner:owner-group:10"), false);
+  assert.equal(subject.state.hasSeenControlMessage("owner:owner-group:12"), false);
+  assert.equal(subject.state.hasSeenControlMessage("owner:owner-group:13"), false);
   assertNoLegacyDelivery(subject);
   assertNoLegacyDelivery(subject, subject.state, "group-route");
 });

@@ -679,6 +679,31 @@ export function createControlPlane(options = {}) {
     return { windowTarget: { type, id }, windowSelfId: selfId, windowOwnerSenderAllowlist: allowlist };
   }
 
+  function resolveTrustedGroupOwnerSenders(configuration) {
+    let targets = configuration.targets;
+    if (notifier.bindingPath) {
+      let raw;
+      try {
+        raw = JSON.parse(fs.readFileSync(notifier.bindingPath, "utf8").replace(/^\uFEFF/, ""));
+      } catch {
+        return [];
+      }
+      if (raw.controlPlane?.enabled !== true || String(raw.expectedSelfId).trim() !== configuration.expectedSelfId) {
+        return [];
+      }
+      targets = raw.controlPlane.targets;
+    }
+    const privateIds = [...new Set(
+      Object.entries(configuration.targets ?? {})
+        .filter(([key, entry]) => String(entry?.type ?? "").trim().toLowerCase() === "private"
+          && Object.hasOwn(targets ?? {}, key)
+          && String(targets[key]?.type ?? "").trim().toLowerCase() === "private")
+        .map(([key]) => nativeWindowId(typeof targets[key]?.id === "string" ? targets[key].id.trim() : targets[key]?.id))
+        .filter(Boolean),
+    )].sort();
+    return privateIds.length === 1 ? privateIds : [];
+  }
+
   function requireCurrentWindowPolicy(route, policy = ownerWindowPolicy(route.targetKey)) {
     if (JSON.stringify(route.windowTarget) !== JSON.stringify(policy.windowTarget)
       || route.windowSelfId !== policy.windowSelfId
@@ -840,6 +865,9 @@ export function createControlPlane(options = {}) {
           results.push({ outcome: "owner_window_policy_failed", targetKey, error: publicError(error) });
         }
       }
+      const trustedGroupOwnerSenders = windowPolicy?.windowOwnerSenderAllowlist?.length
+        ? windowPolicy.windowOwnerSenderAllowlist
+        : resolveTrustedGroupOwnerSenders(configuration);
       for (const message of chronologicalMessages(history.messages)) {
         if (message.isSelf) continue;
         const quotedAlert = message.replyMessageId
@@ -875,7 +903,16 @@ export function createControlPlane(options = {}) {
         const route = readyRoutes.find((candidate) => candidate.routeKey === resolvedRouteKey);
         if (!route) continue;
         if (history.target.type === "private" && String(message.senderId) !== String(history.target.id)) continue;
-        if (history.target.type === "group" && !message.mentionedUserIds.includes(configuration.expectedSelfId)) continue;
+        if (history.target.type === "group") {
+          const senderId = String(message.senderId ?? "");
+          const mentionedSelf = Array.isArray(message.mentionedUserIds)
+            && message.mentionedUserIds.includes(configuration.expectedSelfId);
+          if (trustedGroupOwnerSenders.length) {
+            if (!trustedGroupOwnerSenders.includes(senderId)) continue;
+          } else if (route.replyDelivery !== "events_only" && !mentionedSelf) {
+            continue;
+          }
+        }
         const sequence = Number(message.messageSeq);
         if (!Number.isSafeInteger(sequence)) continue;
         const key = messageKey(`owner:${targetKey}`, message);

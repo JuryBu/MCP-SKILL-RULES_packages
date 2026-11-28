@@ -804,10 +804,19 @@ test("owner private and group replies require their configured sender or mention
         {
           isSelf: false,
           replyMessageId: "501",
+          senderId: "9999999999",
+          messageSeq: 19,
+          time: BASE_TIME,
+          text: "unauthorized group sender with mention",
+          mentionedUserIds: ["1000000001"],
+        },
+        {
+          isSelf: false,
+          replyMessageId: "501",
           senderId: PLACEHOLDER_OWNER_PRIVATE_ID,
           messageSeq: 20,
           time: BASE_TIME,
-          text: "missing mention",
+          text: "valid group quote without mention",
           mentionedUserIds: [],
         },
         {
@@ -868,6 +877,7 @@ test("owner private and group replies require their configured sender or mention
       })),
       [
         { outcome: "owner_reply_delivered", routeKey: "private-route", messageSeq: 11 },
+        { outcome: "owner_reply_delivered", routeKey: "group-route", messageSeq: 20 },
         { outcome: "owner_reply_delivered", routeKey: "group-route", messageSeq: 21 },
       ],
     );
@@ -875,16 +885,18 @@ test("owner private and group replies require their configured sender or mention
       fixture.wakeCalls.map((call) => [call.threadId, call.pendingThroughSequence]),
       [
         ["conversation-private", 11],
+        ["conversation-group", 20],
         ["conversation-group", 21],
       ],
     );
     assert.match(fixture.wakeCalls[0].prompt, /valid private reply/);
-    assert.match(fixture.wakeCalls[1].prompt, /valid group reply/);
+    assert.match(fixture.wakeCalls[1].prompt, /valid group quote without mention/);
+    assert.match(fixture.wakeCalls[2].prompt, /valid group reply/);
     assert.equal(fixture.state.getOwnerRoute("private-route").lastInboundMessageSeq, 11);
     assert.equal(fixture.state.getOwnerRoute("group-route").lastInboundMessageSeq, 21);
 
     await fixture.controlPlane.scanOwnerReplies();
-    assert.equal(fixture.wakeCalls.length, 2);
+    assert.equal(fixture.wakeCalls.length, 3);
   } finally {
     fixture.cleanup();
   }
