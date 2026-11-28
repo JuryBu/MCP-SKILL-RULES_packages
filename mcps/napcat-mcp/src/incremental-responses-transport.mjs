@@ -264,7 +264,8 @@ const nonRetryableWsErrorCodes = new Set([
   "WS_ERR_INVALID_CLOSE_CODE", "WS_ERR_INVALID_CONTROL_PAYLOAD_LENGTH",
   "WS_ERR_UNEXPECTED_CONTINUATION_FRAME", "WS_ERR_UNSUPPORTED_MESSAGE_LENGTH",
 ]);
-const safeLocalItemTypes = new Set(["reasoning", "message", "function_call", "custom_tool_call"]);
+const compactionItemTypes = new Set(["compaction", "compaction_trigger", "context_compaction", "compaction_summary"]);
+const safeLocalItemTypes = new Set(["reasoning", "message", "function_call", "custom_tool_call", ...compactionItemTypes]);
 const safeLocalResponseEvents = new Set([
   "response.created", "response.in_progress", "response.queued",
   "response.completed", "response.failed", "response.incomplete",
@@ -318,6 +319,7 @@ function deferrableNativeOutput(event) {
   if (isNativeReasoningProgressEvent(event)
     || /^response\.(?:function_call_arguments|custom_tool_call_input)\.(?:delta|done)$/.test(event.type)) return true;
   if (["response.output_item.added", "response.output_item.done"].includes(event.type)) {
+    if (compactionItemTypes.has(event.item?.type)) return true;
     if (event.type.endsWith(".added") && ["function_call", "custom_tool_call"].includes(event.item?.type)) return true;
     return event.item?.type === "message" && !itemHasOutput(event.item);
   }
@@ -334,7 +336,7 @@ export function nativeEventCommitsOutput(event) {
     const output = event.response?.output;
     if (output === undefined) return false;
     if (!Array.isArray(output)) return true;
-    return output.some(item => item?.type !== "reasoning" && itemHasOutput(item));
+    return output.some(item => item?.type !== "reasoning" && !compactionItemTypes.has(item?.type) && itemHasOutput(item));
   }
   if (protocolControlEvent(event)) return false;
   return !deferrableNativeOutput(event);
@@ -342,7 +344,10 @@ export function nativeEventCommitsOutput(event) {
 
 function discardableInterruptEvent(event) {
   if (reasoningAnchorEvent(event)) return true;
-  if (event.type === "response.output_item.added") return ["message", "function_call", "custom_tool_call"].includes(event.item?.type);
+  if (event.type === "response.output_item.added") {
+    return ["message", "function_call", "custom_tool_call"].includes(event.item?.type)
+      || compactionItemTypes.has(event.item?.type);
+  }
   if (/^response\.(?:output_text|refusal|function_call_arguments|custom_tool_call_input)\.(?:delta|done)$/.test(event.type)) return true;
   return ["response.content_part.added", "response.content_part.done"].includes(event.type)
     && ["output_text", "refusal"].includes(event.part?.type);
@@ -557,6 +562,7 @@ export function createIncrementalResponsesTransport(options = {}) {
     job.onPreparationProgress = null;
     job.onPacketSending = null;
     job.onUploadProgress = null;
+    job.onDrainReconciliationRequired = null;
     job.observeReasoningProgress = null;
     job.packet = null;
     job.warmConsumer = null;
@@ -694,7 +700,9 @@ export function createIncrementalResponsesTransport(options = {}) {
     }
     if (job.drainMode === "interrupt" && job.handoffExtended) {
       if (!interruptConsumer(job)) job.drainDeadline = performance.now();
-    } else if (job.drainMode === "interrupt" && performance.now() >= job.drainDeadline && interruptConsumer(job)) {
+    } else if (job.drainMode === "interrupt" && performance.now() >= job.drainDeadline
+      && (job.outputObserved || (job.record.interruptDiagnostics?.progressFrames ?? 0) > 0)
+      && interruptConsumer(job)) {
       job.handoffExtended = true;
       job.drainDeadline = job.cancelledAt + Math.max(interruptTimeoutMs, interruptHandoffTimeoutMs);
       job.record.interruptDiagnostics.handoffWaitBudgetMs = Math.max(interruptTimeoutMs, interruptHandoffTimeoutMs);
@@ -1284,12 +1292,30 @@ export function createIncrementalResponsesTransport(options = {}) {
     const terminalResponseEvent = ["response.completed", "response.failed", "response.incomplete", "error"].includes(event.type);
     if (responseOutput !== undefined && responseOutput !== null
       && (!Array.isArray(responseOutput)
-        || responseOutput.some(item => !["reasoning", "message"].includes(item?.type)
+        || responseOutput.some(item => !["reasoning", "message"].includes(item?.type) && !compactionItemTypes.has(item?.type)
           && (!["function_call", "custom_tool_call"].includes(item?.type)
             || !["in_progress", "incomplete"].includes(item?.status) || job.visibleOutputCommitted))
         || terminalResponseEvent && event.type !== "response.completed" && !job.atomicUntilVisibleOutput
           && responseOutput.some(item => item?.type === "message" && itemHasOutput(item)))) {
       job.record.recoveryReconciliationRequired = true;
+    }
+    if (job.draining && job.drainMode === "interrupt" && job.record.recoveryReconciliationRequired === true) {
+      job.draining = false;
+      try {
+        job.onDrainReconciliationRequired?.({
+          sessionKey: session.key,
+          turnId: job.turnId,
+          operationId: job.operationId,
+          acceptance: job.record.acceptance,
+        });
+      } catch {}
+      const sameTurnQueued = session.queue.filter(queued => queued.turnId === job.turnId && !queued.settled);
+      for (const queued of sameTurnQueued) {
+        queued.record.localRejection = true;
+        queued.record.recoveryReconciliationRequired = true;
+        settle(queued, "WS_DRAIN_SIDE_EFFECT_RECONCILIATION_REQUIRED");
+      }
+      return failConnection(session, "WS_DRAIN_SIDE_EFFECT_RECONCILIATION_REQUIRED");
     }
     if (event.type.startsWith("response.")) {
       job.record.acceptance = true;
@@ -1406,10 +1432,17 @@ export function createIncrementalResponsesTransport(options = {}) {
         && classifyModelFailure({ source: "sse", statusCode: status, message: event, progressObserved: false }).httpCompatibilityFallback === true) {
         job.record.acceptance = false;
       }
+      const onlyDeferredCompactionOutput = job.atomicUntilVisibleOutput && !job.visibleOutputCommitted
+        && !job.record.recoveryReconciliationRequired
+        && Array.isArray(event.response?.output)
+        && (!event.response.output.length
+          || event.response.output.every(item => compactionItemTypes.has(item?.type) || item?.type === "reasoning"));
       if (event.type === "response.failed" && event.response?.status === "failed"
         && !job.record.prewarmCompatibilityBlocked
-        && event.response.id === packet.establishedResponseId && !job.outputObserved
-        && Array.isArray(event.response.output) && event.response.output.length === 0) {
+        && event.response.id === packet.establishedResponseId
+        && (!job.outputObserved || onlyDeferredCompactionOutput)
+        && Array.isArray(event.response.output)
+        && (event.response.output.length === 0 || onlyDeferredCompactionOutput)) {
         job.record.terminalOutcome = "failed_no_output";
         job.record.terminalEvidence = createModelFailureTerminalEvidence({ operationId: job.operationId,
           attempt: job.record.attempt, generation: session.generation,
@@ -1783,7 +1816,7 @@ export function createIncrementalResponsesTransport(options = {}) {
     }
   }
 
-  function createRequestClient({ sessionKey, turnId, operationId, payload, fullInput, recoveryResponseId, url, headers, onPreparationProgress, onPacketSending, onUploadProgress,
+  function createRequestClient({ sessionKey, turnId, operationId, payload, fullInput, recoveryResponseId, url, headers, onPreparationProgress, onPacketSending, onUploadProgress, onDrainReconciliationRequired,
     retryWithoutOutput = false, nativeWebSocket = false, atomicUntilVisibleOutput = false, allowInterruptedContextRebuild = false, reasoningProgressBudget } = {}) {
     let currentRecord;
     let canonicalRecord;
@@ -1817,7 +1850,8 @@ export function createIncrementalResponsesTransport(options = {}) {
           visibleOutputCommitted: false, deferredOutputBytes: 0, settled: false, bytes: 0, session: null, response: null, timer: null,
           signal: requestOptions.signal, onPreparationProgress: onPreparationProgress ?? options.onPreparationProgress,
           onPacketSending: onPacketSending ?? options.onPacketSending,
-          onUploadProgress: onUploadProgress ?? options.onUploadProgress };
+          onUploadProgress: onUploadProgress ?? options.onUploadProgress,
+          onDrainReconciliationRequired: onDrainReconciliationRequired ?? options.onDrainReconciliationRequired };
         currentRecord = record;
         job.progressBudget?.setLimit(maxSessionBytes);
         pendingJobs.add(job);

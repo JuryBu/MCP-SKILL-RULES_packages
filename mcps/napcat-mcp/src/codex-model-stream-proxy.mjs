@@ -234,6 +234,35 @@ export function isMeaningfulResponsesSseFrame(frame) {
   return parsed.event ? eventPayloadHasContent(parsed.event) : false;
 }
 
+const SAFE_LOCAL_SSE_ITEM_TYPES = new Set([
+  "reasoning", "message", "function_call", "custom_tool_call",
+  ...COMPACTION_CONTROL_TYPES,
+]);
+const SAFE_LOCAL_SSE_RESPONSE_EVENTS = new Set([
+  "response.created", "response.in_progress", "response.queued",
+  "response.completed", "response.failed", "response.incomplete",
+  "response.output_item.added", "response.output_item.done",
+  "response.content_part.added", "response.content_part.done",
+  "response.output_text.delta", "response.output_text.done",
+  "response.refusal.delta", "response.refusal.done",
+  "response.reasoning_text.delta", "response.reasoning_text.done",
+  "response.reasoning_summary_part.added", "response.reasoning_summary_part.done",
+  "response.reasoning_summary_text.delta", "response.reasoning_summary_text.done",
+  "response.function_call_arguments.delta", "response.function_call_arguments.done",
+  "response.custom_tool_call_input.delta", "response.custom_tool_call_input.done",
+  "response.interrupt.accepted", "response.output_item.interrupted",
+]);
+function isNonLocalSseSideEffectEvent(event) {
+  if (!event || typeof event !== "object") return false;
+  if (event.item && typeof event.item === "object" && !SAFE_LOCAL_SSE_ITEM_TYPES.has(event.item.type)) return true;
+  const type = typeof event.type === "string" ? event.type : "";
+  if (type.startsWith("response.") && !SAFE_LOCAL_SSE_RESPONSE_EVENTS.has(type) && !/(?:^|\.)(?:metadata|rate_limits?)$/u.test(type)) return true;
+  if (event.response?.output !== undefined && event.response?.output !== null) {
+    if (!Array.isArray(event.response.output) || event.response.output.some(item => item && !SAFE_LOCAL_SSE_ITEM_TYPES.has(item.type))) return true;
+  }
+  return false;
+}
+
 function isToolEvent(event) {
   if (!event || typeof event !== "object") return false;
   if (isToolResponseItem(event.item)) return true;
@@ -557,6 +586,7 @@ function executeTurnAttempt(options) {
     let sawExecutableToolDone = false;
     let sawCompaction = compactionRequest;
     let sawHostedTool = false;
+    let sawNonLocalSideEffect = false;
     const toolItemTypes = new Set();
     const toolNames = new Set();
     let terminalFailure = null;
@@ -669,7 +699,7 @@ function executeTurnAttempt(options) {
         ...(!sawCompaction ? { ...waitBudget?.snapshot(Date.now()), progressIdentityState: progressTracker.snapshot() } : {}),
         progressObserved: lastProgressAt !== null,
         deliveredResponseCreated,
-        frames, sawContent, sawReplayUnsafeContent, sawSubstantiveWork, sawExecutableToolDone, deliveredExecutableToolDone, holdingToolDone, preparationPending: preparation.active(), sawTool, sawCompaction, sawHostedTool, toolItemTypes: [...toolItemTypes], toolNames: [...toolNames] });
+        frames, sawContent, sawReplayUnsafeContent, sawSubstantiveWork, sawExecutableToolDone, deliveredExecutableToolDone, holdingToolDone, preparationPending: preparation.active(), sawTool, sawCompaction, sawHostedTool, sawNonLocalSideEffect, toolItemTypes: [...toolItemTypes], toolNames: [...toolNames] });
     };
     const abortWith = (reason) => {
       upstreamResponse?.destroy();
@@ -774,6 +804,8 @@ function executeTurnAttempt(options) {
         cancelDownstream();
         return false;
       }
+      const deliveredEvent = parseSseFrame(wire).event;
+      if (deliveredEvent?.type === "response.output_item.done") options.onToolDone?.(deliveredEvent.item);
       ensureSseHead(downstream, upstreamHeaders);
       if (!downstream.write(wire)) {
         waitingForDrain = true;
@@ -784,7 +816,6 @@ function executeTurnAttempt(options) {
         drainTimer.unref?.();
       }
       requestState.downstreamFrames += 1;
-      const deliveredEvent = parseSseFrame(wire).event;
       if (deliveredEvent?.type === "response.created" || deliveredEvent?.response?.id || deliveredEvent?.response_id) {
         deliveredResponseCreated = true;
       }
@@ -1045,6 +1076,7 @@ function executeTurnAttempt(options) {
           armTimer(progressTimeoutMs, "PROGRESS_IDLE_TIMEOUT");
         }
         if (eventHasSubstantiveWork(event)) sawSubstantiveWork = true;
+        if (isNonLocalSseSideEffectEvent(event)) sawNonLocalSideEffect = true;
         if (["function_call", "custom_tool_call", "local_shell_call"].includes(event?.item?.type)
           || /^response\.(?:function_call_arguments|custom_tool_call_input|local_shell_call)\./u.test(type ?? "")) sawLocalTool = true;
         if (isToolEvent(event)) {
@@ -1086,8 +1118,6 @@ function executeTurnAttempt(options) {
           completeFromUpstream(wire);
           return;
         }
-
-        if (type === "response.output_item.done") options.onToolDone?.(event.item);
 
         if (sawCompaction) {
           writeWire(wire);
@@ -1289,8 +1319,9 @@ function executeBufferedCompactionAttempt(options) {
           ? { progressObserved: false, toolDelivered: false } : {}),
         cancelled: outcome.kind === "cancelled",
       });
-      const requiresReconciliation = directHttpReconciliationRequired(outcome, classified, connected,
-        requestTransmissionState, outcome.upstreamTerminalObserved === true);
+      const requiresReconciliation = outcome.kind !== "cancelled"
+        && directHttpReconciliationRequired(outcome, classified, connected,
+          requestTransmissionState, outcome.upstreamTerminalObserved === true);
       const policy = requiresReconciliation ? { ...classified, retryable: false } : classified;
       resolve({ ...outcome, policy, requestTransmissionState, requiresReconciliation,
         elapsedMs: Date.now() - startedAt, failureDiagnostics: diagnostics });
@@ -2374,7 +2405,10 @@ export function createCodexModelStreamProxy(options = {}) {
             payload: inspected.payload, url: incrementalUpstreamUrl.href, headers: websocketHeaders,
             onPreparationProgress: (progress) => requestState.onPreparationProgress?.(progress),
             onPacketSending: (progress) => requestState.onPacketSending?.(progress),
-            onUploadProgress: (progress) => requestState.onUploadProgress?.(progress) }) : null;
+            onUploadProgress: (progress) => requestState.onUploadProgress?.(progress),
+            onDrainReconciliationRequired: () => {
+              if (key) { try { operationLedger?.markUnresolvedReconciliation?.(key, { acceptance: "accepted", reason: "drain_side_effect_observed" }); } catch {} }
+            } }) : null;
         if (upstreamClient) websocketAttempts += 1;
         serverAttempt += 1;
         const transport = upstreamClient ? "websocket" : "http";
@@ -2423,7 +2457,17 @@ export function createCodexModelStreamProxy(options = {}) {
           && !outcome.sawSubstantiveWork && !outcome.sawTool && !outcome.deliveredExecutableToolDone
           && !outcome.sawHostedTool && (!outcome.sawCompaction || compactionRequest && outcome.frames === 0);
         const transportOperation = upstreamClient ? incrementalTransport?.getOperation?.(requestId) : null;
+        const noIrreversibleEffects = !outcome.deliveredExecutableToolDone
+          && !outcome.sawHostedTool
+          && !outcome.sawNonLocalSideEffect
+          && inspected.payload?.store !== true
+          && transportOperation?.recoveryReconciliationRequired !== true;
+        const cancelledWithoutIrreversibleEffects = outcome.kind === "cancelled" && noIrreversibleEffects;
+        const unfinishedCompactionTransient = compactionRequest && noIrreversibleEffects
+          && ["temporary", "acceptance_unknown"].includes(outcome.policy?.category);
         outcome.requiresReconciliation = outcome.kind !== "completed"
+          && !cancelledWithoutIrreversibleEffects
+          && !unfinishedCompactionTransient
           && (outcome.transportReconciliationRequired === true || transportOperation?.requiresReconciliation === true);
          if (outcome.requiresReconciliation) outcome.policy = { ...outcome.policy, retryable: false,
            acceptance: outcome.policy?.acceptance === "accepted" || [true, "accepted"].includes(outcome.transportAcceptance) ? "accepted" : "unknown" };

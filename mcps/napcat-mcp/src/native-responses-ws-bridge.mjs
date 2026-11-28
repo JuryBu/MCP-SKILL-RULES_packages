@@ -157,7 +157,10 @@ function nativeFailureNotice(error) {
 
 const unresolvedNativeNotice = "上游是否完成仍待核实，已保留已有信息和操作记录，未自动重发。";
 const executableNativeTools = new Set(["function_call", "custom_tool_call"]);
-const safeLocalBridgeItemTypes = new Set(["reasoning", "message", "function_call", "custom_tool_call"]);
+const safeLocalBridgeItemTypes = new Set([
+  "reasoning", "message", "function_call", "custom_tool_call",
+  "compaction", "compaction_trigger", "context_compaction", "compaction_summary",
+]);
 const safeLocalBridgeResponseEvents = new Set([
   "response.created", "response.in_progress", "response.queued",
   "response.completed", "response.failed", "response.incomplete",
@@ -186,6 +189,11 @@ function safeForClientTextContinuation(job, operation) {
     && !job.sawNonLocalSideEffect && job.storeRequested !== true
     && job.protocolProgress?.deliveredText === true);
 }
+function safeForClientCancellation(job, operation) {
+  return Boolean(job && operation?.recoveryReconciliationRequired !== true
+    && !job.deliveredExecutableToolDone && !job.unrecordedExecutableTool
+    && !job.sawNonLocalSideEffect && job.storeRequested !== true);
+}
 
 function recordedNativeToolFingerprint(item) {
   if (!executableNativeTools.has(item?.type) || typeof item.id !== "string" || !item.id
@@ -211,9 +219,12 @@ function confirmedNativeToolContinuation(job, event) {
   return job.recordedNativeTools.size > 0 && [...job.deliveredItems.values()].every(hasProof) && event.response.output.every(hasProof);
 }
 
-function nativePendingDisposition(operation, job = null) {
+function nativePendingDisposition(operation, job = null, { cancelled = false } = {}) {
   if (operation?.requiresReconciliation !== true) return null;
   if (safeForClientTextContinuation(job, operation)) {
+    return null;
+  }
+  if (cancelled && safeForClientCancellation(job, operation)) {
     return null;
   }
   const accepted = [true, "accepted"].includes(operation.acceptance);
@@ -704,7 +715,7 @@ export function attachNativeResponsesBridge({ server, createRequestClient, relea
       const recoveryState = (job, phase, fields = {}) => {
         job.recoveryPhase = phase;
         job.recoveryWait = { type: "model_recovery_state", requestId: job.operationId, operationId: job.operationId,
-          threadId: job.metadata.thread_id, turnId: job.metadata.turn_id, requestKind: "turn",
+          threadId: job.metadata.thread_id, turnId: job.metadata.turn_id, requestKind: job.metadata?.request_kind ?? "turn",
           sequence: ++job.recoverySequence, phase, reason: job.recoveryReason, willRetry: false,
           canContinueHttp: false, transport: job.httpFallback ? "http" : "ws", ...fields };
         try { onRecoveryState({ ...job.recoveryWait }); }
@@ -747,8 +758,9 @@ export function attachNativeResponsesBridge({ server, createRequestClient, relea
         if (!job || job.released) return;
         clientKeepalive.stop();
         job.released = true;
+        const cancelled = outcome.kind === "cancelled";
         const protect = outcome.kind !== "completed" && !outcome.confirmedUpstreamTerminal;
-        const beforeAbort = protect ? pendingReconciliation(job, outcome.userRequested) : null;
+        const beforeAbort = protect ? pendingReconciliation(job, outcome.userRequested, cancelled) : null;
         job.outcome = { ...outcome, ...beforeAbort };
         job.cancelled = true;
         job.currentAbort?.();
@@ -757,7 +769,7 @@ export function attachNativeResponsesBridge({ server, createRequestClient, relea
         clearInterval(job.resumeTimer);
         job.resumeTimer = null;
         job.response?.resume();
-        if (protect && !beforeAbort) Object.assign(job.outcome, pendingReconciliation(job, outcome.userRequested));
+        if (protect && !beforeAbort) Object.assign(job.outcome, pendingReconciliation(job, outcome.userRequested, cancelled));
         job.readHttpTransmissionState = null;
         const settlementError = settle(job);
         job.admissionLease?.release();
@@ -861,26 +873,39 @@ export function attachNativeResponsesBridge({ server, createRequestClient, relea
           && !job.deliveredExecutableToolDone && job.deliveredItems.size === 0 && failureWithoutOutput && !outcome.progressObserved
           && outcome.transportRetryWithoutOutput !== false && outcome.transportReconciliationRequired !== true
           && !outcome.deliveredExecutableToolDone && outcome.failure?.category !== "capacity";
-        const unresolvedHttpOutput = outcome.transportReconciliationRequired === true || outcome.kind !== "completed"
-          && (outcome.progressObserved || outcome.sawSubstantiveWork || outcome.sawTool || outcome.deliveredExecutableToolDone);
+        const cancelledCleanHttp = outcome.kind === "cancelled" && !outcome.sawNonLocalSideEffect
+          && !outcome.sawHostedTool && !outcome.deliveredExecutableToolDone
+          && !outcome.sawExecutableToolDone && !outcome.holdingToolDone && job.storeRequested !== true;
+        const compactionHttpTransient = job.compacting && outcome.kind !== "completed"
+          && ["temporary", "acceptance_unknown"].includes(outcome.policy?.category)
+          && !outcome.sawNonLocalSideEffect && !outcome.sawHostedTool && !outcome.sawTool
+          && !outcome.deliveredExecutableToolDone && !outcome.sawExecutableToolDone
+          && !outcome.holdingToolDone && job.storeRequested !== true;
+        const unresolvedHttpOutput = !cancelledCleanHttp && !compactionHttpTransient
+          && (outcome.transportReconciliationRequired === true || outcome.kind !== "completed"
+            && (outcome.progressObserved || outcome.sawSubstantiveWork || outcome.sawTool || outcome.deliveredExecutableToolDone));
         const canRetry = !unresolvedHttpOutput && outcome.policy?.retryable === true && !outcome.localRejection && !outcome.sawReplayUnsafeContent
           && !outcome.sawSubstantiveWork && !outcome.sawTool && !outcome.sawExecutableToolDone
-          && !outcome.sawHostedTool && (!outcome.sawCompaction || sourceCompactionReplay);
-        return { canRetry, sourceCompactionReplay: canRetry && sourceCompactionReplay,
-          requiresReconciliation: unresolvedHttpOutput || !canRetry && outcome.policy?.acceptance === "unknown",
-          recoveryReconciliationRequired: Boolean(outcome.transportReconciliationRequired || outcome.sawHostedTool
-            || outcome.sawTool || outcome.sawExecutableToolDone || outcome.holdingToolDone || outcome.sawCompaction),
+          && !outcome.sawHostedTool && !outcome.sawNonLocalSideEffect
+          && (!outcome.sawCompaction || sourceCompactionReplay || compactionHttpTransient);
+        return { canRetry, sourceCompactionReplay: canRetry && (sourceCompactionReplay || compactionHttpTransient),
+          requiresReconciliation: !cancelledCleanHttp && !compactionHttpTransient
+            && (unresolvedHttpOutput || !canRetry && outcome.policy?.acceptance === "unknown"),
+          recoveryReconciliationRequired: cancelledCleanHttp || compactionHttpTransient ? false
+            : Boolean(outcome.transportReconciliationRequired || outcome.sawNonLocalSideEffect || outcome.sawHostedTool
+              || outcome.sawTool || outcome.sawExecutableToolDone || outcome.holdingToolDone || outcome.sawCompaction),
           acceptance: outcome.policy?.acceptance === "rejected" || outcome.policy?.acceptance === "not_sent" ? false
             : outcome.policy?.acceptance === "accepted" ? true : "unknown",
           requestTransmissionState: outcome.requestTransmissionState, terminalOutcome: outcome.kind === "completed" ? "completed" : undefined };
       };
-      const pendingReconciliation = (job, userRequested = false) => {
+      const pendingReconciliation = (job, userRequested = false, cancelled = false) => {
         if (!job.started || !job.context?.key) return null;
         try {
-          const observed = nativePendingDisposition(operationFor(job), job) ?? job.nativeReconciliationEvidence ?? null;
+          const observed = nativePendingDisposition(operationFor(job), job, { cancelled }) ?? job.nativeReconciliationEvidence ?? null;
           if (observed || userRequested === true || !job.httpFallback || job.httpOutcome) return observed;
+          if (cancelled && safeForClientCancellation(job, { recoveryReconciliationRequired: false })) return null;
           return nativePendingDisposition({ requiresReconciliation: true, recoveryReconciliationRequired: true, acceptance: "unknown",
-            requestTransmissionState: job.readHttpTransmissionState?.() }, job);
+            requestTransmissionState: job.readHttpTransmissionState?.() }, job, { cancelled });
         } catch { return job.nativeReconciliationEvidence ?? null; }
       };
       const fail = (job, error, capacity) => {
@@ -892,7 +917,9 @@ export function attachNativeResponsesBridge({ server, createRequestClient, relea
           failureOperation = capacity?.operation
             ?? (!job.httpFallback && attempt?.operationId === job.operationId ? attempt : operationFor(job));
         } catch {}
-        job.nativeReconciliationEvidence ??= nativePendingDisposition(failureOperation, job);
+        job.nativeReconciliationEvidence ??= nativePendingDisposition(failureOperation, job, {
+          cancelled: Boolean(job.cancelled || job.interruptResponseId),
+        });
         const failureDiagnostics = nativeWsFailureDiagnostics(job, error, failureOperation);
         emit("native_ws_failure_diagnostic", { operationId: job.operationId,
           ...failureDiagnostics });
@@ -976,14 +1003,19 @@ export function attachNativeResponsesBridge({ server, createRequestClient, relea
           && failureOperation.nativePreviousResponseMismatch.connectionOpen === false
           && failureOperation.nativePreviousResponseMismatch.lastResetWasIdle === true;
         const managedCapacity = capacity && managedRecovery && job.ordinaryTurn && !internalJob(job) && !job.httpFallback;
+        const compactionNativeRetry = job.compacting && !job.httpFallback && !internalJob(job)
+          && failureOperation?.retryableWithoutDelivery === true
+          && !nativeWsCapacityFailure(error)
+          && ["temporary", "acceptance_unknown"].includes(recoveryPolicy.category)
+          && recoveryPolicy.retryable === true;
         const operation = managedCapacity ? failureOperation : managedRecovery && job.started && job.generating
-          && (!job.compacting || failureOperation?.sourceCompactionReplay === true) && !idleContextLoss
+          && (!job.compacting || failureOperation?.sourceCompactionReplay === true || compactionNativeRetry) && !idleContextLoss
           && !job.context?.internalMemory && !job.context?.internalMemoryPrewarm
           && job.metadata?.thread_id && job.metadata?.turn_id
           && (job.fullInput || job.replayableSource && !job.replayableSource.requestBody.released)
           && !job.progressObserved && !job.deliveredExecutableToolDone && !job.interruptResponseId
           && (job.httpFallback ? failureOperation?.canRetry
-            : recoveryAction === "retry_request" && !nativeWsCapacityFailure(error)) ? failureOperation : null;
+            : (recoveryAction === "retry_request" || compactionNativeRetry) && !nativeWsCapacityFailure(error)) ? failureOperation : null;
         if (operation) {
           job.recoveryStartedAt ??= Date.now();
           job.managedWaiting = true;
@@ -1055,7 +1087,11 @@ export function attachNativeResponsesBridge({ server, createRequestClient, relea
           job.request?.destroy();
           return;
         }
-        if (job.attemptStarted !== null) retryGate.record({ metadata: job.metadata, error, elapsedMs: performance.now() - job.attemptStarted });
+        const skipCompactionFastRestartCooldown = job.compacting && failureOperation?.retryableWithoutDelivery === true
+          && error?.closeCode === 1012;
+        if (job.attemptStarted !== null && !skipCompactionFastRestartCooldown) {
+          retryGate.record({ metadata: job.metadata, error, elapsedMs: performance.now() - job.attemptStarted });
+        }
         const persistenceError = release(job, { kind: "failed", error });
         emit("native_ws_request_failed", { operationId: job.operationId, code: error?.code ?? "NATIVE_WS_UPSTREAM_ERROR" });
         closeFailedPeer(peer, persistenceError ?? error);
@@ -1191,7 +1227,7 @@ export function attachNativeResponsesBridge({ server, createRequestClient, relea
           const unrelatedControl = ordinaryNative && !matchesActive;
           if (waitingNative && matchesActive && payload.mode === "discard_partial_items") {
             const job = active;
-            if (pendingReconciliation(job)) {
+            if (pendingReconciliation(job, false, true)) {
               finishNotice(job, null, unresolvedNativeNotice, job.fullInput, "native_ws_terminal_notice");
               job.request?.destroy();
               return;
@@ -1608,6 +1644,19 @@ export function attachNativeResponsesBridge({ server, createRequestClient, relea
                     finishNotice(job, event, nativeFailureNotice(event), fullInput,
                       category === "quota" ? "native_ws_quota_stopped" : "native_ws_terminal_notice", { category });
                     return;
+                  }
+                  if (!acknowledgedInterrupt && !observedIncomplete && event.type !== "response.completed"
+                    && job.generating && job.compacting && managedRecovery && !internalJob(job) && !job.httpFallback
+                    && !job.progressObserved && !job.deliveredExecutableToolDone && !job.interruptResponseId
+                    && terminalOperation?.retryableWithoutDelivery === true) {
+                    const category = classifyModelFailure({ source: "sse", message: event }).category;
+                    if (["temporary", "acceptance_unknown"].includes(category) && !nativeWsCapacityFailure(event)) {
+                      const upstreamError = event.response?.error ?? event.error ?? {};
+                      fail(job, { code: upstreamError.code ?? upstreamError.type ?? "NATIVE_WS_UPSTREAM_ERROR",
+                        httpStatus: nativeWsHttpStatus(event) ?? nativeWsHttpStatus(upstreamError) ?? nativeWsHttpStatus(event.response),
+                        upstreamError, upstreamFailureSignals: event });
+                      return;
+                    }
                   }
                   job.terminal = true;
                   if ((event.type === "response.completed" || acknowledgedInterrupt) && fullInput

@@ -40,7 +40,7 @@ const CODE_GROUPS = [
   ["transport_capacity", false, false, ["session_limit", "operation_limit"]],
   ["permanent", true, false, ["invalid_request_error", "invalid_request", "invalid_argument", "context_length_exceeded", "model_not_found", "unsupported_parameter", "unsupported_value"]],
   ["temporary", true, false, ["rate_limit_exceeded", "rate_limit_error", "too_many_requests", "overloaded_error", "engine_overloaded", "server_is_overloaded", "server_overloaded", "model_at_capacity"]],
-  ["temporary", false, false, GENERIC_TEMPORARY_SERVER_CODES],
+  ["temporary", false, false, [...GENERIC_TEMPORARY_SERVER_CODES, "internal_error", "flex_unavailable", "slow_down", "timeout", "bad_gateway", "gateway_timeout"]],
   ["temporary", true, true, ["websocket_connection_limit_reached"]],
   ["temporary", false, true, ["econnreset", "econnrefused", "econnaborted", "etimedout", "enotfound", "eai_again", "enetunreach", "ehostunreach", "epipe", "err_network", "err_socket_closed", "err_stream_premature_close", "err_tls_handshake_timeout", "und_err_connect_timeout", "und_err_headers_timeout", "und_err_body_timeout", "und_err_socket", "fetch_failed", "connection_failed", "ws_connection_error", "ws_connect_timeout", "ws_connection_closed", "ws_send_error", "ws_terminal_timeout",
     "first_progress_timeout", "progress_idle_timeout", "upstream_idle_timeout", "ws_prewarm_timeout",

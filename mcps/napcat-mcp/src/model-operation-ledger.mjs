@@ -354,10 +354,11 @@ export function createModelOperationLedger({ state, onStateChange, onExpired, ma
       if (!entries.has(hash)) return;
       if (outcome.localRejection && entries.get(hash).phase !== "submitting") return;
       const acceptance = outcome.policy?.acceptance ?? "unknown";
-      const replayableWithoutTool = outcome.kind === "cancelled" || outcome.policy?.retryable === true
-        || (["temporary", "acceptance_unknown"].includes(outcome.policy?.category)
-          && !outcome.deliveredExecutableToolDone && !outcome.sawCompaction);
-      const requiresReconciliation = entries.get(hash).requiresReconciliation === true
+      const currentEntry = entries.get(hash);
+      const hasRecordedTools = Boolean(outcome.deliveredExecutableToolDone || currentEntry?.continuation?.tools?.length);
+      const replayableWithoutTool = (outcome.kind === "cancelled" && !hasRecordedTools) || outcome.policy?.retryable === true
+        || (["temporary", "acceptance_unknown"].includes(outcome.policy?.category) && !hasRecordedTools);
+      const requiresReconciliation = currentEntry.requiresReconciliation === true
         || outcome.requiresReconciliation === true && ["accepted", "unknown"].includes(acceptance);
       if (!requiresReconciliation && (outcome.localRejection || outcome.kind === "completed" || ["rejected", "not_sent"].includes(acceptance)
         || outcome.policy?.terminalOutcome === "failed_no_output" || replayableWithoutTool)) {
@@ -406,6 +407,31 @@ export function createModelOperationLedger({ state, onStateChange, onExpired, ma
       }
       entries.set(hash, unresolved);
       try { save(); } catch (error) { error.requestAccepted = acceptance; throw error; }
+    },
+    markUnresolvedReconciliation(key, { acceptance = "accepted", reason = "drain_side_effect_observed" } = {}) {
+      if (typeof key !== "string" || !key) return false;
+      const hash = operationHash(key);
+      const previous = entries.get(hash);
+      const threadPart = key.split("\u0000")[0];
+      const threadHash = previous?.threadHash ?? (threadPart ? operationHash(threadPart) : undefined);
+      const proof = previous?.reconciliationProof ?? previous?.continuation;
+      const normalizedAcceptance = acceptance === "accepted" ? "accepted" : "unknown";
+      const unresolved = {
+        phase: "unresolved",
+        acceptance: normalizedAcceptance,
+        reason: validReason(reason) ? reason : "drain_side_effect_observed",
+        updatedAt: now(),
+        requiresReconciliation: true,
+        ...(threadHash ? { threadHash } : {}),
+        ...(proof ? { reconciliationProof: clone(proof) } : {}),
+      };
+      entries.set(hash, unresolved);
+      try { save(); } catch (error) {
+        if (previous) entries.set(hash, previous); else entries.delete(hash);
+        error.requestAccepted = normalizedAcceptance;
+        throw error;
+      }
+      return true;
     },
     exportThread(threadId) {
       if ([...entries.values()].some(entry => !entry.threadHash)) {
