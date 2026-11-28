@@ -22,7 +22,7 @@ import { restrictBoardRelayDispatcher } from "../src/board-entry-contract.mjs";
 const root = fileURLToPath(new URL("../", import.meta.url));
 const mockFactories = { antigravity: () => new MockAdapter() };
 
-test("isolated live launch loads its machine book; the real shared facade leaves personal contacts private", async context => {
+test("isolated live launch shares each caller's personal book across direct and local shared host facade, while keeping disabled entries read-only", async context => {
   const value = configuration();
   const files = await fixture(context, value);
   const endpointFile = join(files.directory, "fixture-endpoint.json");
@@ -30,6 +30,17 @@ test("isolated live launch loads its machine book; the real shared facade leaves
   value.multi_recipient_enabled = true;
   value.principals[0].address_book_identity_bound = true;
   const identity = { ...value.principals[0].identity, surface: "desktop" };
+  const hostScope = { machine_id: identity.machine_id, host: identity.host, surface: identity.surface };
+  const sharedHostPrincipal = {
+    ...value.principals[0], id: "fixture-live-shared-host", token: "fixture-live-shared-host-token",
+    identity: { ...hostScope, conversation_id: "*" }, caller_scope: hostScope,
+  };
+  delete sharedHostPrincipal.address_book_identity_bound;
+  const disabledHostPrincipal = {
+    ...sharedHostPrincipal, id: "fixture-live-disabled-host", token: "fixture-live-disabled-host-token",
+    address_book_identity_bound: false,
+  };
+  value.principals.push(sharedHostPrincipal, disabledHostPrincipal);
   const caller = { host: identity.host, conversation_id: identity.conversation_id };
   const configured = value.targets[0];
   const target = { machine_id: configured.machine_id, host: configured.host, surface: configured.surface, conversation_id: configured.conversation_id };
@@ -52,14 +63,27 @@ test("isolated live launch loads its machine book; the real shared facade leaves
 
   const profile = join(files.directory, "fixture-connection.json");
   const registry = join(files.directory, "fixture-registry.json");
-  await writeFile(profile, JSON.stringify({ endpoint_file: endpointFile, identity, token: value.principals[0].token }), "utf8");
+  await writeFile(profile, JSON.stringify({ endpoint_file: endpointFile, identity: sharedHostPrincipal.identity, caller_scope: hostScope, token: sharedHostPrincipal.token }), "utf8");
   await writeFile(registry, JSON.stringify({ version: 1, connections: [{ connection_file: profile }] }), "utf8");
   const facade = await createMcpStdioFacade({ registryFile: registry, includeContacts: true, includeMultiRecipient: true });
   files.cleanup(() => facade.close());
   const visible = await facade.callTool("communication_contacts", { caller, action: "list" });
-  assert.deepEqual(visible.structuredContent?.contacts.map(entry => entry.alias), ["共有"]);
-  const denied = await facade.callTool("communication_contacts", { caller, action: "set_note", contact: "共有", note: "不得覆盖" });
+  assert.deepEqual(visible.structuredContent?.contacts.map(entry => entry.alias), ["共有", "个人"]);
+  assert.deepEqual(visible.structuredContent?.caller, caller);
+  const updated = await facade.callTool("communication_contacts", { caller, action: "set_note", contact: "共有", note: "共享入口可写个人备注" });
+  assert.notEqual(updated.isError, true);
+  assert.deepEqual(updated.structuredContent?.caller, caller);
+  assert.equal((await direct.callTool({ name: "communication_contacts", arguments: { caller, action: "get", contact: "共有" } })).structuredContent?.note, "共享入口可写个人备注");
+
+  // Explicitly disabled principal still remains read-only
+  const disabledClient = new Client({ name: "fixture-disabled-host", version: "1.0.0" });
+  files.cleanup(() => disabledClient.close());
+  await disabledClient.connect(new StreamableHTTPClientTransport(new URL(service.url), {
+    requestInit: { headers: { Authorization: `Bearer ${disabledHostPrincipal.token}` } },
+  }));
+  const denied = await disabledClient.callTool({ name: "communication_contacts", arguments: { caller, action: "set_note", contact: "共有", note: "不得覆盖" } });
   assert.equal(denied.structuredContent?.error?.code, "caller_unverified");
+
   const grouped = await facade.callTool("communication_send_message", { caller, targets: [{ contact: "共有" }], text: "真实隔离门面群发",
     dedupe_key: "fixture-live-one-recipient-batch" });
   assert.notEqual(grouped.isError, true, JSON.stringify(grouped.structuredContent));
@@ -239,6 +263,87 @@ test("board retries and incoming events consult the narrower board and attachmen
   assert.equal((await scoped.dispatchCustomOp({ ...request, attachments: [] })).status, "accepted");
   unregister();
   assert.equal(connected.has("board_delta"), false);
+});
+
+test("live board runtime allows authorized local shared host scope to open an existing board while rejecting external channel principals", async context => {
+  const { files, principal, identity, caller } = await prepareBoardFixture(context);
+  const hostScope = { machine_id: identity.machine_id, host: identity.host, surface: identity.surface };
+  const sharedHostPrincipal = {
+    ...principal, id: "fixture-board-shared-host", token: "fixture-board-shared-host-token",
+    identity: { ...hostScope, conversation_id: "*" }, caller_scope: hostScope,
+  };
+  delete sharedHostPrincipal.address_book_identity_bound;
+  const qqChannelPrincipal = {
+    id: "fixture-board-qq-channel", token: "fixture-board-qq-channel-token",
+    identity: { machine_id: identity.machine_id, host: "qq", surface: "group", conversation_id: "fixture-qq-group" },
+    allowed_targets: [], origin_kinds: ["human_message"], channel_component: "napcat_owner",
+  };
+  const githubScopePrincipal = {
+    id: "fixture-board-github-scope", token: "fixture-board-github-scope-token",
+    identity: { machine_id: identity.machine_id, host: "github", surface: "webhook", conversation_id: "*" },
+    caller_scope: { machine_id: identity.machine_id, host: "github", surface: "webhook" },
+    allowed_targets: [], origin_kinds: ["agent_message"],
+  };
+  files.value.principals.push(sharedHostPrincipal, qqChannelPrincipal, githubScopePrincipal);
+  await writeFile(files.configPath, JSON.stringify(files.value), "utf8");
+  const endpointFile = join(files.directory, "fixture-shared-board-endpoint.json");
+
+  // External QQ channel and non-model host (e.g. github) principals must be rejected at startup
+  for (const badId of [qqChannelPrincipal.id, githubScopePrincipal.id]) {
+    await assert.rejects(startLiveFromConfig({
+      ...files, factories: mockFactories,
+      boards: { enabled: true, principalIds: [badId], notifyIntervalMs: 0 },
+    }), { code: "invalid_config" });
+  }
+
+  // Start real live board runtime granting both dedicated and local shared host principals
+  const service = await startLiveService({ ...files, endpointFile }, {
+    startRuntime: options => startLiveFromConfig({
+      ...options, factories: mockFactories,
+      boards: { enabled: true, principalIds: [principal.id, sharedHostPrincipal.id], notifyIntervalMs: 0 },
+    }),
+  });
+  files.cleanup(() => service.close());
+
+  // 1) Pre-create an existing board and post via dedicated principal
+  const direct = new Client({ name: "fixture-direct-board-seed", version: "1.0.0" });
+  files.cleanup(() => direct.close());
+  await direct.connect(new StreamableHTTPClientTransport(new URL(service.url), {
+    requestInit: { headers: { Authorization: "Bearer " + principal.token } },
+  }));
+  const created = await direct.callTool({ name: "communication_board", arguments: { caller, action: "create", title: "现役既有交流板" } });
+  assert.notEqual(created.isError, true, JSON.stringify(created.structuredContent));
+  const boardId = created.structuredContent.board_id;
+  await direct.callTool({ name: "communication_board", arguments: { caller, action: "post", board: { board_id: boardId }, body: "已有首帖内容" } });
+
+  // 2) Connect through real shared stdio facade using ONLY the host-scoped connection (no per-conversation card)
+  const profile = join(files.directory, "fixture-shared-board-conn.json");
+  const registry = join(files.directory, "fixture-shared-board-reg.json");
+  await writeFile(profile, JSON.stringify({ endpoint_file: endpointFile, identity: sharedHostPrincipal.identity, caller_scope: hostScope, token: sharedHostPrincipal.token }), "utf8");
+  await writeFile(registry, JSON.stringify({ version: 1, connections: [{ connection_file: profile }] }), "utf8");
+  const facade = await createMcpStdioFacade({ registryFile: registry, includeContacts: true, includeBoard: true });
+  files.cleanup(() => facade.close());
+
+  const readExisting = await facade.callTool("communication_board", { caller, action: "read", board: { contact: "现役既有交流板" } });
+  assert.notEqual(readExisting.isError, true, JSON.stringify(readExisting.structuredContent));
+  assert.equal(readExisting.structuredContent.posts[0].body, "已有首帖内容");
+  assert.deepEqual(readExisting.structuredContent.caller, caller);
+  const posted = await facade.callTool("communication_board", { caller, action: "post", board: { contact: "现役既有交流板" }, body: "普通入口补发第二帖" });
+  assert.notEqual(posted.isError, true, JSON.stringify(posted.structuredContent));
+  assert.equal(posted.structuredContent.seq, 2);
+  assert.deepEqual(posted.structuredContent.caller, caller);
+
+  // 3) Impersonating another host or calling as non-member fails closed with exact submitted caller echoed
+  const nonMemberCaller = { host: identity.host, conversation_id: "fixture-uninvited-conv" };
+  const deniedRead = await facade.callTool("communication_board", { caller: nonMemberCaller, action: "read", board: { board_id: boardId } });
+  assert.equal(deniedRead.isError, true);
+  assert.equal(deniedRead.structuredContent?.error?.code, "forbidden");
+  assert.deepEqual(deniedRead.structuredContent?.caller, nonMemberCaller);
+  const otherHostCaller = { host: "windsurf", conversation_id: identity.conversation_id };
+  const deniedHost = await facade.callTool("communication_board", { caller: otherHostCaller, action: "list" });
+  assert.equal(deniedHost.isError, true);
+  assert.equal(deniedHost.structuredContent?.error?.code, "caller_unregistered");
+  assert.deepEqual(deniedHost.structuredContent?.caller, otherHostCaller);
 });
 
 test("the real private board MCP entry keeps each member's alias and post across a live restart", async context => {

@@ -17,14 +17,53 @@ export const boardOperations = Object.freeze({
   delete_archived: { required: ["expected_archive_version"], optional: ["expected_state_version"] },
 });
 
+export const LOCAL_MODEL_HOSTS = Object.freeze(new Set(["codex", "antigravity", "windsurf"]));
+
+function validConcretePart(part) {
+  return typeof part === "string" && part.length > 0 && part !== "*" && part === part.trim() &&
+    !/[\u0000-\u001f\u007f]/u.test(part);
+}
+
+function validLocalScope(scope, machineId) {
+  if (!scope || typeof scope !== "object" || Array.isArray(scope) || typeof machineId !== "string" || !machineId) return false;
+  return ["machine_id", "host", "surface"].every(key => validConcretePart(scope[key])) &&
+    scope.machine_id === machineId && LOCAL_MODEL_HOSTS.has(scope.host);
+}
+
+function isAgentOnlyOrigins(principal) {
+  return principal.origin_kinds === undefined || (Array.isArray(principal.origin_kinds) && principal.origin_kinds.length > 0 &&
+    principal.origin_kinds.every(kind => kind === "agent_message"));
+}
+
+export function isLocalSharedHostPrincipal(principal, machineId) {
+  if (!principal || principal.address_book_identity_bound === false || principal.channel_component != null) return false;
+  const scope = principal.caller_scope;
+  if (!validLocalScope(scope, machineId)) return false;
+  if (!isAgentOnlyOrigins(principal)) return false;
+  const identity = principal.identity;
+  if (!identity || typeof identity !== "object") return false;
+  return identity.machine_id === scope.machine_id && identity.host === scope.host && identity.surface === scope.surface;
+}
+
+export function isLocalPersonalPrincipal(principal, machineId) {
+  if (!principal || typeof machineId !== "string" || !machineId) return false;
+  if (principal.address_book_identity_bound === true && principal.caller_scope == null) {
+    return principal.identity?.machine_id === machineId;
+  }
+  return isLocalSharedHostPrincipal(principal, machineId);
+}
+
+export function isAuthorizedBoardPrincipal(principal, machineId) {
+  if (!principal || typeof machineId !== "string" || !machineId) return false;
+  if (isLocalSharedHostPrincipal(principal, machineId)) {
+    return principal.identity?.conversation_id === "*" || validConcretePart(principal.identity?.conversation_id);
+  }
+  return isLocalBoardCaller(principal, machineId);
+}
+
 export function isLocalBoardCaller(principal, machineId) {
-  if (principal?.address_book_identity_bound !== true || principal.caller_scope != null ||
-    typeof machineId !== "string" || principal.identity?.machine_id !== machineId) return false;
-  return ["machine_id", "host", "surface", "conversation_id"].every(key => {
-    const part = principal.identity[key];
-    return typeof part === "string" && part.length > 0 && part !== "*" && part === part.trim() &&
-      !/[\u0000-\u001f\u007f]/u.test(part);
-  });
+  if (!isLocalPersonalPrincipal(principal, machineId)) return false;
+  return ["machine_id", "host", "surface", "conversation_id"].every(key => validConcretePart(principal.identity?.[key]));
 }
 
 export function restrictBoardRelayDispatcher(dispatcher, peerMachines, capabilitiesFor) {

@@ -23,7 +23,7 @@ import { ChannelContentReader } from "./channel-content.mjs";
 import { batchRecipientNotice } from "./adapters/host-message.mjs";
 import { deriveBatchDedupeKeys, normalizeRecipientsInput, planReplyAllSubMessages, projectBatchSendReceipt, projectVisibilityForRecipient,
   renderPeerRecipientsForReceiver, validateAndDedupeRecipients } from "./multi-recipient.mjs";
-import { isLocalBoardCaller, normalizeBoardInvocation } from "./board-entry-contract.mjs";
+import { isAuthorizedBoardPrincipal, isLocalBoardCaller, isLocalPersonalPrincipal, normalizeBoardInvocation } from "./board-entry-contract.mjs";
 
 const DELIVERY_RESULTS = new Set(["accepted", "busy", "failed_before_send", "unknown"]);
 const DELIVERY_BOUNDARIES = new Set(["accepted", "failed_before_send", "unknown", "expired", "unsupported"]);
@@ -331,8 +331,8 @@ export class CommunicationCore {
     const principal = matches[0];
     const effective = principalForCaller(principal, caller);
     if (remember && principal.caller_scope) this.directory?.rememberCaller(effective.identity);
-    if (context.shared_facade === true && effective.address_book_identity_bound === true) {
-      return { ...effective, address_book_identity_bound: false };
+    if (context.shared_facade === true) {
+      return { ...effective, shared_facade_request: true };
     }
     return effective;
   }
@@ -375,8 +375,8 @@ export class CommunicationCore {
     const allowed = new Set(principalIds);
     const principals = registryValues(this.principals);
     if (allowed.size !== principalIds.length || principalIds.some(id => typeof id !== "string" ||
-      !principals.some(principal => principal.id === id && isLocalBoardCaller(principal, this.addressBookMachineId)))) {
-      throw new CoreError("invalid_config", "交流板只可授权本机具名连接");
+      !principals.some(principal => principal.id === id && isAuthorizedBoardPrincipal(principal, this.addressBookMachineId)))) {
+      throw new CoreError("invalid_config", "交流板只可授权已登记的本机对话或宿主连接");
     }
     const lifetime = new AbortController();
     const detach = () => {
@@ -389,10 +389,10 @@ export class CommunicationCore {
     return detach;
   }
 
-  canUseBoardTool(principalId, sharedFacade = false) {
-    if (!this.#boardEntry?.allowed.has(principalId) || sharedFacade) return false;
+  canUseBoardTool(principalId) {
+    if (!this.#boardEntry?.allowed.has(principalId)) return false;
     const matches = registryValues(this.principals).filter(principal => principal.id === principalId);
-    return matches.length === 1 && isLocalBoardCaller(matches[0], this.addressBookMachineId);
+    return matches.length === 1 && isAuthorizedBoardPrincipal(matches[0], this.addressBookMachineId);
   }
 
   board(context, input) {
@@ -400,7 +400,7 @@ export class CommunicationCore {
     if (!entry) throw new CoreError("board_unavailable", "本机交流板尚未启用");
     const principal = this.principal(context, input?.caller, { remember: false });
     if (!entry.allowed.has(principal.id) || !isLocalBoardCaller(principal, this.addressBookMachineId)) {
-      throw new CoreError("caller_unverified", "交流板需要能核实本机具体对话的连接");
+      throw new CoreError("caller_unverified", "当前连接未获本机交流板授权");
     }
     const signal = context?.signal ? AbortSignal.any([context.signal, entry.signal]) : entry.signal;
     if (signal.aborted) throw new CoreError("request_cancelled", "交流板请求已取消");
@@ -428,7 +428,7 @@ export class CommunicationCore {
   contactAccess(principal) {
     if (!this.addressBook) throw new CoreError("contacts_unavailable", "本机通讯录尚未启用");
     if (principal.identity.machine_id !== this.addressBookMachineId) throw new CoreError("forbidden", "只可查看本机通讯录");
-    return principal.address_book_identity_bound === true && principal.caller_scope == null;
+    return isLocalPersonalPrincipal(principal, this.addressBookMachineId);
   }
 
   contactForCaller(principal, alias) {
@@ -906,8 +906,7 @@ export class CommunicationCore {
     if (existing && existing.payload_hash !== payloadHash) throw new CoreError("dedupe_conflict", "同一去重键已经对应其它消息内容");
     this.validateReply(envelope);
     const persist = append => {
-      if (this.addressBook && principal.address_book_identity_bound === true && principal.caller_scope == null &&
-        principal.identity.machine_id === this.addressBookMachineId) this.addressBook.openForSend(principal);
+      if (this.addressBook && isLocalPersonalPrincipal(principal, this.addressBookMachineId)) this.addressBook.openForSend(principal);
       const original = this.store.findMessageByDedupe(sourceKey, dedupeKey);
       if (original) {
         if (original.payload_hash !== payloadHash) throw new CoreError("dedupe_conflict", "同一去重键已经对应其它消息内容");
@@ -925,7 +924,8 @@ export class CommunicationCore {
         payload_hash: payloadHash,
         principal_id: principal.id,
         source_identity_version: 2,
-        ...(relayIngress?.sourceVerified === true || (principal.address_book_identity_bound === true && principal.caller_scope == null)
+        ...(relayIngress?.sourceVerified === true ||
+          (principal.shared_facade_request !== true && principal.address_book_identity_bound === true && principal.caller_scope == null)
           ? { source_identity_verified: true } : {}),
         ...(relayIngress ? { relay_inbound: true } : {}),
         envelope,

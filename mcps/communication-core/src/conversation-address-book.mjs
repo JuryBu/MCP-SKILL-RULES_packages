@@ -1,4 +1,5 @@
 import { assertExactKeys, CoreError, identityKey, normalizeIdentity, requireText } from "./contracts.mjs";
+import { isLocalSharedHostPrincipal } from "./board-entry-contract.mjs";
 
 const ADDRESS_KEYS = ["machine_id", "host", "surface", "conversation_id"];
 const CONTROL = /[\u0000-\u001f\u007f]/u;
@@ -44,11 +45,16 @@ export function normalizeBoardAddress(value, fallbackMachine) {
 }
 
 function bookActor(principal, machineId) {
-  if (principal?.address_book_identity_bound !== true || principal.caller_scope != null) {
+  const bound = principal?.address_book_identity_bound === true && principal.caller_scope == null;
+  const sharedHost = isLocalSharedHostPrincipal(principal, machineId);
+  if (!bound && !sharedHost) {
     throw new CoreError("forbidden", "当前入口无法确认这次调用属于哪条对话");
   }
   const identity = checkedAddress(principal.identity);
   if (identity.machine_id !== machineId) throw new CoreError("forbidden", "只能操作本机自己的通讯录");
+  if (sharedHost && (identity.host !== principal.caller_scope.host || identity.surface !== principal.caller_scope.surface)) {
+    throw new CoreError("forbidden", "来源对话超出当前本机宿主入口范围");
+  }
   return identity;
 }
 

@@ -135,22 +135,31 @@ test("startup fails closed without a valid absolute registry; no fallback client
   assert.equal(mocks.created.length, 0);
 });
 
-test("the shared contacts facade refuses writes before making a Core connection", async context => {
+test("the shared contacts and board facade forwards writes and echoes exact submitted caller on success and error", async context => {
   const files = await fixture(context);
   const mocks = mockClients();
-  const facade = await files.facade({ includeContacts: true, ...mocks });
+  const facade = await files.facade({ includeContacts: true, includeBoard: true, ...mocks });
+  const client = await attachClient(files, facade);
+  const toolNames = (await client.listTools()).tools.map(entry => entry.name);
+  assert.ok(toolNames.includes("communication_contacts"));
+  assert.ok(toolNames.includes("communication_board"));
   const submitted = { host: caller.host, conversation_id: caller.conversation_id };
-  const denied = await facade.callTool("communication_contacts", {
+  const write = await facade.callTool("communication_contacts", {
     caller: submitted,
-    action: "set_note", contact: "共有联系人", note: "共享入口只读",
+    action: "set_note", contact: "共有联系人", note: "个人备注",
   });
-  assert.equal(errorCode(denied), "caller_unverified");
-  assert.deepEqual(denied.structuredContent.caller, submitted);
-  assert.equal(mocks.created.length, 0);
-  const read = await facade.callTool("communication_contacts", { caller: submitted, action: "list" });
-  assert.notEqual(read.isError, true);
-  assert.deepEqual(read.structuredContent.caller, submitted);
-  assert.deepEqual(JSON.parse(read.content[0].text.split("\n")[1]).caller, submitted);
+  assert.notEqual(write.isError, true);
+  assert.deepEqual(write.structuredContent.caller, submitted);
+  assert.deepEqual(JSON.parse(write.content[0].text.split("\n")[1]).caller, submitted);
+  assert.equal(mocks.created.length, 1);
+  const boardCall = await facade.callTool("communication_board", { caller: submitted, action: "list" });
+  assert.notEqual(boardCall.isError, true);
+  assert.deepEqual(boardCall.structuredContent.caller, submitted);
+  // Foreign/impersonated host rejected locally still echoes exact submitted caller without dialing backend
+  const foreignCaller = { host: "impersonated-host", conversation_id: caller.conversation_id };
+  const denied = await facade.callTool("communication_board", { caller: foreignCaller, action: "list" });
+  assert.equal(errorCode(denied), "caller_unregistered");
+  assert.deepEqual(denied.structuredContent.caller, foreignCaller);
   assert.equal(mocks.created.length, 1);
 });
 
@@ -563,4 +572,121 @@ test("real SDK HTTP started-call failure never retries and cannot expose raw res
   await delay(100);
   assert.equal(calls, 1);
   assert.ok(!JSON.stringify(response).includes(sentinel));
+});
+
+test("real stdio host-scoped facade renames inherited contacts, opens an existing board, echoes caller, and rejects impersonation", { timeout: 15000 }, async context => {
+  const { openBoardRuntime } = await import("../src/board-sync.mjs");
+  const root = await mkdtemp(join(tmpdir(), "communication-facade-board-"));
+  const closers = [];
+  context.after(async () => {
+    for (const close of closers.reverse()) await close();
+    await rm(root, { recursive: true, force: true });
+  });
+  const machineId = "facade-shared-machine";
+  const convA = { machine_id: machineId, host: "antigravity", surface: "desktop", conversation_id: "shared-conv-a" };
+  const convB = { machine_id: machineId, host: "antigravity", surface: "desktop", conversation_id: "shared-conv-b" };
+  const peerCodex = { machine_id: machineId, host: "codex", surface: "desktop", conversation_id: "peer-codex" };
+  const hostScope = { machine_id: machineId, host: "antigravity", surface: "desktop" };
+  const principals = [
+    { id: "shared-ag-host", token: "synthetic-shared-ag-host-token", identity: { ...hostScope, conversation_id: "*" },
+      caller_scope: hostScope, allowed_targets: [], origin_kinds: ["agent_message"] },
+  ];
+  const store = new MessageStore({ filePath: join(root, "core.sqlite") });
+  const core = new CommunicationCore({ store, targets: [], principals, adapters: { mock: new MockAdapter() } });
+  closers.push(async () => { await core.close(); store.close(); });
+  core.attachAddressBook({
+    machineId,
+    sharedContacts: [{ id: "shared-peer", alias: "协作搭档", target: peerCodex, note: "公共说明" }],
+  });
+  await core.start();
+  const boardRuntime = await openBoardRuntime({
+    localMachineId: machineId, privateRoot: root, boardRoot: join(root, "boards"),
+    superAdminIdentities: [convA], allowedUploadRoots: [],
+    openStore: create => store.openBoardStore(create, { privateRoot: root, allowedUploadRoots: [], now: () => core.nowMs() }),
+    addressBookAdapter: Object.freeze({
+      saveBoardForIdentity: (member, board) => core.addressBook.saveBoardForIdentity(member, board),
+      listBoardsForIdentity: member => core.addressBook.listBoardsForIdentity(member),
+      resolve: (principal, alias) => core.addressBook.resolve(principal, alias),
+      resolveDisplayName: (receiverId, peer) => core.resolveDisplayName(receiverId, peer),
+    }),
+    peerMachines: [], notifyIntervalMs: 0, now: () => core.nowMs(),
+  });
+  closers.push(() => boardRuntime.close());
+  await boardRuntime.start?.();
+  // Pre-seed an existing board with convA as member and 1 initial post (no new identity created)
+  const createdBoard = await boardRuntime.invoke({ action: "create", actorIdentity: convA, params: { title: "已有双机验收板" } });
+  const existingBoard = { machine_id: machineId, board_id: createdBoard.board_id };
+  await boardRuntime.invoke({ action: "post", actorIdentity: convA, board: existingBoard, params: { body: "预置历史帖子正文" } });
+  const detachBoard = core.attachBoardEntry({ invoke: inv => boardRuntime.invoke(inv), principalIds: ["shared-ag-host"] });
+  closers.push(() => detachBoard());
+  const http = await createMcpHttpServer({ core, principals });
+  closers.push(() => http.close());
+
+  const endpointFile = join(root, "active.endpoint.json");
+  const profileFile = join(root, "ag-host.connection.json");
+  const registryFile = join(root, "ag.registry.json");
+  await writeJson(endpointFile, { version: 1, state: "listening", owner_id: "shared-owner-1", pid: process.pid,
+    config_path: join(root, "cfg.json"), state_dir: root, endpoint_file: endpointFile, started_at: "2026-11-28T15:30:00+08:00", url: http.url });
+  await writeJson(profileFile, { endpoint_file: endpointFile, identity: { ...hostScope, conversation_id: "*" }, caller_scope: hostScope, token: principals[0].token });
+  await writeJson(registryFile, { version: 1, connections: [{ connection_file: profileFile }] });
+
+  const transport = new StdioClientTransport({
+    command: process.execPath,
+    args: [join(moduleRoot, "scripts", "broker-stdio.mjs")],
+    cwd: moduleRoot,
+    env: { ...process.env, COMMUNICATION_CORE_FACADE_REGISTRY: registryFile, COMMUNICATION_CORE_FACADE_CONTACTS: "1", COMMUNICATION_CORE_FACADE_BOARD: "1" },
+    stderr: "pipe",
+  });
+  const client = new Client({ name: "real-shared-stdio-sdk-test", version: "1.0.0" });
+  closers.push(() => client.close());
+  await client.connect(transport, { timeout: 5000 });
+  const toolNames = (await client.listTools()).tools.map(t => t.name);
+  assert.ok(toolNames.includes("communication_contacts"));
+  assert.ok(toolNames.includes("communication_board"));
+
+  const shortA = { host: "antigravity", conversation_id: convA.conversation_id };
+  const shortB = { host: "antigravity", conversation_id: convB.conversation_id };
+
+  // 1) Rename inherited shared contact via shared stdio facade without altering default or convB
+  const renamed = await client.callTool({ name: "communication_contacts", arguments: { caller: shortA, action: "rename", contact: "协作搭档", alias: "我的核心伙伴" } });
+  assert.notEqual(renamed.isError, true, JSON.stringify(renamed.structuredContent));
+  assert.deepEqual(renamed.structuredContent.caller, shortA);
+  const readB = await client.callTool({ name: "communication_contacts", arguments: { caller: shortB, action: "get", contact: "协作搭档" } });
+  assert.notEqual(readB.isError, true);
+  assert.equal(readB.structuredContent.alias, "协作搭档");
+  assert.deepEqual(readB.structuredContent.caller, shortB);
+
+  // 2) Open pre-existing board by personal contact alias, read existing post (< 9 KiB) and post new reply
+  const listed = await client.callTool({ name: "communication_board", arguments: { caller: shortA, action: "list" } });
+  assert.notEqual(listed.isError, true, JSON.stringify(listed.structuredContent));
+  assert.equal(listed.structuredContent.boards.length, 1);
+  assert.deepEqual(listed.structuredContent.caller, shortA);
+  const readBoard = await client.callTool({ name: "communication_board", arguments: { caller: shortA, action: "read", board: { contact: "已有双机验收板" } } });
+  assert.notEqual(readBoard.isError, true, JSON.stringify(readBoard.structuredContent));
+  assert.ok(Buffer.byteLength(JSON.stringify(readBoard.structuredContent), "utf8") <= 9216);
+  assert.equal(readBoard.structuredContent.posts[0].body, "预置历史帖子正文");
+  assert.deepEqual(readBoard.structuredContent.caller, shortA);
+  const posted = await client.callTool({ name: "communication_board", arguments: { caller: shortA, action: "post", board: { contact: "已有双机验收板" }, body: "普通共享入口实发第二帖" } });
+  assert.notEqual(posted.isError, true, JSON.stringify(posted.structuredContent));
+  assert.equal(posted.structuredContent.seq, 2);
+  assert.deepEqual(posted.structuredContent.caller, shortA);
+
+  // 3) Non-member convB still denied on existing board; error still echoes exact submitted short caller
+  const deniedNonMember = await client.callTool({ name: "communication_board", arguments: { caller: shortB, action: "read", board: existingBoard } });
+  assert.equal(deniedNonMember.isError, true);
+  assert.equal(errorCode(deniedNonMember), "forbidden");
+  assert.deepEqual(deniedNonMember.structuredContent.caller, shortB);
+
+  // 4) Foreign machine & other-host impersonation still rejected with exact submitted caller echoed
+  const impersonatedHost = { host: "codex", conversation_id: peerCodex.conversation_id };
+  const deniedHost = await client.callTool({ name: "communication_board", arguments: { caller: impersonatedHost, action: "list" } });
+  assert.equal(deniedHost.isError, true);
+  assert.equal(errorCode(deniedHost), "caller_unregistered");
+  assert.deepEqual(deniedHost.structuredContent.caller, impersonatedHost);
+
+  const foreignMachine = { machine_id: "remote-machine", host: "antigravity", surface: "desktop", conversation_id: convA.conversation_id };
+  const deniedForeign = await client.callTool({ name: "communication_contacts", arguments: { caller: foreignMachine, action: "list" } });
+  assert.equal(deniedForeign.isError, true);
+  assert.equal(errorCode(deniedForeign), "caller_unregistered");
+  assert.deepEqual(deniedForeign.structuredContent.caller, foreignMachine);
 });

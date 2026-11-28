@@ -419,6 +419,7 @@ export function attachCoreRelay(core, configuration, machineProviders) {
       }),
         async readRecent(target, { lastRounds = 3, signal, principal } = {}) {
           if (principal?.address_book_identity_bound !== true || principal.caller_scope != null ||
+            principal.shared_facade_request === true ||
             principal.identity?.machine_id !== machineId || !principal.allowed_host_snapshots?.some(grant =>
               grant.all_conversations !== true && grant.conversation_id && identityKey(grant) === identityKey(target))) throw forbidden();
           const reply = await dispatcher.querySnapshot({

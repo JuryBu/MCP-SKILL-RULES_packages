@@ -95,13 +95,34 @@ test("books are local to a machine and host even for the same conversation ident
   assert.equal(view.target.machine_id, peerMachine);
 });
 
-test("only a trusted concrete local identity opens a personal book", context => {
+test("only a trusted concrete local identity or local model host scope opens a personal book", context => {
   const { book, database } = setup(context).open();
   assert.throws(() => book.list({ identity: recipient }), { code: "forbidden" });
   assert.throws(() => book.list({ ...principal(recipient), caller_scope: { host: "codex" } }), { code: "forbidden" });
   assert.throws(() => book.list(principal({ ...recipient, machine_id: peerMachine })), { code: "forbidden" });
   assert.throws(() => book.list(principal({ ...recipient, conversation_id: "*" })), { code: "invalid_input" });
+  // External channels (including github/webhook/non-model hosts), disabled flag, or cross-host impersonation under caller_scope stay forbidden
+  for (const [host, surface] of [["qq", "group"], ["wechat", "private"], ["github", "webhook"], ["external-bot", "api"]]) {
+    assert.throws(() => book.list({ identity: { machine_id: localMachine, host, surface, conversation_id: "ext-1" },
+      caller_scope: { machine_id: localMachine, host, surface }, origin_kinds: ["agent_message"] }), { code: "forbidden" });
+  }
+  assert.throws(() => book.list({ identity: recipient, caller_scope: { machine_id: localMachine, host: "codex", surface: "desktop" },
+    origin_kinds: ["human_message"] }), { code: "forbidden" });
+  assert.throws(() => book.list({ identity: recipient, caller_scope: { machine_id: localMachine, host: "codex", surface: "desktop" },
+    channel_component: "napcat_owner", origin_kinds: ["agent_message"] }), { code: "forbidden" });
+  assert.throws(() => book.list({ identity: recipient, caller_scope: { machine_id: localMachine, host: "codex", surface: "desktop" },
+    address_book_identity_bound: false, origin_kinds: ["agent_message"] }), { code: "forbidden" });
+  assert.throws(() => book.list({ identity: { ...recipient, host: "antigravity" }, caller_scope: { machine_id: localMachine, host: "codex", surface: "desktop" },
+    origin_kinds: ["agent_message"] }), { code: "forbidden" });
   assert.equal(bookCount(database), 0);
+  // All three local model hosts (codex / antigravity / windsurf) access the exact same personal book as dedicated identities
+  for (const host of ["codex", "antigravity", "windsurf"]) {
+    const id = { ...recipient, host };
+    const sharedHostActor = { identity: id, caller_scope: { machine_id: localMachine, host, surface: "desktop" }, origin_kinds: ["agent_message"] };
+    book.rename(sharedHostActor, { contact: "协作窗口", alias: `共享改名-${host}` });
+    assert.equal(book.resolve(principal(id), `共享改名-${host}`).target.conversation_id, "sample-room");
+  }
+  assert.equal(bookCount(database), 3);
 });
 
 test("board aliases are stable across repeated invitations and only appear in each member's book", context => {

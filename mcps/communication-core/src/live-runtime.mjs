@@ -26,7 +26,7 @@ import { HostStatusProvider, createAntigravityStatusReader, createCodexStatusRea
 import { createWindsurfDesktopStatusReader } from "./windsurf-desktop-status.mjs";
 import { WindowIngressController } from "./window-ingress.mjs";
 import { CORE_RELAY_ADAPTER, attachCoreRelay, prepareCoreRelay } from "./core-relay-bridge.mjs";
-import { isLocalBoardCaller, restrictBoardRelayDispatcher } from "./board-entry-contract.mjs";
+import { isAuthorizedBoardPrincipal, LOCAL_MODEL_HOSTS, restrictBoardRelayDispatcher } from "./board-entry-contract.mjs";
 
 const MAX_ENTRIES = 256;
 const IDENTITY_FIELDS = ["machine_id", "host", "surface", "conversation_id"];
@@ -249,7 +249,8 @@ async function readConfiguration(configPath) {
       if (callerScope && (identity.conversation_id !== "*" || Object.entries(callerScope).some(([field, value]) => identity[field] !== value))) throw invalidConfiguration();
       if (!callerScope && identity.conversation_id === "*") throw invalidConfiguration();
       if (entry.address_book_identity_bound !== undefined && typeof entry.address_book_identity_bound !== "boolean") throw invalidConfiguration();
-      if (entry.address_book_identity_bound === true && (callerScope || addressBook?.machineId !== identity.machine_id)) throw invalidConfiguration();
+      if (entry.address_book_identity_bound === true && (addressBook?.machineId !== identity.machine_id ||
+        (callerScope && !LOCAL_MODEL_HOSTS.has(callerScope.host)))) throw invalidConfiguration();
       const targetScopes = entry.allowed_target_scopes === undefined ? undefined : boundedList(entry.allowed_target_scopes, 32, 0).map(normalizeHostScope);
       if (targetScopes && new Set(targetScopes.map(scope => JSON.stringify(scope))).size !== targetScopes.length) throw invalidConfiguration();
       const originKinds = uniqueTextList(entry.origin_kinds ?? ["agent_message"], "origin_kind", 32, 1, 64);
@@ -267,7 +268,7 @@ async function readConfiguration(configPath) {
         ...(hostSnapshots === undefined ? {} : { allowed_host_snapshots: hostSnapshots }),
         ...(callerScope ? { caller_scope: callerScope } : {}),
         ...(targetScopes ? { allowed_target_scopes: targetScopes } : {}),
-        ...(entry.address_book_identity_bound === true ? { address_book_identity_bound: true } : {}),
+        ...(entry.address_book_identity_bound !== undefined ? { address_book_identity_bound: entry.address_book_identity_bound } : {}),
         origin_kinds: originKinds,
         ...(entry.channel_component === undefined ? {} : { channel_component: requireText(entry.channel_component, "channel_component", 64) }),
       };
@@ -329,7 +330,7 @@ function prepareBoardRuntimeOptions(value, configuration, directory, relayConfig
     (value.notifyLocalMember !== undefined && typeof value.notifyLocalMember !== "function") || !configuration.addressBook) throw invalidConfiguration();
   const principalIds = uniqueTextList(value.principalIds, "交流板连接授权", MAX_ENTRIES, 1, 128);
   if (principalIds.some(id => !configuration.principals.some(principal => principal.id === id &&
-    isLocalBoardCaller(principal, configuration.localMachineId)))) throw invalidConfiguration();
+    isAuthorizedBoardPrincipal(principal, configuration.localMachineId)))) throw invalidConfiguration();
   const superAdminIdentities = boundedList(value.superAdminIdentities ?? [], MAX_ENTRIES, 0).map(identity => {
     assertExactKeys(identity, IDENTITY_FIELDS, "交流板管理员");
     if (IDENTITY_FIELDS.some(field => typeof identity[field] !== "string" || identity[field] === "*" ||

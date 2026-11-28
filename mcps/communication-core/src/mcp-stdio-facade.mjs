@@ -6,12 +6,12 @@ import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { CallToolRequestSchema, CallToolResultSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
-import { communicationContactsTool, communicationToolEntries, listCommunicationToolDefinitions, withSubmittedCaller } from "./mcp-server.mjs";
+import { communicationBoardTool, communicationContactsTool, communicationToolEntries, listCommunicationToolDefinitions, withSubmittedCaller } from "./mcp-server.mjs";
 
 export const FACADE_INSTRUCTIONS =
   "每次填写真实 caller 的 host 与稳定 conversation_id。唯一匹配登记时可省 machine_id、surface；有多个匹配须补齐。已登记的宿主统一入口无需逐个登记CID；broker未提供可信宿主CID，门面按登记选连接，未鉴别实际宿主来源。" +
   "目标按端和对话ID寻址，也可用原绑定或已启用的联系人。普通代理发送可省 origin，本人来源需要原授权。发送默认next_model_boundary，能中途插入就插入；仅明确延后时用when_idle。Codex新消息默认hidden，可用message_visibility=visible。QQ来信回原QQ。" +
-  "等待投递或回复与确认处理分开，实际处理后才ACK。结果未知时查原请求ID，保持原dedupe_key，不自动重发。门面只连接原核心，不启动服务。共享门面启用通讯录后可只读本机共有联系人；个人读写通过能核实具体对话的独立入口。" +
+  "等待投递或回复与确认处理分开，实际处理后才ACK。结果未知时查原请求ID，保持原dedupe_key，不自动重发。门面只连接原核心，不启动服务。已启用通讯录或交流板的本机入口按传入 caller 操作个人通讯录与交流板，回执原样回显传入对话，不扩大原有跨端授权。" +
   "QQ 最近内容无需绑定或启用采集；下载使用本调用者在对应窗口取得的 attachment_ref，结果未知先核原请求与目录。普通发送可省 dedupe_key 与 expires_at（同分钟去重、24h 过期）；ack_processing 可只填 caller、message_id、processing，附可选进度 note；合法 in_reply_to 回信可确认原信。";
 
 const CONNECT_TIMEOUT_MS = 4000;
@@ -189,9 +189,10 @@ export async function createFacadeHttpClient({ url, token, signal, timeoutMs }) 
 
 export async function createMcpStdioFacade({ registryFile = process.env.COMMUNICATION_CORE_FACADE_REGISTRY, clientFactory = createFacadeHttpClient,
   includeContacts = process.env.COMMUNICATION_CORE_FACADE_CONTACTS === "1",
-  includeMultiRecipient = process.env.COMMUNICATION_CORE_FACADE_MULTI_RECIPIENT === "1" } = {}) {
+  includeMultiRecipient = process.env.COMMUNICATION_CORE_FACADE_MULTI_RECIPIENT === "1",
+  includeBoard = process.env.COMMUNICATION_CORE_FACADE_BOARD === "1" } = {}) {
   try { await readRegistry(registryFile); } catch { throw new Error("facade_config_invalid"); }
-  const features = { includeContacts, includeMultiRecipient };
+  const features = { includeContacts, includeMultiRecipient, includeBoard };
   const entries = communicationToolEntries(features);
   const clients = new Map();
   const ownedClients = new Set();
@@ -214,9 +215,8 @@ export async function createMcpStdioFacade({ registryFile = process.env.COMMUNIC
     const definition = entries.find(entry => entry.definition.name === name);
     const parsed = definition?.validator.safeParse(args);
     if (!parsed?.success || parsed.data.caller.conversation_id === "*") return failure("invalid_input");
-    const submittedCaller = definition === communicationContactsTool ? parsed.data.caller : undefined;
+    const submittedCaller = (definition === communicationContactsTool || definition === communicationBoardTool) ? parsed.data.caller : undefined;
     const fail = code => withSubmittedCaller(failure(code), submittedCaller);
-    if (submittedCaller && !["list", "get"].includes(parsed.data.action)) return fail("caller_unverified");
     const signal = AbortSignal.any([lifetime.signal, ...(extra.signal ? [extra.signal] : [])]);
     let snapshot;
     try { snapshot = await readRegistry(registryFile); } catch {

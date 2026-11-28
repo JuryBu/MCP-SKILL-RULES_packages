@@ -31,6 +31,13 @@ const principals = [
   { id: "fixture-second-token", token: "synthetic-token-contact-second", identity: second, allowed_targets: ["first-binding"], origin_kinds: ["agent_message"], address_book_identity_bound: true },
   { id: "fixture-host-token", token: "synthetic-token-host", identity: { ...first, conversation_id: "*" }, allowed_targets: ["second-binding"], origin_kinds: ["agent_message"],
     caller_scope: { machine_id: machine, host: first.host, surface: first.surface } },
+  { id: "fixture-readonly-host-token", token: "synthetic-token-readonly-host", identity: { ...first, conversation_id: "*" }, allowed_targets: ["second-binding"], origin_kinds: ["agent_message"],
+    caller_scope: { machine_id: machine, host: first.host, surface: first.surface }, address_book_identity_bound: false },
+  { id: "fixture-qq-channel-token", token: "synthetic-token-qq-channel", identity: { machine_id: machine, host: "qq", surface: "group", conversation_id: "fixture-qq-room" },
+    allowed_targets: ["first-binding"], origin_kinds: ["human_message"], channel_component: "napcat_owner" },
+  { id: "fixture-github-scope-token", token: "synthetic-token-github-scope", identity: { machine_id: machine, host: "github", surface: "webhook", conversation_id: "*" },
+    allowed_targets: ["first-binding"], origin_kinds: ["agent_message"],
+    caller_scope: { machine_id: machine, host: "github", surface: "webhook" } },
 ];
 const sharedContacts = [{ id: "fixture-shared", alias: "共有", target: second, note: "公共备注" }];
 
@@ -53,6 +60,7 @@ async function fixture(context) {
         allowed_target_scopes: [dynamicScope] },
       configured[1], configured[2],
       { ...configured[1], id: "fixture-third-token", identity: third, token: "synthetic-token-contact-third", allowed_targets: ["first-binding", "second-binding"] },
+      configured[3], configured[4], configured[5],
     ];
     const conversationRoutes = enableMultiRecipient ? [{ ...dynamicScope, adapter_id: "fixture-adapter",
       capabilities: { next_model_boundary: true, when_idle: true } }] : [];
@@ -114,41 +122,66 @@ async function delivered(client, caller, message_id) {
   assert.fail("mock delivery did not arrive");
 }
 
-test("the board tool is absent by default, and a running board tool is visible only to bound local identities", async context => {
+test("the board tool works for authorized dedicated and local shared host entries while blocking ungranted, disabled and external channel routes", async context => {
   const open = await fixture(context);
   const baseline = await open();
   const baselineClient = await baseline.connect(0);
   assert.ok(!(await baselineClient.listTools()).tools.some(tool => tool.name === "communication_board"));
+  // External channel (including github/non-model host scopes) and explicitly disabled principals cannot be registered for board access
+  assert.throws(() => baseline.core.attachBoardEntry({ invoke: () => ({}), principalIds: ["fixture-qq-channel-token"] }), { code: "invalid_config" });
+  assert.throws(() => baseline.core.attachBoardEntry({ invoke: () => ({}), principalIds: ["fixture-github-scope-token"] }), { code: "invalid_config" });
+  assert.throws(() => baseline.core.attachBoardEntry({ invoke: () => ({}), principalIds: ["fixture-readonly-host-token"] }), { code: "invalid_config" });
   await baseline.close();
   const requests = [];
-  const live = await open({ boardPrincipalIndexes: [0], boardInvoke: input => {
+  const live = await open({ boardPrincipalIndexes: [0, 2], boardInvoke: input => {
     requests.push(input);
-    return { items: [] };
+    return { items: [{ board_id: "existing-board" }] };
   } });
   const direct = await live.connect(0);
   const shared = await live.connect(0, { shared: true });
-  const host = await live.connect(2);
+  const host = await live.connect(2, { shared: true });
   const notGranted = await live.connect(1);
-  const definition = (await direct.listTools()).tools.find(tool => tool.name === "communication_board");
-  assert.equal(definition.inputSchema.properties.action.enum.length, 13);
-  assert.ok(definition.inputSchema.properties.action.enum.includes("subscribe"));
-  assert.ok(definition.inputSchema.properties.action.enum.includes("unsubscribe"));
-  assert.equal(definition.annotations.destructiveHint, true);
+  const readonlyHost = await live.connect(3, { shared: true });
+  const qqChannel = await live.connect(4);
+  const githubScope = await live.connect(5, { shared: true });
+  for (const allowed of [direct, shared, host]) {
+    const definition = (await allowed.listTools()).tools.find(tool => tool.name === "communication_board");
+    assert.ok(definition);
+    assert.equal(definition.inputSchema.properties.action.enum.length, 13);
+    assert.ok(definition.inputSchema.properties.action.enum.includes("subscribe"));
+    assert.ok(definition.inputSchema.properties.action.enum.includes("unsubscribe"));
+    assert.equal(definition.annotations.destructiveHint, true);
+  }
   const input = { caller: short(first), action: "list" };
-  for (const client of [shared, host, notGranted]) {
+  for (const client of [notGranted, readonlyHost, qqChannel, githubScope]) {
     assert.ok(!(await client.listTools()).tools.some(tool => tool.name === "communication_board"));
     await expectError(client, "board", input, "invalid_input");
   }
   await expectError(direct, "board", { ...input, caller: short(second) }, "caller_mismatch");
-  await expectError(direct, "board", { ...input, caller: { ...short(first), conversation_id: "*" } }, "invalid_input");
+  // Local shared host still blocks impersonating another host or another machine
+  const wrongHost = await call(host, "board", { ...input, caller: { host: "antigravity", conversation_id: first.conversation_id } });
+  assert.equal(wrongHost.isError, true);
+  assert.equal(wrongHost.structuredContent?.error?.code, "caller_mismatch");
+  assert.deepEqual(wrongHost.structuredContent?.caller, { host: "antigravity", conversation_id: first.conversation_id });
+  const wrongMachine = await call(host, "board", { ...input, caller: { machine_id: "fixture-external-machine", host: first.host, conversation_id: first.conversation_id } });
+  assert.equal(wrongMachine.isError, true);
+  assert.equal(wrongMachine.structuredContent?.error?.code, "caller_mismatch");
+  assert.deepEqual(wrongMachine.structuredContent?.caller, { machine_id: "fixture-external-machine", host: first.host, conversation_id: first.conversation_id });
+  await expectError(host, "board", { ...input, caller: { ...short(first), conversation_id: "*" } }, "invalid_input");
   await expectError(direct, "board", { ...input, actorIdentity: second }, "invalid_input");
   assert.equal(requests.length, 0);
-  assert.deepEqual(await ok(direct, "board", input), { items: [], caller: input.caller });
-  assert.equal(requests.length, 1);
+  // Pre-existing board alias registered for `first` is usable directly through the local shared host route
+  const existingBoard = { machine_id: machine, board_id: "existing-board" };
+  live.core.addressBook.saveBoardForIdentity(first, { ...existingBoard, baseTitle: "已有交流板" });
+  assert.deepEqual(await ok(direct, "board", input), { items: [{ board_id: "existing-board" }], caller: input.caller });
+  assert.deepEqual(await ok(shared, "board", input), { items: [{ board_id: "existing-board" }], caller: input.caller });
+  assert.deepEqual(await ok(host, "board", { caller: short(first), action: "read", board: { contact: "已有交流板" } }),
+    { items: [{ board_id: "existing-board" }], caller: short(first) });
+  assert.equal(requests.length, 3);
   assert.deepEqual(requests[0].actorIdentity, first);
-  assert.equal(requests[0].board, undefined);
-  assert.deepEqual(requests[0].params, {});
-  assert.ok(Object.isFrozen(requests[0].actorIdentity));
+  assert.deepEqual(requests[2].actorIdentity, first);
+  assert.deepEqual(requests[2].board, existingBoard);
+  assert.ok(Object.isFrozen(requests[2].actorIdentity));
 });
 
 test("the board tool resolves only the caller's alias and checks each action's address and parameters", async context => {
@@ -181,23 +214,36 @@ test("the board tool resolves only the caller's alias and checks each action's a
   ]);
 });
 
-test("a conversation can rename an inherited contact without changing the shared default or a peer's book", async context => {
+test("a conversation can rename an inherited contact via dedicated or local shared host route without changing defaults or peers", async context => {
   const open = await fixture(context);
   const live = await open();
   const owner = await live.connect(0);
   const other = await live.connect(1);
-  const shared = await live.connect(2);
+  const sharedHost = await live.connect(2, { shared: true });
+  const readonlyHost = await live.connect(3, { shared: true });
+  const qqChannel = await live.connect(4);
+  const githubScope = await live.connect(5, { shared: true });
   const input = { caller: short(first), action: "rename", contact: "共有", alias: "我的名字" };
-  await expectError(shared, "contacts", input, "caller_unverified");
+  await expectError(readonlyHost, "contacts", input, "caller_unverified");
+  await expectError(qqChannel, "contacts", { ...input, caller: { host: "qq", conversation_id: "fixture-qq-room" } }, "caller_unverified");
+  await expectError(githubScope, "contacts", { ...input, caller: { host: "github", conversation_id: "fixture-pr-1" } }, "caller_unverified");
   await expectError(owner, "contacts", { ...input, caller: short(second) }, "caller_mismatch");
-  const result = await ok(owner, "contacts", input);
+  // Local shared host renames directly for `first` and echoes the exact submitted short caller
+  const result = await ok(sharedHost, "contacts", input);
   assert.deepEqual(result.caller, input.caller);
-  const renamed = await ok(owner, "contacts", { caller: short(first), action: "get", contact: input.alias });
-  assert.equal(renamed.alias, input.alias);
-  assert.deepEqual(renamed.target, second);
-  assert.equal(renamed.note, "公共备注");
-  for (const [client, caller] of [[other, short(second)], [shared, short(first)]]) {
-    await expectError(client, "contacts", { caller, action: "get", contact: input.alias }, "contact_not_found");
+  // Dedicated entry and shared host entry see the exact same personal book for `first`
+  for (const client of [owner, sharedHost]) {
+    const renamed = await ok(client, "contacts", { caller: short(first), action: "get", contact: input.alias });
+    assert.equal(renamed.alias, input.alias);
+    assert.deepEqual(renamed.target, second);
+    assert.equal(renamed.note, "公共备注");
+    assert.deepEqual(renamed.caller, short(first));
+  }
+  for (const [client, caller] of [[other, short(second)], [sharedHost, short(third)], [readonlyHost, short(first)]]) {
+    const missing = await call(client, "contacts", { caller, action: "get", contact: input.alias });
+    assert.equal(missing.isError, true);
+    assert.equal(missing.structuredContent?.error?.code, "contact_not_found");
+    assert.deepEqual(missing.structuredContent?.caller, caller);
     const entry = await ok(client, "contacts", { caller, action: "get", contact: "共有" });
     assert.equal(entry.alias, "共有");
     assert.deepEqual(entry.target, second);
@@ -296,26 +342,38 @@ test("sixteen authorized recipients return their full identities and one bounded
   assert.equal(new Set(results.map(entry => entry.delivery_id)).size, 16);
 });
 
-test("trusted dedicated callers use only their own book; a declared shared route only reads the defaults", async context => {
+test("dedicated and local shared host routes share each caller's personal book; disabled and channel routes stay read-only", async context => {
   const open = await fixture(context);
   const service = await open();
   const primary = await service.connect(0);
   const partner = await service.connect(1);
   const sharedEntry = await service.connect(2);
   const sharedPathForExact = await service.connect(0, { shared: true });
+  const readonlyHost = await service.connect(3, { shared: true });
+  const qqChannel = await service.connect(4);
+  const githubScope = await service.connect(5, { shared: true });
   assert.ok((await primary.listTools()).tools.some(tool => tool.name === "communication_contacts"));
   await ok(primary, "contacts", { caller: short(first), action: "save", alias: "同伴", target: second, note: "我的备注" });
-  await ok(primary, "contacts", { caller: short(first), action: "set_note", contact: "共有", note: "我的共有备注" });
-  assert.equal((await ok(primary, "contacts", { caller: short(first), action: "list" })).contacts.length, 2);
+  await ok(sharedEntry, "contacts", { caller: short(first), action: "set_note", contact: "共有", note: "我的共有备注" });
+  for (const client of [primary, sharedEntry, sharedPathForExact]) {
+    const view = await ok(client, "contacts", { caller: short(first), action: "list" });
+    assert.equal(view.contacts.length, 2);
+    assert.equal((await ok(client, "contacts", { caller: short(first), action: "get", contact: "共有" })).note, "我的共有备注");
+    assert.equal((await ok(client, "contacts", { caller: short(first), action: "get", contact: "同伴" })).note, "我的备注");
+  }
   assert.equal((await ok(partner, "contacts", { caller: short(second), action: "list" })).contacts[0].note, "公共备注");
   await expectError(primary, "contacts", { caller: short(second), action: "list" }, "caller_mismatch");
-  for (const shared of [sharedEntry, sharedPathForExact]) {
-    const view = await ok(shared, "contacts", { caller: short(first), action: "list" });
+  for (const [restricted, caller] of [
+    [readonlyHost, short(first)],
+    [qqChannel, { host: "qq", conversation_id: "fixture-qq-room" }],
+    [githubScope, { host: "github", conversation_id: "fixture-pr-1" }],
+  ]) {
+    const view = await ok(restricted, "contacts", { caller, action: "list" });
     assert.deepEqual(view.contacts.map(contact => contact.note), ["公共备注"]);
-    await expectError(shared, "contacts", { caller: short(first), action: "get", contact: "同伴" }, "contact_not_found");
-    await expectError(shared, "contacts", { caller: short(first), action: "set_note", contact: "共有", note: "拒绝" }, "caller_unverified");
+    await expectError(restricted, "contacts", { caller, action: "get", contact: "同伴" }, "contact_not_found");
+    await expectError(restricted, "contacts", { caller, action: "set_note", contact: "共有", note: "拒绝" }, "caller_unverified");
   }
-  await ok(primary, "contacts", { caller: short(first), action: "remove", contact: "共有" });
+  await ok(sharedEntry, "contacts", { caller: short(first), action: "remove", contact: "共有" });
   assert.equal((await ok(primary, "contacts", { caller: short(first), action: "get", contact: "共有" })).note, "公共备注");
 });
 

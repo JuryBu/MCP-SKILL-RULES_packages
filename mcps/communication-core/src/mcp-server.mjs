@@ -305,7 +305,7 @@ const boardFileField = objectField({
   bundle_label: optional(textField(512)),
 });
 const boardTool = tool("board", "board",
-  "用已核实的本机对话查看或操作交流板。create 和 list 无需填写 board；其他动作可用个人短代号 {contact} 或板地址 {machine_id,board_id}。delete_archived 会永久移除已归档的板，须提供该次归档版本。", {
+  "按本次传入的本机对话 caller 查看或操作交流板（回执原样回显传入对话）。create 和 list 无需填写 board；其他动作可用个人短代号 {contact} 或板地址 {machine_id,board_id}。delete_archived 会永久移除已归档的板，须提供该次归档版本。", {
     action: choiceField(Object.keys(boardOperations)),
     board: optional(oneOfFields([boardAddressField, contactAddressField])),
     title: optional(textField(512)),
@@ -329,6 +329,7 @@ const boardTool = tool("board", "board",
     expected_state_version: optional(integerField(0)),
   }, false);
 boardTool.definition.annotations = { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true };
+export { boardTool as communicationBoardTool };
 
 export function communicationToolEntries({ includeContacts = false, includeMultiRecipient = false, includeBoard = false } = {}) {
   return [
